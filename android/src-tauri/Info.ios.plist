@@ -4,6 +4,17 @@
   <dict>
     <key>NSCameraUsageDescription</key>
     <string>Scan the one-use QR code shown by your Napstr desktop.</string>
+    <key>CFBundleURLTypes</key>
+    <array>
+      <dict>
+        <key>CFBundleTypeRole</key>
+        <string>Viewer</string>
+        <key>CFBundleURLSchemes</key>
+        <array>
+          <string>napstr</string>
+        </array>
+      </dict>
+    </array>
   </dict>
 </plist>
 

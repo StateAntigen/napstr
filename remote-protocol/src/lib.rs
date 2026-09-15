@@ -8,6 +8,32 @@ pub const MAX_PAGE_SIZE: usize = 200;
 const PAIRING_URI_PREFIX: &str = "napstrfy://pair/";
 const LEGACY_PAIRING_URI_PREFIX: &str = "nostrfy://pair/";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackUri {
+    pub file_id: String,
+}
+
+impl TrackUri {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        let value = value.trim();
+        let file_id = value
+            .strip_prefix("napstr://track/")
+            .ok_or("This is not a Napstr track URI")?;
+        if file_id.len() != 64
+            || !file_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || file_id.bytes().any(|byte| byte.is_ascii_uppercase())
+            || file_id.contains('/')
+            || file_id.contains('?')
+            || file_id.contains('#')
+        {
+            return Err("The Napstr track URI contains an invalid file ID".into());
+        }
+        Ok(Self {
+            file_id: file_id.to_string(),
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PairingTicket {
@@ -239,6 +265,27 @@ mod tests {
                 device_name: "Old phone".into()
             }
         );
+    }
+
+    #[test]
+    fn track_uri_round_trips_and_rejects_ambiguous_forms() {
+        let file_id = "a".repeat(64);
+        assert_eq!(
+            TrackUri::parse(&format!("napstr://track/{file_id}"))
+                .unwrap()
+                .file_id,
+            file_id
+        );
+        for value in [
+            "napstrfy://track/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "napstr://track/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "napstr://track/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "napstr://track/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/extra",
+            "napstr://track/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa?download=1",
+            "napstr://track/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#player",
+        ] {
+            assert!(TrackUri::parse(value).is_err(), "accepted {value}");
+        }
     }
 
     #[test]

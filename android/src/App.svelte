@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
+  import { getCurrent, onOpenUrl } from '@tauri-apps/plugin-deep-link';
   import {
     Format,
     checkPermissions,
@@ -28,6 +29,7 @@
   let statusLoading = $state(true);
   let statusPending = $state(false);
   let pairingCode = $state('');
+  let pendingTrackId = $state('');
   let pairing = $state(false);
   let scanning = $state(false);
   let cameraPermissionDenied = $state(false);
@@ -289,6 +291,11 @@
       notice = `Connected to ${desktop}`;
       await refreshStatus();
       await loadLibrary();
+      if (pendingTrackId) {
+        const fileId = pendingTrackId;
+        pendingTrackId = '';
+        await openTrackUri(`napstr://track/${fileId}`);
+      }
     } catch (nextError) {
       error = String(nextError);
     } finally {
@@ -413,6 +420,34 @@
       if (viewVersion === musicViewVersion) error = String(nextError);
     } finally {
       if (viewVersion === musicViewVersion) loading = false;
+    }
+  }
+
+  async function openTrackUri(uri: string) {
+    try {
+      const fileId = await invoke<string>('track_file_id_from_uri', { uri });
+      activeTab = 'music';
+      if (!status.paired) {
+        pendingTrackId = fileId;
+        notice = 'Pair Napstrfy to open this track';
+        return;
+      }
+      const local = [...tracks, ...likedMusic].find((track) => track.fileId === fileId);
+      if (local) {
+        selected = local;
+        notice = `Track link opened: ${title(local)}`;
+        return;
+      }
+      await searchTracks(fileId);
+      const remote = tracks.find((track) => track.fileId === fileId);
+      if (remote) {
+        selected = remote;
+        notice = `Track link opened: ${title(remote)}`;
+      } else {
+        error = 'That track is not currently available from the paired Napstr desktop.';
+      }
+    } catch (nextError) {
+      error = `Could not open track link: ${String(nextError)}`;
     }
   }
 
@@ -986,7 +1021,26 @@
     } catch { podcastHistory = []; }
     void loadCachedLibrary()
       .then(() => refreshStatus(true, false))
-      .then(() => { if (status.connected) void loadLibrary(); });
+      .then(async () => {
+        if (status.connected) await loadLibrary();
+        if (status.paired && pendingTrackId) {
+          const fileId = pendingTrackId;
+          pendingTrackId = '';
+          await openTrackUri(`napstr://track/${fileId}`);
+        }
+      });
+    let stopDeepLink = () => {};
+    const handleDeepLinks = (urls: string[]) => {
+      const uri = urls.find((value) => value.startsWith('napstr://track/'));
+      if (uri) void openTrackUri(uri);
+    };
+    void getCurrent().then((urls) => { if (urls) handleDeepLinks(urls); }).catch(() => {});
+    void onOpenUrl(handleDeepLinks).then((unlisten) => { stopDeepLink = unlisten; }).catch(() => {});
+    const deepLinkListener = (event: Event) => {
+      const uri = (event as CustomEvent<string>).detail;
+      if (typeof uri === 'string') void openTrackUri(uri);
+    };
+    window.addEventListener('napstr-deep-link', deepLinkListener);
     void refreshPodcastDownloads();
     const statusTimer = window.setInterval(() => {
       if (!document.hidden) void refreshStatus();
@@ -1006,11 +1060,13 @@
     document.addEventListener('visibilitychange', foreground);
     window.addEventListener('napstrfy-media-action', handleSystemMediaAction);
     return () => {
+      stopDeepLink();
       window.clearInterval(statusTimer);
       window.clearInterval(transferTimer);
       window.clearInterval(podcastTimer);
       document.removeEventListener('visibilitychange', foreground);
       window.removeEventListener('napstrfy-media-action', handleSystemMediaAction);
+      window.removeEventListener('napstr-deep-link', deepLinkListener);
       androidMediaBridge()?.clear();
     };
   });

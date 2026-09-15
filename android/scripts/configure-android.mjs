@@ -55,6 +55,19 @@ if (!manifest.includes('android:name=".MediaNotificationService"')) {
         <provider`,
   );
 }
+if (!manifest.includes('android:scheme="napstr"')) {
+  const activityEnd = manifest.indexOf('        </activity>');
+  if (activityEnd >= 0) {
+    manifest = `${manifest.slice(0, activityEnd)}        <intent-filter>
+            <action android:name="android.intent.action.VIEW" />
+            <category android:name="android.intent.category.DEFAULT" />
+            <category android:name="android.intent.category.BROWSABLE" />
+            <data android:scheme="napstr" android:host="track" />
+        </intent-filter>
+
+${manifest.slice(activityEnd)}`;
+  }
+}
 await writeFile(manifestPath, manifest);
 
 const javaDirectory = resolve(main, 'java/net/napstr/nostrfy');

@@ -3,6 +3,7 @@
   import { getVersion } from '@tauri-apps/api/app';
   import { invoke } from '@tauri-apps/api/core';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+  import { getCurrent, onOpenUrl, register } from '@tauri-apps/plugin-deep-link';
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { open } from '@tauri-apps/plugin-dialog';
 
@@ -647,6 +648,36 @@
     await loadPlayerTrack(index);
   }
 
+  async function openTrackUri(uri: string) {
+    try {
+      const fileId = await invoke<string>('track_file_id_from_uri', { uri });
+      activeView = 'Search';
+      query = fileId;
+      const local = sharedFiles.find((file) => file.fileId === fileId);
+      if (local) {
+        const result = results.find((item) => item.fileId === fileId) ?? mapFiles([local])[0];
+        results = [result];
+        resultsAreNetwork = false;
+        searchedQuery = fileId;
+        resultPage = 0;
+        selectResult(result, true);
+        activityMessage = `Track link opened: ${result.name}`;
+        return;
+      }
+      query = fileId;
+      await search();
+      const result = results.find((item) => item.fileId === fileId);
+      if (result) {
+        selectResult(result, true);
+        activityMessage = `Track link opened: ${result.name}`;
+      } else {
+        activityMessage = 'That track is not currently available in the Napstr catalogue';
+      }
+    } catch (error) {
+      activityMessage = `Could not open track link: ${String(error)}`;
+    }
+  }
+
   async function togglePlayer() {
     if (!currentTrack) {
       if (activeView === 'Downloads' && selectedTagFile) await playAudio(selectedTagFile.fileId, selectedTagFile.filename, playerMode, 'downloads');
@@ -1269,9 +1300,14 @@
     matchingUsers = [];
     try {
       const trimmedQuery = query.trim();
+      // A 64-character hex string is both a valid track file ID and a raw public
+      // key. Only an explicitly selected user (a clicked name or a chosen
+      // candidate) may resolve it, so hashes always reach the track search.
+      const ambiguousHexQuery = /^[0-9a-f]{64}$/i.test(trimmedQuery);
+      const exactFileId = /^[0-9a-f]{64}$/.test(trimmedQuery);
       let user = searchUser && [searchUser.displayName, searchUser.npub, searchUser.pubkey].some((name) => name.trim() === trimmedQuery) ? searchUser : null;
       searchUser = user;
-      if (!user && trimmedQuery) {
+      if (!user && trimmedQuery && !ambiguousHexQuery) {
         const known = knownUsersNamed(trimmedQuery);
         try {
           const users = networkConnected ? await invoke<CatalogueUser[]>('resolve_catalogue_user', { query: trimmedQuery }) : [];
@@ -1336,7 +1372,9 @@
           trimmedQuery
             ? invoke<NetworkResult[]>('network_search', { query: trimmedQuery })
             : invoke<CatalogueBrowsePage>('network_browse', { cursor: null, limit: 500, cacheLimit: 10000 }),
-          invoke<NativeFile[]>('search_catalog', { query: trimmedQuery })
+          exactFileId
+            ? invoke<NativeFile[]>('search_catalog_file_id', { fileId: trimmedQuery })
+            : invoke<NativeFile[]>('search_catalog', { query: trimmedQuery })
         ]);
         if (generation !== browseGeneration) return;
         const networkMatches = networkOutcome.status === 'fulfilled'
@@ -1388,7 +1426,9 @@
         }
       } else if (nativeReady) {
         try {
-          const matches = await invoke<NativeFile[]>('search_catalog', { query: query.trim() });
+          const matches = /^[0-9a-f]{64}$/.test(query.trim())
+            ? await invoke<NativeFile[]>('search_catalog_file_id', { fileId: query.trim() })
+            : await invoke<NativeFile[]>('search_catalog', { query: query.trim() });
           if (generation !== browseGeneration) return;
           results = mergeAudiobooks(mapFiles(matches.filter((item) => minimumSources <= 1 && item.size <= maximumBytes() && matchesType(item.mime, item.format))), [], query.trim());
           resultsAreNetwork = false;
@@ -2008,6 +2048,7 @@
   onMount(() => {
     desktopRuntime = '__TAURI_INTERNALS__' in window;
     if (!desktopRuntime) return;
+    void register('napstr').catch(() => {});
     const savedPlayerMode = window.localStorage.getItem('napstr-player-mode');
     if (savedPlayerMode === 'single' || savedPlayerMode === 'folder' || savedPlayerMode === 'all') playerMode = savedPlayerMode;
     const savedPlayerVolume = Number(window.localStorage.getItem('napstr-player-volume'));
@@ -2027,6 +2068,21 @@
       });
     let destroyed = false;
     const eventUnlisteners: UnlistenFn[] = [];
+    const handleDeepLinks = (urls: string[]) => {
+      const uri = urls.find((value) => value.startsWith('napstr://track/'));
+      if (uri) void openTrackUri(uri);
+    };
+    void getCurrent().then((urls) => { if (urls) handleDeepLinks(urls); }).catch(() => {});
+    void onOpenUrl(handleDeepLinks).then((unlisten) => {
+      if (destroyed) unlisten();
+      else eventUnlisteners.push(unlisten);
+    }).catch(() => {});
+    void listen<string>('napstr-deep-link', ({ payload }) => {
+      void openTrackUri(payload);
+    }).then((unlisten) => {
+      if (destroyed) unlisten();
+      else eventUnlisteners.push(unlisten);
+    });
     void listen<string>('napstr-public-chat', ({ payload: topic }) => {
       if (topic === 'napstr-trollbox') void refreshTrollbox();
       const fileId = selected?.fileId?.toLowerCase();

@@ -19,7 +19,8 @@
   },
   "dependencies": {
     "@tauri-apps/api": "^2.3.0",
-    "@tauri-apps/plugin-barcode-scanner": "^2.4.5"
+    "@tauri-apps/plugin-barcode-scanner": "^2.4.5",
+    "@tauri-apps/plugin-deep-link": "^2.0.0"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^5.0.0",

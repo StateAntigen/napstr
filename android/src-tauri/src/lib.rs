@@ -2,7 +2,7 @@ use futures_util::StreamExt;
 use iroh::{endpoint::presets, Endpoint, EndpointAddr, EndpointId, SecretKey};
 use napstr_remote_protocol::{
     ClientRequest, PairingTicket, RemoteAudiobook, RemoteAudiobookSummary, RemoteTrack,
-    RemoteTransfer, ServerResponse, ALPN, MAX_CONTROL_FRAME_BYTES,
+    RemoteTransfer, ServerResponse, TrackUri, ALPN, MAX_CONTROL_FRAME_BYTES,
 };
 use quick_xml::{events::Event, Reader};
 use serde::{Deserialize, Serialize};
@@ -1812,6 +1812,11 @@ async fn pair_desktop(
 }
 
 #[tauri::command]
+fn track_file_id_from_uri(uri: String) -> Result<String, String> {
+    TrackUri::parse(&uri).map(|track| track.file_id)
+}
+
+#[tauri::command]
 async fn forget_desktop(state: State<'_, AppState>) -> Result<(), String> {
     state.remote.forget().await
 }
@@ -2308,6 +2313,7 @@ pub fn run() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_deep_link::init())
         .setup(|app| {
             #[cfg(mobile)]
             app.handle().plugin(tauri_plugin_barcode_scanner::init())?;
@@ -2326,6 +2332,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             companion_status,
             pair_desktop,
+            track_file_id_from_uri,
             forget_desktop,
             remote_library,
             cached_library,

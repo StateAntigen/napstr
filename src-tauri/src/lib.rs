@@ -1,4 +1,5 @@
 use chrono::Utc;
+use napstr_remote_protocol::TrackUri;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -1301,6 +1302,20 @@ fn search_catalog(query: String, state: State<'_, AppState>) -> Result<Vec<Share
 }
 
 #[tauri::command]
+fn search_catalog_file_id(
+    file_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<SharedFile>, String> {
+    if file_id.len() != 64
+        || !file_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || file_id.bytes().any(|byte| byte.is_ascii_uppercase())
+    {
+        return Err("invalid SHA-256 file ID".into());
+    }
+    load_files_by_id(&open_db(&state)?, &[file_id])
+}
+
+#[tauri::command]
 fn save_audiobook(
     folder: String,
     title: String,
@@ -1740,6 +1755,11 @@ fn open_napstr_folder(state: State<'_, AppState>) -> Result<(), String> {
     open_with_system(&folder, "Napstr folder")
 }
 
+#[tauri::command]
+fn track_file_id_from_uri(uri: String) -> Result<String, String> {
+    TrackUri::parse(&uri).map(|track| track.file_id)
+}
+
 fn playable_audio_path(connection: &Connection, file_id: &str) -> Result<PathBuf, String> {
     let blocked: bool = connection
         .query_row(
@@ -2114,6 +2134,20 @@ pub fn run() {
     let shutdown_services = Arc::new(Mutex::new(None::<ShutdownServices>));
     let setup_shutdown_services = shutdown_services.clone();
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            if let Some(uri) = argv
+                .iter()
+                .find(|argument| argument.starts_with("napstr://"))
+            {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.unminimize();
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+                let _ = app.emit("napstr-deep-link", uri.clone());
+            }
+        }))
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
             let app_data = app
@@ -2208,6 +2242,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_snapshot,
             search_catalog,
+            search_catalog_file_id,
             save_audiobook,
             remove_audiobook,
             set_napstr_folder,
@@ -2218,6 +2253,7 @@ pub fn run() {
             remove_transfer,
             get_transfers,
             open_napstr_folder,
+            track_file_id_from_uri,
             open_release_url,
             open_napstrfy_website,
             player::play_audio,

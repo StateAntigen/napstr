@@ -293,6 +293,34 @@ fn catalogue_identifier_filter(file_ids: &[String], author: Option<PublicKey>) -
     }
 }
 
+fn is_file_id(value: &str) -> bool {
+    value.len() == 64
+        && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && value.bytes().all(|byte| !byte.is_ascii_uppercase())
+}
+
+/// A bare 64-character hex string is ambiguous: it is a valid track file ID and
+/// also a valid raw public key. Such a query must never be auto-resolved as a
+/// user, otherwise searching by file ID browses an unrelated empty catalogue.
+fn is_ambiguous_hex_query(query: &str) -> bool {
+    query.len() == 64 && query.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Whether the cached metadata database already holds a profile for the key.
+/// This is the evidence used to tell a hex public key apart from a file ID.
+async fn client_knows_pubkey(client: &Client, pubkey: &PublicKey) -> bool {
+    let Ok(events) = client
+        .database()
+        .query(Filter::new().kind(Kind::Metadata).author(*pubkey).limit(1))
+        .await
+    else {
+        return false;
+    };
+    events
+        .into_iter()
+        .any(|event| event.kind == Kind::Metadata && event.verify().is_ok())
+}
+
 async fn fetch_catalogue_identifiers(
     client: &Client,
     file_ids: &[String],
@@ -1685,6 +1713,19 @@ impl NetworkService {
         let known = self.trollbox_profiles.read().await.clone();
         if let Ok(key) = PublicKey::parse(query) {
             let pubkey = key.to_hex();
+            // Track file IDs are 64-character hex digests and `PublicKey::parse`
+            // accepts the same shape, so a hash query must only be treated as a
+            // user when the key is already a known Napstr identity. Otherwise it
+            // falls through to an ordinary search, which resolves exact file IDs.
+            if is_ambiguous_hex_query(query) && !known.contains_key(&pubkey) {
+                let known_key = match self.client.read().await.clone() {
+                    Some(client) => client_knows_pubkey(&client, &key).await,
+                    None => false,
+                };
+                if !known_key {
+                    return Ok(Vec::new());
+                }
+            }
             return Ok(vec![CatalogueUser {
                 display_name: known.get(&pubkey).cloned().unwrap_or_else(|| query.into()),
                 npub: key.to_bech32().map_err(|error| error.to_string())?,
@@ -1938,6 +1979,7 @@ impl NetworkService {
             .ok_or("Nostr is not connected")?;
         let query = query.trim();
         let author_hex = author.map(|key| key.to_hex());
+        let exact_file_id = is_file_id(query);
         let browse_result_limit = browse.as_ref().map(|(_, limit, _)| *limit);
         let mut requested_file_ids = HashSet::new();
         let mut requested_file_id_order = Vec::new();
@@ -2038,46 +2080,62 @@ impl NetworkService {
             }
         } else {
             let availability_query = self.availability_snapshot(&client);
-            let mut filters = vec![catalogue_name_search_filter(query)];
-            filters.extend(catalogue_tag_search_filters(query));
-            let search_query = stream::iter(filters)
-                .map(|filter| {
-                    let client = client.clone();
-                    async move {
-                        client
-                            .fetch_events(filter, Duration::from_secs(8))
-                            .await
-                            .map_err(|error| error.to_string())
-                    }
-                })
-                .buffer_unordered(CATALOGUE_QUERY_TOKEN_LIMIT + 1)
-                .collect::<Vec<_>>();
-            let (availability, fetched) = tokio::join!(availability_query, search_query);
-            let mut successful_queries = 0usize;
-            let mut failures = Vec::new();
-            for result in fetched {
-                match result {
-                    Ok(events) => {
-                        successful_queries += 1;
-                        for event in events.iter() {
-                            events_by_id.insert(event.id, event.clone());
-                        }
-                    }
-                    Err(error) => failures.push(error),
+            if is_file_id(query) {
+                requested_file_ids.insert(query.to_string());
+                requested_file_id_order.push(query.to_string());
+                let (availability, fetched) = tokio::join!(
+                    availability_query,
+                    fetch_catalogue_identifiers(&client, &requested_file_id_order, author)
+                );
+                let availability = availability?;
+                online = availability.online.clone();
+                available_by_file = availability.available_by_file.clone();
+                let (events, _) = fetched?;
+                for event in events {
+                    events_by_id.insert(event.id, event);
                 }
+            } else {
+                let mut filters = vec![catalogue_name_search_filter(query)];
+                filters.extend(catalogue_tag_search_filters(query));
+                let search_query = stream::iter(filters)
+                    .map(|filter| {
+                        let client = client.clone();
+                        async move {
+                            client
+                                .fetch_events(filter, Duration::from_secs(8))
+                                .await
+                                .map_err(|error| error.to_string())
+                        }
+                    })
+                    .buffer_unordered(CATALOGUE_QUERY_TOKEN_LIMIT + 1)
+                    .collect::<Vec<_>>();
+                let (availability, fetched) = tokio::join!(availability_query, search_query);
+                let mut successful_queries = 0usize;
+                let mut failures = Vec::new();
+                for result in fetched {
+                    match result {
+                        Ok(events) => {
+                            successful_queries += 1;
+                            for event in events.iter() {
+                                events_by_id.insert(event.id, event.clone());
+                            }
+                        }
+                        Err(error) => failures.push(error),
+                    }
+                }
+                if successful_queries == 0 {
+                    catalogue_search_error = Some(format!(
+                        "catalogue search failed: {}",
+                        failures
+                            .first()
+                            .map(String::as_str)
+                            .unwrap_or("all relay queries failed")
+                    ));
+                }
+                let availability = availability?;
+                online = availability.online.clone();
+                available_by_file = availability.available_by_file.clone();
             }
-            if successful_queries == 0 {
-                catalogue_search_error = Some(format!(
-                    "catalogue search failed: {}",
-                    failures
-                        .first()
-                        .map(String::as_str)
-                        .unwrap_or("all relay queries failed")
-                ));
-            }
-            let availability = availability?;
-            online = availability.online.clone();
-            available_by_file = availability.available_by_file.clone();
             let authors = events_by_id
                 .values()
                 .map(|event| event.pubkey)
@@ -2242,6 +2300,7 @@ impl NetworkService {
                             &cached.tags,
                         ],
                     ))
+                || (exact_file_id && cached.file_id != query)
                 || (query.is_empty() && !requested_file_ids.contains(&cached.file_id))
                 || !valid_file_id(&cached.file_id)
                 || cached.size == 0
@@ -2318,16 +2377,19 @@ impl NetworkService {
             let Ok(catalogue_tags) = super::normalise_tags(&content.tags) else {
                 continue;
             };
-            if !super::search_matches(
-                query,
-                &[
-                    &content.filename,
-                    &content.title,
-                    &content.artist,
-                    &content.album,
-                    &catalogue_tags,
-                ],
-            ) {
+            if (!exact_file_id
+                && !super::search_matches(
+                    query,
+                    &[
+                        &content.filename,
+                        &content.title,
+                        &content.artist,
+                        &content.album,
+                        &catalogue_tags,
+                    ],
+                ))
+                || (exact_file_id && content.file_id != query)
+            {
                 continue;
             }
             let pubkey = event.pubkey.to_hex();
@@ -4135,6 +4197,38 @@ mod tests {
         let key = Keys::generate().public_key();
         assert_eq!(PublicKey::parse(&key.to_bech32().unwrap()).unwrap(), key);
         assert_eq!(PublicKey::parse(&key.to_hex()).unwrap(), key);
+    }
+
+    #[test]
+    fn bare_hex_queries_stay_ambiguous_between_file_ids_and_public_keys() {
+        let file_id = "3f".repeat(32);
+        assert!(is_file_id(&file_id));
+        assert!(is_ambiguous_hex_query(&file_id));
+        assert!(is_ambiguous_hex_query(&file_id.to_uppercase()));
+        assert!(!is_ambiguous_hex_query(&file_id[..63]));
+        assert!(!is_ambiguous_hex_query(&"z".repeat(64)));
+        assert!(!is_ambiguous_hex_query(""));
+        let key = Keys::generate().public_key();
+        // A hex public key has exactly the shape of a track file ID, so a search
+        // for one must never select a user without cached evidence.
+        assert!(is_ambiguous_hex_query(&key.to_hex()));
+        // Bech32 keys stay unambiguous and still resolve to a user directly.
+        assert!(!is_ambiguous_hex_query(&key.to_bech32().unwrap()));
+        assert!(!is_ambiguous_hex_query("Alice Smith"));
+    }
+
+    #[tokio::test]
+    async fn cached_metadata_is_the_evidence_that_a_hex_query_is_a_known_user() {
+        let known = Keys::generate();
+        let stranger = Keys::generate();
+        let client = nostr_client(known.clone());
+        let metadata = EventBuilder::new(Kind::Metadata, r#"{"name":"Alice"}"#)
+            .sign_with_keys(&known)
+            .unwrap();
+        client.database().save_event(&metadata).await.unwrap();
+
+        assert!(client_knows_pubkey(&client, &known.public_key()).await);
+        assert!(!client_knows_pubkey(&client, &stranger.public_key()).await);
     }
 
     #[test]

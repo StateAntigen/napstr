@@ -96,6 +96,17 @@ The `fileId` is the lowercase hexadecimal SHA-256 digest of the complete file
 bytes. It is exactly 64 hexadecimal characters. Identical bytes therefore share
 one catalogue identity and may have multiple seeders.
 
+Clients MAY expose a track deep link using this exact URI shape:
+
+```text
+napstr://track/<lowercase-64-character-hex-file-id>
+```
+
+The URI identifies a file only; it grants no access and does not bypass local
+blocking, pairing, catalogue validation, or transfer authorization. Clients
+MUST reject uppercase IDs, query strings, fragments, extra path segments, and
+IDs that are not exactly 32 decoded bytes.
+
 Interoperable clients MUST support these catalogue claims:
 
 | Extension | `format` | `mime` |
