@@ -24,6 +24,13 @@ use tokio::{
     sync::{Mutex, Notify, RwLock},
 };
 
+const REQUEST_ATTEMPTS: usize = 2;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+// A deep link is an interactive action, so one quick attempt beats leaving the
+// user waiting a minute before the app admits that Napstr is asleep.
+const LOOKUP_ATTEMPTS: usize = 1;
+const LOOKUP_TIMEOUT: Duration = Duration::from_secs(12);
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SavedDesktop {
@@ -1419,7 +1426,16 @@ impl RemoteClient {
     }
 
     async fn request(&self, request: ClientRequest) -> Result<ServerResponse, String> {
-        let (response, _) = self.exchange(request).await?;
+        self.request_with(request, REQUEST_ATTEMPTS, REQUEST_TIMEOUT).await
+    }
+
+    async fn request_with(
+        &self,
+        request: ClientRequest,
+        attempts: usize,
+        timeout: Duration,
+    ) -> Result<ServerResponse, String> {
+        let (response, _) = self.exchange_with(request, attempts, timeout).await?;
         match response {
             ServerResponse::Error { message } => Err(message),
             response => Ok(response),
@@ -1430,11 +1446,20 @@ impl RemoteClient {
         &self,
         request: ClientRequest,
     ) -> Result<(ServerResponse, iroh::endpoint::RecvStream), String> {
+        self.exchange_with(request, REQUEST_ATTEMPTS, REQUEST_TIMEOUT).await
+    }
+
+    async fn exchange_with(
+        &self,
+        request: ClientRequest,
+        attempts: usize,
+        timeout: Duration,
+    ) -> Result<(ServerResponse, iroh::endpoint::RecvStream), String> {
         let mut last_error = "Napstr is unavailable".to_string();
-        for _ in 0..2 {
+        for _ in 0..attempts {
             match self.connect().await {
                 Ok(connection) => match tokio::time::timeout(
-                    Duration::from_secs(30),
+                    timeout,
                     exchange_on(&connection, request.clone()),
                 )
                 .await
@@ -1592,9 +1617,13 @@ impl RemoteClient {
             });
         }
         let response = match self
-            .request(ClientRequest::Track {
-                file_id: file_id.to_string(),
-            })
+            .request_with(
+                ClientRequest::Track {
+                    file_id: file_id.to_string(),
+                },
+                LOOKUP_ATTEMPTS,
+                LOOKUP_TIMEOUT,
+            )
             .await
         {
             Ok(response) => response,
@@ -1614,9 +1643,13 @@ impl RemoteClient {
 
     async fn lookup_track_by_search(&self, file_id: &str) -> Result<TrackLookup, String> {
         match self
-            .request(ClientRequest::Search {
-                query: file_id.to_string(),
-            })
+            .request_with(
+                ClientRequest::Search {
+                    query: file_id.to_string(),
+                },
+                LOOKUP_ATTEMPTS,
+                LOOKUP_TIMEOUT,
+            )
             .await?
         {
             ServerResponse::Search { tracks } => Ok(track_lookup(
@@ -2649,6 +2682,119 @@ mod tests {
         fs::write(audio.join(format!("{file_id}.mp3")), b"short").unwrap();
         assert!(cached_entries_in(&root).unwrap().is_empty());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    fn deep_link_track(file_id: &str, size: u64) -> RemoteTrack {
+        RemoteTrack {
+            file_id: file_id.to_string(),
+            filename: "deep-link.mp3".into(),
+            title: "Deep Link".into(),
+            artist: "Napstr".into(),
+            album: String::new(),
+            format: "MP3".into(),
+            mime: "audio/mpeg".into(),
+            size,
+            tags: String::new(),
+            local: true,
+            sources: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_deep_link_resolves_from_the_phone_cache_without_a_desktop() {
+        let root = std::env::temp_dir().join(format!(
+            "napstrfy-deep-link-{}-{}",
+            std::process::id(),
+            chrono_timestamp()
+        ));
+        let audio = root.join("audio");
+        fs::create_dir_all(&audio).unwrap();
+        let bytes = b"deep link audio cached on this phone";
+        let file_id = hex::encode(Sha256::digest(bytes));
+        let track = deep_link_track(&file_id, bytes.len() as u64);
+        fs::write(audio.join(format!("{file_id}.mp3")), bytes).unwrap();
+        save_json(
+            &audio.join(format!("{file_id}.json")),
+            &CachedRemoteAudio {
+                track: track.clone(),
+                library_visible: true,
+            },
+        )
+        .unwrap();
+
+        let remote = RemoteClient::new(root.clone());
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                // No desktop is paired, so an answer can only come from the
+                // cache: this is the ordering that keeps a link instant.
+                let lookup = remote.lookup_track(&file_id).await.unwrap();
+                assert_eq!(lookup.source, Some(TrackSource::Phone));
+                assert_eq!(lookup.track, Some(track));
+                assert_eq!(lookup.file_id, file_id);
+
+                // A file that is not cached must report as unknown to the UI
+                // instead of opening an unrelated track.
+                let missing = remote.lookup_track(&"ab".repeat(32)).await;
+                assert!(missing.is_err() || missing.unwrap().track.is_none());
+
+                assert!(remote.lookup_track("not-a-file-id").await.is_err());
+            });
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn deep_link_sources_and_wire_names_are_stable() {
+        let cached = deep_link_track(&"a".repeat(64), 1);
+        let catalogue_id = "b".repeat(64);
+        let mut catalogue_only = deep_link_track(&catalogue_id, 1);
+        catalogue_only.local = false;
+
+        // The UI switches on these exact strings.
+        assert_eq!(
+            serde_json::to_value(TrackSource::Phone).unwrap(),
+            serde_json::json!("phone")
+        );
+        assert_eq!(
+            serde_json::to_value(TrackSource::Desktop).unwrap(),
+            serde_json::json!("desktop")
+        );
+        assert_eq!(
+            serde_json::to_value(TrackSource::Catalogue).unwrap(),
+            serde_json::json!("catalogue")
+        );
+
+        let from_host = track_lookup(&cached.file_id, Some(cached.clone()));
+        assert_eq!(from_host.source, Some(TrackSource::Desktop));
+        let serialized = serde_json::to_value(&from_host).unwrap();
+        assert_eq!(serialized["fileId"], serde_json::json!(cached.file_id));
+        assert_eq!(serialized["source"], serde_json::json!("desktop"));
+
+        let from_catalogue = track_lookup(&catalogue_id, Some(catalogue_only));
+        assert_eq!(from_catalogue.source, Some(TrackSource::Catalogue));
+
+        let unknown = track_lookup(&"c".repeat(64), None);
+        assert!(unknown.track.is_none());
+        assert!(unknown.source.is_none());
+    }
+
+    #[test]
+    fn only_an_old_desktop_triggers_the_search_fallback() {
+        // Answering an unknown request is what an older Napstr does; the old
+        // search path is only safe for that case.
+        assert!(is_unsupported_request("invalid Napstrfy request"));
+        assert!(is_unsupported_request(
+            "Napstr returned an unexpected response"
+        ));
+        // A real failure must surface as a failure, not as a silent downgrade
+        // to the slower text search.
+        assert!(!is_unsupported_request("Napstr is unavailable"));
+        assert!(!is_unsupported_request(
+            "Napstr did not answer the request in time"
+        ));
+        assert!(!is_unsupported_request("This phone is not paired with Napstr"));
     }
 
     #[test]

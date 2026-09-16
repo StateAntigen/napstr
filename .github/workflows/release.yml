@@ -247,6 +247,16 @@ jobs:
       - name: Verify Napstrfy interface
         working-directory: android
         run: npm run check
+      - name: Build Napstrfy interface
+        working-directory: android
+        run: npm run build
+      - name: Test Napstrfy companion core
+        working-directory: android
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+        env:
+          # The companion only ships an Android binary, so its tests do not
+          # need debug info and the link is much faster without it.
+          CARGO_PROFILE_DEV_DEBUG: "0"
       - name: Generate Android project
         working-directory: android
         run: npm run android:init

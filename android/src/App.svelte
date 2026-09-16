@@ -16,6 +16,8 @@
   const podcastGenres = ['Comedy', 'News', 'True Crime', 'Society & Culture', 'Technology', 'History', 'Business', 'Science', 'Arts', 'Sports', 'Education', 'Music'];
   const likedMusicKey = 'napstrfy-liked-music';
   const likedPodcastsKey = 'napstrfy-liked-podcasts';
+  const recentTracksKey = 'napstrfy-recent-tracks';
+  const recentTrackLimit = 4;
   type AppTab = 'music' | 'podcasts' | 'audiobooks';
   type PlayMode = 'all' | 'random' | 'repeat' | 'once';
   type TrackSource = 'phone' | 'desktop' | 'catalogue';
@@ -43,8 +45,12 @@
   let notice = $state('');
   let query = $state('');
   let tracks = $state<RemoteTrack[]>([]);
+  let recentTracks = $state<RemoteTrack[]>([]);
   let likedMusic = $state<RemoteTrack[]>([]);
   let showingLikedMusic = $state(false);
+  // Non-empty while a deep link is being resolved, so the notice can show that
+  // work is happening instead of appearing only once the answer arrives.
+  let lookupFileId = $state('');
   let total = $state(0);
   let loading = $state(false);
   let loadingMore = $state(false);
@@ -134,8 +140,29 @@
     try {
       window.localStorage.setItem(key, JSON.stringify(value));
     } catch {
-      error = 'Napstrfy could not save that favourite on this phone.';
+      error = 'Napstrfy could not save that to this phone.';
     }
+  }
+
+  // The sorted library is rebuilt whenever Napstr's library revision changes,
+  // and a finished download bumps that revision. A deep-linked track therefore
+  // cannot stay at the top of the sorted list, so it is remembered here and
+  // rendered above the list instead.
+  function rememberTrack(track: RemoteTrack) {
+    recentTracks = [track, ...recentTracks.filter((item) => item.fileId !== track.fileId)]
+      .slice(0, recentTrackLimit);
+    saveLikes(recentTracksKey, recentTracks);
+  }
+
+  function forgetRecentTracks() {
+    recentTracks = [];
+    saveLikes(recentTracksKey, []);
+  }
+
+  /// Whether the selection still points at a row the user can see.
+  function isTrackVisible(fileId: string) {
+    return tracks.some((item) => item.fileId === fileId)
+      || recentTracks.some((item) => item.fileId === fileId);
   }
 
   function isTrackLiked(track: RemoteTrack) {
@@ -254,7 +281,7 @@
       }
       tracks = offline.tracks;
       total = offline.total;
-      if (!selected || !tracks.some((track) => track.fileId === selected?.fileId)) selected = tracks[0] ?? null;
+      if (!selected || !isTrackVisible(selected.fileId)) selected = tracks[0] ?? null;
     } catch {
       // A damaged cache must never prevent pairing or normal online use.
     }
@@ -376,7 +403,7 @@
       tracks = append ? [...tracks, ...page.tracks] : page.tracks;
       total = page.total;
       loadedLibraryRevision = status.libraryRevision;
-      if (!selected || !tracks.some((track) => track.fileId === selected?.fileId)) selected = tracks[0] ?? null;
+      if (!selected || !isTrackVisible(selected.fileId)) selected = tracks[0] ?? null;
     } catch (nextError) {
       if (viewVersion === musicViewVersion) error = String(nextError);
     } finally {
@@ -400,7 +427,7 @@
       tracks = page.tracks;
       total = page.total;
       loadedLibraryRevision = revision;
-      if (!selected || !tracks.some((track) => track.fileId === selected?.fileId)) selected = tracks[0] ?? null;
+      if (!selected || !isTrackVisible(selected.fileId)) selected = tracks[0] ?? null;
     } catch {
       // Keep the current list visible and retry after the next status check.
     } finally {
@@ -429,6 +456,18 @@
     }
   }
 
+  // Android reports a cold-start link twice, from getCurrent() and from
+  // onOpenUrl, which used to run the whole lookup and notice twice.
+  let lastDeepLinkUri = '';
+  let lastDeepLinkAt = 0;
+  function handleDeepLink(uri: string) {
+    const now = Date.now();
+    if (uri === lastDeepLinkUri && now - lastDeepLinkAt < 5000) return;
+    lastDeepLinkUri = uri;
+    lastDeepLinkAt = now;
+    void openTrackUri(uri);
+  }
+
   async function openTrackUri(uri: string) {
     try {
       const fileId = await invoke<string>('track_file_id_from_uri', { uri });
@@ -438,6 +477,11 @@
         notice = 'Pair Napstrfy to open this track';
         return;
       }
+      // Resolving against a sleeping desktop can take seconds, so say what is
+      // happening before waiting for the answer.
+      lookupFileId = fileId;
+      error = '';
+      notice = 'Looking for this track…';
       // A file ID is resolved exactly, never by words: this phone's cache
       // first, then the paired desktop's library, then the public catalogue.
       const lookup = await invoke<TrackLookup>('lookup_track', { fileId });
@@ -446,22 +490,22 @@
         // A missing track is a definite answer from the desktop, not a
         // failure: a read-only pairing also reports nothing here because it
         // cannot search the catalogue for a file the host does not hold.
+        notice = '';
         error = 'That track is not in your Napstr library yet. Ask the sender to share the file, then open the link again.';
         return;
       }
-      error = '';
       selected = track;
       query = '';
       showingLikedMusic = false;
-      if (!tracks.some((item) => item.fileId === track.fileId)) {
-        tracks = [track, ...tracks];
-        total = Math.max(total, tracks.length);
-      }
-      if (lookup.source === 'phone') notice = `${title(track)} is saved on this phone`;
-      else if (lookup.source === 'desktop') notice = `Track link opened: ${title(track)}`;
+      rememberTrack(track);
+      if (lookup.source === 'phone') notice = `${title(track)} is available offline on this phone`;
+      else if (lookup.source === 'desktop') notice = `${title(track)} is streaming from ${status.desktopName || 'Napstr'}`;
       else notice = `${title(track)} is in the Napstr catalogue; open it to ask Napstr to download it`;
     } catch (nextError) {
+      notice = '';
       error = `Could not open track link: ${String(nextError)}`;
+    } finally {
+      lookupFileId = '';
     }
   }
 
@@ -523,6 +567,9 @@
       return;
     }
     const queue = tracks.filter((item) => item.local);
+    // The row may come from "Recently played", or be the deep-linked track
+    // before the library page that contains it has loaded.
+    if (!queue.some((item) => item.fileId === track.fileId)) queue.unshift(track);
     playerQueue = queue;
     playerQueueLibraryVisible = true;
     playerIndex = queue.findIndex((item) => item.fileId === track.fileId);
@@ -545,6 +592,7 @@
       audio.volume = volume;
       await audio.play();
       playing = true;
+      rememberTrack(cached.track);
       const nextIndex = playMode === 'random'
         ? randomUpcoming
         : playerQueue.length > 1
@@ -645,6 +693,12 @@
         if (likedMusic.some((item) => item.fileId === pendingFileId)) {
           likedMusic = likedMusic.map((item) => item.fileId === pendingFileId ? local : item);
           saveLikes(likedMusicKey, likedMusic);
+        }
+        // A downloaded track may have been opened from a deep link rather than
+        // from the library list, so refresh its "Recently played" copy too.
+        if (recentTracks.some((item) => item.fileId === pendingFileId)) {
+          recentTracks = recentTracks.map((item) => item.fileId === pendingFileId ? local : item);
+          saveLikes(recentTracksKey, recentTracks);
         }
         if (selected?.fileId === pendingFileId) selected = local;
         const next = new Map(pending);
@@ -1021,6 +1075,10 @@
       if (Array.isArray(saved)) likedMusic = saved.filter(isStoredTrack).slice(0, 1000);
     } catch { likedMusic = []; }
     try {
+      const saved = JSON.parse(window.localStorage.getItem(recentTracksKey) || '[]') as unknown;
+      if (Array.isArray(saved)) recentTracks = saved.filter(isStoredTrack).slice(0, recentTrackLimit);
+    } catch { recentTracks = []; }
+    try {
       const saved = JSON.parse(window.localStorage.getItem(likedPodcastsKey) || '[]') as unknown;
       if (Array.isArray(saved)) {
         likedPodcasts = saved.filter(isStoredPodcast).slice(0, 500).map((feed) => ({
@@ -1046,13 +1104,13 @@
     let stopDeepLink = () => {};
     const handleDeepLinks = (urls: string[]) => {
       const uri = urls.find((value) => value.startsWith('napstr://track/'));
-      if (uri) void openTrackUri(uri);
+      if (uri) handleDeepLink(uri);
     };
     void getCurrent().then((urls) => { if (urls) handleDeepLinks(urls); }).catch(() => {});
     void onOpenUrl(handleDeepLinks).then((unlisten) => { stopDeepLink = unlisten; }).catch(() => {});
     const deepLinkListener = (event: Event) => {
       const uri = (event as CustomEvent<string>).detail;
-      if (typeof uri === 'string') void openTrackUri(uri);
+      if (typeof uri === 'string') handleDeepLink(uri);
     };
     window.addEventListener('napstr-deep-link', deepLinkListener);
     void refreshPodcastDownloads();
@@ -1088,6 +1146,26 @@
 
 <svelte:head><title>Napstrfy</title></svelte:head>
 
+{#snippet trackRow(track: RemoteTrack, index: number)}
+  <div class:selected={selected?.fileId === track.fileId} class:remote={!track.local} class="track-row">
+    <button class="track-open" disabled={status.streamOnly && !track.local} onclick={() => activateTrack(track)}>
+      <TrackArtwork {track} lookup={index < 24} />
+      <span class="track-copy">
+        <strong>{title(track)}</strong>
+        <small>{artist(track)}{track.album ? ` · ${track.album}` : ''}</small>
+        <span class="track-meta">{readableSize(track.size)}{#if !track.local} · {track.sources.length} {track.sources.length === 1 ? 'seeder' : 'seeders'}{/if}</span>
+      </span>
+      <span
+        class="track-action"
+        class:download={!track.local && !status.streamOnly && !pending.has(track.fileId)}
+        class:busy={pending.has(track.fileId)}
+        class:blocked={!track.local && status.streamOnly}
+      >{pending.has(track.fileId) ? '···' : track.local ? '⋮' : status.streamOnly ? 'Unavailable' : '⇩'}</span>
+    </button>
+    <button class:liked={isTrackLiked(track)} class="like-button" onclick={() => toggleTrackLike(track)} aria-label={`${isTrackLiked(track) ? 'Unlike' : 'Like'} ${title(track)}`}>{isTrackLiked(track) ? '♥' : '♡'}</button>
+  </div>
+{/snippet}
+
 {#if !status.paired && activeTab !== 'podcasts'}
   <main class="pair-screen">
     <div class="pair-glow"></div>
@@ -1122,7 +1200,7 @@
     </header>
 
     {#if error}<button class="error-banner" onclick={() => (error = '')}>{error}<span>×</span></button>{/if}
-    {#if notice}<button class="notice-banner" onclick={() => (notice = '')}>{notice}<span>×</span></button>{/if}
+    {#if notice}<button class="notice-banner" onclick={() => (notice = '')}><span class="notice-copy">{#if lookupFileId}<i class="spinner"></i>{/if}{notice}</span><span>×</span></button>{/if}
 
     {#if activeTab === 'music'}
       <section class="search-area">
@@ -1133,6 +1211,17 @@
         <div class="chips"><button class:active={showingLikedMusic} onclick={showLikedTracks}>♥ Liked</button>{#each musicChips as chip}<button class:active={!showingLikedMusic && query.toLocaleLowerCase() === chip.toLocaleLowerCase()} onclick={() => selectChip(chip)}>{chip}</button>{/each}</div>
       </section>
 
+      {#if !showingLikedMusic && !query.trim() && recentTracks.length > 0}
+        <section class="recent-area">
+          <div class="section-label"><b>Recently played</b><button class="recent-clear" onclick={forgetRecentTracks}>Clear</button></div>
+          <div class="track-list recent-list">
+            {#each recentTracks as track, index (track.fileId)}
+              {@render trackRow(track, index)}
+            {/each}
+          </div>
+        </section>
+      {/if}
+
       <section class="library-heading">
         <div><p>{showingLikedMusic ? 'FAVOURITES' : query ? 'SEARCH RESULTS' : 'YOUR NAPSTR'}</p><h1>{showingLikedMusic ? 'Liked music' : query ? query : 'Your music'}</h1></div>
         <span>{total} {total === 1 ? 'track' : 'tracks'}</span>
@@ -1142,18 +1231,7 @@
         {#if loading}<div class="loading-list"><i></i><span>Asking Napstr…</span></div>{/if}
         {#if !loading && tracks.length === 0}<div class="empty-library"><img src="/napstr-logo-small.png" alt="" /><h2>{showingLikedMusic ? 'No liked tracks yet' : 'No tracks found'}</h2><p>{showingLikedMusic ? 'Tap the heart beside a song to keep it here.' : query ? 'Try different words or clear the search.' : 'Add music to your Napstr folder on the computer.'}</p></div>{/if}
         {#each tracks as track, index (track.fileId)}
-          <div class:selected={selected?.fileId === track.fileId} class:remote={!track.local} class="track-row">
-            <button class="track-open" disabled={status.streamOnly && !track.local} onclick={() => activateTrack(track)}>
-              <TrackArtwork {track} lookup={index < 24} />
-              <span class="track-copy">
-                <strong>{title(track)}</strong>
-                <small>{artist(track)}{track.album ? ` · ${track.album}` : ''}</small>
-                <span class="track-meta">{readableSize(track.size)}{#if !track.local} · {track.sources.length} {track.sources.length === 1 ? 'seeder' : 'seeders'}{/if}</span>
-              </span>
-              <span class="track-action">{pending.has(track.fileId) ? '···' : track.local ? '⋮' : status.streamOnly ? 'Unavailable' : '⇩'}</span>
-            </button>
-            <button class:liked={isTrackLiked(track)} class="like-button" onclick={() => toggleTrackLike(track)} aria-label={`${isTrackLiked(track) ? 'Unlike' : 'Like'} ${title(track)}`}>{isTrackLiked(track) ? '♥' : '♡'}</button>
-          </div>
+          {@render trackRow(track, index)}
         {/each}
         {#if !showingLikedMusic && tracks.length < total}<button class="load-more" onclick={() => loadLibrary(true)} disabled={loadingMore}>{loadingMore ? 'Loading…' : `Load more · ${tracks.length} of ${total}`}</button>{/if}
       </section>
