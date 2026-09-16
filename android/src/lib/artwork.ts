@@ -7,7 +7,8 @@ import type { RemoteTrack } from './types';
  * The paired host resolves these, because it owns the relay pool, the
  * catalogue, and the availability heartbeats that decide which claim wins.
  * Lookups are batched: a list page asks for every album it shows in one call
- * instead of querying per row.
+ * instead of querying per row. An album the host has no cover event for simply
+ * has no artwork here.
  */
 export type AlbumCover = {
   key: string;
@@ -32,6 +33,19 @@ const CACHE_PREFIX = 'napstrfy-cover:v2:';
 const LEGACY_CACHE_PREFIX = 'napstrfy-artwork:';
 /** Keys per companion call. Mirrors `MAX_COVER_KEYS * 4` in the phone crate. */
 const INVOKE_KEY_LIMIT = 160;
+/**
+ * Direct MusicBrainz and Cover Art Archive lookups.
+ *
+ * Off, so artwork can only be what Napstr publishers actually asserted against
+ * an album key. The cover NIP permits a client-side fallback, but resolving art
+ * from a third party reintroduces exactly the guesswork the cover events exist
+ * to replace, and it hides a missing cover event behind a plausible image.
+ *
+ * Turning this back on also needs `https://musicbrainz.org` and
+ * `https://coverartarchive.org` in the CSP `connect-src` of
+ * `android/src-tauri/tauri.conf.json`, which are still present.
+ */
+const EXTERNAL_ARTWORK_FALLBACK: boolean = false;
 /** Albums nothing has artwork for are retried after this long. */
 const NEGATIVE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 /** A page composes in stages: gather its keys briefly before asking. */
@@ -147,48 +161,63 @@ function requestCover(key: string): Promise<AlbumCover | null> {
 async function flush() {
   flushHandle = null;
   const batch = [...pending.keys()];
-  const resolved = await resolveCovers(batch);
+  const { covers, unanswered } = await resolveCovers(batch);
   for (const key of batch) {
     const waiters = pending.get(key) ?? [];
     pending.delete(key);
-    const cover = resolved.get(key) ?? null;
-    writeCache(key, cover);
+    const cover = covers.get(key) ?? null;
+    // A request that failed is not an answer, so it must not be remembered as
+    // "this album has no cover". Only the host saying so is cached.
+    if (!unanswered.has(key)) writeCache(key, cover);
     for (const resolve of waiters) resolve(cover);
   }
   // Keys requested while this batch was in flight wait for the next one.
   if (pending.size) flushHandle = window.setTimeout(flush, BATCH_DELAY_MS);
 }
 
-async function resolveCovers(keys: string[]): Promise<Map<string, AlbumCover>> {
-  const resolved = new Map<string, AlbumCover>();
+type CoverResolution = {
+  /** Covers the host answered with, keyed by cover key. */
+  covers: Map<string, AlbumCover>;
+  /** Keys whose request failed, so nothing was learned about them. */
+  unanswered: Set<string>;
+};
+
+async function resolveCovers(keys: string[]): Promise<CoverResolution> {
+  const covers = new Map<string, AlbumCover>();
   const misses: string[] = [];
+  const unanswered = new Set<string>();
   for (let index = 0; index < keys.length; index += INVOKE_KEY_LIMIT) {
     const slice = keys.slice(index, index + INVOKE_KEY_LIMIT);
     try {
-      const covers = await invoke<AlbumCover[]>('remote_covers', { keys: slice });
-      for (const cover of covers) {
-        if (cover.art || cover.thumb || cover.coverFileId) resolved.set(cover.key, cover);
+      const found = await invoke<AlbumCover[]>('remote_covers', { keys: slice });
+      for (const cover of found) {
+        if (cover.art || cover.thumb || cover.coverFileId) covers.set(cover.key, cover);
+      }
+      if (EXTERNAL_ARTWORK_FALLBACK) {
+        for (const key of slice) if (!covers.has(key)) misses.push(key);
       }
     } catch {
-      // Unpaired, offline, or a host older than the cover NIP: the external
-      // lookup below is exactly the fallback that case is meant to use.
-    }
-    for (const key of slice) if (!resolved.has(key)) misses.push(key);
-  }
-  for (const key of misses) {
-    const url = await externalArtwork(key);
-    if (url) {
-      // A cover event satisfies its key, so only albums without one get here.
-      resolved.set(key, { ...emptyCover(key), art: url, thumb: url, source: 'musicbrainz' });
+      // Unpaired, offline, or a host older than the cover NIP.
+      for (const key of slice) unanswered.add(key);
     }
   }
-  return resolved;
+  if (EXTERNAL_ARTWORK_FALLBACK) {
+    for (const key of misses) {
+      const url = await externalArtwork(key);
+      if (url) {
+        // A cover event satisfies its key, so only albums without one get here.
+        covers.set(key, { ...emptyCover(key), art: url, thumb: url, source: 'musicbrainz' });
+      }
+    }
+  }
+  return { covers, unanswered };
 }
 
 /**
- * MusicBrainz release search followed by the Cover Art Archive, kept as the
- * client-optional fallback the cover NIP allows for albums no cover event
- * answers. Serialised and spaced out to respect the MusicBrainz rate limit.
+ * MusicBrainz release search followed by the Cover Art Archive, the
+ * client-optional fallback the cover NIP allows. Currently unreachable:
+ * `EXTERNAL_ARTWORK_FALLBACK` is off. Serialised and spaced out to respect the
+ * MusicBrainz rate limit, for whenever it is switched back on.
  */
 function externalArtwork(key: string): Promise<string> {
   const [artist, album] = key.split('|');
