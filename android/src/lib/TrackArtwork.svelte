@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { artworkFor, artworkHue } from './artwork';
+  import { artworkHue, coverFor } from './artwork';
   import type { RemoteTrack } from './types';
 
   let { track, lookup = false, large = false }: { track: RemoteTrack; lookup?: boolean; large?: boolean } = $props();
@@ -11,7 +11,14 @@
     let alive = true;
     image = '';
     failed = false;
-    if (lookup) artworkFor(track).then((url) => { if (alive) image = url; });
+    if (lookup) {
+      void coverFor(track).then((cover) => {
+        if (!alive || !cover) return;
+        // Dense grids prefer the published thumbnail; a large tile wants the
+        // full front cover, falling back to whichever the publisher gave us.
+        image = large ? cover.art || cover.thumb : cover.thumb || cover.art;
+      });
+    }
     return () => { alive = false; };
   });
 </script>

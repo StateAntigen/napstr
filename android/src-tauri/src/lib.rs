@@ -1,8 +1,8 @@
 use futures_util::StreamExt;
 use iroh::{endpoint::presets, Endpoint, EndpointAddr, EndpointId, SecretKey};
 use napstr_remote_protocol::{
-    ClientRequest, PairingTicket, RemoteAudiobook, RemoteAudiobookSummary, RemoteTrack,
-    RemoteTransfer, ServerResponse, ALPN, MAX_CONTROL_FRAME_BYTES,
+    ClientRequest, PairingTicket, RemoteAlbumCover, RemoteAudiobook, RemoteAudiobookSummary,
+    RemoteTrack, RemoteTransfer, ServerResponse, ALPN, MAX_CONTROL_FRAME_BYTES, MAX_COVER_KEYS,
 };
 use quick_xml::{events::Event, Reader};
 use serde::{Deserialize, Serialize};
@@ -1842,6 +1842,75 @@ async fn cached_library(state: State<'_, AppState>) -> Result<OfflineLibrary, St
     state.remote.offline_library().await
 }
 
+/// Album artwork for the given `artist|album` keys, resolved by the paired
+/// Napstr host from kind `30427` cover events.
+///
+/// The phone never talks to relays itself: the host owns the relay pool, the
+/// catalogue, and the availability heartbeats that decide which claim wins.
+/// Requests are chunked so each one, and each answer, fits inside a single
+/// control frame.
+async fn companion_covers(
+    remote: &RemoteClient,
+    keys: Vec<String>,
+) -> Result<Vec<RemoteAlbumCover>, String> {
+    let keys = normalise_cover_request(&keys);
+    let mut covers = Vec::new();
+    for batch in keys.chunks(MAX_COVER_KEYS) {
+        let response = remote
+            .request(ClientRequest::AlbumCovers {
+                keys: batch.to_vec(),
+            })
+            .await?;
+        match response {
+            ServerResponse::AlbumCovers {
+                covers: batch_covers,
+            } => covers.extend(batch_covers),
+            response => return Err(unexpected_response(&response)),
+        }
+    }
+    Ok(covers)
+}
+
+#[tauri::command]
+async fn remote_covers(
+    keys: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<RemoteAlbumCover>, String> {
+    companion_covers(&state.remote, keys).await
+}
+
+/// Cover keys are `trim(artist)|trim(album)`, lowercased, exactly one
+/// separator, at most 300 characters, exactly as the cover NIP defines them.
+/// Rewriting here means the phone and the host always agree on the key, and a
+/// sloppy caller cannot silently match nothing.
+fn normalise_cover_request(keys: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut normalised = Vec::new();
+    for key in keys {
+        let Some(key) = normalise_cover_key(key) else {
+            continue;
+        };
+        if seen.insert(key.clone()) {
+            normalised.push(key);
+        }
+        if normalised.len() >= MAX_COVER_KEYS * 4 {
+            break;
+        }
+    }
+    normalised
+}
+
+fn normalise_cover_key(value: &str) -> Option<String> {
+    let mut halves = value.split('|');
+    let artist = halves.next()?.trim().to_lowercase();
+    let album = halves.next()?.trim().to_lowercase();
+    if halves.next().is_some() || artist.is_empty() || album.is_empty() {
+        return None;
+    }
+    let key = format!("{artist}|{album}");
+    (key.chars().count() <= 300).then_some(key)
+}
+
 #[tauri::command]
 async fn reconcile_audio_cache(
     protected_file_ids: Vec<String>,
@@ -2329,6 +2398,7 @@ pub fn run() {
             forget_desktop,
             remote_library,
             cached_library,
+            remote_covers,
             reconcile_audio_cache,
             remote_search,
             remote_audiobooks,
@@ -2535,6 +2605,43 @@ mod tests {
     #[test]
     fn mobile_names_drop_direction_overrides() {
         assert_eq!(clean_device_name("My\u{202e}Phone"), "MyPhone");
+    }
+
+    #[test]
+    fn cover_keys_match_the_cover_nip_normalisation() {
+        assert_eq!(
+            normalise_cover_key("  Pink Floyd |Animals ").as_deref(),
+            Some("pink floyd|animals")
+        );
+        assert_eq!(
+            normalise_cover_key("BEYONCÉ|Lemonade").as_deref(),
+            Some("beyoncé|lemonade")
+        );
+        // Edition markers are preserved: matching is against the catalogue's own
+        // display strings, and the host handles the canonical alias.
+        assert_eq!(
+            normalise_cover_key("Artist|Album (Deluxe Edition)").as_deref(),
+            Some("artist|album (deluxe edition)")
+        );
+        // A key that is not addressable is dropped rather than sent on.
+        assert_eq!(normalise_cover_key("artist"), None);
+        assert_eq!(normalise_cover_key("artist|"), None);
+        assert_eq!(normalise_cover_key("|album"), None);
+        assert_eq!(normalise_cover_key("a|b|c"), None);
+        assert_eq!(normalise_cover_key(&format!("{}|album", "a".repeat(299))), None);
+
+        let request = normalise_cover_request(&[
+            " Artist | Album ".into(),
+            "artist|album".into(),
+            "junk".into(),
+        ]);
+        assert_eq!(request, vec!["artist|album".to_string()]);
+
+        // A caller cannot buy an unbounded amount of relay work in one go.
+        let many = (0..MAX_COVER_KEYS * 5)
+            .map(|index| format!("artist|album{index}"))
+            .collect::<Vec<_>>();
+        assert_eq!(normalise_cover_request(&many).len(), MAX_COVER_KEYS * 4);
     }
 
     #[test]

@@ -5,9 +5,9 @@ use crate::{
 use chrono::Utc;
 use iroh::{endpoint::presets, Endpoint, SecretKey};
 use napstr_remote_protocol::{
-    ClientRequest, PairingTicket, RemoteAudiobook, RemoteAudiobookSummary, RemoteSource,
-    RemoteTrack, RemoteTransfer, ServerResponse, ALPN, MAX_CONTROL_FRAME_BYTES, MAX_PAGE_SIZE,
-    PROTOCOL_VERSION,
+    ClientRequest, PairingTicket, RemoteAlbumCover, RemoteAudiobook, RemoteAudiobookSummary,
+    RemoteSource, RemoteTrack, RemoteTransfer, ServerResponse, ALPN, MAX_CONTROL_FRAME_BYTES,
+    MAX_COVER_KEYS, MAX_PAGE_SIZE, PROTOCOL_VERSION,
 };
 use qrcode::{render::svg, QrCode};
 use rusqlite::{params, OptionalExtension};
@@ -710,6 +710,19 @@ impl MobileService {
                 )
                 .await
             }
+            ClientRequest::AlbumCovers { keys } => {
+                if keys.len() > MAX_COVER_KEYS {
+                    return Err("Too many album covers were requested at once".into());
+                }
+                let covers = self
+                    .network
+                    .album_covers(keys)
+                    .await?
+                    .into_iter()
+                    .map(remote_album_cover)
+                    .collect();
+                write_response(send, &ServerResponse::AlbumCovers { covers }).await
+            }
             ClientRequest::Status => {
                 write_response(
                     send,
@@ -822,6 +835,7 @@ fn check_request_permission(stream_only: bool, request: &ClientRequest) -> Resul
         | ClientRequest::Audiobook { .. }
         | ClientRequest::FetchAudio { .. }
         | ClientRequest::Available { .. }
+        | ClientRequest::AlbumCovers { .. }
         | ClientRequest::Status
         | ClientRequest::Ping => Ok(()),
         _ => Err("This phone has read-only access. Downloads on the Napstr host are not permitted.".into()),
@@ -830,6 +844,25 @@ fn check_request_permission(stream_only: bool, request: &ClientRequest) -> Resul
 
 fn is_sha256_file_id(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Trim the host's bookkeeping (event ids, timestamps) from a resolved cover
+/// before it crosses the wire.
+fn remote_album_cover(cover: crate::network::AlbumCover) -> RemoteAlbumCover {
+    RemoteAlbumCover {
+        key: cover.key,
+        art: cover.art,
+        thumb: cover.thumb,
+        mbid: cover.mbid,
+        year: cover.year,
+        genre: cover.genre,
+        collection: cover.collection,
+        source: cover.source,
+        cover_file_id: cover.cover_file_id,
+        mime: cover.mime,
+        author: cover.author,
+        seeder: cover.seeder,
+    }
 }
 
 fn remote_audiobook(
