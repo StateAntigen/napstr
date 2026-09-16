@@ -18,6 +18,12 @@
   const likedPodcastsKey = 'napstrfy-liked-podcasts';
   type AppTab = 'music' | 'podcasts' | 'audiobooks';
   type PlayMode = 'all' | 'random' | 'repeat' | 'once';
+  type TrackSource = 'phone' | 'desktop' | 'catalogue';
+  type TrackLookup = {
+    fileId: string;
+    track: RemoteTrack | null;
+    source: TrackSource | null;
+  };
   const playModes: Array<{ value: PlayMode; icon: string; label: string }> = [
     { value: 'all', icon: '↻A', label: 'Play all' },
     { value: 'random', icon: '⤨', label: 'Play random' },
@@ -432,20 +438,28 @@
         notice = 'Pair Napstrfy to open this track';
         return;
       }
-      const local = [...tracks, ...likedMusic].find((track) => track.fileId === fileId);
-      if (local) {
-        selected = local;
-        notice = `Track link opened: ${title(local)}`;
+      // A file ID is resolved exactly, never by words: this phone's cache
+      // first, then the paired desktop's library, then the public catalogue.
+      const lookup = await invoke<TrackLookup>('lookup_track', { fileId });
+      const track = lookup.track;
+      if (!track) {
+        // A missing track is a definite answer from the desktop, not a
+        // failure: a read-only pairing also reports nothing here because it
+        // cannot search the catalogue for a file the host does not hold.
+        error = 'That track is not in your Napstr library yet. Ask the sender to share the file, then open the link again.';
         return;
       }
-      await searchTracks(fileId);
-      const remote = tracks.find((track) => track.fileId === fileId);
-      if (remote) {
-        selected = remote;
-        notice = `Track link opened: ${title(remote)}`;
-      } else {
-        error = 'That track is not currently available from the paired Napstr desktop.';
+      error = '';
+      selected = track;
+      query = '';
+      showingLikedMusic = false;
+      if (!tracks.some((item) => item.fileId === track.fileId)) {
+        tracks = [track, ...tracks];
+        total = Math.max(total, tracks.length);
       }
+      if (lookup.source === 'phone') notice = `${title(track)} is saved on this phone`;
+      else if (lookup.source === 'desktop') notice = `Track link opened: ${title(track)}`;
+      else notice = `${title(track)} is in the Napstr catalogue; open it to ask Napstr to download it`;
     } catch (nextError) {
       error = `Could not open track link: ${String(nextError)}`;
     }

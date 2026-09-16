@@ -107,6 +107,19 @@ blocking, pairing, catalogue validation, or transfer authorization. Clients
 MUST reject uppercase IDs, query strings, fragments, extra path segments, and
 IDs that are not exactly 32 decoded bytes.
 
+A file ID is not a search phrase, so a client MUST resolve a link by exact ID
+and MUST NOT substitute a word search for it. The order is:
+
+1. a copy already cached or indexed by the client;
+2. the paired library, when the client is a companion of another client;
+3. the public catalogue.
+
+A companion that delegates resolution to its host MUST keep the exact-ID lookup
+available to read-only pairings: a file that was never published to relays is
+still playable from the host's library. When no copy exists anywhere, the
+client MUST report that the file is unavailable rather than open an unrelated
+track.
+
 Interoperable clients MUST support these catalogue claims:
 
 | Extension | `format` | `mime` |

@@ -458,6 +458,36 @@ impl MobileService {
         Ok((page, total, audiobook_chapter_ids))
     }
 
+    /// Resolve one file ID exactly for a `napstr://track/<file-id>` deep link.
+    ///
+    /// The local library answers first so the hash resolves for files that were
+    /// never published to relays and for read-only pairings, which are not
+    /// allowed to search the catalogue at all.
+    async fn track_lookup(
+        &self,
+        file_id: &str,
+        stream_only: bool,
+    ) -> Result<Option<RemoteTrack>, String> {
+        if !is_sha256_file_id(file_id)
+            || file_id.bytes().any(|byte| byte.is_ascii_uppercase())
+        {
+            return Err("Invalid track lookup".into());
+        }
+        if let Ok(track) = local_track(&self.db_path, file_id) {
+            return Ok(Some(track));
+        }
+        if stream_only {
+            return Ok(None);
+        }
+        Ok(self
+            .network
+            .search(file_id)
+            .await?
+            .into_iter()
+            .find(|result| result.file_id == file_id)
+            .map(catalogue_track))
+    }
+
     async fn serve_request(
         &self,
         remote_id: &str,
@@ -516,26 +546,7 @@ impl MobileService {
                     {
                         continue;
                     }
-                    tracks.push(RemoteTrack {
-                        file_id: result.file_id,
-                        filename: result.filename,
-                        title: result.title,
-                        artist: result.artist,
-                        album: result.album,
-                        format: result.format,
-                        mime: result.mime,
-                        size: result.size,
-                        tags: result.tags,
-                        local: false,
-                        sources: result
-                            .sources
-                            .into_iter()
-                            .map(|source| RemoteSource {
-                                pubkey: source.pubkey,
-                                display_name: source.display_name,
-                            })
-                            .collect(),
-                    });
+                    tracks.push(catalogue_track(result));
                 }
                 tracks.sort_by(|left, right| {
                     right
@@ -546,6 +557,10 @@ impl MobileService {
                 });
                 tracks.truncate(MAX_PAGE_SIZE);
                 write_response(send, &ServerResponse::Search { tracks }).await
+            }
+            ClientRequest::Track { file_id } => {
+                let track = self.track_lookup(&file_id, stream_only).await?;
+                write_response(send, &ServerResponse::Track { track }).await
             }
             ClientRequest::Audiobooks { query } => {
                 let query = query.trim();
@@ -817,6 +832,7 @@ fn check_request_permission(stream_only: bool, request: &ClientRequest) -> Resul
     match request {
         ClientRequest::Library { .. }
         | ClientRequest::Search { .. }
+        | ClientRequest::Track { .. }
         | ClientRequest::Audiobooks { .. }
         | ClientRequest::AudiobookLibrary { .. }
         | ClientRequest::Audiobook { .. }
@@ -1005,19 +1021,27 @@ fn page_music_library(
     offset: usize,
     limit: usize,
 ) -> (Vec<RemoteTrack>, usize) {
+    // A bare file ID is not a text query. Without this, a `napstr://track/<id>`
+    // deep link would compare the hash against file names and tags and report
+    // that the user's own file is unavailable.
+    let exact_file_id = exact_file_id_query(query);
     let mut page = Vec::with_capacity(limit.min(tracks.len()));
     let mut total = 0usize;
     for track in tracks {
-        if !search_matches(
-            query,
-            &[
-                &track.filename,
-                &track.title,
-                &track.artist,
-                &track.album,
-                &track.tags,
-            ],
-        ) {
+        let matched = match exact_file_id {
+            Some(file_id) => track.file_id == file_id,
+            None => search_matches(
+                query,
+                &[
+                    &track.filename,
+                    &track.title,
+                    &track.artist,
+                    &track.album,
+                    &track.tags,
+                ],
+            ),
+        };
+        if !matched {
             continue;
         }
         if total >= offset && page.len() < limit {
@@ -1026,6 +1050,40 @@ fn page_music_library(
         total += 1;
     }
     (page, total)
+}
+
+/// A bare lowercase SHA-256 digest is a file ID, never a search phrase.
+fn exact_file_id_query(query: &str) -> Option<&str> {
+    let query = query.trim();
+    (query.len() == 64
+        && query
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    .then_some(query)
+}
+
+/// A catalogue hit is always remote: the desktop does not hold these bytes.
+fn catalogue_track(result: crate::network::CatalogueResult) -> RemoteTrack {
+    RemoteTrack {
+        file_id: result.file_id,
+        filename: result.filename,
+        title: result.title,
+        artist: result.artist,
+        album: result.album,
+        format: result.format,
+        mime: result.mime,
+        size: result.size,
+        tags: result.tags,
+        local: false,
+        sources: result
+            .sources
+            .into_iter()
+            .map(|source| RemoteSource {
+                pubkey: source.pubkey,
+                display_name: source.display_name,
+            })
+            .collect(),
+    }
 }
 
 fn library_revision(db_path: &Path) -> Result<u64, String> {
@@ -1290,6 +1348,68 @@ mod tests {
             }
         )
         .is_ok());
+        // A read-only phone may still open a shared track link, so the exact
+        // file-ID lookup is allowed even though it cannot request downloads.
+        assert!(check_request_permission(
+            true,
+            &ClientRequest::Track {
+                file_id: "a".repeat(64)
+            }
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn a_bare_file_id_never_takes_the_text_search_path() {
+        let file_id = "3f".repeat(32);
+        assert_eq!(exact_file_id_query(&file_id), Some(file_id.as_str()));
+        assert_eq!(exact_file_id_query(&format!("  {file_id}  ")), Some(file_id.as_str()));
+        // Uppercase is not a file ID on the wire, so it stays an ordinary
+        // (and in practice empty) text search.
+        assert_eq!(exact_file_id_query(&file_id.to_uppercase()), None);
+        assert_eq!(exact_file_id_query(&file_id[..63]), None);
+        assert_eq!(exact_file_id_query(&"g".repeat(64)), None);
+        assert_eq!(exact_file_id_query("Metallica"), None);
+        assert_eq!(exact_file_id_query(""), None);
+    }
+
+    #[test]
+    fn music_library_pages_may_be_paged_by_exact_file_id() {
+        let track = |file_id: &str, filename: &str| RemoteTrack {
+            file_id: file_id.into(),
+            filename: filename.into(),
+            title: "A Song".into(),
+            artist: "An Artist".into(),
+            album: String::new(),
+            format: "MP3".into(),
+            mime: "audio/mpeg".into(),
+            size: 1,
+            tags: String::new(),
+            local: true,
+            sources: Vec::new(),
+        };
+        let wanted = "3f".repeat(32);
+        let tracks = vec![
+            track(&wanted, "Song.mp3"),
+            track(&"aa".repeat(32), "Other.mp3"),
+        ];
+
+        // A deep-link hash resolves the one matching file and nothing else.
+        let (page, total) = page_music_library(&tracks, &wanted, 0, 100);
+        assert_eq!(total, 1);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].file_id, wanted);
+
+        // The same query still works as an ordinary text search for words.
+        let (page, total) = page_music_library(&tracks, "other", 0, 100);
+        assert_eq!(total, 1);
+        assert_eq!(page[0].filename, "Other.mp3");
+
+        // A hash that is not in the library stays empty rather than matching
+        // every file whose name happens to look like hex.
+        let (page, total) = page_music_library(&tracks, &"11".repeat(32), 0, 100);
+        assert_eq!(total, 0);
+        assert!(page.is_empty());
     }
 
     #[test]

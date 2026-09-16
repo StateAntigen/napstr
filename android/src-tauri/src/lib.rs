@@ -63,6 +63,26 @@ struct OfflineLibrary {
     desktop_name: String,
 }
 
+/// Where a `napstr://track/<file-id>` deep link found its file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum TrackSource {
+    /// Already cached on this phone, so it plays without the desktop.
+    Phone,
+    /// The paired desktop holds the file and streams it over Iroh.
+    Desktop,
+    /// Only catalogue seeders have it, so the desktop has to download it.
+    Catalogue,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TrackLookup {
+    file_id: String,
+    track: Option<RemoteTrack>,
+    source: Option<TrackSource>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CachedRemoteAudio {
@@ -1546,6 +1566,67 @@ impl RemoteClient {
         }
     }
 
+    async fn cached_track(&self, file_id: &str) -> Result<Option<RemoteTrack>, String> {
+        Ok(self
+            .cached_entries()
+            .await?
+            .into_iter()
+            .find(|item| item.track.file_id == file_id)
+            .map(|item| item.track))
+    }
+
+    /// Resolve one file ID exactly, which is what a `napstr://track/<file-id>`
+    /// deep link needs.
+    ///
+    /// Order matters: a file already on this phone must open without the
+    /// desktop, and a file on the desktop must resolve without the catalogue.
+    /// Desktops that predate [`ClientRequest::Track`] reject the request, so
+    /// the old search path is kept as a fallback.
+    async fn lookup_track(&self, file_id: &str) -> Result<TrackLookup, String> {
+        validate_file_id(file_id)?;
+        if let Some(track) = self.cached_track(file_id).await? {
+            return Ok(TrackLookup {
+                file_id: file_id.to_string(),
+                track: Some(track),
+                source: Some(TrackSource::Phone),
+            });
+        }
+        let response = match self
+            .request(ClientRequest::Track {
+                file_id: file_id.to_string(),
+            })
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                return if is_unsupported_request(&error) {
+                    self.lookup_track_by_search(file_id).await
+                } else {
+                    Err(error)
+                }
+            }
+        };
+        match response {
+            ServerResponse::Track { track } => Ok(track_lookup(file_id, track)),
+            response => Err(unexpected_response(&response)),
+        }
+    }
+
+    async fn lookup_track_by_search(&self, file_id: &str) -> Result<TrackLookup, String> {
+        match self
+            .request(ClientRequest::Search {
+                query: file_id.to_string(),
+            })
+            .await?
+        {
+            ServerResponse::Search { tracks } => Ok(track_lookup(
+                file_id,
+                tracks.into_iter().find(|track| track.file_id == file_id),
+            )),
+            response => Err(unexpected_response(&response)),
+        }
+    }
+
     async fn cache_audio(
         self: &Arc<Self>,
         requested_track: RemoteTrack,
@@ -1814,6 +1895,14 @@ async fn pair_desktop(
 #[tauri::command]
 fn track_file_id_from_uri(uri: String) -> Result<String, String> {
     TrackUri::parse(&uri).map(|track| track.file_id)
+}
+
+#[tauri::command]
+async fn lookup_track(
+    file_id: String,
+    state: State<'_, AppState>,
+) -> Result<TrackLookup, String> {
+    state.remote.lookup_track(&file_id).await
 }
 
 #[tauri::command]
@@ -2246,6 +2335,28 @@ fn unexpected_response(response: &ServerResponse) -> String {
     }
 }
 
+/// A desktop that reports a file as `local: false` can only stream it from the
+/// catalogue, so the phone has to ask the host to download it before playback.
+fn track_lookup(file_id: &str, track: Option<RemoteTrack>) -> TrackLookup {
+    TrackLookup {
+        file_id: file_id.to_string(),
+        source: track.as_ref().map(|track| {
+            if track.local {
+                TrackSource::Desktop
+            } else {
+                TrackSource::Catalogue
+            }
+        }),
+        track,
+    }
+}
+
+/// Desktops older than the companion track lookup answer with one of these
+/// instead of a result, so the caller can fall back to an ordinary search.
+fn is_unsupported_request(error: &str) -> bool {
+    error.contains("invalid Napstrfy request") || error.contains("unexpected response")
+}
+
 fn save_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
@@ -2333,6 +2444,7 @@ pub fn run() {
             companion_status,
             pair_desktop,
             track_file_id_from_uri,
+            lookup_track,
             forget_desktop,
             remote_library,
             cached_library,

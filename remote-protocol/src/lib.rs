@@ -151,6 +151,16 @@ pub enum ClientRequest {
     Search {
         query: String,
     },
+    /// Exact lookup of one file by its SHA-256 ID.
+    ///
+    /// A file ID is not a text query: `napstr://track/<file-id>` deep links
+    /// must resolve the single file that hashes to it, including files the
+    /// desktop holds but has not published with searchable words. Companions
+    /// send this first and fall back to [`ClientRequest::Search`] when the
+    /// desktop answers that the request is unknown.
+    Track {
+        file_id: String,
+    },
     Audiobooks {
         query: String,
     },
@@ -197,6 +207,14 @@ pub enum ServerResponse {
     },
     Search {
         tracks: Vec<RemoteTrack>,
+    },
+    /// Result of [`ClientRequest::Track`].
+    ///
+    /// `track` is `None` when neither the desktop library nor the catalogue
+    /// knows the file ID. A track with `local: false` is only available from
+    /// the catalogue, so it can be streamed but not downloaded from the host.
+    Track {
+        track: Option<RemoteTrack>,
     },
     Audiobooks {
         audiobooks: Vec<RemoteAudiobook>,
@@ -286,6 +304,24 @@ mod tests {
         ] {
             assert!(TrackUri::parse(value).is_err(), "accepted {value}");
         }
+    }
+
+    #[test]
+    fn track_lookup_requests_and_responses_keep_their_wire_shape() {
+        let file_id = "3f".repeat(32);
+        let request = ClientRequest::Track {
+            file_id: file_id.clone(),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert_eq!(json, format!(r#"{{"type":"track","fileId":"{file_id}"}}"#));
+        assert_eq!(serde_json::from_str::<ClientRequest>(&json).unwrap(), request);
+
+        // An unknown file is an ordinary answer, not an error, so a deep link
+        // can report "not in your library" instead of a protocol failure.
+        let missing = ServerResponse::Track { track: None };
+        let json = serde_json::to_string(&missing).unwrap();
+        assert_eq!(json, r#"{"type":"track","track":null}"#);
+        assert_eq!(serde_json::from_str::<ServerResponse>(&json).unwrap(), missing);
     }
 
     #[test]
