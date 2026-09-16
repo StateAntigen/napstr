@@ -18,6 +18,7 @@ use tauri::{Emitter, Manager, State};
 use walkdir::WalkDir;
 
 mod audio;
+mod cover;
 mod mobile;
 mod network;
 mod player;
@@ -1930,6 +1931,14 @@ async fn network_search_audiobooks(
 }
 
 #[tauri::command]
+async fn network_covers(
+    keys: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<network::AlbumCover>, String> {
+    state.network.album_covers(keys).await
+}
+
+#[tauri::command]
 async fn network_browse(
     cursor: Option<network::CatalogueBrowseCursor>,
     limit: Option<usize>,
@@ -2235,6 +2244,7 @@ pub fn run() {
             publish_profile,
             network_search,
             network_search_audiobooks,
+            network_covers,
             network_browse,
             network_browse_user,
             resolve_catalogue_user,
