@@ -46,16 +46,27 @@ const INVOKE_KEY_LIMIT = 160;
  * `android/src-tauri/tauri.conf.json`, which are still present.
  */
 const EXTERNAL_ARTWORK_FALLBACK: boolean = false;
-/** Albums nothing has artwork for are retried after this long. */
-const NEGATIVE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+/**
+ * How long stored artwork is trusted before it is asked for again.
+ *
+ * Publishers replace their cover claim, and image URLs rot, so a cover that
+ * answered once is not permanent. Asking is a local call to the host.
+ */
+const STORED_COVER_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 /** A page composes in stages: gather its keys briefly before asking. */
 const BATCH_DELAY_MS = 40;
 /** MusicBrainz asks clients to stay near one request per second. */
 const LOOKUP_SPACING_MS = 1100;
 
-type CachedCover = { at: number; cover: AlbumCover | null };
 type Waiter = (cover: AlbumCover | null) => void;
 
+/**
+ * Covers resolved while the app is open, including albums the host has no cover
+ * for. Absence is deliberately not persisted: the host re-checks relays on its
+ * own schedule and answering again costs one batched call, so carrying a "no"
+ * across launches only ever delays artwork that has since been published.
+ */
+const sessionCovers = new Map<string, AlbumCover | null>();
 const pending = new Map<string, Waiter[]>();
 let flushHandle: number | null = null;
 let lookupQueue: Promise<void> = Promise.resolve();
@@ -78,23 +89,52 @@ function emptyCover(key: string): AlbumCover {
   };
 }
 
-function readCache(key: string): CachedCover | null {
+/**
+ * `undefined` means nothing is known yet; `null` means the host answered and
+ * has no cover for this album.
+ */
+function cachedCover(key: string): AlbumCover | null | undefined {
+  const known = sessionCovers.get(key);
+  if (known !== undefined) return known;
+  const stored = readStoredCover(key);
+  if (stored) sessionCovers.set(key, stored);
+  return stored;
+}
+
+function readStoredCover(key: string): AlbumCover | null {
   try {
     const raw = window.localStorage.getItem(CACHE_PREFIX + key);
     if (!raw) return null;
-    const cached = JSON.parse(raw) as CachedCover;
-    if (!cached.cover && Date.now() - cached.at > NEGATIVE_TTL_MS) return null;
-    return cached;
+    const stored = JSON.parse(raw) as { at: number; cover: AlbumCover | null };
+    if (!stored.cover) return null;
+    if (Date.now() - stored.at > STORED_COVER_TTL_MS) return null;
+    return stored.cover;
   } catch {
     return null;
   }
 }
 
-function writeCache(key: string, cover: AlbumCover | null) {
+/** Remember what a request learned. Only artwork is worth writing to disk. */
+function rememberCover(key: string, cover: AlbumCover | null) {
+  sessionCovers.set(key, cover);
+  if (!cover) {
+    // A claim can be withdrawn, so a stored cover must go when the host says
+    // there is none rather than linger until its own expiry.
+    dropStoredCover(key);
+    return;
+  }
   try {
     window.localStorage.setItem(CACHE_PREFIX + key, JSON.stringify({ at: Date.now(), cover }));
   } catch {
     // Artwork is cosmetic; a full or unavailable cache must not affect playback.
+  }
+}
+
+function dropStoredCover(key: string) {
+  try {
+    window.localStorage.removeItem(CACHE_PREFIX + key);
+  } catch {
+    // Nothing to reclaim; the entry is only wasted space.
   }
 }
 
@@ -148,8 +188,8 @@ export function preloadCovers(tracks: RemoteTrack[]) {
 }
 
 function requestCover(key: string): Promise<AlbumCover | null> {
-  const cached = readCache(key);
-  if (cached) return Promise.resolve(cached.cover);
+  const cached = cachedCover(key);
+  if (cached !== undefined) return Promise.resolve(cached);
   return new Promise((resolve) => {
     const waiters = pending.get(key);
     if (waiters) waiters.push(resolve);
@@ -167,8 +207,8 @@ async function flush() {
     pending.delete(key);
     const cover = covers.get(key) ?? null;
     // A request that failed is not an answer, so it must not be remembered as
-    // "this album has no cover". Only the host saying so is cached.
-    if (!unanswered.has(key)) writeCache(key, cover);
+    // "this album has no cover". Only the host saying so is remembered.
+    if (!unanswered.has(key)) rememberCover(key, cover);
     for (const resolve of waiters) resolve(cover);
   }
   // Keys requested while this batch was in flight wait for the next one.
