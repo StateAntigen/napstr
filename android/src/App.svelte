@@ -9,6 +9,7 @@
     scan
   } from '@tauri-apps/plugin-barcode-scanner';
   import TrackArtwork from './lib/TrackArtwork.svelte';
+  import { artworkHue, coverFor, type AlbumCover } from './lib/artwork';
   import type { AudiobookLibraryPage, CachedAudio, CompanionStatus, LibraryPage, PodcastDownload, PodcastEpisode, PodcastFeed, RemoteAudiobook, RemoteAudiobookSummary, RemoteTrack, RemoteTransfer } from './lib/types';
 
   const musicChips = ['Rock', 'Soundtrack', 'Punk', 'Folk', 'Upbeat'];
@@ -80,6 +81,14 @@
   let podcastViewVersion = 0;
   let currentPodcast = $state<PodcastEpisode | null>(null);
   let activeMedia = $state<'music' | 'podcast'>('music');
+  // The expandable now-playing sheet. Audiobook chapters run through the same
+  // player as music, so the library flag is what distinguishes "music only".
+  let showNowPlaying = $state(false);
+  let nowCover = $state<AlbumCover | null>(null);
+  let nowArtFailed = $state(false);
+  let sheetDragY = $state(0);
+  let sheetDragging = $state(false);
+  let sheetDragStart = 0;
   let audio: HTMLAudioElement;
   let lastSystemMediaSync = 0;
 
@@ -661,6 +670,98 @@
     if (audio) audio.volume = value;
   }
 
+  let upNext = $derived(upNextEntries());
+
+  // Track the sheet's cover alongside playback. The batched cache means this is
+  // free when the library list already resolved the same album.
+  $effect(() => {
+    const track = current;
+    nowArtFailed = false;
+    if (!track) {
+      nowCover = null;
+      return;
+    }
+    let alive = true;
+    void coverFor(track).then((cover) => { if (alive) nowCover = cover; });
+    return () => { alive = false; };
+  });
+
+  $effect(() => {
+    if (!current) showNowPlaying = false;
+  });
+
+  $effect(() => {
+    document.body.style.overflow = showNowPlaying ? 'hidden' : '';
+    return () => { document.body.style.overflow = ''; };
+  });
+
+  function nowPlayingAvailable() {
+    return activeMedia === 'music' && playerQueueLibraryVisible && !!current;
+  }
+
+  function openNowPlaying() {
+    if (nowPlayingAvailable()) showNowPlaying = true;
+  }
+
+  function closeNowPlaying() {
+    showNowPlaying = false;
+    sheetDragY = 0;
+  }
+
+  function sheetCoverUrl() {
+    if (!nowCover || nowArtFailed) return '';
+    return nowCover.art || nowCover.thumb;
+  }
+
+  /** What actually plays next, honouring the current play mode. */
+  function upNextEntries(): Array<{ index: number; track: RemoteTrack }> {
+    const entries: Array<{ index: number; track: RemoteTrack }> = [];
+    if (activeMedia !== 'music' || playerQueue.length < 2) return entries;
+    const push = (index: number) => {
+      const track = playerQueue[index];
+      if (track) entries.push({ index, track });
+    };
+    if (playMode === 'random') {
+      push(randomUpcoming);
+      return entries;
+    }
+    if (playMode === 'repeat') {
+      push(playerIndex);
+      return entries;
+    }
+    for (let index = playerIndex + 1; index < playerQueue.length; index += 1) push(index);
+    if (playMode === 'all') {
+      for (let index = 0; index < playerIndex; index += 1) push(index);
+    }
+    return entries;
+  }
+
+  async function playFromQueue(index: number) {
+    const track = playerQueue[index];
+    if (!track) return;
+    playerIndex = index;
+    selected = track;
+    resetRandomOrder();
+    await playTrack(track);
+  }
+
+  function startSheetDrag(event: PointerEvent) {
+    sheetDragging = true;
+    sheetDragStart = event.clientY;
+  }
+
+  function moveSheetDrag(event: PointerEvent) {
+    if (!sheetDragging) return;
+    sheetDragY = Math.max(0, event.clientY - sheetDragStart);
+  }
+
+  function endSheetDrag() {
+    if (!sheetDragging) return;
+    sheetDragging = false;
+    if (sheetDragY > 90) closeNowPlaying();
+    else sheetDragY = 0;
+  }
+
   async function moveTrack(direction: -1 | 1) {
     if (activeMedia !== 'music' || playerQueue.length < 2) return;
     let next: number;
@@ -1195,10 +1296,18 @@
     </nav>
 
     <section class:empty={activeMedia === 'music' ? !current : !currentPodcast} class="now-playing">
-      {#if activeMedia === 'podcast' && currentPodcast}
-        {#if currentPodcast.image}<img class="podcast-player-art" src={currentPodcast.image} alt="" />{:else}<div class="empty-art">◉</div>{/if}
-      {:else if current}<TrackArtwork track={current} large lookup />{:else}<div class="empty-art">♪</div>{/if}
-      <div class="now-copy"><strong>{activeMedia === 'podcast' && currentPodcast ? currentPodcast.title : current ? title(current) : 'Choose something to play'}</strong><small>{activeMedia === 'podcast' && currentPodcast ? currentPodcast.feedTitle : current ? artist(current) : 'Music and podcasts, wherever you are'}</small></div>
+      <button
+        class="now-open"
+        disabled={!nowPlayingAvailable()}
+        onclick={openNowPlaying}
+        aria-label="Open the now playing screen"
+      >
+        {#if activeMedia === 'podcast' && currentPodcast}
+          {#if currentPodcast.image}<img class="podcast-player-art" src={currentPodcast.image} alt="" />{:else}<div class="empty-art">◉</div>{/if}
+        {:else if current}<TrackArtwork track={current} large lookup />{:else}<div class="empty-art">♪</div>{/if}
+        <div class="now-copy"><strong>{activeMedia === 'podcast' && currentPodcast ? currentPodcast.title : current ? title(current) : 'Choose something to play'}</strong><small>{activeMedia === 'podcast' && currentPodcast ? currentPodcast.feedTitle : current ? artist(current) : 'Music and podcasts, wherever you are'}</small></div>
+        {#if nowPlayingAvailable()}<span class="now-open-hint" aria-hidden="true">⌃</span>{/if}
+      </button>
       <div class="timeline"><input type="range" min="0" max={duration || 0} step="0.1" value={currentTime} oninput={(event) => seek(Number(event.currentTarget.value))} disabled={!current && !currentPodcast} /><span>{clock(currentTime)} / {clock(duration)}</span></div>
       <div class="player-buttons">
         <button onclick={() => moveTrack(-1)} disabled={activeMedia !== 'music' || playerQueue.length < 2 || (playMode === 'random' && randomHistoryIndex <= 0)} aria-label="Previous track">|◀</button>
@@ -1209,6 +1318,70 @@
       <label class="volume">⌁ <input type="range" min="0" max="1" step="0.02" value={volume} oninput={(event) => setVolume(Number(event.currentTarget.value))} /></label>
     </section>
   </main>
+{/if}
+
+{#if showNowPlaying && current && activeMedia === 'music'}
+  <div
+    class="now-sheet"
+    class:dragging={sheetDragging}
+    style={`--sheet-drag:${sheetDragY}px`}
+    role="dialog"
+    aria-modal="true"
+    aria-label="Now playing"
+  >
+    {#if sheetCoverUrl()}
+      <div class="now-sheet-backdrop" style={`background-image:url(${sheetCoverUrl()})`}></div>
+    {/if}
+    <div class="now-sheet-scrim"></div>
+
+    <div
+      class="now-sheet-head"
+      role="presentation"
+      onpointerdown={startSheetDrag}
+      onpointermove={moveSheetDrag}
+      onpointerup={endSheetDrag}
+      onpointercancel={endSheetDrag}
+    >
+      <p>{playModeDetails().label}</p>
+      <button class="now-sheet-close" onclick={closeNowPlaying} aria-label="Collapse the now playing screen">⌄</button>
+    </div>
+
+    {#if sheetCoverUrl()}
+      <img class="now-sheet-cover" src={sheetCoverUrl()} alt="" onerror={() => (nowArtFailed = true)} />
+    {:else}
+      <div class="now-sheet-cover empty" style={`--cover-hue:${artworkHue(current.fileId)}`}>♪</div>
+    {/if}
+
+    <div class="now-sheet-copy">
+      <h1>{title(current)}</h1>
+      <p>{artist(current)}</p>
+      {#if current.album || nowCover?.year}<small>{[current.album, nowCover?.year].filter(Boolean).join(' · ')}</small>{/if}
+    </div>
+
+    <div class="now-sheet-timeline">
+      <input type="range" min="0" max={duration || 0} step="0.1" value={currentTime} oninput={(event) => seek(Number(event.currentTarget.value))} aria-label="Seek" />
+      <span>{clock(currentTime)} / {clock(duration)}</span>
+    </div>
+
+    <div class="now-sheet-actions">
+      <button onclick={() => moveTrack(-1)} disabled={playerQueue.length < 2 || (playMode === 'random' && randomHistoryIndex <= 0)} aria-label="Previous track">|◀</button>
+      <button class="play-main" onclick={togglePlayer} disabled={caching} aria-label={playing ? 'Pause' : 'Play'}>{caching ? '···' : playing ? 'Ⅱ' : '▶'}</button>
+      <button onclick={() => moveTrack(1)} disabled={playerQueue.length < 2} aria-label="Next track">▶|</button>
+      <button class="mode-button" onclick={cyclePlayMode} aria-label={playModeDetails().label} title={playModeDetails().label}>{playModeDetails().icon}</button>
+    </div>
+
+    <div class="now-sheet-queue">
+      <div class="section-label"><b>{playMode === 'random' ? 'Playing randomly' : 'Up next'}</b><span>{upNext.length === 1 ? '1 track' : `${upNext.length} tracks`}</span></div>
+      {#each upNext.slice(0, 30) as entry, position (entry.index)}
+        <button class="now-sheet-row" onclick={() => playFromQueue(entry.index)}>
+          <TrackArtwork track={entry.track} lookup={position < 8} />
+          <span><strong>{title(entry.track)}</strong><small>{artist(entry.track)}</small></span>
+          <b>›</b>
+        </button>
+      {/each}
+      {#if upNext.length > 30}<p class="now-sheet-more">and {upNext.length - 30} more</p>{/if}
+    </div>
+  </div>
 {/if}
 
 <audio
