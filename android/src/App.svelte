@@ -9,10 +9,13 @@
     scan
   } from '@tauri-apps/plugin-barcode-scanner';
   import TrackArtwork from './lib/TrackArtwork.svelte';
+  import CoverDebug from './lib/CoverDebug.svelte';
   import { artworkHue, coverFor, type AlbumCover } from './lib/artwork';
   import type { AudiobookLibraryPage, CachedAudio, CompanionStatus, LibraryPage, PodcastDownload, PodcastEpisode, PodcastFeed, RemoteAudiobook, RemoteAudiobookSummary, RemoteTrack, RemoteTransfer } from './lib/types';
 
   const musicChips = ['Rock', 'Soundtrack', 'Punk', 'Folk', 'Upbeat'];
+  /** Temporary: cover-art diagnostics overlay. Delete with CoverDebug.svelte. */
+  const COVER_DEBUG = true;
   const podcastGenres = ['Comedy', 'News', 'True Crime', 'Society & Culture', 'Technology', 'History', 'Business', 'Science', 'Arts', 'Sports', 'Education', 'Music'];
   const likedMusicKey = 'napstrfy-liked-music';
   const likedPodcastsKey = 'napstrfy-liked-podcasts';
@@ -1172,10 +1175,10 @@
       <section class="track-list" aria-busy={loading}>
         {#if loading}<div class="loading-list"><i></i><span>Asking Napstr…</span></div>{/if}
         {#if !loading && tracks.length === 0}<div class="empty-library"><img src="/napstr-logo-small.png" alt="" /><h2>{showingLikedMusic ? 'No liked tracks yet' : 'No tracks found'}</h2><p>{showingLikedMusic ? 'Tap the heart beside a song to keep it here.' : query ? 'Try different words or clear the search.' : 'Add music to your Napstr folder on the computer.'}</p></div>{/if}
-        {#each tracks as track, index (track.fileId)}
+        {#each tracks as track (track.fileId)}
           <div class:selected={selected?.fileId === track.fileId} class:remote={!track.local} class="track-row">
             <button class="track-open" disabled={status.streamOnly && !track.local} onclick={() => activateTrack(track)}>
-              <TrackArtwork {track} lookup={index < 24} />
+              <TrackArtwork {track} lookup />
               <span class="track-copy">
                 <strong>{title(track)}</strong>
                 <small>{artist(track)}{track.album ? ` · ${track.album}` : ''}</small>
@@ -1382,6 +1385,10 @@
       {#if upNext.length > 30}<p class="now-sheet-more">and {upNext.length - 30} more</p>{/if}
     </div>
   </div>
+{/if}
+
+{#if COVER_DEBUG}
+  <CoverDebug {tracks} {status} />
 {/if}
 
 <audio

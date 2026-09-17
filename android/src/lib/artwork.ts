@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
+import { recordCoverEvent } from './coverDebug';
 import type { RemoteTrack } from './types';
 
 /**
@@ -20,7 +21,7 @@ export type AlbumCover = {
   year: string;
   genre: string;
   collection: string;
-  /** Provenance hint such as `itunes`, `embedded`, or `musicbrainz`. */
+  /** Provenance hint from the publisher, such as `itunes`, `musicbrainz`, or `embedded`. */
   source: string;
   coverFileId: string;
   mime: string;
@@ -34,19 +35,6 @@ const LEGACY_CACHE_PREFIX = 'napstrfy-artwork:';
 /** Keys per companion call. Mirrors `MAX_COVER_KEYS * 4` in the phone crate. */
 const INVOKE_KEY_LIMIT = 160;
 /**
- * Direct MusicBrainz and Cover Art Archive lookups.
- *
- * Off, so artwork can only be what Napstr publishers actually asserted against
- * an album key. The cover NIP permits a client-side fallback, but resolving art
- * from a third party reintroduces exactly the guesswork the cover events exist
- * to replace, and it hides a missing cover event behind a plausible image.
- *
- * Turning this back on also needs `https://musicbrainz.org` and
- * `https://coverartarchive.org` in the CSP `connect-src` of
- * `android/src-tauri/tauri.conf.json`, which are still present.
- */
-const EXTERNAL_ARTWORK_FALLBACK: boolean = false;
-/**
  * How long stored artwork is trusted before it is asked for again.
  *
  * Publishers replace their cover claim, and image URLs rot, so a cover that
@@ -55,8 +43,6 @@ const EXTERNAL_ARTWORK_FALLBACK: boolean = false;
 const STORED_COVER_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 /** A page composes in stages: gather its keys briefly before asking. */
 const BATCH_DELAY_MS = 40;
-/** MusicBrainz asks clients to stay near one request per second. */
-const LOOKUP_SPACING_MS = 1100;
 
 type Waiter = (cover: AlbumCover | null) => void;
 
@@ -69,48 +55,36 @@ type Waiter = (cover: AlbumCover | null) => void;
 const sessionCovers = new Map<string, AlbumCover | null>();
 const pending = new Map<string, Waiter[]>();
 let flushHandle: number | null = null;
-let lookupQueue: Promise<void> = Promise.resolve();
-let nextLookup = 0;
-
-function emptyCover(key: string): AlbumCover {
-  return {
-    key,
-    art: '',
-    thumb: '',
-    mbid: '',
-    year: '',
-    genre: '',
-    collection: '',
-    source: '',
-    coverFileId: '',
-    mime: '',
-    author: '',
-    seeder: false
-  };
-}
 
 /**
- * `undefined` means nothing is known yet; `null` means the host answered and
- * has no cover for this album.
+ * `undefined` means nothing is known yet; `null` means the host already answered
+ * and has no cover for this album. The two must stay distinct: treating
+ * "unknown" as "no cover" resolves the answer without ever asking for it.
  */
 function cachedCover(key: string): AlbumCover | null | undefined {
   const known = sessionCovers.get(key);
   if (known !== undefined) return known;
   const stored = readStoredCover(key);
-  if (stored) sessionCovers.set(key, stored);
+  if (stored === undefined) return undefined;
+  sessionCovers.set(key, stored);
   return stored;
 }
 
-function readStoredCover(key: string): AlbumCover | null {
+function readStoredCover(key: string): AlbumCover | undefined {
   try {
     const raw = window.localStorage.getItem(CACHE_PREFIX + key);
-    if (!raw) return null;
+    if (!raw) return undefined;
     const stored = JSON.parse(raw) as { at: number; cover: AlbumCover | null };
-    if (!stored.cover) return null;
-    if (Date.now() - stored.at > STORED_COVER_TTL_MS) return null;
+    if (!stored.cover) {
+      // An earlier build could store a "no cover" verdict. Drop it rather than
+      // let a stale no keep suppressing the question.
+      dropStoredCover(key);
+      return undefined;
+    }
+    if (Date.now() - stored.at > STORED_COVER_TTL_MS) return undefined;
     return stored.cover;
   } catch {
-    return null;
+    return undefined;
   }
 }
 
@@ -153,15 +127,11 @@ function dropLegacyCache() {
 
 dropLegacyCache();
 
-function pause(ms: number) {
-  return new Promise((resolve) => window.setTimeout(resolve, ms));
-}
-
 /**
  * The cover key from the cover NIP: `trim(artist)|trim(album)`, lowercased,
  * preserved verbatim otherwise so it matches the catalogue display strings.
  */
-export function coverKey(artist: string, album: string): string {
+function coverKey(artist: string, album: string): string {
   const artistHalf = artist.trim().toLowerCase();
   const albumHalf = album.trim().toLowerCase();
   if (!artistHalf || !albumHalf) return '';
@@ -172,24 +142,19 @@ export function coverKey(artist: string, album: string): string {
 
 export function coverFor(track: RemoteTrack): Promise<AlbumCover | null> {
   const key = coverKey(track.artist ?? '', track.album ?? '');
-  return key ? requestCover(key) : Promise.resolve(null);
-}
-
-/** The URL for a small artwork tile, preferring the published thumbnail. */
-export async function artworkFor(track: RemoteTrack): Promise<string> {
-  const cover = await coverFor(track);
-  if (!cover) return '';
-  return cover.thumb || cover.art;
-}
-
-/** Warm the cache for tracks about to be shown, so scrolling never stalls. */
-export function preloadCovers(tracks: RemoteTrack[]) {
-  for (const track of tracks) void coverFor(track);
+  if (!key) {
+    recordCoverEvent('skip', `${track.title || track.filename}: no artist or album tag`);
+    return Promise.resolve(null);
+  }
+  return requestCover(key);
 }
 
 function requestCover(key: string): Promise<AlbumCover | null> {
   const cached = cachedCover(key);
-  if (cached !== undefined) return Promise.resolve(cached);
+  if (cached !== undefined) {
+    recordCoverEvent('cached', `${key} → ${cached ? 'cover' : 'host has none'}`);
+    return Promise.resolve(cached);
+  }
   return new Promise((resolve) => {
     const waiters = pending.get(key);
     if (waiters) waiters.push(resolve);
@@ -224,67 +189,74 @@ type CoverResolution = {
 
 async function resolveCovers(keys: string[]): Promise<CoverResolution> {
   const covers = new Map<string, AlbumCover>();
-  const misses: string[] = [];
   const unanswered = new Set<string>();
   for (let index = 0; index < keys.length; index += INVOKE_KEY_LIMIT) {
     const slice = keys.slice(index, index + INVOKE_KEY_LIMIT);
+    const started = Date.now();
+    recordCoverEvent('request', `${slice.length} keys: ${previewKeys(slice)}`);
     try {
       const found = await invoke<AlbumCover[]>('remote_covers', { keys: slice });
+      recordCoverEvent(
+        'answer',
+        `${slice.length} keys → ${found.length} covers in ${Date.now() - started} ms`
+      );
       for (const cover of found) {
         if (cover.art || cover.thumb || cover.coverFileId) covers.set(cover.key, cover);
       }
-      if (EXTERNAL_ARTWORK_FALLBACK) {
-        for (const key of slice) if (!covers.has(key)) misses.push(key);
-      }
-    } catch {
+    } catch (error) {
       // Unpaired, offline, or a host older than the cover NIP.
+      recordCoverEvent(
+        'error',
+        `${slice.length} keys failed in ${Date.now() - started} ms: ${String(error)}`
+      );
       for (const key of slice) unanswered.add(key);
-    }
-  }
-  if (EXTERNAL_ARTWORK_FALLBACK) {
-    for (const key of misses) {
-      const url = await externalArtwork(key);
-      if (url) {
-        // A cover event satisfies its key, so only albums without one get here.
-        covers.set(key, { ...emptyCover(key), art: url, thumb: url, source: 'musicbrainz' });
-      }
     }
   }
   return { covers, unanswered };
 }
 
-/**
- * MusicBrainz release search followed by the Cover Art Archive, the
- * client-optional fallback the cover NIP allows. Currently unreachable:
- * `EXTERNAL_ARTWORK_FALLBACK` is off. Serialised and spaced out to respect the
- * MusicBrainz rate limit, for whenever it is switched back on.
- */
-function externalArtwork(key: string): Promise<string> {
-  const [artist, album] = key.split('|');
-  if (!artist || !album) return Promise.resolve('');
-  const work = lookupQueue.then(async () => {
-    const wait = Math.max(0, nextLookup - Date.now());
-    if (wait) await pause(wait);
-    nextLookup = Date.now() + LOOKUP_SPACING_MS;
-    try {
-      const query = `release:${JSON.stringify(album)} AND artist:${JSON.stringify(artist)}`;
-      const response = await fetch(
-        `https://musicbrainz.org/ws/2/release/?fmt=json&limit=1&query=${encodeURIComponent(query)}`
-      );
-      if (!response.ok) throw new Error('artwork lookup failed');
-      const data = (await response.json()) as { releases?: { id?: string }[] };
-      const candidate = data.releases?.[0]?.id ?? '';
-      const release = /^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(candidate) ? candidate : '';
-      return release ? `https://coverartarchive.org/release/${release}/front-250` : '';
-    } catch {
-      return '';
-    }
+function previewKeys(keys: string[]): string {
+  const shown = keys.slice(0, 2).join(', ');
+  return keys.length > 2 ? `${shown}, +${keys.length - 2}` : shown;
+}
+
+/** Temporary: what the cache currently knows, for the debug panel. */
+export function debugCoverState(tracks: RemoteTrack[]) {
+  return tracks.map((track) => {
+    const key = coverKey(track.artist ?? '', track.album ?? '');
+    const known = key ? sessionCovers.get(key) : undefined;
+    const stored = key ? readStoredCover(key) : undefined;
+    const cover = known ?? stored ?? null;
+    return {
+      fileId: track.fileId,
+      title: track.title || track.filename,
+      key,
+      state: !key
+        ? 'no key'
+        : known === null
+          ? 'host: none'
+          : cover
+            ? 'resolved'
+            : 'unknown',
+      url: cover ? cover.thumb || cover.art : ''
+    };
   });
-  lookupQueue = work.then(
-    () => undefined,
-    () => undefined
-  );
-  return work;
+}
+
+/** Temporary: drop every cached cover so the next render asks again. */
+export function clearCoverCache() {
+  sessionCovers.clear();
+  pending.clear();
+  try {
+    const stale: string[] = [];
+    for (let index = 0; index < window.localStorage.length; index += 1) {
+      const name = window.localStorage.key(index);
+      if (name?.startsWith(CACHE_PREFIX)) stale.push(name);
+    }
+    for (const name of stale) window.localStorage.removeItem(name);
+  } catch {
+    // Nothing to clear.
+  }
 }
 
 export function artworkHue(fileId: string) {
