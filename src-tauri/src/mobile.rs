@@ -216,15 +216,27 @@ impl MobileService {
         stream_only: bool,
     ) -> Result<MobilePairingOffer, String> {
         self.start().await?;
+        if let Some(endpoint) = self.endpoint.read().await.clone() {
+            // Waiting briefly gives the ticket a relay path as well as the
+            // endpoint identity. A DNS lookup remains available if it times out.
+            let _ = tokio::time::timeout(Duration::from_secs(12), endpoint.online()).await;
+        }
+        self.issue_pairing(stream_only).await
+    }
+
+    /// Mint a one-use code for the endpoint that is already running.
+    ///
+    /// This starts nothing on purpose: it is also reached from request handling,
+    /// and a request that arrived over Iroh has already proved the endpoint is
+    /// up. Calling `start` from there would make `start` reachable through its
+    /// own spawned tasks, which the compiler cannot type (E0391).
+    async fn issue_pairing(&self, stream_only: bool) -> Result<MobilePairingOffer, String> {
         let endpoint = self
             .endpoint
             .read()
             .await
             .clone()
             .ok_or("Iroh is not running")?;
-        // Waiting briefly gives the ticket a relay path as well as the endpoint
-        // identity. A DNS lookup remains available if this times out.
-        let _ = tokio::time::timeout(Duration::from_secs(12), endpoint.online()).await;
         let endpoint_addr = serde_json::to_string(&endpoint.addr())
             .map_err(|error| format!("could not encode the Iroh address: {error}"))?;
         let token = hex::encode(rand::random::<[u8; 32]>());
@@ -467,7 +479,7 @@ impl MobileService {
     }
 
     async fn serve_request(
-        self: &Arc<Self>,
+        &self,
         remote_id: &str,
         request: ClientRequest,
         send: &mut iroh::endpoint::SendStream,
@@ -756,7 +768,7 @@ impl MobileService {
                 // Only a read-only code can come out of here, which is what lets
                 // a phone with write access lend its access on without ever
                 // widening it: whoever scans this browses and plays, no more.
-                let offer = self.create_pairing(true).await?;
+                let offer = self.issue_pairing(true).await?;
                 let desktop_name = self.desktop_name();
                 let mut qr_svg = offer.qr_svg;
                 let candidate = ServerResponse::ReadOnlyTicket {

@@ -346,9 +346,18 @@ async fn resolve(
         escape_query(&candidate.album),
         escape_query(&candidate.artist)
     );
+    // Encoded through `Url` rather than `RequestBuilder::query`, which reqwest
+    // 0.13 puts behind its `query` feature. This needs no extra dependency and
+    // keeps the desktop's reqwest features identical to the companion's.
+    let mut search_url = reqwest::Url::parse("https://musicbrainz.org/ws/2/release-group/")
+        .map_err(|error| format!("could not build the MusicBrainz query: {error}"))?;
+    search_url
+        .query_pairs_mut()
+        .append_pair("query", &query)
+        .append_pair("fmt", "json")
+        .append_pair("limit", "3");
     let search = client
-        .get("https://musicbrainz.org/ws/2/release-group/")
-        .query(&[("query", query.as_str()), ("fmt", "json"), ("limit", "3")])
+        .get(search_url)
         .send()
         .await
         .map_err(|error| format!("MusicBrainz lookup failed: {error}"))?;

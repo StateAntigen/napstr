@@ -36,7 +36,11 @@ const COVER_KEY_SEPARATOR: char = '|';
 
 /// The raw JSON body of a kind `30427` event. Unknown properties are ignored,
 /// as the NIP requires.
-#[derive(Debug, Clone, Default, Deserialize)]
+///
+/// `Serialize` is derived for the publishing side (`cover_event`), so the body
+/// this host writes is produced by the same declaration that reads it and the
+/// two cannot drift apart.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CoverContent {
     protocol: String,
