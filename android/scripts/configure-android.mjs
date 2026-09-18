@@ -63,6 +63,7 @@ for (const filename of [
   'MainActivity.kt',
   'MediaControlBridge.kt',
   'MediaNotificationService.kt',
+  'BackBridge.kt',
 ]) {
   await copyFile(resolve(native, filename), resolve(javaDirectory, filename));
 }

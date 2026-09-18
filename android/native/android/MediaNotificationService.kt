@@ -6,14 +6,22 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.PowerManager
 import android.support.v4.media.MediaMetadataCompat
 import android.support.v4.media.session.MediaSessionCompat
 import android.support.v4.media.session.PlaybackStateCompat
 import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
 import androidx.media.app.NotificationCompat.MediaStyle
+import java.net.HttpURLConnection
+import java.net.URL
+import java.util.concurrent.Executors
 
 class MediaNotificationService : Service() {
   private lateinit var mediaSession: MediaSessionCompat
@@ -26,6 +34,13 @@ class MediaNotificationService : Service() {
   private var canNext = false
   private var foregroundStarted = false
   private var screenWakeLock: PowerManager.WakeLock? = null
+  private var artworkUrl = ""
+  private var artwork: Bitmap? = null
+  private var artworkRequest = 0
+  private val mainHandler = Handler(Looper.getMainLooper())
+  private val artworkLoader = Executors.newSingleThreadExecutor { runnable ->
+    Thread(runnable, "napstrfy-artwork").apply { isDaemon = true }
+  }
 
   override fun onCreate() {
     super.onCreate()
@@ -75,7 +90,37 @@ class MediaNotificationService : Service() {
     duration = intent.getLongExtra(EXTRA_DURATION, 0L).coerceAtLeast(0L)
     canPrevious = intent.getBooleanExtra(EXTRA_CAN_PREVIOUS, false)
     canNext = intent.getBooleanExtra(EXTRA_CAN_NEXT, false)
+    updateArtwork(intent.getStringExtra(EXTRA_ARTWORK).orEmpty())
     updateScreenWakeLock()
+  }
+
+  /**
+   * The webview pushes the cover URL on every state change, so only a genuine
+   * change is worth a fetch; anything already decoded is reused from the cache.
+   */
+  private fun updateArtwork(url: String) {
+    if (url == artworkUrl) return
+    artworkUrl = url
+    artwork = ArtworkCache.peek(url)
+    artworkRequest += 1
+    if (artwork != null) return updateSession()
+    if (url.isEmpty()) return updateSession()
+    val request = artworkRequest
+    artworkLoader.execute {
+      val loaded = ArtworkCache.load(url)
+      mainHandler.post {
+        if (loaded == null || request != artworkRequest) return@post
+        artwork = loaded
+        updateSession()
+        refreshNotification()
+      }
+    }
+  }
+
+  /** Re-posts the notification once artwork arrives, without alerting again. */
+  private fun refreshNotification() {
+    if (!foregroundStarted) return
+    NotificationManagerCompat.from(this).notify(NOTIFICATION_ID, buildNotification())
   }
 
   @Suppress("DEPRECATION")
@@ -99,13 +144,16 @@ class MediaNotificationService : Service() {
   }
 
   private fun updateSession() {
-    mediaSession.setMetadata(
-      MediaMetadataCompat.Builder()
-        .putString(MediaMetadataCompat.METADATA_KEY_TITLE, title)
-        .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, artist)
-        .putLong(MediaMetadataCompat.METADATA_KEY_DURATION, duration)
-        .build()
-    )
+    val metadata = MediaMetadataCompat.Builder()
+      .putString(MediaMetadataCompat.METADATA_KEY_TITLE, title)
+      .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, artist)
+      .putLong(MediaMetadataCompat.METADATA_KEY_DURATION, duration)
+    // The lock screen, media output picker and Android Auto read the session.
+    artwork?.let {
+      metadata.putBitmap(MediaMetadataCompat.METADATA_KEY_ALBUM_ART, it)
+      metadata.putBitmap(MediaMetadataCompat.METADATA_KEY_ART, it)
+    }
+    mediaSession.setMetadata(metadata.build())
     var actions = PlaybackStateCompat.ACTION_PLAY or
       PlaybackStateCompat.ACTION_PAUSE or
       PlaybackStateCompat.ACTION_PLAY_PAUSE or
@@ -136,6 +184,7 @@ class MediaNotificationService : Service() {
       .setContentTitle(title)
       .setContentText(artist)
       .setContentIntent(launch)
+      .apply { artwork?.let { setLargeIcon(it) } }
       .setOnlyAlertOnce(true)
       .setSilent(true)
       .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
@@ -193,6 +242,7 @@ class MediaNotificationService : Service() {
   }
 
   override fun onDestroy() {
+    artworkLoader.shutdownNow()
     releaseScreenWakeLock()
     mediaSession.isActive = false
     mediaSession.release()
@@ -210,6 +260,7 @@ class MediaNotificationService : Service() {
     const val ACTION_NEXT = "net.napstr.nostrfy.media.NEXT"
     const val EXTRA_TITLE = "title"
     const val EXTRA_ARTIST = "artist"
+    const val EXTRA_ARTWORK = "artwork"
     const val EXTRA_PLAYING = "playing"
     const val EXTRA_POSITION = "position"
     const val EXTRA_DURATION = "duration"
@@ -217,5 +268,67 @@ class MediaNotificationService : Service() {
     const val EXTRA_CAN_NEXT = "canNext"
     private const val CHANNEL_ID = "napstrfy_playback"
     private const val NOTIFICATION_ID = 7302
+  }
+}
+
+/**
+ * Decoded covers for the notification, kept in a tiny LRU so scrolling through
+ * tracks does not re-download the same five albums.
+ */
+private object ArtworkCache {
+  private const val MAX_ENTRIES = 4
+  private const val MAX_EDGE = 512
+  private const val CONNECT_TIMEOUT_MS = 5_000
+  private const val READ_TIMEOUT_MS = 8_000
+  private val entries = LinkedHashMap<String, Bitmap>(MAX_ENTRIES, 0.75f, true)
+
+  @Synchronized fun peek(url: String): Bitmap? = entries[url]
+
+  fun load(url: String): Bitmap? {
+    // Covers are published as HTTPS URLs; anything else is not ours to fetch.
+    if (!url.startsWith("https://")) return null
+    peek(url)?.let { return it }
+    val decoded = try {
+      val connection = (URL(url).openConnection() as HttpURLConnection).apply {
+        connectTimeout = CONNECT_TIMEOUT_MS
+        readTimeout = READ_TIMEOUT_MS
+        instanceFollowRedirects = true
+        setRequestProperty("Accept", "image/*")
+      }
+      try {
+        connection.inputStream.use { stream -> BitmapFactory.decodeStream(stream) }
+      } finally {
+        connection.disconnect()
+      }
+    } catch (_: Exception) {
+      null
+    } ?: return null
+    return remember(url, decoded)
+  }
+
+  @Synchronized private fun remember(url: String, decoded: Bitmap): Bitmap {
+    val longest = maxOf(decoded.width, decoded.height)
+    if (longest <= MAX_EDGE) {
+      store(url, decoded)
+      return decoded
+    }
+    val ratio = MAX_EDGE.toFloat() / longest
+    val scaled = Bitmap.createScaledBitmap(
+      decoded,
+      (decoded.width * ratio).toInt().coerceAtLeast(1),
+      (decoded.height * ratio).toInt().coerceAtLeast(1),
+      true
+    )
+    if (scaled != decoded) decoded.recycle()
+    store(url, scaled)
+    return scaled
+  }
+
+  @Synchronized private fun store(url: String, bitmap: Bitmap) {
+    entries[url] = bitmap
+    while (entries.size > MAX_ENTRIES) {
+      val oldest = entries.keys.firstOrNull() ?: return
+      entries.remove(oldest)
+    }
   }
 }

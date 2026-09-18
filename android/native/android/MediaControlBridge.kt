@@ -21,6 +21,7 @@ class MediaControlBridge(private val activity: MainActivity) {
       action = MediaNotificationService.ACTION_UPDATE
       putExtra(MediaNotificationService.EXTRA_TITLE, safeText(state.optString("title"), 300))
       putExtra(MediaNotificationService.EXTRA_ARTIST, safeText(state.optString("artist"), 300))
+      putExtra(MediaNotificationService.EXTRA_ARTWORK, safeText(state.optString("artwork"), 512))
       putExtra(MediaNotificationService.EXTRA_PLAYING, state.optBoolean("playing"))
       putExtra(MediaNotificationService.EXTRA_POSITION, state.optDouble("position").coerceIn(0.0, MAX_SECONDS).toLong() * 1000L)
       putExtra(MediaNotificationService.EXTRA_DURATION, state.optDouble("duration").coerceIn(0.0, MAX_SECONDS).toLong() * 1000L)

@@ -10,23 +10,48 @@
   } from '@tauri-apps/plugin-barcode-scanner';
   import TrackArtwork from './lib/TrackArtwork.svelte';
   import CoverDebug from './lib/CoverDebug.svelte';
-  import { artworkHue, coverFor, type AlbumCover } from './lib/artwork';
+  import { artworkHue, coverFor, coverKey, type AlbumCover } from './lib/artwork';
   import type { AudiobookLibraryPage, CachedAudio, CompanionStatus, LibraryPage, PodcastDownload, PodcastEpisode, PodcastFeed, RemoteAudiobook, RemoteAudiobookSummary, RemoteTrack, RemoteTransfer } from './lib/types';
 
   const musicChips = ['Rock', 'Soundtrack', 'Punk', 'Folk', 'Upbeat'];
+  const musicHistoryKey = 'napstrfy-played-albums';
+  /** Matches the CSS transition, so the drawer unmounts once it has slid away. */
+  const SHEET_ANIMATION_MS = 280;
+  /** Fraction of the drawer's height a drag must cover to dismiss it. */
+  const SHEET_DISMISS_RATIO = 0.2;
+  /** Fraction of the screen a drag up on the collapsed bar must cover to open it. */
+  const BAR_OPEN_RATIO = 0.2;
+  /** Upward speed, in px/ms, that opens the drawer even on a short pull. */
+  const BAR_FLING_SPEED = 0.35;
+  /** Movement below this is a tap on the bar, not a pull. */
+  const BAR_DRAG_SLOP = 6;
   /** Temporary: cover-art diagnostics overlay. Delete with CoverDebug.svelte. */
   const COVER_DEBUG = true;
+  /** The host caps a library page at 200, so one album always fits. */
+  const MAX_ALBUM_TRACKS = 200;
+  /** Albums grouped out of the tracks this phone has loaded. */
+  type AlbumShelf = {
+    key: string;
+    artist: string;
+    album: string;
+    representative: RemoteTrack;
+    tracks: RemoteTrack[];
+  };
+  type ArtistShelf = { name: string; representative: RemoteTrack; count: number };
+  type PlayedAlbum = { key: string; artist: string; album: string };
   const podcastGenres = ['Comedy', 'News', 'True Crime', 'Society & Culture', 'Technology', 'History', 'Business', 'Science', 'Arts', 'Sports', 'Education', 'Music'];
   const likedMusicKey = 'napstrfy-liked-music';
   const likedPodcastsKey = 'napstrfy-liked-podcasts';
   type AppTab = 'music' | 'podcasts' | 'audiobooks';
-  type PlayMode = 'all' | 'random' | 'repeat' | 'once';
-  const playModes: Array<{ value: PlayMode; icon: string; label: string }> = [
-    { value: 'all', icon: '↻A', label: 'Play all' },
-    { value: 'random', icon: '⤨', label: 'Play random' },
-    { value: 'repeat', icon: '↻1', label: 'Repeat track' },
-    { value: 'once', icon: '▶1', label: 'Play once' }
-  ];
+  /** Repeating is a choice of three, and shuffling is independent of it. */
+  type LoopMode = 'off' | 'all' | 'one';
+  const LOOP_MODES: LoopMode[] = ['off', 'all', 'one'];
+  const LOOP_LABELS: Record<LoopMode, string> = {
+    off: 'Repeat off',
+    all: 'Repeat all',
+    one: 'Repeat this track'
+  };
+  const playModeKey = 'napstrfy-play-mode';
   let activeTab = $state<AppTab>('music');
   let status = $state<CompanionStatus>({ streamOnly: false, paired: false, connected: false, desktopName: '', endpointId: '', libraryRevision: 0, error: '' });
   let statusLoading = $state(true);
@@ -54,7 +79,8 @@
   let playerQueue = $state<RemoteTrack[]>([]);
   let playerQueueLibraryVisible = true;
   let playerIndex = $state(-1);
-  let playMode = $state<PlayMode>('all');
+  let loopMode = $state<LoopMode>('all');
+  let shuffle = $state(false);
   let randomHistory = $state<number[]>([]);
   let randomHistoryIndex = $state(-1);
   let randomUpcoming = $state(-1);
@@ -91,7 +117,81 @@
   let nowArtFailed = $state(false);
   let sheetDragY = $state(0);
   let sheetDragging = $state(false);
+  let sheetDragPending = $state(false);
+  /** False when the gesture began inside a queue that is scrolled down. */
+  let sheetDragAllowed = false;
   let sheetDragStart = 0;
+  /** Scroll offset when the gesture began: a scrolled list scrolls, it does not drag. */
+  let sheetScrollTop = 0;
+  /** Set for one frame on open so the drawer slides up instead of appearing. */
+  let sheetEntering = $state(false);
+  /** Set while sliding away; the drawer unmounts when the animation ends. */
+  let sheetClosing = $state(false);
+  /** The playlist lives in its own view so the drawer never scrolls. */
+  let showQueue = $state(false);
+  let sheetElement = $state<HTMLDivElement | undefined>(undefined);
+  let sheetScroller = $state<HTMLDivElement | undefined>(undefined);
+  let sheetCloseTimer = 0;
+  /** Dragging the collapsed bar upward pulls the drawer into view. */
+  let barElement = $state<HTMLButtonElement | undefined>(undefined);
+  let barDragging = $state(false);
+  let barDragTravelled = $state(0);
+  let barDragStart = 0;
+  let barDragLastY = 0;
+  let barDragLastAt = 0;
+  let barDragSpeed = 0;
+  /** Where the bar rests: the drawer's top edge starts level with it. */
+  let barRestTop = $state(0);
+  let barSwallowClick = false;
+
+  /** How far the finger must pull to open, which is also how far the bar fades. */
+  let barOpenTravel = $derived(Math.max(1, barRestTop * BAR_OPEN_RATIO));
+  /** The bar rides up with the drawer and is gone by the time it would open. */
+  let barShift = $derived(barDragging ? -barDragTravelled : 0);
+  let barFade = $derived(barDragging ? Math.max(0, 1 - barDragTravelled / barOpenTravel) : 1);
+  /** The played portion of the card, starting where the artwork ends. */
+  let barProgress = $derived(duration > 0 ? Math.min(1, Math.max(0, currentTime / duration)) : 0);
+  let nowTitle = $derived(
+    activeMedia === 'podcast' && currentPodcast
+      ? currentPodcast.title
+      : current
+        ? title(current)
+        : 'Choose something to play'
+  );
+  let nowArtist = $derived(
+    activeMedia === 'podcast' && currentPodcast
+      ? currentPodcast.feedTitle
+      : current
+        ? artist(current)
+        : 'Music and podcasts, wherever you are'
+  );
+  /** A title wider than the card scrolls rather than being cut in half. */
+  let titleClipper = $state<HTMLDivElement | undefined>(undefined);
+  let titleText = $state<HTMLSpanElement | undefined>(undefined);
+  let titleOverflows = $state(false);
+
+  $effect(() => {
+    const text = nowTitle;
+    if (!text) {
+      titleOverflows = false;
+      return;
+    }
+    const clipper = titleClipper;
+    const element = titleText;
+    if (!clipper || !element) return;
+    // Measure once the new title has been laid out.
+    const frame = window.requestAnimationFrame(() => {
+      titleOverflows = element.scrollWidth > clipper.clientWidth + 1;
+    });
+    return () => window.cancelAnimationFrame(frame);
+  });
+  /** The navigation bar slides away with the drawer instead of being covered. */
+  let navShift = $derived(
+    showNowPlaying ? Math.min(1, Math.max(0, 1 - sheetDragY / Math.max(1, barRestTop))) : 0
+  );
+  let discoverAlbums = $state<AlbumShelf[]>([]);
+  let discoverSeed = '';
+  let playedAlbums = $state<PlayedAlbum[]>(readPlayedAlbums());
   let audio: HTMLAudioElement;
   let lastSystemMediaSync = 0;
 
@@ -102,6 +202,23 @@
 
   function androidMediaBridge(): AndroidMediaBridge | undefined {
     return (window as Window & { NapstrfyMedia?: AndroidMediaBridge }).NapstrfyMedia;
+  }
+
+  type AndroidBackBridge = {
+    setDrawerOpen(open: boolean): void;
+  };
+
+  function androidBackBridge(): AndroidBackBridge | undefined {
+    return (window as Window & { NapstrfyBack?: AndroidBackBridge }).NapstrfyBack;
+  }
+
+  /** The hardware back button arrives as an event, not a callback. */
+  function handleSystemBack() {
+    if (showQueue) {
+      showQueue = false;
+      return;
+    }
+    if (showNowPlaying) closeNowPlaying();
   }
 
   function title(track: RemoteTrack) {
@@ -193,14 +310,22 @@
     selected = tracks[0] ?? null;
   }
 
-  function playModeDetails() {
-    return playModes.find((mode) => mode.value === playMode) ?? playModes[0];
-  }
-
   function randomIndexExcept(currentIndex: number) {
     if (playerQueue.length < 2) return -1;
-    const candidate = Math.floor(Math.random() * (playerQueue.length - 1));
-    return candidate >= currentIndex ? candidate + 1 : candidate;
+    const played = new Set(randomHistory);
+    const pool: number[] = [];
+    for (let index = 0; index < playerQueue.length; index += 1) {
+      if (index === currentIndex || played.has(index)) continue;
+      pool.push(index);
+    }
+    // A finished cycle only starts again when the queue is set to repeat.
+    if (pool.length === 0 && loopMode !== 'off') {
+      for (let index = 0; index < playerQueue.length; index += 1) {
+        if (index !== currentIndex) pool.push(index);
+      }
+    }
+    if (pool.length === 0) return -1;
+    return pool[Math.floor(Math.random() * pool.length)];
   }
 
   function resetRandomOrder() {
@@ -209,11 +334,26 @@
     randomUpcoming = randomIndexExcept(playerIndex);
   }
 
-  function cyclePlayMode() {
-    const index = playModes.findIndex((mode) => mode.value === playMode);
-    playMode = playModes[(index + 1) % playModes.length].value;
-    window.localStorage.setItem('napstrfy-play-mode', playMode);
-    if (playMode === 'random') resetRandomOrder();
+  function savePlaySettings() {
+    try {
+      window.localStorage.setItem(playModeKey, JSON.stringify({ loop: loopMode, shuffle }));
+    } catch {
+      // A preference that cannot be stored is only a lost convenience.
+    }
+  }
+
+  function cycleLoopMode() {
+    loopMode = LOOP_MODES[(LOOP_MODES.indexOf(loopMode) + 1) % LOOP_MODES.length];
+    // The unplayed pool depends on whether a finished cycle may start again.
+    resetRandomOrder();
+    savePlaySettings();
+    syncSystemMedia(true);
+  }
+
+  function toggleShuffle() {
+    shuffle = !shuffle;
+    resetRandomOrder();
+    savePlaySettings();
     syncSystemMedia(true);
   }
 
@@ -416,11 +556,37 @@
     loading = true;
     error = '';
     try {
-      const results = await invoke<RemoteTrack[]>('remote_search', { query: query.trim() });
+      // Two passes. The host answers for its own folder straight away, so those
+      // results appear before the relay round trip has finished; the network
+      // search then only adds what the local pass did not already have.
+      const local = await invoke<LibraryPage>('remote_library', {
+        query: query.trim(),
+        offset: 0,
+        limit: MAX_ALBUM_TRACKS
+      });
       if (viewVersion !== musicViewVersion) return;
-      tracks = results;
-      total = tracks.length;
+      const known = new Set(local.tracks.map((track) => track.fileId));
+      tracks = local.tracks;
+      total = local.tracks.length;
       selected = tracks[0] ?? null;
+      try {
+        const found = await invoke<RemoteTrack[]>('remote_search', { query: query.trim() });
+        if (viewVersion !== musicViewVersion) return;
+        const merged = [
+          ...local.tracks,
+          ...found.filter((track) => !known.has(track.fileId))
+        ];
+        tracks = merged;
+        total = merged.length;
+        if (!selected || !merged.some((track) => track.fileId === selected?.fileId)) {
+          selected = merged[0] ?? null;
+        }
+      } catch (networkError) {
+        // The host's own files are still worth showing when the network is out.
+        if (viewVersion === musicViewVersion) {
+          notice = `Showing results from Napstr only: ${String(networkError)}`;
+        }
+      }
     } catch (nextError) {
       if (viewVersion === musicViewVersion) error = String(nextError);
     } finally {
@@ -508,10 +674,11 @@
       audio.volume = volume;
       await audio.play();
       playing = true;
-      const nextIndex = playMode === 'random'
+      rememberPlayedAlbum(cached.track);
+      const nextIndex = shuffle
         ? randomUpcoming
         : playerQueue.length > 1
-          ? (playerIndex + 1) % playerQueue.length
+          ? (playerIndex + 1 < playerQueue.length ? playerIndex + 1 : loopMode === 'off' ? -1 : 0)
           : -1;
       const next = nextIndex >= 0 ? playerQueue[nextIndex] : undefined;
       if (next?.local) {
@@ -637,10 +804,13 @@
     bridge.update(JSON.stringify({
       title: activeMedia === 'podcast' ? currentPodcast?.title : current ? title(current) : '',
       artist: activeMedia === 'podcast' ? currentPodcast?.feedTitle : current ? artist(current) : '',
+      artwork: activeMedia === 'podcast'
+        ? currentPodcast?.image ?? ''
+        : nowCover && !nowArtFailed ? nowCover.art || nowCover.thumb : '',
       playing,
       position: Number.isFinite(currentTime) ? currentTime : 0,
       duration: Number.isFinite(duration) ? duration : 0,
-      canPrevious: activeMedia === 'music' && playerQueue.length > 1 && (playMode !== 'random' || randomHistoryIndex > 0),
+      canPrevious: activeMedia === 'music' && playerQueue.length > 1 && (!shuffle || randomHistoryIndex > 0),
       canNext: activeMedia === 'music' && playerQueue.length > 1
     }));
   }
@@ -668,13 +838,6 @@
     currentTime = value;
   }
 
-  function setVolume(value: number) {
-    volume = value;
-    if (audio) audio.volume = value;
-  }
-
-  let upNext = $derived(upNextEntries());
-
   // Track the sheet's cover alongside playback. The batched cache means this is
   // free when the library list already resolved the same album.
   $effect(() => {
@@ -684,13 +847,58 @@
       nowCover = null;
       return;
     }
+    // Drop the previous album's cover straight away: the notification reads
+    // this value, and a stale cover is worse than none.
+    nowCover = null;
     let alive = true;
     void coverFor(track).then((cover) => { if (alive) nowCover = cover; });
     return () => { alive = false; };
   });
 
   $effect(() => {
-    if (!current) showNowPlaying = false;
+    if (!current) {
+      showNowPlaying = false;
+      showQueue = false;
+    }
+  });
+
+  // While a drag is in flight the browser must not claim the gesture as a
+  // scroll: these listeners are deliberately non-passive so they can stop that.
+  $effect(() => {
+    const targets: HTMLElement[] = [];
+    if (sheetElement) targets.push(sheetElement);
+    if (barElement) targets.push(barElement);
+    if (targets.length === 0) return;
+    const hold: EventListener = (event) => {
+      if (sheetDragging || barDragging) event.preventDefault();
+    };
+    for (const target of targets) target.addEventListener('touchmove', hold, { passive: false });
+    return () => {
+      for (const target of targets) target.removeEventListener('touchmove', hold);
+    };
+  });
+
+  /** Albums this phone has loaded, which is what both shelves are built from. */
+  let libraryAlbums = $derived(albumsFromTracks(tracks));
+  /** Search results grouped the way the results view presents them. */
+  let resultArtists = $derived(artistsFromTracks(tracks));
+  let searching = $derived(Boolean(query.trim()) && !showingLikedMusic);
+
+  let lastPlayed = $derived(
+    playedAlbums
+      .map((played) => libraryAlbums.find((album) => album.key === played.key))
+      .filter((album): album is AlbumShelf => Boolean(album))
+      .slice(0, 12)
+  );
+
+  // Reshuffle only when the album set itself changes, so the shelf does not
+  // jump around while the user is looking at it.
+  $effect(() => {
+    const albums = libraryAlbums;
+    const seed = albums.map((album) => album.key).sort().join('|');
+    if (seed === discoverSeed) return;
+    discoverSeed = seed;
+    discoverAlbums = shuffled(albums).slice(0, 12);
   });
 
   $effect(() => {
@@ -698,45 +906,46 @@
     return () => { document.body.style.overflow = ''; };
   });
 
+  // The drawer, and the playlist above it, own the hardware back button.
+  $effect(() => {
+    androidBackBridge()?.setDrawerOpen(showQueue || (showNowPlaying && !sheetClosing));
+  });
+
   function nowPlayingAvailable() {
     return activeMedia === 'music' && playerQueueLibraryVisible && !!current;
   }
 
   function openNowPlaying() {
-    if (nowPlayingAvailable()) showNowPlaying = true;
+    if (!nowPlayingAvailable()) return;
+    // Tapping the bar mid-close should bring the drawer back, not be ignored.
+    window.clearTimeout(sheetCloseTimer);
+    if (showNowPlaying && !sheetClosing) return;
+    sheetClosing = false;
+    sheetDragY = 0;
+    if (showNowPlaying) return;
+    // Remember where the bar sits: the drawer's travel and the navigation bar's
+    // slide are both measured against it.
+    barRestTop = barElement?.getBoundingClientRect().top ?? window.innerHeight;
+    sheetEntering = true;
+    showNowPlaying = true;
+    // Remove the start position on the next frame so the transition runs.
+    window.requestAnimationFrame(() => { sheetEntering = false; });
   }
 
   function closeNowPlaying() {
-    showNowPlaying = false;
-    sheetDragY = 0;
+    if (!showNowPlaying || sheetClosing) return;
+    sheetClosing = true;
+    sheetDragging = false;
+    sheetCloseTimer = window.setTimeout(() => {
+      showNowPlaying = false;
+      sheetClosing = false;
+      sheetDragY = 0;
+    }, SHEET_ANIMATION_MS);
   }
 
   function sheetCoverUrl() {
     if (!nowCover || nowArtFailed) return '';
     return nowCover.art || nowCover.thumb;
-  }
-
-  /** What actually plays next, honouring the current play mode. */
-  function upNextEntries(): Array<{ index: number; track: RemoteTrack }> {
-    const entries: Array<{ index: number; track: RemoteTrack }> = [];
-    if (activeMedia !== 'music' || playerQueue.length < 2) return entries;
-    const push = (index: number) => {
-      const track = playerQueue[index];
-      if (track) entries.push({ index, track });
-    };
-    if (playMode === 'random') {
-      push(randomUpcoming);
-      return entries;
-    }
-    if (playMode === 'repeat') {
-      push(playerIndex);
-      return entries;
-    }
-    for (let index = playerIndex + 1; index < playerQueue.length; index += 1) push(index);
-    if (playMode === 'all') {
-      for (let index = 0; index < playerIndex; index += 1) push(index);
-    }
-    return entries;
   }
 
   async function playFromQueue(index: number) {
@@ -749,26 +958,247 @@
   }
 
   function startSheetDrag(event: PointerEvent) {
-    sheetDragging = true;
+    if (sheetClosing) return;
+    // Sliders own their own gestures.
+    if ((event.target as HTMLElement | null)?.closest('input')) return;
+    const target = (event.target as Node | null) ?? null;
+    sheetDragPending = true;
+    sheetDragging = false;
     sheetDragStart = event.clientY;
+    sheetScrollTop = sheetScroller?.scrollTop ?? 0;
+    // A gesture starting inside the queue belongs to the queue until it is back
+    // at its top; everything above it can be pulled away at once.
+    sheetDragAllowed = !(target && sheetScroller?.contains(target)) || sheetScrollTop <= 0;
   }
 
   function moveSheetDrag(event: PointerEvent) {
+    const travel = event.clientY - sheetDragStart;
+    if (sheetDragPending) {
+      if (!sheetDragAllowed && travel > 6) {
+        sheetDragPending = false;
+        return;
+      }
+      // Wait for a real downward pull before stealing the gesture.
+      if (travel < 6) {
+        if (travel > -6) return;
+        sheetDragPending = false;
+        return;
+      }
+      sheetDragPending = false;
+      sheetDragging = true;
+    }
     if (!sheetDragging) return;
-    sheetDragY = Math.max(0, event.clientY - sheetDragStart);
+    sheetDragY = Math.max(0, travel);
   }
 
   function endSheetDrag() {
+    sheetDragPending = false;
     if (!sheetDragging) return;
     sheetDragging = false;
-    if (sheetDragY > 90) closeNowPlaying();
+    const height = sheetElement?.offsetHeight ?? window.innerHeight;
+    // Pulling the drawer a fifth of the way down commits to closing.
+    if (sheetDragY > height * SHEET_DISMISS_RATIO) closeNowPlaying();
     else sheetDragY = 0;
+  }
+
+  function startBarDrag(event: PointerEvent) {
+    if (!nowPlayingAvailable() || showNowPlaying) return;
+    barDragging = true;
+    barDragTravelled = 0;
+    barDragSpeed = 0;
+    barDragStart = event.clientY;
+    barDragLastY = event.clientY;
+    barDragLastAt = performance.now();
+    barRestTop = barElement?.getBoundingClientRect().top ?? window.innerHeight;
+    // Keep every move on the bar even once the drawer covers it.
+    (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
+  }
+
+  function moveBarDrag(event: PointerEvent) {
+    if (!barDragging) return;
+    const now = performance.now();
+    const elapsed = now - barDragLastAt;
+    if (elapsed > 0) barDragSpeed = (barDragLastY - event.clientY) / elapsed;
+    barDragLastY = event.clientY;
+    barDragLastAt = now;
+    barDragTravelled = barDragStart - event.clientY;
+    if (barDragTravelled <= BAR_DRAG_SLOP) return;
+    if (!showNowPlaying) {
+      // Mount the drawer with its top edge level with the bar, so it rises out
+      // from underneath it rather than appearing at the foot of the page.
+      sheetClosing = false;
+      sheetEntering = false;
+      sheetDragging = true;
+      showNowPlaying = true;
+    }
+    sheetDragY = Math.max(0, barRestTop - barDragTravelled);
+  }
+
+  function endBarDrag() {
+    if (!barDragging) return;
+    barDragging = false;
+    const travelled = barDragTravelled;
+    barDragTravelled = 0;
+    // A deliberate pull should not also fire the button's click handler.
+    barSwallowClick = travelled > 8;
+    if (!showNowPlaying) return;
+    sheetDragging = false;
+    // The pull that fades the bar out is the pull that opens the drawer, so
+    // the release decision matches what the finger just saw.
+    if (travelled > barOpenTravel || barDragSpeed > BAR_FLING_SPEED) sheetDragY = 0;
+    else closeNowPlaying();
+  }
+
+  function handleBarClick() {
+    if (barSwallowClick) {
+      barSwallowClick = false;
+      return;
+    }
+    openNowPlaying();
+  }
+
+  /** Seek by a relative amount, staying inside the track. */
+  function nudge(seconds: number) {
+    if (!current && !currentPodcast) return;
+    const limit = duration > 0 ? duration : Number.POSITIVE_INFINITY;
+    seek(Math.min(Math.max(0, currentTime + seconds), limit));
+  }
+
+  /** Albums among the loaded tracks, grouped by the key covers are addressed by. */
+  function albumsFromTracks(source: RemoteTrack[]): AlbumShelf[] {
+    const groups = new Map<string, AlbumShelf>();
+    for (const track of source) {
+      const key = coverKey(track.artist ?? '', track.album ?? '');
+      if (!key) continue;
+      const existing = groups.get(key);
+      if (existing) existing.tracks.push(track);
+      else groups.set(key, {
+        key,
+        artist: track.artist,
+        album: track.album,
+        representative: track,
+        tracks: [track]
+      });
+    }
+    return [...groups.values()];
+  }
+
+  /**
+   * Artists among a set of tracks. There is no artist record on the wire, so a
+   * search groups the results it already has rather than asking the host for
+   * something it does not model.
+   */
+  function artistsFromTracks(source: RemoteTrack[]): ArtistShelf[] {
+    const groups = new Map<string, ArtistShelf>();
+    for (const track of source) {
+      const name = (track.artist ?? '').trim();
+      if (!name) continue;
+      const key = name.toLocaleLowerCase();
+      const existing = groups.get(key);
+      if (existing) existing.count += 1;
+      else groups.set(key, { name, representative: track, count: 1 });
+    }
+    return [...groups.values()].sort((left, right) => right.count - left.count);
+  }
+
+  function shuffled<T>(items: T[]): T[] {
+    const copy = [...items];
+    for (let index = copy.length - 1; index > 0; index -= 1) {
+      const swap = Math.floor(Math.random() * (index + 1));
+      [copy[index], copy[swap]] = [copy[swap], copy[index]];
+    }
+    return copy;
+  }
+
+  function readPlayedAlbums(): PlayedAlbum[] {
+    try {
+      const raw = window.localStorage.getItem(musicHistoryKey);
+      const parsed = raw ? (JSON.parse(raw) as PlayedAlbum[]) : [];
+      return Array.isArray(parsed)
+        ? parsed.filter((entry) => entry && typeof entry.key === 'string')
+        : [];
+    } catch {
+      return [];
+    }
+  }
+
+  /** Recent albums live on the phone: the host has no play history to ask for. */
+  function rememberPlayedAlbum(track: RemoteTrack) {
+    const key = coverKey(track.artist ?? '', track.album ?? '');
+    if (!key) return;
+    playedAlbums = [
+      { key, artist: track.artist, album: track.album },
+      ...playedAlbums.filter((entry) => entry.key !== key)
+    ].slice(0, 24);
+    try {
+      window.localStorage.setItem(musicHistoryKey, JSON.stringify(playedAlbums));
+    } catch {
+      // A history that cannot be stored is only a lost convenience.
+    }
+  }
+
+  /**
+   * The shelves are grouped out of the tracks this phone has loaded, which is
+   * one page of the library. An album's other tracks are usually not in it, so
+   * ask the host for the album before queueing anything.
+   */
+  async function albumPlaylist(album: AlbumShelf): Promise<RemoteTrack[]> {
+    const name = album.album.trim();
+    if (!name) return album.tracks;
+    try {
+      const page = await invoke<LibraryPage>('remote_library', {
+        query: name, offset: 0, limit: MAX_ALBUM_TRACKS
+      });
+      const sameAlbum = (track: RemoteTrack) =>
+        (track.album ?? '').trim().toLocaleLowerCase() === name.toLocaleLowerCase();
+      // Prefer the exact artist|album key, but fall back to the album name so a
+      // guest credit on one track does not silently drop it from the playlist.
+      const byKey = page.tracks.filter(
+        (track) => coverKey(track.artist ?? '', track.album ?? '') === album.key
+      );
+      const found = byKey.length > album.tracks.length ? byKey : page.tracks.filter(sameAlbum);
+      return found.length > album.tracks.length ? found : album.tracks;
+    } catch {
+      // Offline, or a host that cannot answer: play what the shelf already had.
+      return album.tracks;
+    }
+  }
+
+  async function playAlbum(album: AlbumShelf) {
+    const playlist = await albumPlaylist(album);
+    const playable = playlist.filter((track) => track.local);
+    if (playable.length === 0) {
+      // Nothing from this album is on the host yet; reuse the track flow, which
+      // asks for it rather than doing nothing.
+      await activateTrack(playlist[0] ?? album.representative);
+      return;
+    }
+    playerQueue = playable;
+    playerQueueLibraryVisible = true;
+    playerIndex = 0;
+    selected = playable[0];
+    resetRandomOrder();
+    await playTrack(playable[0]);
+  }
+
+  /** `MP3 · 320 kb/s`. The rate is the file's own average, not a claim. */
+  function fileSummary(track: RemoteTrack): string {
+    const parts: string[] = [];
+    if (track.format) parts.push(track.format.toUpperCase());
+    const bitrate = averageBitrate(track);
+    if (bitrate > 0) parts.push(`${bitrate} kb/s`);
+    return parts.join(' · ');
+  }
+
+  function averageBitrate(track: RemoteTrack): number {
+    if (!track.size || duration <= 0) return 0;
+    return Math.round((track.size * 8) / duration / 1000);
   }
 
   async function moveTrack(direction: -1 | 1) {
     if (activeMedia !== 'music' || playerQueue.length < 2) return;
     let next: number;
-    if (playMode === 'random') {
+    if (shuffle) {
       if (direction === -1) {
         if (randomHistoryIndex <= 0) return;
         randomHistoryIndex -= 1;
@@ -797,12 +1227,18 @@
     playing = false;
     syncSystemMedia(true);
     if (activeMedia !== 'music') return;
-    if (playMode === 'once') return;
-    if (playMode === 'repeat') {
+    if (loopMode === 'one') {
       audio.currentTime = 0;
       audio.play().catch((nextError) => (error = String(nextError)));
       return;
     }
+    if (shuffle) {
+      // Every track has been played and the queue is not set to repeat.
+      if (randomUpcoming < 0) return;
+      void moveTrack(1);
+      return;
+    }
+    if (playerIndex >= playerQueue.length - 1 && loopMode === 'off') return;
     void moveTrack(1);
   }
 
@@ -1069,8 +1505,21 @@
   }
 
   onMount(() => {
-    const savedPlayMode = window.localStorage.getItem('napstrfy-play-mode');
-    if (playModes.some((mode) => mode.value === savedPlayMode)) playMode = savedPlayMode as PlayMode;
+    // Older builds stored one of four mode names; newer ones store both
+    // settings together. Either shape restores cleanly.
+    try {
+      const saved = window.localStorage.getItem(playModeKey) ?? '';
+      if (saved.startsWith('{')) {
+        const parsed = JSON.parse(saved) as { loop?: string; shuffle?: boolean };
+        if (LOOP_MODES.includes(parsed.loop as LoopMode)) loopMode = parsed.loop as LoopMode;
+        shuffle = parsed.shuffle === true;
+      } else if (saved) {
+        loopMode = saved === 'once' ? 'off' : saved === 'repeat' ? 'one' : saved === 'random' ? 'off' : 'all';
+        shuffle = saved === 'random';
+      }
+    } catch {
+      // An unreadable preference just means the defaults.
+    }
     try {
       const saved = JSON.parse(window.localStorage.getItem(likedMusicKey) || '[]') as unknown;
       if (Array.isArray(saved)) likedMusic = saved.filter(isStoredTrack).slice(0, 1000);
@@ -1109,12 +1558,15 @@
     };
     document.addEventListener('visibilitychange', foreground);
     window.addEventListener('napstrfy-media-action', handleSystemMediaAction);
+    window.addEventListener('napstrfy-back', handleSystemBack);
     return () => {
       window.clearInterval(statusTimer);
       window.clearInterval(transferTimer);
       window.clearInterval(podcastTimer);
       document.removeEventListener('visibilitychange', foreground);
       window.removeEventListener('napstrfy-media-action', handleSystemMediaAction);
+      window.removeEventListener('napstrfy-back', handleSystemBack);
+      androidBackBridge()?.setDrawerOpen(false);
       androidMediaBridge()?.clear();
     };
   });
@@ -1171,6 +1623,85 @@
         <div><p>{showingLikedMusic ? 'FAVOURITES' : query ? 'SEARCH RESULTS' : 'YOUR NAPSTR'}</p><h1>{showingLikedMusic ? 'Liked music' : query ? query : 'Your music'}</h1></div>
         <span>{total} {total === 1 ? 'track' : 'tracks'}</span>
       </section>
+
+      {#if !query && !showingLikedMusic && (discoverAlbums.length > 0 || lastPlayed.length > 0)}
+        <section class="album-shelves">
+          {#if lastPlayed.length > 0}
+            <div class="album-shelf-block">
+              <div class="section-label"><b>Last played</b><span>Recent albums</span></div>
+              <div class="album-shelf">
+                {#each lastPlayed as album (album.key)}
+                  <div class="album-card">
+                    <button class="album-open" onclick={() => playAlbum(album)} aria-label={`Play ${album.album} by ${album.artist || 'an unknown artist'}`}>
+                      <TrackArtwork track={album.representative} lookup />
+                      <span class="album-play" aria-hidden="true">▶</span>
+                    </button>
+                    <strong>{album.album}</strong>
+                    <small>{album.artist || 'Unknown artist'}</small>
+                  </div>
+                {/each}
+              </div>
+            </div>
+          {/if}
+          {#if discoverAlbums.length > 0}
+            <div class="album-shelf-block">
+              <div class="section-label"><b>Discover albums</b><span>{libraryAlbums.length} in this library</span></div>
+              <div class="album-shelf">
+                {#each discoverAlbums as album (album.key)}
+                  <div class="album-card">
+                    <button class="album-open" onclick={() => playAlbum(album)} aria-label={`Play ${album.album} by ${album.artist || 'an unknown artist'}`}>
+                      <TrackArtwork track={album.representative} lookup />
+                      <span class="album-play" aria-hidden="true">▶</span>
+                    </button>
+                    <strong>{album.album}</strong>
+                    <small>{album.artist || 'Unknown artist'}</small>
+                  </div>
+                {/each}
+              </div>
+            </div>
+          {/if}
+        </section>
+      {/if}
+
+      {#if searching && (resultArtists.length > 0 || libraryAlbums.length > 0)}
+        <section class="album-shelves">
+          {#if resultArtists.length > 0}
+            <div class="album-shelf-block">
+              <div class="section-label"><b>Artists</b><span>{resultArtists.length} in these results</span></div>
+              <div class="album-shelf">
+                {#each resultArtists as entry (entry.name)}
+                  <div class="artist-card">
+                    <button class="artist-open" onclick={() => void searchTracks(entry.name)} aria-label={`Show tracks by ${entry.name}`}>
+                      <TrackArtwork track={entry.representative} lookup />
+                      <span class="album-play" aria-hidden="true">⌕</span>
+                    </button>
+                    <strong>{entry.name}</strong>
+                    <small>{entry.count} {entry.count === 1 ? 'track' : 'tracks'}</small>
+                  </div>
+                {/each}
+              </div>
+            </div>
+          {/if}
+          {#if libraryAlbums.length > 0}
+            <div class="album-shelf-block">
+              <div class="section-label"><b>Albums</b><span>{libraryAlbums.length} in these results</span></div>
+              <div class="album-shelf">
+                {#each libraryAlbums as album (album.key)}
+                  <div class="album-card">
+                    <button class="album-open" onclick={() => playAlbum(album)} aria-label={`Play ${album.album} by ${album.artist || 'an unknown artist'}`}>
+                      <TrackArtwork track={album.representative} lookup />
+                      <span class="album-play" aria-hidden="true">▶</span>
+                    </button>
+                    <strong>{album.album}</strong>
+                    <small>{album.artist || 'Unknown artist'}</small>
+                  </div>
+                {/each}
+              </div>
+            </div>
+          {/if}
+        </section>
+        <div class="section-label tracks-label"><b>Tracks</b><span>{tracks.length} {tracks.length === 1 ? 'result' : 'results'}</span></div>
+      {/if}
 
       <section class="track-list" aria-busy={loading}>
         {#if loading}<div class="loading-list"><i></i><span>Asking Napstr…</span></div>{/if}
@@ -1291,34 +1822,49 @@
       {/if}
     {/if}
 
-    <nav class="bottom-nav" aria-label="Napstrfy navigation">
+    <nav class:dragging={sheetDragging || barDragging} style={`--nav-shift:${navShift}`} class="bottom-nav" aria-label="Napstrfy navigation">
       <button class:active={activeTab === 'music'} onclick={() => (activeTab = 'music')}><span>♫</span>Music</button>
       <button class:active={activeTab === 'podcasts'} onclick={showPodcasts}><span>◉</span>Podcasts</button>
       <button class:active={activeTab === 'audiobooks'} onclick={showAudiobooks}><span>▥</span>Audiobooks</button>
       <button onclick={() => status.paired ? forgetDesktop() : (activeTab = 'music')}><span>⚙</span>Pairing</button>
     </nav>
 
-    <section class:empty={activeMedia === 'music' ? !current : !currentPodcast} class="now-playing">
+    <section
+      class:dragging={barDragging}
+      style={`--bar-shift:${barShift}px; --bar-opacity:${barFade}; --bar-progress:${barProgress}`}
+      class:empty={activeMedia === 'music' ? !current : !currentPodcast}
+      class="now-playing"
+    >
+      <span class="now-fill" aria-hidden="true"></span>
       <button
         class="now-open"
+        bind:this={barElement}
         disabled={!nowPlayingAvailable()}
-        onclick={openNowPlaying}
+        onclick={handleBarClick}
+        onpointerdown={startBarDrag}
+        onpointermove={moveBarDrag}
+        onpointerup={endBarDrag}
+        onpointercancel={endBarDrag}
         aria-label="Open the now playing screen"
       >
         {#if activeMedia === 'podcast' && currentPodcast}
           {#if currentPodcast.image}<img class="podcast-player-art" src={currentPodcast.image} alt="" />{:else}<div class="empty-art">◉</div>{/if}
         {:else if current}<TrackArtwork track={current} large lookup />{:else}<div class="empty-art">♪</div>{/if}
-        <div class="now-copy"><strong>{activeMedia === 'podcast' && currentPodcast ? currentPodcast.title : current ? title(current) : 'Choose something to play'}</strong><small>{activeMedia === 'podcast' && currentPodcast ? currentPodcast.feedTitle : current ? artist(current) : 'Music and podcasts, wherever you are'}</small></div>
-        {#if nowPlayingAvailable()}<span class="now-open-hint" aria-hidden="true">⌃</span>{/if}
+        <div class="now-copy">
+          <div class="now-title" bind:this={titleClipper}>
+            {#key nowTitle}
+              <div class:marquee={titleOverflows} class="now-title-row">
+                <span bind:this={titleText}>{nowTitle}</span>
+                {#if titleOverflows}<span aria-hidden="true">{nowTitle}</span>{/if}
+              </div>
+            {/key}
+          </div>
+          <small>{nowArtist}</small>
+        </div>
       </button>
-      <div class="timeline"><input type="range" min="0" max={duration || 0} step="0.1" value={currentTime} oninput={(event) => seek(Number(event.currentTarget.value))} disabled={!current && !currentPodcast} /><span>{clock(currentTime)} / {clock(duration)}</span></div>
-      <div class="player-buttons">
-        <button onclick={() => moveTrack(-1)} disabled={activeMedia !== 'music' || playerQueue.length < 2 || (playMode === 'random' && randomHistoryIndex <= 0)} aria-label="Previous track">|◀</button>
-        <button class="play-main" onclick={togglePlayer} disabled={(!current && !currentPodcast) || caching}>{caching ? '···' : playing ? 'Ⅱ' : '▶'}</button>
-        <button onclick={() => moveTrack(1)} disabled={activeMedia !== 'music' || playerQueue.length < 2} aria-label="Next track">▶|</button>
-        <button class="mode-button" class:active={activeMedia === 'music'} onclick={cyclePlayMode} disabled={activeMedia !== 'music'} aria-label={playModeDetails().label} title={playModeDetails().label}>{playModeDetails().icon}</button>
-      </div>
-      <label class="volume">⌁ <input type="range" min="0" max="1" step="0.02" value={volume} oninput={(event) => setVolume(Number(event.currentTarget.value))} /></label>
+      <button class="now-play" onclick={togglePlayer} disabled={(!current && !currentPodcast) || caching} aria-label={playing ? 'Pause' : 'Play'}>
+        {#if caching}<span class="icon-busy"></span>{:else if playing}<span class="icon-pause"></span>{:else}<span class="icon-play"></span>{/if}
+      </button>
     </section>
   </main>
 {/if}
@@ -1326,63 +1872,128 @@
 {#if showNowPlaying && current && activeMedia === 'music'}
   <div
     class="now-sheet"
+    class:entering={sheetEntering}
+    class:closing={sheetClosing}
     class:dragging={sheetDragging}
-    style={`--sheet-drag:${sheetDragY}px`}
+    bind:this={sheetElement}
+    style={`--sheet-drag:${sheetDragY}px; --cover-hue:${artworkHue(current.fileId)}`}
     role="dialog"
     aria-modal="true"
+    tabindex="-1"
     aria-label="Now playing"
+    onpointerdown={startSheetDrag}
+    onpointermove={moveSheetDrag}
+    onpointerup={endSheetDrag}
+    onpointercancel={endSheetDrag}
   >
-    {#if sheetCoverUrl()}
-      <div class="now-sheet-backdrop" style={`background-image:url(${sheetCoverUrl()})`}></div>
-    {/if}
-    <div class="now-sheet-scrim"></div>
-
-    <div
-      class="now-sheet-head"
-      role="presentation"
-      onpointerdown={startSheetDrag}
-      onpointermove={moveSheetDrag}
-      onpointerup={endSheetDrag}
-      onpointercancel={endSheetDrag}
-    >
-      <p>{playModeDetails().label}</p>
-      <button class="now-sheet-close" onclick={closeNowPlaying} aria-label="Collapse the now playing screen">⌄</button>
+    <div class="now-sheet-hero">
+      {#if sheetCoverUrl()}
+        <div class="now-sheet-backdrop" style={`background-image:url(${sheetCoverUrl()})`}></div>
+      {:else}
+        <div class="now-sheet-backdrop empty"></div>
+      {/if}
+      <div class="now-sheet-scrim"></div>
+      <div class="now-sheet-art">
+        {#if sheetCoverUrl()}
+          <img src={sheetCoverUrl()} alt="" onerror={() => (nowArtFailed = true)} />
+        {:else}<div class="now-sheet-art-empty">♪</div>{/if}
+      </div>
     </div>
 
-    {#if sheetCoverUrl()}
-      <img class="now-sheet-cover" src={sheetCoverUrl()} alt="" onerror={() => (nowArtFailed = true)} />
-    {:else}
-      <div class="now-sheet-cover empty" style={`--cover-hue:${artworkHue(current.fileId)}`}>♪</div>
-    {/if}
+    <div class="now-sheet-body" bind:this={sheetScroller}>
+      <div class="now-sheet-timeline">
+        <input type="range" min="0" max={duration || 0} step="0.1" value={currentTime} oninput={(event) => seek(Number(event.currentTarget.value))} aria-label="Seek" />
+      </div>
 
-    <div class="now-sheet-copy">
-      <h1>{title(current)}</h1>
-      <p>{artist(current)}</p>
-      {#if current.album || nowCover?.year}<small>{[current.album, nowCover?.year].filter(Boolean).join(' · ')}</small>{/if}
+      <div class="now-sheet-meta">
+        <span>{clock(currentTime)}</span>
+        <span class="now-sheet-speed">Speed: 1x</span>
+        <span>{clock(duration)}</span>
+      </div>
+
+      <div class="now-sheet-copy">
+        <h1>{title(current)}</h1>
+        <p>{artist(current)}</p>
+        {#if current.album}<small>{current.album}</small>{/if}
+        {#if fileSummary(current)}<em>{fileSummary(current)}</em>{/if}
+      </div>
+
+      <div class="now-sheet-actions">
+        <button onclick={() => moveTrack(-1)} disabled={playerQueue.length < 2 || (shuffle && randomHistoryIndex <= 0)} aria-label="Previous track">|◀</button>
+        <button class="skip-button" onclick={() => nudge(-10)} aria-label="Back 10 seconds">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <circle cx="12" cy="12" r="7.4" />
+            <path class="filled" d="M12 1.9 8.4 5.2l3.6 3.3z" />
+            <text class="filled" x="12" y="15.1" text-anchor="middle" font-size="8.4" font-weight="700">10</text>
+          </svg>
+        </button>
+        <button class="play-main" class:square={playing} onclick={togglePlayer} disabled={caching} aria-label={playing ? 'Pause' : 'Play'}>
+          {#if caching}<span class="icon-busy"></span>{:else if playing}<span class="icon-pause"></span>{:else}<span class="icon-play"></span>{/if}
+        </button>
+        <button class="skip-button" onclick={() => nudge(10)} aria-label="Forward 10 seconds">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <circle cx="12" cy="12" r="7.4" />
+            <path class="filled" d="M12 1.9 15.6 5.2 12 8.5z" />
+            <text class="filled" x="12" y="15.1" text-anchor="middle" font-size="8.4" font-weight="700">10</text>
+          </svg>
+        </button>
+        <button onclick={() => moveTrack(1)} disabled={playerQueue.length < 2} aria-label="Next track">▶|</button>
+      </div>
+
+      <div class="now-sheet-modes">
+        <button class:active={loopMode !== 'off'} onclick={cycleLoopMode} aria-label={LOOP_LABELS[loopMode]} title={LOOP_LABELS[loopMode]}>
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M4.5 9.2A4.7 4.7 0 0 1 9.2 4.5H18" /><path d="M15.6 1.8 18.6 4.5 15.6 7.2" />
+            <path d="M19.5 14.8a4.7 4.7 0 0 1-4.7 4.7H6" /><path d="M8.4 22.2 5.4 19.5 8.4 16.8" />
+            {#if loopMode === 'one'}<path d="M11.7 11.4 12.9 10.3v5.2" /><path d="M11.2 15.5h3.4" />{/if}
+          </svg>
+        </button>
+        <button class:active={shuffle} onclick={toggleShuffle} aria-label={shuffle ? 'Shuffle on' : 'Shuffle off'} title="Shuffle">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M3.5 6.5h3.2l10.1 11h4" /><path d="M18.3 3.7 21 6.5l-2.7 2.8" />
+            <path d="M3.5 17.5h3.2l10.1-11h4" /><path d="M18.3 14.7 21 17.5l-2.7 2.8" />
+          </svg>
+        </button>
+        <button onclick={() => (showQueue = true)} aria-label="Open the playlist" title="Playlist">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M4 6.5h16" /><path d="M4 12h16" /><path d="M4 17.5h9" />
+            <path class="filled" d="M19.4 15.4a1.5 1.5 0 1 1-3 0 1.5 1.5 0 0 1 3 0z" />
+            <path d="M16.4 15.4v-3.6l3-.7" />
+          </svg>
+        </button>
+        <button disabled aria-label="Smart playlists, coming soon" title="Smart playlists, coming soon">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M12 12h.01" /><path d="M8.4 8.4a5.1 5.1 0 0 0 0 7.2" /><path d="M15.6 8.4a5.1 5.1 0 0 1 0 7.2" />
+          </svg>
+        </button>
+        <button class="now-mode-like" class:liked={current ? isTrackLiked(current) : false} onclick={() => current && toggleTrackLike(current)} aria-label="Like this track" disabled={!current}>
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M12 20.3c-1.4-1-7.2-5.2-7.2-9.4A4.2 4.2 0 0 1 12 8.2a4.2 4.2 0 0 1 7.2 2.7c0 4.2-5.8 8.4-7.2 9.4z" />
+          </svg>
+        </button>
+      </div>
     </div>
+  </div>
+{/if}
 
-    <div class="now-sheet-timeline">
-      <input type="range" min="0" max={duration || 0} step="0.1" value={currentTime} oninput={(event) => seek(Number(event.currentTarget.value))} aria-label="Seek" />
-      <span>{clock(currentTime)} / {clock(duration)}</span>
-    </div>
-
-    <div class="now-sheet-actions">
-      <button onclick={() => moveTrack(-1)} disabled={playerQueue.length < 2 || (playMode === 'random' && randomHistoryIndex <= 0)} aria-label="Previous track">|◀</button>
-      <button class="play-main" onclick={togglePlayer} disabled={caching} aria-label={playing ? 'Pause' : 'Play'}>{caching ? '···' : playing ? 'Ⅱ' : '▶'}</button>
-      <button onclick={() => moveTrack(1)} disabled={playerQueue.length < 2} aria-label="Next track">▶|</button>
-      <button class="mode-button" onclick={cyclePlayMode} aria-label={playModeDetails().label} title={playModeDetails().label}>{playModeDetails().icon}</button>
-    </div>
-
-    <div class="now-sheet-queue">
-      <div class="section-label"><b>{playMode === 'random' ? 'Playing randomly' : 'Up next'}</b><span>{upNext.length === 1 ? '1 track' : `${upNext.length} tracks`}</span></div>
-      {#each upNext.slice(0, 30) as entry, position (entry.index)}
-        <button class="now-sheet-row" onclick={() => playFromQueue(entry.index)}>
-          <TrackArtwork track={entry.track} lookup={position < 8} />
-          <span><strong>{title(entry.track)}</strong><small>{artist(entry.track)}</small></span>
-          <b>›</b>
+{#if showQueue && activeMedia === 'music'}
+  <div class="queue-view" role="dialog" aria-modal="true" aria-label="Playlist">
+    <header class="queue-head">
+      <div>
+        <p>{shuffle ? 'SHUFFLED' : 'PLAYING NEXT'}</p>
+        <h1>{playerQueue.length === 1 ? '1 track' : `${playerQueue.length} tracks`}</h1>
+      </div>
+      <button class="queue-close" onclick={() => (showQueue = false)} aria-label="Close the playlist">×</button>
+    </header>
+    <div class="queue-list">
+      {#each playerQueue as track, index (track.fileId)}
+        <button class:playing={index === playerIndex} class="queue-row" onclick={() => playFromQueue(index)}>
+          <span class="queue-index">{index === playerIndex ? '▶' : index + 1}</span>
+          <TrackArtwork track={track} lookup={index < 12} />
+          <span class="queue-copy"><strong>{title(track)}</strong><small>{artist(track)}</small></span>
         </button>
       {/each}
-      {#if upNext.length > 30}<p class="now-sheet-more">and {upNext.length - 30} more</p>{/if}
+      {#if playerQueue.length === 0}<p class="queue-empty">Nothing is queued yet.</p>{/if}
     </div>
   </div>
 {/if}

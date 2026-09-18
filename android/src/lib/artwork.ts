@@ -130,8 +130,9 @@ dropLegacyCache();
 /**
  * The cover key from the cover NIP: `trim(artist)|trim(album)`, lowercased,
  * preserved verbatim otherwise so it matches the catalogue display strings.
+ * Exported because album grouping in the UI must use the same identity.
  */
-function coverKey(artist: string, album: string): string {
+export function coverKey(artist: string, album: string): string {
   const artistHalf = artist.trim().toLowerCase();
   const albumHalf = album.trim().toLowerCase();
   if (!artistHalf || !albumHalf) return '';
