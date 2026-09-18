@@ -350,3 +350,39 @@ body.resizing-transfer-pane, body.resizing-transfer-pane * { cursor: ns-resize !
 .chat-block { margin-left: auto; padding: 0 3px; color: #666; background: transparent; border: 0; font-size: 10px; cursor: pointer; }
 
 .mini-cancel { width: 20px; height: 20px; padding: 0; justify-self: end; }
+
+/* ---- Album art, and the two ways to show results ------------------------
+   Art is always a square tile, whether it came from a signed kind `30427`
+   claim or from this computer's own resolution. A tile with nothing in it is a
+   music note rather than an error, because the NIP treats image URLs as
+   perishable and never a reason to penalise anybody. */
+
+.cover-art { display: grid; place-items: center; flex: 0 0 auto; overflow: hidden; color: #86a5a7; background: linear-gradient(145deg, #4d7477, #21403f); border: 1px solid #2c2c2c; }
+.cover-art img { display: block; width: 100%; height: 100%; object-fit: cover; }
+.cover-art.empty { font-family: Georgia, serif; }
+.cover-art.small { width: 28px; height: 28px; font-size: 12px; }
+.cover-art.medium { width: 52px; height: 52px; font-size: 20px; }
+.cover-art.large { width: 110px; height: 110px; font-size: 32px; box-shadow: 2px 2px 0 rgba(0, 0, 0, .35); }
+
+.detail-cover { display: grid; place-items: center; padding: 10px 10px 2px; }
+
+.results-caption-tools { display: flex; align-items: center; gap: 6px; }
+.view-toggle { width: 22px; height: 18px; padding: 0; color: #333; background: var(--face); border: 1px solid; border-color: var(--light) #555 #555 var(--light); font-size: 11px; line-height: 1; cursor: pointer; }
+.view-toggle.active { color: white; background: var(--navy); border-color: #333 var(--light) var(--light) #333; }
+.view-toggle:disabled { color: #888; cursor: default; }
+
+.result-grid { flex: 1; min-height: 0; overflow: auto; padding: 8px; display: grid; grid-template-columns: repeat(auto-fill, minmax(116px, 1fr)); gap: 8px; align-content: start; background: white; }
+.result-card { display: grid; justify-items: center; gap: 3px; padding: 6px; color: inherit; background: transparent; border: 1px solid transparent; font: inherit; text-align: center; cursor: pointer; }
+.result-card:hover { background: #eef4f6; }
+.result-card.selected { color: white; background: var(--navy); border-color: var(--navy); }
+.result-card b, .result-card small { display: block; width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.result-card b { font-size: 11px; }
+.result-card small { color: #555; font-size: 10px; }
+.result-card.selected small, .result-card.selected .result-card-meta { color: #ccd6ea; }
+.result-card-album { font-style: italic; }
+.result-card-meta { margin-top: 2px; display: inline-flex; align-items: center; gap: 3px; color: #444; font: 10px "Courier New", monospace; }
+.result-card-meta .source-dot { margin-right: 0; }
+.result-card .cover-art { box-shadow: 2px 2px 0 rgba(0, 0, 0, .3); }
+
+/* The middle column now names where an album came from as well as its size. */
+.cover-candidate { grid-template-columns: minmax(0, 1fr) 150px minmax(0, 1fr); }

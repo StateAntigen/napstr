@@ -2669,6 +2669,34 @@ impl NetworkService {
         apply_cover_seeders(&connection, covers, availability.as_deref())
     }
 
+    /// Covers for rendering: the winning claim where somebody made one, and
+    /// otherwise the best art this computer resolved for itself.
+    ///
+    /// This is deliberately not [`NetworkService::album_covers`]. That answers
+    /// "does somebody assert a cover for this album", which is what the scanner
+    /// must ask before it signs anything; this answers "what picture should be
+    /// drawn", and a local resolution — which no relay has ever seen and which
+    /// nobody's key signs — is only ever good enough for the second question.
+    pub async fn best_known_covers(&self, keys: Vec<String>) -> Result<Vec<AlbumCover>, String> {
+        let covers = self.album_covers(keys.clone()).await?;
+        let requested = cover::normalised_request(&keys, COVER_KEY_LIMIT);
+        let claimed = covers
+            .iter()
+            .map(|cover| cover.key.clone())
+            .collect::<HashSet<_>>();
+        let missing = requested
+            .into_iter()
+            .filter(|key| !claimed.contains(key))
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            return Ok(covers);
+        }
+        let connection = super::open_connection(&self.db_path)?;
+        let mut covers = covers;
+        covers.extend(cover::resolved_covers(&connection, &missing)?);
+        Ok(covers)
+    }
+
     pub async fn request_download(
         &self,
         file_id: String,
@@ -3015,6 +3043,17 @@ impl NetworkService {
     /// to report, and who wrote it, is the host's job: the phone has no business
     /// naming a pubkey it cannot verify.
     ///
+    /// The report carries `e` and `p` with the meanings NIP-56 gives them, and
+    /// `napstr-cover` for the album key, so a consumer that only knows NIP-56
+    /// reads every tag correctly. `x` is deliberately absent: NIP-56 defines it
+    /// as the SHA-256 of the reported content, so putting an `artist|album` key
+    /// there would hand a compliant reader a content hash it should trust.
+    ///
+    /// The key is repeated rather than left to be derived from `e` because kind
+    /// `30427` is addressable: its author can replace the claim at the same `d`
+    /// at any time, which changes the event id and orphans a report that named
+    /// only that.
+    ///
     /// Returns the id of the signed report. It is written to the relays before
     /// this returns, so nothing is queued behind it.
     pub async fn report_cover(
@@ -3048,6 +3087,7 @@ impl NetworkService {
         let tags = vec![
             Tag::parse(["e", cover.event_id.as_str(), report_type.as_str()]),
             Tag::parse(["p", cover.author.as_str(), report_type.as_str()]),
+            Tag::parse(["napstr-cover", key.as_str()]),
             Tag::parse(["client", "Napstr"]),
         ]
         .into_iter()

@@ -762,6 +762,12 @@ button. A report is kind `1984`:
 }
 ```
 
+`x` always carries the SHA-256 of the reported content, as NIP-56 defines it.
+A report about an album cover names the cover event with `e` and carries the
+album key in a `napstr-cover` tag; it MUST NOT put the album key in `x`. See
+[NIP-NAPSTR-COVER.md](NIP-NAPSTR-COVER.md) for the cover report shape and for
+why the key is repeated there.
+
 Supported report types are `illegal`, `malware`, `spam`, `nudity`, `profanity`,
 `impersonation`, and `other`.
 

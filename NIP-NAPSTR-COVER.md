@@ -179,8 +179,38 @@ album key. Consumers apply this order:
 2. Within the same trust class, newest `created_at` wins.
 3. Events from locally blocked authors are ignored (see "Reports and local
    blocking" in the main document). Wrong or abusive covers SHOULD be reported
-   with NIP-56 kind `1984` using an `e` tag on the cover event and an `x` tag
-   carrying the cover key.
+   as an ordinary NIP-56 kind `1984` report, with the tag meanings the main
+   document defines:
+
+   ```json
+   {
+     "kind": 1984,
+     "content": "reason, between 1 and 500 characters",
+     "tags": [
+       ["p", "<cover author public key>", "spam"],
+       ["e", "<cover event ID>", "spam"],
+       ["napstr-cover", "<artist|album>"],
+       ["client", "Napstr"]
+     ]
+   }
+   ```
+
+   `e` names the claim being reported, `p` names its author, and
+   `napstr-cover` carries the album key that claim answers.
+
+   `x` is **not** used for the album key. NIP-56 defines `x` as the SHA-256 of
+   the reported content, and a consumer following it would read a key as a
+   content hash. A cover report MAY carry `x` only when the reported claim
+   publishes the image's own file ID in its `x` tag, in which case the report
+   repeats that same value under the same report type.
+
+   The album key is carried explicitly rather than left to be derived from `e`
+   because kind `30427` is addressable: its author may replace the claim at the
+   same `d` coordinate at any time, which changes the event ID and orphans a
+   report that named only that. A report that arrives without the claim it
+   names — from a relay the consumer does not read, or after the claim was
+   replaced — is still meaningful while the key is present. A consumer that
+   holds the claim MAY match on `e` instead.
 
 A consumer that holds a valid seeder-authored event MAY ignore later
 non-seeder events for the same key until the seeder's event is replaced by its

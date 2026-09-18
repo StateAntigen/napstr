@@ -732,9 +732,13 @@ impl MobileService {
                 if keys.len() > MAX_COVER_KEYS {
                     return Err("Too many album covers were requested at once".into());
                 }
+                // The rendering view, not the assertion view: a phone should
+                // see the art this computer resolved for itself, exactly as the
+                // desktop's own window does. Reporting one of those is refused
+                // by `report_cover`, because there is no claim to report.
                 let covers = self
                     .network
-                    .album_covers(keys)
+                    .best_known_covers(keys)
                     .await?
                     .into_iter()
                     .map(remote_album_cover)

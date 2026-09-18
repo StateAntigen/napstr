@@ -18,7 +18,7 @@
 
 use chrono::Utc;
 use nostr_sdk::prelude::*;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -595,7 +595,33 @@ pub(crate) fn initialise_cover_schema(connection: &Connection) -> Result<(), Str
             "CREATE INDEX IF NOT EXISTS remote_catalogue_cover_key
                ON remote_catalogue(cover_key);
              CREATE INDEX IF NOT EXISTS remote_catalogue_canonical_cover_key
-               ON remote_catalogue(canonical_cover_key);",
+               ON remote_catalogue(canonical_cover_key);
+             -- What this computer resolved from MusicBrainz or the Cover Art
+             -- Archive, so a second run never asks the same question twice and
+             -- a polite pause is remembered across restarts.
+             CREATE TABLE IF NOT EXISTS album_art_lookups (
+               cover_key TEXT PRIMARY KEY,
+               checked_at TEXT NOT NULL,
+               outcome TEXT NOT NULL,
+               retry_at TEXT NOT NULL,
+               art TEXT NOT NULL DEFAULT '',
+               thumb TEXT NOT NULL DEFAULT '',
+               mbid TEXT NOT NULL DEFAULT '',
+               year TEXT NOT NULL DEFAULT '',
+               collection TEXT NOT NULL DEFAULT '',
+               source TEXT NOT NULL DEFAULT ''
+             );
+             -- The albums a window actually put on screen, which is what
+             -- \"albums seen in search results\" means. Deliberately not the
+             -- catalogue cache: that holds everything ever browsed, which on a
+             -- used install is thousands of records this computer does not own.
+             CREATE TABLE IF NOT EXISTS cover_watch (
+               cover_key TEXT PRIMARY KEY,
+               artist TEXT NOT NULL,
+               album TEXT NOT NULL,
+               noted_at TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS cover_watch_noted_at ON cover_watch(noted_at);",
         )
         .map_err(|error| error.to_string())?;
     if backfill {
@@ -711,6 +737,384 @@ pub(crate) fn mark_cover_keys_checked(
             .map_err(|error| error.to_string())?;
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// External art resolution cache
+// ---------------------------------------------------------------------------
+//
+// Everything below is the *resolver's* memory, not a claim. Nothing here is
+// signed, nothing here is published, and nothing here is ever served as a kind
+// `30427`.
+
+/// How long a resolution is trusted before MusicBrainz is asked again. Cover
+/// art changes very slowly, so this is measured in weeks.
+pub(crate) const ART_FOUND_LIFETIME_SECONDS: i64 = 30 * 24 * 60 * 60;
+/// How long "nobody has scanned this record" is trusted. Long, because it is
+/// the answer that costs a request to rediscover and never changes quickly.
+pub(crate) const ART_NONE_LIFETIME_SECONDS: i64 = 14 * 24 * 60 * 60;
+
+/// A front cover this computer resolved from a third-party API.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ArtLookup {
+    pub key: String,
+    pub art: String,
+    pub thumb: String,
+    pub mbid: String,
+    pub year: String,
+    pub collection: String,
+    pub source: String,
+}
+
+/// What one lookup learned, and therefore when it may be repeated.
+pub(crate) enum ArtLookupOutcome<'a> {
+    /// The archive had a front cover.
+    Found(&'a ArtLookup),
+    /// A considered answer: no art exists for this release group.
+    NoArt,
+    /// A transient failure, parked for `retry_after_seconds` so a throttling
+    /// MusicBrainz is not asked the same album again immediately.
+    Failed { retry_after_seconds: i64 },
+}
+
+/// What the cache already knows about one key.
+pub(crate) enum CachedArt {
+    /// A resolution worth using without asking anybody.
+    Found(Box<ArtLookup>),
+    /// Asked recently and answered "none", or parked after a failure.
+    Suppressed,
+    /// Never asked, or the answer is old enough to ask again.
+    Unknown,
+}
+
+fn retry_stamp(now: chrono::DateTime<Utc>, seconds: i64) -> String {
+    (now + chrono::Duration::seconds(seconds.max(1))).to_rfc3339()
+}
+
+/// File what a lookup learned about `key`, and set when it may be tried again.
+pub(crate) fn record_art_lookup(
+    connection: &Connection,
+    key: &str,
+    outcome: ArtLookupOutcome<'_>,
+) -> Result<(), String> {
+    let key = normalise_cover_key(key).ok_or("invalid album cover key")?;
+    let now = Utc::now();
+    let checked_at = now.to_rfc3339();
+    match outcome {
+        ArtLookupOutcome::Found(lookup) => {
+            connection
+                .execute(
+                    "INSERT INTO album_art_lookups(cover_key,checked_at,outcome,retry_at,art,thumb,mbid,year,collection,source)
+                     VALUES(?1,?2,'found',?3,?4,?5,?6,?7,?8,?9)
+                     ON CONFLICT(cover_key) DO UPDATE SET
+                       checked_at=excluded.checked_at, outcome='found', retry_at=excluded.retry_at,
+                       art=excluded.art, thumb=excluded.thumb, mbid=excluded.mbid,
+                       year=excluded.year, collection=excluded.collection, source=excluded.source",
+                    params![
+                        key,
+                        checked_at,
+                        retry_stamp(now, ART_FOUND_LIFETIME_SECONDS),
+                        lookup.art,
+                        lookup.thumb,
+                        lookup.mbid,
+                        lookup.year,
+                        lookup.collection,
+                        lookup.source
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        ArtLookupOutcome::NoArt => {
+            connection
+                .execute(
+                    "INSERT INTO album_art_lookups(cover_key,checked_at,outcome,retry_at,art,thumb,mbid,year,collection,source)
+                     VALUES(?1,?2,'none',?3,'','','','','','')
+                     ON CONFLICT(cover_key) DO UPDATE SET
+                       checked_at=excluded.checked_at, outcome='none', retry_at=excluded.retry_at,
+                       art='', thumb='', mbid='', year='', collection='', source=''",
+                    params![key, checked_at, retry_stamp(now, ART_NONE_LIFETIME_SECONDS)],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        ArtLookupOutcome::Failed {
+            retry_after_seconds,
+        } => {
+            // A failure must never bury a resolution that worked, so a `found`
+            // row is left exactly as it is.
+            connection
+                .execute(
+                    "INSERT INTO album_art_lookups(cover_key,checked_at,outcome,retry_at,art,thumb,mbid,year,collection,source)
+                     VALUES(?1,?2,'error',?3,'','','','','','')
+                     ON CONFLICT(cover_key) DO UPDATE SET
+                       checked_at=excluded.checked_at, outcome='error', retry_at=excluded.retry_at
+                     WHERE album_art_lookups.outcome <> 'found'",
+                    params![key, checked_at, retry_stamp(now, retry_after_seconds)],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+/// What the cache already knows about `key`, honouring the retry stamp.
+pub(crate) fn cached_art(connection: &Connection, key: &str) -> Result<CachedArt, String> {
+    let Some(key) = normalise_cover_key(key) else {
+        return Ok(CachedArt::Unknown);
+    };
+    let row = connection
+        .query_row(
+            "SELECT outcome,retry_at,art,thumb,mbid,year,collection,source
+               FROM album_art_lookups WHERE cover_key=?1",
+            [&key],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some((outcome, retry_at, art, thumb, mbid, year, collection, source)) = row else {
+        return Ok(CachedArt::Unknown);
+    };
+    let pending = chrono::DateTime::parse_from_rfc3339(&retry_at)
+        .map(|retry_at| retry_at > Utc::now())
+        .unwrap_or(false);
+    if !pending {
+        return Ok(CachedArt::Unknown);
+    }
+    if outcome == "found" && !art.is_empty() {
+        return Ok(CachedArt::Found(Box::new(ArtLookup {
+            key,
+            art,
+            thumb,
+            mbid,
+            year,
+            collection,
+            source,
+        })));
+    }
+    Ok(CachedArt::Suppressed)
+}
+
+/// A resolution this computer holds for `key`, whatever its age.
+///
+/// Freshness decides whether MusicBrainz should be asked again; it never
+/// withholds a picture this computer already has, because a working image is
+/// worth more than a retry stamp. This is what makes "sign what I resolved"
+/// possible with lookups switched off.
+pub(crate) fn stored_art(connection: &Connection, key: &str) -> Result<Option<ArtLookup>, String> {
+    let Some(key) = normalise_cover_key(key) else {
+        return Ok(None);
+    };
+    connection
+        .query_row(
+            "SELECT art,thumb,mbid,year,collection,source FROM album_art_lookups
+               WHERE cover_key=?1 AND art<>''",
+            [&key],
+            |row| {
+                Ok(ArtLookup {
+                    key: key.clone(),
+                    art: row.get(0)?,
+                    thumb: row.get(1)?,
+                    mbid: row.get(2)?,
+                    year: row.get(3)?,
+                    collection: row.get(4)?,
+                    source: row.get(5)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| error.to_string())
+}
+
+/// Every cover key this computer holds art for, in one query.
+///
+/// Used to decide what a publish-only pass can actually act on, so its pending
+/// list never fills up with albums that cannot progress.
+pub(crate) fn stored_art_keys(connection: &Connection) -> Result<HashSet<String>, String> {
+    let mut statement = connection
+        .prepare("SELECT cover_key FROM album_art_lookups WHERE art <> ''")
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?;
+    rows.collect::<Result<HashSet<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// What a window has shown
+// ---------------------------------------------------------------------------
+
+/// How long an album the window showed stays in the worker's queue.
+///
+/// This is *retention*, not a freshness heuristic. The pending list is built
+/// once at the start of a pass, so an album that was on screen while a long pass
+/// ran must still be there when the next pass asks — otherwise it is never
+/// looked up at all. It is measured in hours for exactly that reason.
+pub(crate) const WATCH_RETENTION_HOURS: i64 = 24;
+
+/// Remember the albums a window has just put on screen.
+///
+/// Returns how many addressable albums were recorded. Keys are computed here,
+/// so every caller normalizes them the same way.
+pub(crate) fn note_watched_albums(
+    connection: &Connection,
+    albums: &[(String, String)],
+) -> Result<usize, String> {
+    let now = Utc::now().to_rfc3339();
+    let mut statement = connection
+        .prepare(
+            "INSERT INTO cover_watch(cover_key,artist,album,noted_at) VALUES(?1,?2,?3,?4)
+             ON CONFLICT(cover_key) DO UPDATE SET
+               artist=excluded.artist, album=excluded.album, noted_at=excluded.noted_at",
+        )
+        .map_err(|error| error.to_string())?;
+    let mut noted = 0;
+    for (artist, album) in albums {
+        let Some(key) = cover_key(artist, album) else {
+            continue;
+        };
+        statement
+            .execute(params![key, artist.trim(), album.trim(), now])
+            .map_err(|error| error.to_string())?;
+        noted += 1;
+    }
+    Ok(noted)
+}
+
+/// Albums a window showed recently, newest first, as `(key, artist, album)`.
+pub(crate) fn watched_albums(
+    connection: &Connection,
+) -> Result<Vec<(String, String, String)>, String> {
+    let cutoff = Utc::now() - chrono::Duration::hours(WATCH_RETENTION_HOURS);
+    let mut statement = connection
+        .prepare("SELECT cover_key,artist,album,noted_at FROM cover_watch ORDER BY noted_at DESC")
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?;
+    let mut albums = Vec::new();
+    for row in rows {
+        let (key, artist, album, noted_at) = row.map_err(|error| error.to_string())?;
+        // Compared as timestamps rather than as text, so a differing fraction of
+        // a second cannot decide whether an album is still queued.
+        let recent = chrono::DateTime::parse_from_rfc3339(&noted_at)
+            .map(|noted_at| noted_at > cutoff)
+            .unwrap_or(false);
+        if recent {
+            albums.push((key, artist, album));
+        }
+    }
+    Ok(albums)
+}
+
+/// Drop watch entries that have aged out, so the table cannot grow forever.
+pub(crate) fn prune_watch(connection: &Connection) -> Result<usize, String> {
+    // A coarse text comparison is fine at a day's resolution: a sub-second
+    // boundary error would only leave one entry in the table a moment longer.
+    let cutoff = (Utc::now() - chrono::Duration::hours(WATCH_RETENTION_HOURS)).to_rfc3339();
+    connection
+        .execute("DELETE FROM cover_watch WHERE noted_at < ?1", params![cutoff])
+        .map_err(|error| error.to_string())
+}
+
+/// Keys recently answered "no art", or parked after a failure. Offering those
+/// as candidates again would only spend requests to learn the same thing.
+///
+/// Read in one pass rather than one query per key: the table only ever holds
+/// albums this computer has asked about, so scanning it is cheap even when the
+/// caller offers a whole library.
+pub(crate) fn suppressed_art_keys(
+    connection: &Connection,
+    keys: &[String],
+) -> Result<HashSet<String>, String> {
+    if keys.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let wanted = keys.iter().map(String::as_str).collect::<HashSet<_>>();
+    let now = Utc::now();
+    let mut statement = connection
+        .prepare("SELECT cover_key,outcome,retry_at FROM album_art_lookups")
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?;
+    let mut suppressed = HashSet::new();
+    for row in rows {
+        let (key, outcome, retry_at) = row.map_err(|error| error.to_string())?;
+        if outcome == "found" || !wanted.contains(key.as_str()) {
+            continue;
+        }
+        if chrono::DateTime::parse_from_rfc3339(&retry_at)
+            .map(|retry_at| retry_at > now)
+            .unwrap_or(false)
+        {
+            suppressed.insert(key);
+        }
+    }
+    Ok(suppressed)
+}
+
+/// A resolution this computer holds, shaped for display and for the phone.
+///
+/// `author` and `event_id` are empty on purpose: this is not a claim by anybody,
+/// and a client that needs an author must ask a relay instead.
+pub(crate) fn cover_from_art_lookup(lookup: &ArtLookup) -> AlbumCover {
+    AlbumCover {
+        key: lookup.key.clone(),
+        art: lookup.art.clone(),
+        thumb: lookup.thumb.clone(),
+        mbid: lookup.mbid.clone(),
+        year: lookup.year.clone(),
+        genre: String::new(),
+        collection: lookup.collection.clone(),
+        source: lookup.source.clone(),
+        cover_file_id: String::new(),
+        mime: String::new(),
+        author: String::new(),
+        event_id: String::new(),
+        created_at: 0,
+        seeder: false,
+    }
+}
+
+/// Resolutions held for `keys`, whatever their age.
+///
+/// Freshness is the scanner's business, not the renderer's: an old answer is
+/// still the best picture of that album this computer has.
+pub(crate) fn resolved_covers(
+    connection: &Connection,
+    keys: &[String],
+) -> Result<Vec<AlbumCover>, String> {
+    let mut covers = Vec::new();
+    for key in keys {
+        if let Some(lookup) = stored_art(connection, key)? {
+            covers.push(cover_from_art_lookup(&lookup));
+        }
+    }
+    Ok(covers)
 }
 
 /// Store the newest claim from every author for the given key/event pairs.
@@ -1483,5 +1887,133 @@ mod tests {
             )
             .unwrap();
         assert_eq!(key, "sentinel");
+    }
+
+    fn art_lookup(key: &str, art: &str) -> ArtLookup {
+        ArtLookup {
+            key: key.to_string(),
+            art: art.to_string(),
+            thumb: "https://archive.org/thumb.jpg".to_string(),
+            mbid: "f4a7b0d2-0000-0000-0000-000000000000".to_string(),
+            year: "2007".to_string(),
+            collection: "City of Echoes".to_string(),
+            source: "musicbrainz".to_string(),
+        }
+    }
+
+    #[test]
+    fn art_lookups_remember_answers_so_musicbrainz_is_asked_once() {
+        let connection = cover_database();
+        let key = "artist|album".to_string();
+        assert!(matches!(
+            cached_art(&connection, &key).unwrap(),
+            CachedArt::Unknown
+        ));
+
+        record_art_lookup(
+            &connection,
+            &key,
+            ArtLookupOutcome::Found(&art_lookup(&key, "https://archive.org/front.jpg")),
+        )
+        .unwrap();
+        let CachedArt::Found(found) = cached_art(&connection, &key).unwrap() else {
+            panic!("a recorded resolution must be offered back");
+        };
+        assert_eq!(found.art, "https://archive.org/front.jpg");
+        assert!(suppressed_art_keys(&connection, std::slice::from_ref(&key))
+            .unwrap()
+            .is_empty());
+
+        // A later failure must not bury the resolution that worked.
+        record_art_lookup(
+            &connection,
+            &key,
+            ArtLookupOutcome::Failed {
+                retry_after_seconds: 60,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            cached_art(&connection, &key).unwrap(),
+            CachedArt::Found(_)
+        ));
+    }
+
+    #[test]
+    fn art_lookups_park_albums_that_have_no_art_or_failed() {
+        let connection = cover_database();
+        let empty = "artist|nowhere".to_string();
+        let broken = "artist|offline".to_string();
+        record_art_lookup(&connection, &empty, ArtLookupOutcome::NoArt).unwrap();
+        record_art_lookup(
+            &connection,
+            &broken,
+            ArtLookupOutcome::Failed {
+                retry_after_seconds: 900,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            cached_art(&connection, &empty).unwrap(),
+            CachedArt::Suppressed
+        ));
+        assert!(matches!(
+            cached_art(&connection, &broken).unwrap(),
+            CachedArt::Suppressed
+        ));
+        assert_eq!(
+            suppressed_art_keys(&connection, &[empty.clone(), broken.clone()])
+                .unwrap()
+                .len(),
+            2,
+            "neither album should be offered again while its answer is fresh"
+        );
+
+        // Once the retry stamp passes, the album is a candidate again.
+        let past = (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        connection
+            .execute("UPDATE album_art_lookups SET retry_at=?1", params![past])
+            .unwrap();
+        assert!(matches!(
+            cached_art(&connection, &empty).unwrap(),
+            CachedArt::Unknown
+        ));
+        assert!(suppressed_art_keys(&connection, &[empty]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn resolved_covers_outlive_their_freshness_and_claim_no_author() {
+        let connection = cover_database();
+        let key = "artist|album".to_string();
+        record_art_lookup(
+            &connection,
+            &key,
+            ArtLookupOutcome::Found(&art_lookup(&key, "https://archive.org/front.jpg")),
+        )
+        .unwrap();
+
+        // Age the answer past its retry stamp: the scanner should look again,
+        // but a renderer still has the best picture this computer knows.
+        let past = (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        connection
+            .execute("UPDATE album_art_lookups SET retry_at=?1", params![past])
+            .unwrap();
+        assert!(matches!(
+            cached_art(&connection, &key).unwrap(),
+            CachedArt::Unknown
+        ));
+
+        let covers = resolved_covers(&connection, std::slice::from_ref(&key)).unwrap();
+        assert_eq!(covers.len(), 1);
+        assert_eq!(covers[0].art, "https://archive.org/front.jpg");
+        assert!(
+            covers[0].author.is_empty() && covers[0].event_id.is_empty(),
+            "a local resolution is not a claim by anybody"
+        );
+
+        // An album whose lookup found nothing has nothing to render.
+        let empty = "artist|nowhere".to_string();
+        record_art_lookup(&connection, &empty, ArtLookupOutcome::NoArt).unwrap();
+        assert!(resolved_covers(&connection, &[empty]).unwrap().is_empty());
     }
 }
