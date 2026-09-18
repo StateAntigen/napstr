@@ -8,6 +8,24 @@ pub const MAX_PAGE_SIZE: usize = 200;
 /// Album covers per request. Bounded so a full answer always fits in one
 /// control frame even when every URL is at its maximum length.
 pub const MAX_COVER_KEYS: usize = 40;
+/// NIP-56 report types a cover report may use. `other` exists so a phone is
+/// never forced to mislabelled something to be able to report it at all.
+pub const REPORT_REASONS: [&str; 7] = [
+    "illegal",
+    "malware",
+    "spam",
+    "impersonation",
+    "nudity",
+    "profanity",
+    "other",
+];
+pub const MAX_REPORT_NOTE_CHARS: usize = 500;
+/// Longest pairing-code QR image the host will render, in bytes. A pairing code
+/// is a few hundred bytes, which is a QR of roughly a hundred modules a side,
+/// and the renderer draws one path segment per dark module - so the image is a
+/// little over 100 KB in practice. This sits below `MAX_CONTROL_FRAME_BYTES` so
+/// a ticket and its QR always travel in a single control frame.
+pub const MAX_QR_SVG_BYTES: usize = 192 * 1024;
 const PAIRING_URI_PREFIX: &str = "napstrfy://pair/";
 const LEGACY_PAIRING_URI_PREFIX: &str = "nostrfy://pair/";
 
@@ -125,6 +143,86 @@ pub struct RemoteAlbumCover {
     /// this album, which is the strongest trust signal in the cover NIP.
     pub seeder: bool,
 }
+/// Repeating is a choice of three, matching what the phone's drawer offers.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RemoteRepeat {
+    #[default]
+    Off,
+    All,
+    One,
+}
+
+/// One transport instruction from a write-capable phone to the host's own
+/// player. The phone never plays the desktop's audio itself, so every variant
+/// here is a request the host may still refuse.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum PlaybackCommand {
+    Play,
+    Pause,
+    /// Pause when playing, resume when paused: what a single button wants.
+    Toggle,
+    Stop,
+    Next,
+    Previous,
+    Seek {
+        position_ms: u64,
+    },
+    /// A percentage rather than a fraction: it keeps the command comparable and
+    /// keeps floating point off the wire.
+    Volume {
+        percent: u8,
+    },
+    Repeat {
+        mode: RemoteRepeat,
+    },
+    Shuffle {
+        enabled: bool,
+    },
+}
+
+/// What the host's own player is doing right now, plus the queue facts only the
+/// desktop's frontend knows. Every field is optional on the wire so a newer
+/// phone can still talk to an older host and vice versa.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct RemotePlaybackState {
+    /// False when the host has not played anything this session.
+    pub active: bool,
+    pub playing: bool,
+    pub file_id: String,
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub position_ms: u64,
+    pub duration_ms: u64,
+    pub volume: f64,
+    pub queue_len: usize,
+    /// Index of the playing track in the host's queue, or -1.
+    pub queue_index: i64,
+    pub repeat: RemoteRepeat,
+    pub shuffle: bool,
+    /// True while a phone has driven the host recently, so the desktop can say
+    /// so rather than having tracks appear to move on their own.
+    pub remote_control: bool,
+    /// Why the host cannot play anything, when that is the case - a phone that
+    /// presses play on an idle computer deserves the reason, not silence.
+    pub error: String,
+    pub updated_at: i64,
+}
+
+/// What the host signed and published on this phone's behalf.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct CoverReportResult {
+    /// Event id of the `1984` report.
+    pub report_id: String,
+    /// True when the host accepted it into its publish queue rather than
+    /// having already written it to a relay.
+    pub queued: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteTransfer {
@@ -186,6 +284,25 @@ pub enum ClientRequest {
     AlbumCovers {
         keys: Vec<String>,
     },
+    /// A write-capable phone driving the host's own player.
+    Playback {
+        command: PlaybackCommand,
+    },
+    /// What the host's player is doing. Reading it is harmless, so a phone with
+    /// read-only access may ask too.
+    PlaybackState,
+    /// Ask the host to mint a read-only pairing code this phone can hand to
+    /// another device. Only a phone with write access may ask, so read-only
+    /// access can never re-delegate itself and widen.
+    ReadOnlyTicket,
+    /// NIP-56: ask the host to sign and publish a `1984` report about an album
+    /// cover. The phone holds no Nostr keys, so the host is the only one that
+    /// can speak on the user's behalf.
+    ReportCover {
+        key: String,
+        reason: String,
+        note: String,
+    },
     Status,
     Ping,
 }
@@ -233,6 +350,23 @@ pub enum ServerResponse {
     },
     AlbumCovers {
         covers: Vec<RemoteAlbumCover>,
+    },
+    Playback {
+        state: RemotePlaybackState,
+    },
+    /// A read-only pairing code, minted by the host, for this phone to show.
+    ReadOnlyTicket {
+        /// A `napstrfy://pair/...` code, exactly as the desktop's own QR holds.
+        uri: String,
+        /// The same code drawn as a QR image by the host so the other phone can
+        /// scan it instead of typing it.
+        #[serde(default)]
+        qr_svg: String,
+        expires_at: i64,
+        desktop_name: String,
+    },
+    CoverReported {
+        report: CoverReportResult,
     },
     Status {
         library_revision: u64,
@@ -375,6 +509,112 @@ mod tests {
             serde_json::from_str::<ServerResponse>(&serde_json::to_string(&response).unwrap())
                 .unwrap(),
             response
+        );
+    }
+
+    /// The phone and the desktop are released independently, so these strings
+    /// are part of the contract rather than an implementation detail.
+    #[test]
+    fn playback_wire_names_are_stable() {
+        assert_eq!(
+            serde_json::to_string(&ClientRequest::Playback {
+                command: PlaybackCommand::Seek { position_ms: 1 }
+            })
+            .unwrap(),
+            r#"{"type":"playback","command":{"type":"seek","positionMs":1}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&ClientRequest::PlaybackState).unwrap(),
+            r#"{"type":"playbackState"}"#
+        );
+        assert_eq!(serde_json::to_string(&RemoteRepeat::One).unwrap(), r#""one""#);
+        assert_eq!(
+            serde_json::to_string(&ClientRequest::ReadOnlyTicket).unwrap(),
+            r#"{"type":"readOnlyTicket"}"#
+        );
+    }
+
+    #[test]
+    fn every_playback_command_round_trips() {
+        for command in [
+            PlaybackCommand::Play,
+            PlaybackCommand::Pause,
+            PlaybackCommand::Toggle,
+            PlaybackCommand::Stop,
+            PlaybackCommand::Next,
+            PlaybackCommand::Previous,
+            PlaybackCommand::Seek {
+                position_ms: 42_000,
+            },
+            PlaybackCommand::Volume { percent: 50 },
+            PlaybackCommand::Repeat {
+                mode: RemoteRepeat::One,
+            },
+            PlaybackCommand::Shuffle { enabled: true },
+        ] {
+            let request = ClientRequest::Playback {
+                command: command.clone(),
+            };
+            let json = serde_json::to_string(&request).unwrap();
+            assert_eq!(
+                serde_json::from_str::<ClientRequest>(&json).unwrap(),
+                request
+            );
+        }
+    }
+
+    /// A host that predates a field must still be understood, rather than
+    /// making the phone show an error for a state it could partly render.
+    #[test]
+    fn a_partial_playback_state_still_decodes() {
+        let state: RemotePlaybackState = serde_json::from_str(r#"{"playing":true}"#).unwrap();
+        assert!(state.playing);
+        assert!(!state.active);
+        assert_eq!(state.repeat, RemoteRepeat::Off);
+        assert_eq!(state.queue_index, 0);
+        let response: ServerResponse =
+            serde_json::from_str(r#"{"type":"playback","state":{"title":"Song"}}"#).unwrap();
+        assert_eq!(
+            response,
+            ServerResponse::Playback {
+                state: RemotePlaybackState {
+                    title: "Song".into(),
+                    ..RemotePlaybackState::default()
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn read_only_tickets_and_reports_round_trip() {
+        let response = ServerResponse::ReadOnlyTicket {
+            uri: "napstrfy://pair/abc".into(),
+            qr_svg: "<svg></svg>".into(),
+            expires_at: 123,
+            desktop_name: "Living room".into(),
+        };
+        assert_eq!(
+            serde_json::from_str::<ServerResponse>(&serde_json::to_string(&response).unwrap())
+                .unwrap(),
+            response
+        );
+        // An older host renders no QR, which must not be an error.
+        let bare: ServerResponse =
+            serde_json::from_str(r#"{"type":"readOnlyTicket","uri":"napstrfy://pair/abc","expiresAt":1,"desktopName":"N"}"#)
+                .unwrap();
+        assert!(matches!(
+            bare,
+            ServerResponse::ReadOnlyTicket { qr_svg, .. } if qr_svg.is_empty()
+        ));
+        let request = ClientRequest::ReportCover {
+            key: "artist|album".into(),
+            reason: "spam".into(),
+            note: "not this record".into(),
+        };
+        assert_eq!(
+            serde_json::from_str::<ClientRequest>(&serde_json::to_string(&request).unwrap())
+                .unwrap(),
+            request
         );
     }
 

@@ -19,8 +19,10 @@ use walkdir::WalkDir;
 
 mod audio;
 mod cover;
+mod cover_publish;
 mod mobile;
 mod network;
+mod playback_bridge;
 mod player;
 mod protocol;
 mod tor;
@@ -47,6 +49,10 @@ struct AppState {
     scan_cancel: Arc<AtomicBool>,
     app_handle: tauri::AppHandle,
     player: Arc<player::NativePlayer>,
+    /// Reached by a paired, write-capable phone.
+    playback: Arc<playback_bridge::PlaybackBridge>,
+    /// Resolves album art for this computer's library and publishes it.
+    covers: Arc<cover_publish::CoverPublisher>,
     mobile: Arc<mobile::MobileService>,
     recovering_after_sleep: Arc<AtomicBool>,
 }
@@ -2118,8 +2124,57 @@ async fn close_window(window: tauri::Window, state: State<'_, AppState>) -> Resu
     window.close().map_err(|error| error.to_string())
 }
 
+/// The desktop's window reports what its queue holds, which is the only way a
+/// phone can be told what comes next or move through it.
+#[tauri::command]
+fn publish_playback_state(snapshot: playback_bridge::QueueSnapshot, state: State<'_, AppState>) {
+    state.playback.publish_queue(snapshot);
+}
+
+/// Albums this computer holds that nobody has covered yet.
+#[tauri::command]
+fn cover_candidates(
+    limit: usize,
+    state: State<'_, AppState>,
+) -> Result<Vec<cover_publish::CoverCandidate>, String> {
+    state.covers.candidates(cover_publish::clamp_scan_limit(limit))
+}
+
+#[tauri::command]
+fn cover_scan_status(state: State<'_, AppState>) -> cover_publish::CoverScanStatus {
+    state.covers.status()
+}
+
+/// The opt-in. Nothing is resolved or published while this is off, because a
+/// published claim is signed with the user's own Nostr key.
+#[tauri::command]
+fn set_cover_publishing(
+    enabled: bool,
+    state: State<'_, AppState>,
+) -> cover_publish::CoverScanStatus {
+    state.covers.set_enabled(enabled)
+}
+
+#[tauri::command]
+async fn scan_covers(
+    limit: usize,
+    state: State<'_, AppState>,
+) -> Result<cover_publish::CoverScanStatus, String> {
+    let covers = state.covers.clone();
+    covers.scan(cover_publish::clamp_scan_limit(limit)).await
+}
+
+#[tauri::command]
+fn cancel_cover_scan(state: State<'_, AppState>) {
+    state.covers.cancel();
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // reqwest is built without a TLS provider, so one has to be installed before
+    // anything constructs an HTTPS client. Ignoring the result is deliberate:
+    // another part of the process may already have installed one.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let shutdown_services = Arc::new(Mutex::new(None::<ShutdownServices>));
     let setup_shutdown_services = shutdown_services.clone();
     let app = tauri::Builder::default()
@@ -2139,8 +2194,22 @@ pub fn run() {
             let transfers = Arc::new(transfer::TransferService::new(db_path.clone(), tor.clone()));
             let network =
                 network::NetworkService::new(db_path.clone(), transfers, app.handle().clone());
-            let mobile =
-                mobile::MobileService::new(db_path.clone(), app_data.clone(), network.clone())?;
+            // The audio player owns the sound and the window owns the queue, so
+            // the bridge is what lets a paired phone reach either of them.
+            let player = Arc::new(player::NativePlayer::default());
+            let playback =
+                playback_bridge::PlaybackBridge::new(player.clone(), app.handle().clone());
+            let mobile = mobile::MobileService::new(
+                db_path.clone(),
+                app_data.clone(),
+                network.clone(),
+                playback.clone(),
+            )?;
+            let covers = cover_publish::CoverPublisher::new(
+                db_path.clone(),
+                network.clone(),
+                app.handle().clone(),
+            );
             let scan_lock = Arc::new(Mutex::new(()));
             let scan_cancel = Arc::new(AtomicBool::new(false));
             *setup_shutdown_services
@@ -2185,7 +2254,9 @@ pub fn run() {
                 scan_lock: scan_lock.clone(),
                 scan_cancel: scan_cancel.clone(),
                 app_handle: app.handle().clone(),
-                player: Arc::new(player::NativePlayer::default()),
+                player: player.clone(),
+                playback: playback.clone(),
+                covers: covers.clone(),
                 mobile: mobile.clone(),
                 recovering_after_sleep: Arc::new(AtomicBool::new(false)),
             });
@@ -2235,6 +2306,12 @@ pub fn run() {
             player::seek_audio,
             player::set_audio_volume,
             player::audio_status,
+            publish_playback_state,
+            cover_candidates,
+            cover_scan_status,
+            set_cover_publishing,
+            scan_covers,
+            cancel_cover_scan,
             set_downloads_paused,
             clear_all_transfers,
             start_network,

@@ -78,3 +78,65 @@ export type PodcastDownload = {
   ready: boolean;
 };
 export type RemoteTransfer = { id: string; fileId: string; filename: string; size: number; progress: number; status: string; speed: string };
+
+/** Repeating is a choice of three, matching the drawer and the desktop. */
+export type RemoteRepeat = 'off' | 'all' | 'one';
+
+/**
+ * One transport instruction for the computer's own player. The phone never
+ * plays the desktop's audio, so every one of these can still be refused.
+ */
+export type PlaybackCommand =
+  | { type: 'play' }
+  | { type: 'pause' }
+  | { type: 'toggle' }
+  | { type: 'stop' }
+  | { type: 'next' }
+  | { type: 'previous' }
+  | { type: 'seek'; positionMs: number }
+  | { type: 'volume'; percent: number }
+  | { type: 'repeat'; mode: RemoteRepeat }
+  | { type: 'shuffle'; enabled: boolean };
+
+export type RemotePlaybackState = {
+  active: boolean;
+  playing: boolean;
+  fileId: string;
+  title: string;
+  artist: string;
+  album: string;
+  positionMs: number;
+  durationMs: number;
+  volume: number;
+  queueLen: number;
+  queueIndex: number;
+  repeat: RemoteRepeat;
+  shuffle: boolean;
+  /** True while a phone has driven the host recently. */
+  remoteControl: boolean;
+  error: string;
+  updatedAt: number;
+};
+
+/** A read-only pairing code, minted by the computer, for another device. */
+export type ReadOnlyTicketOffer = {
+  uri: string;
+  /** Empty when the host drew no QR, or drew something unsafe to insert. */
+  qrSvg: string;
+  expiresAt: number;
+  desktopName: string;
+};
+
+export type CoverReport = { reportId: string; queued: boolean };
+
+/** The NIP-56 reasons a cover report may use. */
+export const reportReasons = [
+  { value: 'spam', label: 'Spam or advertising' },
+  { value: 'illegal', label: 'Illegal content' },
+  { value: 'malware', label: 'Malware or a scam' },
+  { value: 'impersonation', label: 'Wrong artist or album' },
+  { value: 'nudity', label: 'Nudity' },
+  { value: 'profanity', label: 'Profanity' },
+  { value: 'other', label: 'Something else' }
+] as const;
+export type ReportReason = (typeof reportReasons)[number]['value'];

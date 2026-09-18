@@ -2,6 +2,7 @@ use crate::transfer::{DownloadOffer, TransferService};
 use chrono::Utc;
 use futures_util::{stream, StreamExt};
 use keyring::Entry;
+use napstr_remote_protocol::{MAX_REPORT_NOTE_CHARS, REPORT_REASONS};
 use nostr_sdk::prelude::*;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -2985,6 +2986,87 @@ impl NetworkService {
             .await
             .map_err(|error| format!("NIP-56 report publication failed: {error}"))?;
         Ok(())
+    }
+
+    /// Publish a cover this host resolved itself, and file it locally so the
+    /// desktop shows it without waiting for a relay to echo it back.
+    ///
+    /// Returns the id of the signed claim. It has reached the relays before this
+    /// returns, so a failure here is a real failure rather than a slow queue.
+    pub async fn publish_cover(&self, fields: cover::CoverClaimFields) -> Result<String, String> {
+        let event = cover::cover_event(&fields, &load_or_create_identity()?)?;
+        let event_id = event.id.to_hex();
+        self.client
+            .read()
+            .await
+            .clone()
+            .ok_or("Nostr is not connected")?
+            .send_event(&event)
+            .await
+            .map_err(|error| format!("cover publication failed: {error}"))?;
+        let connection = super::open_connection(&self.db_path)?;
+        cover::store_cover_events(&connection, &[(fields.key, event)])?;
+        Ok(event_id)
+    }
+
+    /// NIP-56: report the winning cover published for one album key.
+    ///
+    /// A phone sends only the key and the user's own words. Deciding which event
+    /// to report, and who wrote it, is the host's job: the phone has no business
+    /// naming a pubkey it cannot verify.
+    ///
+    /// Returns the id of the signed report. It is written to the relays before
+    /// this returns, so nothing is queued behind it.
+    pub async fn report_cover(
+        &self,
+        key: String,
+        report_type: String,
+        note: String,
+    ) -> Result<String, String> {
+        let report_type = report_type.trim().to_ascii_lowercase();
+        if !REPORT_REASONS.contains(&report_type.as_str()) {
+            return Err("unsupported NIP-56 report type".into());
+        }
+        let note = note.trim().to_string();
+        if note.chars().count() > MAX_REPORT_NOTE_CHARS {
+            return Err(format!(
+                "a report note of at most {MAX_REPORT_NOTE_CHARS} characters is allowed"
+            ));
+        }
+        let key = cover::normalise_cover_key(&key).ok_or("invalid album cover key")?;
+        let cover = self
+            .album_covers(vec![key.clone()])
+            .await?
+            .into_iter()
+            .next()
+            .ok_or("no cover is published for this album yet")?;
+        let content = if note.is_empty() {
+            format!("Album cover for {key} reported as {report_type}")
+        } else {
+            note
+        };
+        let tags = vec![
+            Tag::parse(["e", cover.event_id.as_str(), report_type.as_str()]),
+            Tag::parse(["p", cover.author.as_str(), report_type.as_str()]),
+            Tag::parse(["client", "Napstr"]),
+        ]
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+        let event = EventBuilder::new(Kind::from(1984), content)
+            .tags(tags)
+            .sign_with_keys(&load_or_create_identity()?)
+            .map_err(|error| error.to_string())?;
+        let report_id = event.id.to_hex();
+        self.client
+            .read()
+            .await
+            .clone()
+            .ok_or("Nostr is not connected")?
+            .send_event(&event)
+            .await
+            .map_err(|error| format!("NIP-56 report publication failed: {error}"))?;
+        Ok(report_id)
     }
 
     async fn handle_signal(&self, sender: PublicKey, content: &str) -> Result<(), String> {

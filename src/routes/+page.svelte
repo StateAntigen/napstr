@@ -11,7 +11,7 @@
   const LOCAL_PAGE_SIZE = 100;
   const VISIBLE_SEEDER_LIMIT = 100;
 
-  type View = 'Search' | 'Downloads' | 'Shared' | 'Profile' | 'Settings' | 'Trollbox' | 'Mobile';
+  type View = 'Search' | 'Downloads' | 'Shared' | 'Profile' | 'Settings' | 'Trollbox' | 'Mobile' | 'Covers';
   type PlayerMode = 'single' | 'folder' | 'all';
   type PlayerOrigin = 'search' | 'downloads' | 'shared' | 'audiobook' | 'direct';
   type WindowResizeDirection = 'East' | 'North' | 'NorthEast' | 'NorthWest' | 'South' | 'SouthEast' | 'SouthWest' | 'West';
@@ -53,7 +53,8 @@
     { label: 'Profile', icon: '☺' },
     { label: 'Settings', icon: '⚙' },
     { label: 'Trollbox', icon: '▣' },
-    { label: 'Mobile', icon: '▯' }
+    { label: 'Mobile', icon: '▯' },
+    { label: 'Covers', icon: '▨' }
   ];
 
   type NativeFile = { fileId: string; filename: string; path: string; folder: string; size: number; format: string; status: string; title: string; artist: string; album: string; mime: string; license: string; description: string; tags: string };
@@ -896,10 +897,74 @@
     }
   }
 
+  // ---- Album covers (kind 30427) -------------------------------------------
+  //
+  // The scanner resolves art for albums in this folder and publishes a claim
+  // signed by the user's own identity. Both the lookup and the publish are
+  // opt-in, because a claim is signed with a key the user owns.
+  type CoverCandidate = { key: string; artist: string; album: string; trackCount: number };
+  type CoverScanStatus = {
+    running: boolean;
+    enabled: boolean;
+    published: number;
+    skipped: number;
+    failed: number;
+    remaining: number;
+    current: string;
+    message: string;
+  };
+  let coverCandidates = $state<CoverCandidate[]>([]);
+  let coverStatus = $state<CoverScanStatus | null>(null);
+  let coverLoading = $state(false);
+  let coverError = $state('');
+  let coverLimit = $state(20);
+
+  async function refreshCoverCandidates() {
+    coverLoading = true;
+    coverError = '';
+    try {
+      coverStatus = await invoke<CoverScanStatus>('cover_scan_status');
+      coverCandidates = await invoke<CoverCandidate[]>('cover_candidates', { limit: coverLimit });
+    } catch (error) {
+      coverError = String(error);
+    } finally {
+      coverLoading = false;
+    }
+  }
+
+  async function setCoverPublishing(enabled: boolean) {
+    coverError = '';
+    try {
+      coverStatus = await invoke<CoverScanStatus>('set_cover_publishing', { enabled });
+    } catch (error) {
+      coverError = String(error);
+    }
+  }
+
+  async function startCoverScan() {
+    coverError = '';
+    try {
+      coverStatus = await invoke<CoverScanStatus>('scan_covers', { limit: coverLimit });
+    } catch (error) {
+      coverError = String(error);
+    } finally {
+      await refreshCoverCandidates();
+    }
+  }
+
+  async function cancelCoverScan() {
+    try {
+      await invoke('cancel_cover_scan');
+    } catch (error) {
+      coverError = String(error);
+    }
+  }
+
   function activateView(view: View) {
     activeView = view;
     if (view === 'Trollbox') void refreshTrollbox();
     if (view === 'Mobile') void openMobileConnect();
+    if (view === 'Covers') void refreshCoverCandidates();
   }
 
   async function openMobileConnect() {
@@ -2049,6 +2114,12 @@
       if (destroyed) unlisten();
       else eventUnlisteners.push(unlisten);
     });
+    void listen<CoverScanStatus>('napstr-cover-scan', ({ payload }) => {
+      coverStatus = payload;
+    }).then((unlisten) => {
+      if (destroyed) unlisten();
+      else eventUnlisteners.push(unlisten);
+    });
     void listen<IndexBatch>('napstr-index-batch', ({ payload }) => {
       mergeIndexBatch(payload);
     }).then((unlisten) => {
@@ -2439,6 +2510,51 @@
           <div class="trollbox-compose">
             <input bind:value={trollboxDraft} maxlength="500" autocomplete="off" placeholder={networkConnected ? 'Type a public message…' : 'Connect to Nostr to chat'} disabled={!networkConnected || trollboxSending} aria-label="Trollbox message" onkeydown={(event) => { if (event.key === 'Enter') { event.preventDefault(); void sendTrollboxMessage(); } }} />
             <button class="classic-button primary" type="button" disabled={!networkConnected || trollboxSending || !trollboxDraft.trim()} onclick={() => void sendTrollboxMessage()}>{trollboxSending ? 'Sending…' : 'Send'}</button>
+          </div>
+        </section>
+      {:else if activeView === 'Covers'}
+        <section class="full-panel cover-scan-view">
+          <div class="panel-title"><span></span><b>Album covers</b><span></span></div>
+          <p class="privacy-note wide"><span>i</span> Napstr looks each album up on MusicBrainz and the Cover Art Archive, then signs a kind <code>30427</code> claim with your own Nostr key. Nothing is resolved or published until you switch it on, and an album another author has already covered is left alone.</p>
+
+          <div class="cover-scan-controls">
+            <label class="cover-scan-toggle">
+              <input type="checkbox" checked={coverStatus?.enabled ?? false} onchange={(event) => void setCoverPublishing(event.currentTarget.checked)} />
+              <span>Publish the covers I resolve<small>Signed by your identity and sent to your relays</small></span>
+            </label>
+            <label class="cover-scan-limit">Albums per run <input type="number" min="1" max="200" bind:value={coverLimit} /></label>
+            {#if coverStatus?.running}
+              <button class="classic-button" onclick={() => void cancelCoverScan()}>Stop</button>
+            {:else}
+              <button class="classic-button primary" onclick={() => void startCoverScan()} disabled={!coverStatus?.enabled || coverLoading}>Resolve covers</button>
+            {/if}
+            <button class="classic-button" onclick={() => void refreshCoverCandidates()} disabled={coverLoading}>Refresh list</button>
+          </div>
+
+          {#if coverError}<div class="trollbox-error">{coverError}</div>{/if}
+
+          {#if coverStatus}
+            <div class="cover-scan-status">
+              <span><b>{coverCandidates.length}</b> albums without a cover</span>
+              <span><b>{coverStatus.published}</b> published</span>
+              <span><b>{coverStatus.skipped}</b> with no art anywhere</span>
+              <span><b>{coverStatus.failed}</b> failed</span>
+            </div>
+            {#if coverStatus.current}<p class="cover-scan-current">Looking up {coverStatus.current}</p>{/if}
+            {#if coverStatus.message}<p class="cover-scan-message">{coverStatus.message}</p>{/if}
+          {/if}
+
+          <div class="cover-candidate-list">
+            {#each coverCandidates as candidate (candidate.key)}
+              <div class="cover-candidate">
+                <div><b>{candidate.album}</b><small>{candidate.artist}</small></div>
+                <span>{candidate.trackCount} {candidate.trackCount === 1 ? 'track' : 'tracks'}</span>
+                <code title={candidate.key}>{candidate.key}</code>
+              </div>
+            {/each}
+            {#if !coverLoading && coverCandidates.length === 0}
+              <p class="empty-state compact">Every album in your folder already has a cover.</p>
+            {/if}
           </div>
         </section>
       {:else if activeView === 'Mobile'}

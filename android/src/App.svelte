@@ -9,9 +9,11 @@
     scan
   } from '@tauri-apps/plugin-barcode-scanner';
   import TrackArtwork from './lib/TrackArtwork.svelte';
+  import TrackBadge from './lib/TrackBadge.svelte';
   import CoverDebug from './lib/CoverDebug.svelte';
   import { artworkHue, coverFor, coverKey, type AlbumCover } from './lib/artwork';
-  import type { AudiobookLibraryPage, CachedAudio, CompanionStatus, LibraryPage, PodcastDownload, PodcastEpisode, PodcastFeed, RemoteAudiobook, RemoteAudiobookSummary, RemoteTrack, RemoteTransfer } from './lib/types';
+  import { reportReasons } from './lib/types';
+  import type { AudiobookLibraryPage, CachedAudio, CompanionStatus, CoverReport, LibraryPage, PlaybackCommand, PodcastDownload, PodcastEpisode, PodcastFeed, ReadOnlyTicketOffer, RemoteAudiobook, RemoteAudiobookSummary, RemotePlaybackState, RemoteRepeat, RemoteTrack, RemoteTransfer, ReportReason } from './lib/types';
 
   const musicChips = ['Rock', 'Soundtrack', 'Punk', 'Folk', 'Upbeat'];
   const musicHistoryKey = 'napstrfy-played-albums';
@@ -42,7 +44,7 @@
   const podcastGenres = ['Comedy', 'News', 'True Crime', 'Society & Culture', 'Technology', 'History', 'Business', 'Science', 'Arts', 'Sports', 'Education', 'Music'];
   const likedMusicKey = 'napstrfy-liked-music';
   const likedPodcastsKey = 'napstrfy-liked-podcasts';
-  type AppTab = 'music' | 'podcasts' | 'audiobooks';
+  type AppTab = 'music' | 'search' | 'podcasts' | 'audiobooks';
   /** Repeating is a choice of three, and shuffling is independent of it. */
   type LoopMode = 'off' | 'all' | 'one';
   const LOOP_MODES: LoopMode[] = ['off', 'all', 'one'];
@@ -52,6 +54,26 @@
     one: 'Repeat this track'
   };
   const playModeKey = 'napstrfy-play-mode';
+  type SleepOption = { value: string; label: string; minutes?: number; endsTrack?: boolean };
+  const SLEEP_OPTIONS: SleepOption[] = [
+    { value: '5', label: '5 minutes', minutes: 5 },
+    { value: '10', label: '10 minutes', minutes: 10 },
+    { value: '15', label: '15 minutes', minutes: 15 },
+    { value: '30', label: '30 minutes', minutes: 30 },
+    { value: '45', label: '45 minutes', minutes: 45 },
+    { value: '60', label: '1 hour', minutes: 60 },
+    { value: 'track', label: 'End of track', endsTrack: true }
+  ];
+  /** Everything the album view needs once its tracks have been gathered. */
+  type AlbumView = {
+    key: string;
+    artist: string;
+    album: string;
+    year: string;
+    art: string;
+    tracks: RemoteTrack[];
+    more: AlbumShelf[];
+  };
   let activeTab = $state<AppTab>('music');
   let status = $state<CompanionStatus>({ streamOnly: false, paired: false, connected: false, desktopName: '', endpointId: '', libraryRevision: 0, error: '' });
   let statusLoading = $state(true);
@@ -129,6 +151,45 @@
   let sheetClosing = $state(false);
   /** The playlist lives in its own view so the drawer never scrolls. */
   let showQueue = $state(false);
+  /** The track menu, opened from the drawer or from any album track. */
+  let showActions = $state(false);
+  let showSleepOptions = $state(false);
+  let actionTrack = $state<RemoteTrack | null>(null);
+  let sleepValue = $state('');
+  let sleepEndsAt = $state(0);
+  let sleepClock = $state('');
+  /** Album preview, split into distinct sections. */
+  let showAlbumView = $state(false);
+  let albumView = $state<AlbumView | null>(null);
+  /** File ids held in this phone's audio cache, for the storage badge. */
+  let cachedFileIds = $state<Set<string>>(new Set());
+  let showSettings = $state(false);
+  /** The computer's own player, when this phone is allowed to drive it. */
+  let showRemote = $state(false);
+  let remoteState = $state<RemotePlaybackState | null>(null);
+  let remoteBusy = $state(false);
+  let remoteError = $state('');
+  /** A read-only code the computer minted for somebody else to scan. */
+  let readOnlyTicket = $state<ReadOnlyTicketOffer | null>(null);
+  let ticketBusy = $state(false);
+  let ticketError = $state('');
+  /** NIP-56: reporting the cover on an album, opened from the track menu. */
+  let showReport = $state(false);
+  let reportKey = $state('');
+  let reportLabel = $state('');
+  let reportReason = $state<ReportReason>('spam');
+  let reportNote = $state('');
+  let reportBusy = $state(false);
+  let reportError = $state('');
+  /** The album view's scroller, so opening another album can jump to the top. */
+  let albumScroll = $state<HTMLDivElement | undefined>(undefined);
+
+  $effect(() => {
+    // A different album means a fresh page, not the last one's scroll position.
+    const key = albumView?.key;
+    const element = albumScroll;
+    if (key && element) element.scrollTop = 0;
+  });
   let sheetElement = $state<HTMLDivElement | undefined>(undefined);
   let sheetScroller = $state<HTMLDivElement | undefined>(undefined);
   let sheetCloseTimer = 0;
@@ -151,6 +212,8 @@
   let barFade = $derived(barDragging ? Math.max(0, 1 - barDragTravelled / barOpenTravel) : 1);
   /** The played portion of the card, starting where the artwork ends. */
   let barProgress = $derived(duration > 0 ? Math.min(1, Math.max(0, currentTime / duration)) : 0);
+  /** Whichever track the open menu applies to: the chosen one, else the current. */
+  let menuTrack = $derived(actionTrack ?? (activeMedia === 'music' ? current : null));
   let nowTitle = $derived(
     activeMedia === 'podcast' && currentPodcast
       ? currentPodcast.title
@@ -214,6 +277,26 @@
 
   /** The hardware back button arrives as an event, not a callback. */
   function handleSystemBack() {
+    if (showReport) {
+      showReport = false;
+      return;
+    }
+    if (showRemote) {
+      showRemote = false;
+      return;
+    }
+    if (showSettings) {
+      showSettings = false;
+      return;
+    }
+    if (showActions) {
+      closeActions();
+      return;
+    }
+    if (showAlbumView) {
+      closeAlbumView();
+      return;
+    }
     if (showQueue) {
       showQueue = false;
       return;
@@ -298,6 +381,7 @@
 
   function showLikedTracks() {
     musicViewVersion += 1;
+    activeTab = 'music';
     showingLikedMusic = !showingLikedMusic;
     if (!showingLikedMusic) {
       void searchTracks(query);
@@ -398,9 +482,22 @@
       }
       tracks = offline.tracks;
       total = offline.total;
+      // These are exactly the files this phone holds, which is the first of
+      // the three storage states the badges describe.
+      cachedFileIds = new Set(offline.tracks.map((track) => track.fileId));
       if (!selected || !tracks.some((track) => track.fileId === selected?.fileId)) selected = tracks[0] ?? null;
     } catch {
       // A damaged cache must never prevent pairing or normal online use.
+    }
+  }
+
+  /** Re-reads the phone's audio cache after a download lands. */
+  async function refreshCachedIds() {
+    try {
+      const offline = await invoke<LibraryPage>('cached_library');
+      cachedFileIds = new Set(offline.tracks.map((track) => track.fileId));
+    } catch {
+      // Offline or a damaged cache: the badge falls back to host and network.
     }
   }
 
@@ -784,6 +881,7 @@
         nextAudiobooks.delete(pendingFileId);
         pendingAudiobooks = nextAudiobooks;
         notice = `${title(local)} is ready to play`;
+        void refreshCachedIds();
       }
     } catch { /* the next foreground poll retries */ }
   }
@@ -811,7 +909,9 @@
       position: Number.isFinite(currentTime) ? currentTime : 0,
       duration: Number.isFinite(duration) ? duration : 0,
       canPrevious: activeMedia === 'music' && playerQueue.length > 1 && (!shuffle || randomHistoryIndex > 0),
-      canNext: activeMedia === 'music' && playerQueue.length > 1
+      canNext: activeMedia === 'music' && playerQueue.length > 1,
+      liked: activeMedia === 'music' && !!current && isTrackLiked(current),
+      looping: activeMedia === 'music' && loopMode !== 'off'
     }));
   }
 
@@ -826,6 +926,16 @@
       void moveTrack(-1);
     } else if (action === 'next') {
       void moveTrack(1);
+    } else if (action === 'like') {
+      if (current && activeMedia === 'music') toggleTrackLike(current);
+    } else if (action === 'repeat') {
+      // The notification toggles repeat; the drawer owns the three-way choice.
+      if (activeMedia === 'music') {
+        loopMode = loopMode === 'off' ? 'all' : 'off';
+        resetRandomOrder();
+        savePlaySettings();
+        syncSystemMedia(true);
+      }
     } else if (action.startsWith('seek:')) {
       const milliseconds = Number(action.slice(5));
       if (Number.isFinite(milliseconds)) seek(milliseconds / 1000);
@@ -906,9 +1016,17 @@
     return () => { document.body.style.overflow = ''; };
   });
 
-  // The drawer, and the playlist above it, own the hardware back button.
+  // The drawer, and every view above it, own the hardware back button.
   $effect(() => {
-    androidBackBridge()?.setDrawerOpen(showQueue || (showNowPlaying && !sheetClosing));
+    androidBackBridge()?.setDrawerOpen(
+      showSettings ||
+        showRemote ||
+        showReport ||
+        showActions ||
+        showAlbumView ||
+        showQueue ||
+        (showNowPlaying && !sheetClosing)
+    );
   });
 
   function nowPlayingAvailable() {
@@ -1101,6 +1219,320 @@
     return [...groups.values()].sort((left, right) => right.count - left.count);
   }
 
+  /** Other albums by the same artist, for the "More by" carousel. */
+  async function albumsByArtist(album: AlbumShelf): Promise<AlbumShelf[]> {
+    const name = album.artist.trim();
+    if (!name) return [];
+    const wanted = name.toLocaleLowerCase();
+    const known = libraryAlbums.filter(
+      (entry) => entry.key !== album.key && entry.artist.trim().toLocaleLowerCase() === wanted
+    );
+    try {
+      const page = await invoke<LibraryPage>('remote_library', {
+        query: name, offset: 0, limit: MAX_ALBUM_TRACKS
+      });
+      const sameArtist = page.tracks.filter(
+        (track) => (track.artist ?? '').trim().toLocaleLowerCase() === wanted
+      );
+      const found = albumsFromTracks(sameArtist).filter((entry) => entry.key !== album.key);
+      for (const entry of known) {
+        if (!found.some((other) => other.key === entry.key)) found.push(entry);
+      }
+      return found.slice(0, 12);
+    } catch {
+      // Offline: whatever the loaded page already holds.
+      return known.slice(0, 12);
+    }
+  }
+
+  /**
+   * Opening an album previews it: the tracks, the year the cover NIP carries,
+   * and what else the artist has here. Playback starts from the view.
+   */
+  async function openAlbum(album: AlbumShelf, prepared?: RemoteTrack[]) {
+    // The album page is a full screen of its own. Leaving the drawer open would
+    // stack two full-height views, and the album is what the tap asked for.
+    if (showNowPlaying) closeNowPlaying();
+    closeActions();
+    showAlbumView = true;
+    albumView = {
+      key: album.key,
+      artist: album.artist,
+      album: album.album,
+      year: '',
+      art: '',
+      tracks: prepared ?? album.tracks,
+      more: []
+    };
+    const [tracks, cover, more] = await Promise.all([
+      prepared ? Promise.resolve(prepared) : albumPlaylist(album),
+      coverFor(album.representative).catch(() => null),
+      albumsByArtist(album)
+    ]);
+    // A later open wins, so a slow response cannot overwrite a newer album.
+    if (albumView?.key !== album.key) return;
+    albumView = {
+      key: album.key,
+      artist: album.artist,
+      album: album.album,
+      year: cover?.year ?? '',
+      art: cover ? cover.art || cover.thumb : '',
+      tracks,
+      more
+    };
+  }
+
+  function closeAlbumView() {
+    showAlbumView = false;
+    albumView = null;
+  }
+
+  /** Opens the same album preview from a track, wherever the menu was opened. */
+  async function goToAlbum(track: RemoteTrack) {
+    closeActions();
+    const owner = albumsFromTracks([track])[0];
+    if (!owner) return;
+    const full = await albumPlaylist(owner);
+    await openAlbum({ ...owner, tracks: full.length > 0 ? full : owner.tracks }, full);
+  }
+
+  function goToArtist(name: string) {
+    closeActions();
+    closeAlbumView();
+    if (showNowPlaying) closeNowPlaying();
+    activeTab = 'music';
+    void searchTracks(name.trim());
+  }
+
+  async function playAlbumNow() {
+    const view = albumView;
+    if (!view) return;
+    const playable = view.tracks.filter((track) => track.local);
+    if (playable.length === 0) {
+      await activateTrack(view.tracks[0]);
+      return;
+    }
+    playerQueue = playable;
+    playerQueueLibraryVisible = true;
+    playerIndex = 0;
+    selected = playable[0];
+    resetRandomOrder();
+    await playTrack(playable[0]);
+  }
+
+  async function playAlbumTrack(index: number) {
+    const view = albumView;
+    const track = view?.tracks[index];
+    if (!view || !track) return;
+    if (!track.local) {
+      await requestDownload(track);
+      return;
+    }
+    const playable = view.tracks.filter((item) => item.local);
+    playerQueue = playable;
+    playerQueueLibraryVisible = true;
+    playerIndex = playable.findIndex((item) => item.fileId === track.fileId);
+    selected = track;
+    resetRandomOrder();
+    await playTrack(track);
+  }
+
+  /** Whether this phone has anything to say to the computer's player. */
+  function remoteAvailable() {
+    return status.paired && status.connected;
+  }
+
+  async function refreshRemote() {
+    if (!remoteAvailable()) return;
+    try {
+      remoteState = await invoke<RemotePlaybackState>('remote_playback_state');
+      remoteError = '';
+    } catch (nextError) {
+      remoteError = String(nextError);
+    }
+  }
+
+  function openRemote() {
+    showRemote = true;
+    void refreshRemote();
+  }
+
+  /** Every transport button lands here, so the view never has to guess. */
+  async function sendPlayback(command: PlaybackCommand) {
+    if (remoteBusy) return;
+    remoteBusy = true;
+    try {
+      remoteState = await invoke<RemotePlaybackState>('remote_playback', { command });
+      remoteError = '';
+    } catch (nextError) {
+      remoteError = String(nextError);
+    } finally {
+      remoteBusy = false;
+    }
+  }
+
+  /**
+   * Volume follows a drag, so it cannot be gated on one command being in
+   * flight; the last answer to arrive is the one shown.
+   */
+  async function sendVolume(percent: number) {
+    if (!remoteAvailable()) return;
+    try {
+      remoteState = await invoke<RemotePlaybackState>('remote_playback', {
+        command: { type: 'volume', percent: Math.round(percent) } satisfies PlaybackCommand
+      });
+      remoteError = '';
+    } catch (nextError) {
+      remoteError = String(nextError);
+    }
+  }
+
+  function remotePosition() {
+    if (!remoteState || remoteState.durationMs <= 0) return 0;
+    return Math.min(1, Math.max(0, remoteState.positionMs / remoteState.durationMs));
+  }
+
+  function remoteClock(milliseconds: number) {
+    return clock(Math.max(0, milliseconds) / 1000);
+  }
+
+  /** Ask the computer for a code this phone can hand to another device. */
+  async function requestReadOnlyCode() {
+    if (ticketBusy) return;
+    ticketBusy = true;
+    ticketError = '';
+    try {
+      readOnlyTicket = await invoke<ReadOnlyTicketOffer>('remote_read_only_ticket');
+      if (!readOnlyTicket.qrSvg) {
+        notice = 'Your computer drew no QR for this code. Copy it instead.';
+      }
+    } catch (nextError) {
+      readOnlyTicket = null;
+      ticketError = String(nextError);
+    } finally {
+      ticketBusy = false;
+    }
+  }
+
+  async function copyReadOnlyCode() {
+    const uri = readOnlyTicket?.uri;
+    if (!uri) return;
+    try {
+      await navigator.clipboard.writeText(uri);
+      notice = 'Read-only code copied';
+    } catch {
+      // A refused clipboard still leaves the code on screen to copy by hand.
+      notice = uri;
+    }
+  }
+
+  function ticketMinutesLeft() {
+    if (!readOnlyTicket) return 0;
+    return Math.max(0, Math.round((readOnlyTicket.expiresAt * 1000 - Date.now()) / 60_000));
+  }
+
+  /**
+   * A cover is reported by album key, never by event id: the computer decides
+   * which claim to report, and the phone cannot name a pubkey it cannot verify.
+   */
+  function openCoverReport(track: RemoteTrack) {
+    const key = coverKey(track.artist ?? '', track.album ?? '');
+    if (!key) {
+      error = 'This track names no artist and album to report.';
+      return;
+    }
+    reportKey = key;
+    reportLabel = `${track.album || 'Untitled'} · ${track.artist || 'Unknown artist'}`;
+    reportReason = 'spam';
+    reportNote = '';
+    reportError = '';
+    showReport = true;
+  }
+
+  async function submitCoverReport() {
+    if (reportBusy || !reportKey) return;
+    reportBusy = true;
+    reportError = '';
+    try {
+      const report = await invoke<CoverReport>('remote_report_cover', {
+        key: reportKey,
+        reason: reportReason,
+        note: reportNote.trim()
+      });
+      notice = report.reportId
+        ? `Report published as ${report.reportId.slice(0, 12)}…`
+        : 'Report sent to Napstr';
+      showReport = false;
+      closeActions();
+    } catch (nextError) {
+      reportError = String(nextError);
+    } finally {
+      reportBusy = false;
+    }
+  }
+
+  function nextRemoteRepeat(mode: RemoteRepeat): RemoteRepeat {
+    return mode === 'off' ? 'all' : mode === 'all' ? 'one' : 'off';
+  }
+
+  function remoteRepeatLabel(mode: RemoteRepeat) {
+    return mode === 'off' ? 'Off' : mode === 'all' ? 'All' : 'One track';
+  }
+
+  function openActions(track: RemoteTrack | null) {
+    actionTrack = track;
+    showSleepOptions = false;
+    showActions = true;
+  }
+
+  function closeActions() {
+    showActions = false;
+    showSleepOptions = false;
+    actionTrack = null;
+  }
+
+  /** The track URI other Napstr clients understand. */
+  function trackUri(track: RemoteTrack) {
+    return `napstr://track/${track.fileId}`;
+  }
+
+  async function shareTrack(track: RemoteTrack) {
+    const uri = trackUri(track);
+    try {
+      await navigator.clipboard.writeText(uri);
+      notice = `Copied ${uri}`;
+    } catch {
+      // A refused clipboard still leaves the link on screen to copy by hand.
+      notice = uri;
+    }
+    closeActions();
+  }
+
+  function sleepSummary() {
+    if (!sleepValue) return 'Off';
+    if (sleepValue === 'track') return 'After this track';
+    return sleepClock ? `${sleepClock} left` : 'Running';
+  }
+
+  /** Choosing the running option again turns the timer off. */
+  function chooseSleep(option: SleepOption) {
+    if (sleepValue === option.value) {
+      sleepValue = '';
+      sleepEndsAt = 0;
+      sleepClock = '';
+      return;
+    }
+    sleepValue = option.value;
+    if (option.endsTrack) {
+      sleepEndsAt = 0;
+      sleepClock = '';
+      return;
+    }
+    const total = (option.minutes ?? 0) * 60;
+    sleepEndsAt = Date.now() + total * 1000;
+    sleepClock = `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`;
+  }
+
   function shuffled<T>(items: T[]): T[] {
     const copy = [...items];
     for (let index = copy.length - 1; index > 0; index -= 1) {
@@ -1164,23 +1596,6 @@
     }
   }
 
-  async function playAlbum(album: AlbumShelf) {
-    const playlist = await albumPlaylist(album);
-    const playable = playlist.filter((track) => track.local);
-    if (playable.length === 0) {
-      // Nothing from this album is on the host yet; reuse the track flow, which
-      // asks for it rather than doing nothing.
-      await activateTrack(playlist[0] ?? album.representative);
-      return;
-    }
-    playerQueue = playable;
-    playerQueueLibraryVisible = true;
-    playerIndex = 0;
-    selected = playable[0];
-    resetRandomOrder();
-    await playTrack(playable[0]);
-  }
-
   /** `MP3 · 320 kb/s`. The rate is the file's own average, not a claim. */
   function fileSummary(track: RemoteTrack): string {
     const parts: string[] = [];
@@ -1226,6 +1641,12 @@
   function handleTrackEnded() {
     playing = false;
     syncSystemMedia(true);
+    // A sleep timer set to end of track stops here rather than advancing, for
+    // podcasts as much as for music.
+    if (sleepValue === 'track') {
+      sleepValue = '';
+      return;
+    }
     if (activeMedia !== 'music') return;
     if (loopMode === 'one') {
       audio.currentTime = 0;
@@ -1243,7 +1664,22 @@
   }
 
   function selectChip(chip: string) {
+    activeTab = 'search';
     void searchTracks(query.toLocaleLowerCase() === chip.toLocaleLowerCase() ? '' : chip);
+  }
+
+  /** Switching to the library tab drops any search that was in flight. */
+  function showMusic() {
+    activeTab = 'music';
+    if (query.trim()) {
+      void searchTracks('');
+      return;
+    }
+    if (!showingLikedMusic) void loadLibrary();
+  }
+
+  function showSearch() {
+    activeTab = 'search';
   }
 
   function normalizeGenre(value: string) {
@@ -1550,6 +1986,20 @@
     const podcastTimer = window.setInterval(() => {
       if (!document.hidden && hasActivePodcastDownload()) void refreshPodcastDownloads();
     }, 2500);
+    const sleepTimer = window.setInterval(() => {
+      if (!sleepEndsAt) return;
+      const remaining = sleepEndsAt - Date.now();
+      if (remaining <= 0) {
+        sleepValue = '';
+        sleepEndsAt = 0;
+        sleepClock = '';
+        audio?.pause();
+        notice = 'Sleep timer finished';
+        return;
+      }
+      const seconds = Math.ceil(remaining / 1000);
+      sleepClock = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+    }, 1000);
     const foreground = () => {
       if (document.hidden) return;
       void refreshStatus();
@@ -1563,6 +2013,7 @@
       window.clearInterval(statusTimer);
       window.clearInterval(transferTimer);
       window.clearInterval(podcastTimer);
+      window.clearInterval(sleepTimer);
       document.removeEventListener('visibilitychange', foreground);
       window.removeEventListener('napstrfy-media-action', handleSystemMediaAction);
       window.removeEventListener('napstrfy-back', handleSystemBack);
@@ -1573,6 +2024,29 @@
 </script>
 
 <svelte:head><title>Napstrfy</title></svelte:head>
+
+{#snippet trackList(emptyTitle: string, emptyHint: string, showLoadMore: boolean)}
+  <section class="track-list" aria-busy={loading}>
+    {#if !loading && tracks.length === 0}
+      <div class="empty-library"><img src="/napstr-logo-small.png" alt="" /><h2>{emptyTitle}</h2><p>{emptyHint}</p></div>
+    {/if}
+    {#each tracks as track (track.fileId)}
+      <div class:selected={selected?.fileId === track.fileId} class:remote={!track.local} class="track-row">
+        <button class="track-open" disabled={status.streamOnly && !track.local} onclick={() => activateTrack(track)}>
+          <TrackArtwork {track} lookup />
+          <span class="track-copy">
+            <strong>{title(track)}</strong>
+            <small>{artist(track)}{track.album ? ` · ${track.album}` : ''}</small>
+            <span class="track-meta">{readableSize(track.size)}</span>
+          </span>
+          <TrackBadge {track} cached={cachedFileIds.has(track.fileId)} pending={pending.has(track.fileId)} />
+        </button>
+        <button class:liked={isTrackLiked(track)} class="like-button" onclick={() => toggleTrackLike(track)} aria-label={`${isTrackLiked(track) ? 'Unlike' : 'Like'} ${title(track)}`}>{isTrackLiked(track) ? '♥' : '♡'}</button>
+      </div>
+    {/each}
+    {#if showLoadMore && tracks.length < total}<button class="load-more" onclick={() => loadLibrary(true)} disabled={loadingMore}>{loadingMore ? 'Loading…' : `Load more · ${tracks.length} of ${total}`}</button>{/if}
+  </section>
+{/snippet}
 
 {#if !status.paired && activeTab !== 'podcasts'}
   <main class="pair-screen">
@@ -1599,69 +2073,33 @@
 {:else}
   <main class="app-shell">
     <header class="mobile-header">
-      <div class="brand"><img src="/napstr-logo-small.png" alt="" /><b>napstrfy</b></div>
       {#if status.paired}
-        <button class="desktop-status" class:offline={!status.connected} onclick={reconnect}><i></i><span>{statusPending ? 'Connecting…' : status.connected ? status.desktopName || 'Napstr connected' : 'Reconnect'}{status.streamOnly ? ' · Read only' : ''}</span></button>
+        <button class="status-chip" class:offline={!status.connected} onclick={reconnect} title={status.connected ? `Connected to ${status.desktopName || 'Napstr'}` : 'Reconnect to Napstr'}>
+          <i></i><span>{statusPending ? 'Connecting…' : status.connected ? status.desktopName || 'Napstr' : 'Offline'}{status.streamOnly ? ' · Read only' : ''}</span>
+        </button>
       {:else}
-        <button class="desktop-status offline" onclick={() => (activeTab = 'music')}><i></i><span>Pair Napstr for music</span></button>
+        <button class="status-chip offline" onclick={showMusic}><i></i><span>Pair Napstr</span></button>
       {/if}
+      <button class="header-icon" onclick={() => (showSettings = true)} aria-label="Settings">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M3.4 7.6h9.4" /><path d="M17.6 7.6h3" /><circle cx="15.2" cy="7.6" r="2.4" />
+          <path d="M3.4 16.4h4.2" /><path d="M12.4 16.4h8.2" /><circle cx="10" cy="16.4" r="2.4" />
+        </svg>
+      </button>
     </header>
 
     {#if error}<button class="error-banner" onclick={() => (error = '')}>{error}<span>×</span></button>{/if}
     {#if notice}<button class="notice-banner" onclick={() => (notice = '')}>{notice}<span>×</span></button>{/if}
 
-    {#if activeTab === 'music'}
+    {#if activeTab === 'search'}
       <section class="search-area">
         <form onsubmit={(event) => { event.preventDefault(); event.currentTarget.querySelector('input')?.blur(); void searchTracks(); }}>
           <span>⌕</span><input bind:value={query} placeholder={status.streamOnly ? "Search Napstr’s music" : "Search your music and Nostr"} aria-label="Search tracks" />
+          {#if loading}<i class="search-spinner" role="status" aria-label="Searching"></i>{/if}
           {#if query}<button type="button" class="clear-search" onclick={() => searchTracks('')}>×</button>{/if}
         </form>
         <div class="chips"><button class:active={showingLikedMusic} onclick={showLikedTracks}>♥ Liked</button>{#each musicChips as chip}<button class:active={!showingLikedMusic && query.toLocaleLowerCase() === chip.toLocaleLowerCase()} onclick={() => selectChip(chip)}>{chip}</button>{/each}</div>
       </section>
-
-      <section class="library-heading">
-        <div><p>{showingLikedMusic ? 'FAVOURITES' : query ? 'SEARCH RESULTS' : 'YOUR NAPSTR'}</p><h1>{showingLikedMusic ? 'Liked music' : query ? query : 'Your music'}</h1></div>
-        <span>{total} {total === 1 ? 'track' : 'tracks'}</span>
-      </section>
-
-      {#if !query && !showingLikedMusic && (discoverAlbums.length > 0 || lastPlayed.length > 0)}
-        <section class="album-shelves">
-          {#if lastPlayed.length > 0}
-            <div class="album-shelf-block">
-              <div class="section-label"><b>Last played</b><span>Recent albums</span></div>
-              <div class="album-shelf">
-                {#each lastPlayed as album (album.key)}
-                  <div class="album-card">
-                    <button class="album-open" onclick={() => playAlbum(album)} aria-label={`Play ${album.album} by ${album.artist || 'an unknown artist'}`}>
-                      <TrackArtwork track={album.representative} lookup />
-                      <span class="album-play" aria-hidden="true">▶</span>
-                    </button>
-                    <strong>{album.album}</strong>
-                    <small>{album.artist || 'Unknown artist'}</small>
-                  </div>
-                {/each}
-              </div>
-            </div>
-          {/if}
-          {#if discoverAlbums.length > 0}
-            <div class="album-shelf-block">
-              <div class="section-label"><b>Discover albums</b><span>{libraryAlbums.length} in this library</span></div>
-              <div class="album-shelf">
-                {#each discoverAlbums as album (album.key)}
-                  <div class="album-card">
-                    <button class="album-open" onclick={() => playAlbum(album)} aria-label={`Play ${album.album} by ${album.artist || 'an unknown artist'}`}>
-                      <TrackArtwork track={album.representative} lookup />
-                      <span class="album-play" aria-hidden="true">▶</span>
-                    </button>
-                    <strong>{album.album}</strong>
-                    <small>{album.artist || 'Unknown artist'}</small>
-                  </div>
-                {/each}
-              </div>
-            </div>
-          {/if}
-        </section>
-      {/if}
 
       {#if searching && (resultArtists.length > 0 || libraryAlbums.length > 0)}
         <section class="album-shelves">
@@ -1688,7 +2126,7 @@
               <div class="album-shelf">
                 {#each libraryAlbums as album (album.key)}
                   <div class="album-card">
-                    <button class="album-open" onclick={() => playAlbum(album)} aria-label={`Play ${album.album} by ${album.artist || 'an unknown artist'}`}>
+                    <button class="album-open" onclick={() => void openAlbum(album)} aria-label={`Open ${album.album} by ${album.artist || 'an unknown artist'}`}>
                       <TrackArtwork track={album.representative} lookup />
                       <span class="album-play" aria-hidden="true">▶</span>
                     </button>
@@ -1701,27 +2139,65 @@
           {/if}
         </section>
         <div class="section-label tracks-label"><b>Tracks</b><span>{tracks.length} {tracks.length === 1 ? 'result' : 'results'}</span></div>
+      {:else if !query.trim()}
+        <section class="library-heading"><div><p>SEARCH</p><h1>Find something</h1></div><span>Your library and the network</span></section>
       {/if}
 
-      <section class="track-list" aria-busy={loading}>
-        {#if loading}<div class="loading-list"><i></i><span>Asking Napstr…</span></div>{/if}
-        {#if !loading && tracks.length === 0}<div class="empty-library"><img src="/napstr-logo-small.png" alt="" /><h2>{showingLikedMusic ? 'No liked tracks yet' : 'No tracks found'}</h2><p>{showingLikedMusic ? 'Tap the heart beside a song to keep it here.' : query ? 'Try different words or clear the search.' : 'Add music to your Napstr folder on the computer.'}</p></div>{/if}
-        {#each tracks as track (track.fileId)}
-          <div class:selected={selected?.fileId === track.fileId} class:remote={!track.local} class="track-row">
-            <button class="track-open" disabled={status.streamOnly && !track.local} onclick={() => activateTrack(track)}>
-              <TrackArtwork {track} lookup />
-              <span class="track-copy">
-                <strong>{title(track)}</strong>
-                <small>{artist(track)}{track.album ? ` · ${track.album}` : ''}</small>
-                <span class="track-meta">{readableSize(track.size)}{#if !track.local} · {track.sources.length} {track.sources.length === 1 ? 'seeder' : 'seeders'}{/if}</span>
-              </span>
-              <span class="track-action">{pending.has(track.fileId) ? '···' : track.local ? '⋮' : status.streamOnly ? 'Unavailable' : '⇩'}</span>
-            </button>
-            <button class:liked={isTrackLiked(track)} class="like-button" onclick={() => toggleTrackLike(track)} aria-label={`${isTrackLiked(track) ? 'Unlike' : 'Like'} ${title(track)}`}>{isTrackLiked(track) ? '♥' : '♡'}</button>
-          </div>
-        {/each}
-        {#if !showingLikedMusic && tracks.length < total}<button class="load-more" onclick={() => loadLibrary(true)} disabled={loadingMore}>{loadingMore ? 'Loading…' : `Load more · ${tracks.length} of ${total}`}</button>{/if}
+      {@render trackList(
+        'No tracks found',
+        query.trim() ? 'Try different words or clear the search.' : 'Search your Napstr library and the network.',
+        !showingLikedMusic && Boolean(query.trim())
+      )}
+    {:else if activeTab === 'music'}
+      <section class="library-heading">
+        <div><p>{showingLikedMusic ? 'FAVOURITES' : 'YOUR NAPSTR'}</p><h1>{showingLikedMusic ? 'Liked music' : 'Your music'}</h1></div>
+        <span>{total} {total === 1 ? 'track' : 'tracks'}</span>
       </section>
+
+      {#if !showingLikedMusic && (discoverAlbums.length > 0 || lastPlayed.length > 0)}
+        <section class="album-shelves">
+          {#if lastPlayed.length > 0}
+            <div class="album-shelf-block">
+              <div class="section-label"><b>Last played</b><span>Recent albums</span></div>
+              <div class="album-shelf">
+                {#each lastPlayed as album (album.key)}
+                  <div class="album-card">
+                    <button class="album-open" onclick={() => void openAlbum(album)} aria-label={`Open ${album.album} by ${album.artist || 'an unknown artist'}`}>
+                      <TrackArtwork track={album.representative} lookup />
+                      <span class="album-play" aria-hidden="true">▶</span>
+                    </button>
+                    <strong>{album.album}</strong>
+                    <small>{album.artist || 'Unknown artist'}</small>
+                  </div>
+                {/each}
+              </div>
+            </div>
+          {/if}
+          {#if discoverAlbums.length > 0}
+            <div class="album-shelf-block">
+              <div class="section-label"><b>Discover albums</b><span>{libraryAlbums.length} in this library</span></div>
+              <div class="album-shelf">
+                {#each discoverAlbums as album (album.key)}
+                  <div class="album-card">
+                    <button class="album-open" onclick={() => void openAlbum(album)} aria-label={`Open ${album.album} by ${album.artist || 'an unknown artist'}`}>
+                      <TrackArtwork track={album.representative} lookup />
+                      <span class="album-play" aria-hidden="true">▶</span>
+                    </button>
+                    <strong>{album.album}</strong>
+                    <small>{album.artist || 'Unknown artist'}</small>
+                  </div>
+                {/each}
+              </div>
+            </div>
+          {/if}
+        </section>
+      {/if}
+
+      {@render trackList(
+        showingLikedMusic ? 'No liked tracks yet' : 'No tracks found',
+        showingLikedMusic ? 'Tap the heart beside a song to keep it here.' : 'Add music to your Napstr folder on the computer.',
+        !showingLikedMusic
+      )}
     {:else if activeTab === 'podcasts'}
       <section class="search-area podcast-search">
         <form onsubmit={(event) => { event.preventDefault(); event.currentTarget.querySelector('input')?.blur(); void searchPodcasts(); }}>
@@ -1823,10 +2299,10 @@
     {/if}
 
     <nav class:dragging={sheetDragging || barDragging} style={`--nav-shift:${navShift}`} class="bottom-nav" aria-label="Napstrfy navigation">
-      <button class:active={activeTab === 'music'} onclick={() => (activeTab = 'music')}><span>♫</span>Music</button>
+      <button class:active={activeTab === 'music'} onclick={showMusic}><span>♫</span>Music</button>
+      <button class:active={activeTab === 'search'} onclick={showSearch}><span class="nav-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.4" /><path d="M15.9 15.9 20.6 20.6" /></svg></span>Search</button>
       <button class:active={activeTab === 'podcasts'} onclick={showPodcasts}><span>◉</span>Podcasts</button>
       <button class:active={activeTab === 'audiobooks'} onclick={showAudiobooks}><span>▥</span>Audiobooks</button>
-      <button onclick={() => status.paired ? forgetDesktop() : (activeTab = 'music')}><span>⚙</span>Pairing</button>
     </nav>
 
     <section
@@ -1893,6 +2369,25 @@
         <div class="now-sheet-backdrop empty"></div>
       {/if}
       <div class="now-sheet-scrim"></div>
+      <div class="now-sheet-top">
+        <button class="now-sheet-icon" onclick={closeNowPlaying} aria-label="Close the now playing screen">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 9.5 12 16l7-6.5" /></svg>
+        </button>
+        <div class="now-sheet-top-buttons">
+          {#if remoteAvailable()}
+            <button class="now-sheet-icon" onclick={openRemote} aria-label="Control the computer">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <rect x="3" y="4.6" width="18" height="12" rx="2" /><path d="M12 16.6V20" /><path d="M9 20h6" />
+              </svg>
+            </button>
+          {/if}
+          <button class="now-sheet-icon" onclick={() => openActions(null)} aria-label="Track options">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <circle class="filled" cx="12" cy="5.6" r="1.7" /><circle class="filled" cx="12" cy="12" r="1.7" /><circle class="filled" cx="12" cy="18.4" r="1.7" />
+            </svg>
+          </button>
+        </div>
+      </div>
       <div class="now-sheet-art">
         {#if sheetCoverUrl()}
           <img src={sheetCoverUrl()} alt="" onerror={() => (nowArtFailed = true)} />
@@ -1998,8 +2493,354 @@
   </div>
 {/if}
 
-{#if COVER_DEBUG}
-  <CoverDebug {tracks} {status} />
+{#if showSettings}
+  <div class="settings-view" role="dialog" aria-modal="true" aria-label="Settings">
+    <header class="view-head">
+      <h1>Settings</h1>
+      <button class="view-icon" onclick={() => (showSettings = false)} aria-label="Close settings">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6.5 6.5 17.5 17.5" /><path d="M17.5 6.5 6.5 17.5" /></svg>
+      </button>
+    </header>
+    <div class="settings-scroll">
+      <div class="settings-status">
+        <i class:offline={!status.connected}></i>
+        <div>
+          <strong>{status.paired ? (status.connected ? status.desktopName || 'Napstr' : 'Not reachable') : 'Not paired'}</strong>
+          <small>{status.paired ? (status.connected ? 'Connected over Iroh' : 'Tap reconnect to try again') : 'Pair with Napstr on your computer'}</small>
+        </div>
+      </div>
+      {#if status.streamOnly}<p class="settings-note">This pairing is read only: it can browse and play, but cannot ask Napstr to download or publish.</p>{/if}
+
+      {#if status.paired}
+        <button class="settings-row" onclick={() => { showSettings = false; void reconnect(); }} disabled={statusPending}>
+          <span>Reconnect</span><small>{statusPending ? 'Trying…' : 'Refresh the connection now'}</small>
+        </button>
+        <button class="settings-row danger" onclick={() => { showSettings = false; void forgetDesktop(); }}>
+          <span>Disconnect this phone</span><small>You will need a new QR code</small>
+        </button>
+      {:else}
+        <button class="settings-row" onclick={() => { showSettings = false; showMusic(); }}>
+          <span>Pair Napstr</span><small>Scan a QR code from the computer</small>
+        </button>
+      {/if}
+
+      {#if status.paired}
+        <div class="settings-section">
+          <p>The computer</p>
+          <button class="settings-row" onclick={() => { showSettings = false; openRemote(); }} disabled={!status.connected}>
+            <span>Control its player</span>
+            <small>{status.connected ? (status.streamOnly ? 'See what it is playing' : 'Play, pause, skip and set the volume') : 'Offline'}</small>
+          </button>
+        </div>
+      {/if}
+
+      {#if status.paired && !status.streamOnly}
+        <div class="settings-section">
+          <p>Lend access</p>
+          <button class="settings-row" onclick={() => void requestReadOnlyCode()} disabled={ticketBusy || !status.connected}>
+            <span>Create a read-only code</span>
+            <small>{ticketBusy ? 'Asking Napstr…' : 'For a guest phone'}</small>
+          </button>
+          {#if ticketError}<p class="settings-note">{ticketError}</p>{/if}
+          {#if readOnlyTicket}
+            <div class="ticket-card">
+              {#if readOnlyTicket.qrSvg}
+                <div class="ticket-qr">{@html readOnlyTicket.qrSvg}</div>
+              {:else}
+                <p class="ticket-note">Your computer drew no QR image. Send the code below instead.</p>
+              {/if}
+              <code>{readOnlyTicket.uri}</code>
+              <small>Expires in about {ticketMinutesLeft()} minutes. Whoever scans this can browse, listen and keep what they play, and nothing else.</small>
+              <div class="ticket-actions">
+                <button onclick={() => void copyReadOnlyCode()}>Copy code</button>
+                <button onclick={() => (readOnlyTicket = null)}>Done</button>
+              </div>
+            </div>
+          {/if}
+        </div>
+      {/if}
+
+      {#if COVER_DEBUG}
+        <div class="settings-section">
+          <p>Developer tools</p>
+          <CoverDebug {tracks} {status} embedded />
+        </div>
+      {/if}
+    </div>
+  </div>
+{/if}
+
+{#if showAlbumView && albumView}
+  <div class="album-view" style={`--cover-hue:${artworkHue(albumView.tracks[0]?.fileId ?? albumView.key)}`} role="dialog" aria-modal="true" aria-label={`${albumView.album} by ${albumView.artist}`}>
+    <div class="album-glow" style={albumView.art ? `background-image:url(${albumView.art})` : ''}></div>
+    <div class="album-glow-scrim"></div>
+    <header class="view-head">
+      <button class="view-icon" onclick={closeAlbumView} aria-label="Close the album">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14.5 5 8 12l6.5 7" /></svg>
+      </button>
+      <button class="view-icon" onclick={() => openActions(albumView?.tracks[0] ?? null)} aria-label="Album options" disabled={albumView.tracks.length === 0}>
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <circle class="filled" cx="12" cy="5.6" r="1.7" /><circle class="filled" cx="12" cy="12" r="1.7" /><circle class="filled" cx="12" cy="18.4" r="1.7" />
+        </svg>
+      </button>
+    </header>
+
+    <div class="album-scroll">
+      <div class="album-art">
+        {#if albumView.art}<img src={albumView.art} alt="" />{:else}<div class="album-art-empty">♪</div>{/if}
+      </div>
+
+      <div class="album-title-row">
+        <div class="album-title-copy">
+          <h1>{albumView.album}</h1>
+          <p>{albumView.artist || 'Unknown artist'}</p>
+          <p class="album-meta">Album · {albumView.year || 'Year unknown'}</p>
+        </div>
+        <button class="album-play-all" onclick={() => void playAlbumNow()} disabled={albumView.tracks.length === 0} aria-label={`Play ${albumView.album}`}>
+          {#if caching}<span class="icon-busy"></span>{:else}<span class="icon-play"></span>{/if}
+        </button>
+      </div>
+
+      <ol class="album-tracks">
+        {#each albumView.tracks as track, index (track.fileId)}
+          <li class:playing={current?.fileId === track.fileId}>
+            <button class="album-track" onclick={() => void playAlbumTrack(index)}>
+              <span class="album-track-index">{current?.fileId === track.fileId ? '▶' : index + 1}</span>
+              <span class="album-track-copy"><strong>{title(track)}</strong><small>{artist(track)}</small></span>
+            </button>
+            <button class="album-track-more" onclick={() => openActions(track)} aria-label={`Options for ${title(track)}`}>
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <circle class="filled" cx="12" cy="5.6" r="1.5" /><circle class="filled" cx="12" cy="12" r="1.5" /><circle class="filled" cx="12" cy="18.4" r="1.5" />
+              </svg>
+            </button>
+          </li>
+        {/each}
+      </ol>
+      {#if albumView.tracks.length === 0}<p class="queue-empty">No tracks for this album yet.</p>{/if}
+
+      {#if albumView.more.length > 0}
+        <div class="album-shelf-block">
+          <div class="section-label"><b>More by {albumView.artist}</b><span>{albumView.more.length} albums</span></div>
+          <div class="album-shelf">
+            {#each albumView.more as album (album.key)}
+              <div class="album-card">
+                <button class="album-open" onclick={() => void openAlbum(album)} aria-label={`Open ${album.album}`}>
+                  <TrackArtwork track={album.representative} lookup />
+                  <span class="album-play" aria-hidden="true">▶</span>
+                </button>
+                <strong>{album.album}</strong>
+                <small>{album.artist || 'Unknown artist'}</small>
+              </div>
+            {/each}
+          </div>
+        </div>
+      {/if}
+    </div>
+  </div>
+{/if}
+
+{#if showRemote}
+  <div
+    class="remote-view"
+    role="dialog"
+    aria-modal="true"
+    aria-label={`Playing on ${status.desktopName || 'the computer'}`}
+  >
+    <header class="view-head">
+      <div class="remote-head-copy">
+        <p>PLAYING ON</p>
+        <h1>{status.desktopName || 'Napstr'}</h1>
+      </div>
+      <div class="now-sheet-top-buttons">
+        <button class="view-icon" onclick={() => void refreshRemote()} aria-label="Refresh what the computer is playing">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.4 12a8.4 8.4 0 1 1-2.7-6.2" /><path d="M20.4 4.4v5.4H15" /></svg>
+        </button>
+        <button class="view-icon" onclick={() => (showRemote = false)} aria-label="Close">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6.5 6.5 17.5 17.5" /><path d="M17.5 6.5 6.5 17.5" /></svg>
+        </button>
+      </div>
+    </header>
+
+    <div class="remote-scroll">
+      {#if remoteError}<div class="error-card"><span>{remoteError}</span></div>{/if}
+      {#if remoteState?.error}<div class="error-card"><span>{remoteState.error}</span></div>{/if}
+
+      {#if remoteState?.active}
+        <div class="remote-now">
+          <h2>{remoteState.title || 'Unknown track'}</h2>
+          <p>{remoteState.artist || 'Unknown artist'}</p>
+          {#if remoteState.album}<small>{remoteState.album}</small>{/if}
+        </div>
+        <input
+          class="remote-seek"
+          type="range"
+          min="0"
+          max={remoteState.durationMs || 0}
+          step="1000"
+          value={remoteState.positionMs}
+          onchange={(event) => void sendPlayback({ type: 'seek', positionMs: Number(event.currentTarget.value) })}
+          disabled={status.streamOnly}
+          aria-label="Seek on the computer"
+        />
+        <div class="remote-times">
+          <span>{remoteClock(remoteState.positionMs)}</span>
+          <span>{remoteState.queueLen > 0 ? `Queue: ${remoteState.queueLen}` : 'One track'}</span>
+          <span>{remoteClock(remoteState.durationMs)}</span>
+        </div>
+      {:else}
+        <div class="remote-now">
+          <h2>Nothing is playing there</h2>
+          <p>
+            {status.streamOnly
+              ? 'This pairing is read only, so it cannot start anything.'
+              : 'Napstr will pick up from wherever the computer left off.'}
+          </p>
+        </div>
+      {/if}
+
+      <div class="remote-transport">
+        <button
+          onclick={() => void sendPlayback({ type: 'previous' })}
+          disabled={!remoteState?.active || (remoteState?.queueLen ?? 0) < 2 || status.streamOnly}
+          aria-label="Previous track on the computer">|◀</button>
+        <button
+          class="remote-main"
+          onclick={() => void sendPlayback(remoteState?.active ? { type: 'toggle' } : { type: 'play' })}
+          disabled={remoteBusy || status.streamOnly}
+          aria-label={remoteState?.playing ? 'Pause on the computer' : 'Play on the computer'}>
+          {#if remoteBusy}<span class="icon-busy"></span>{:else if remoteState?.playing}<span class="icon-pause"></span>{:else}<span class="icon-play"></span>{/if}
+        </button>
+        <button
+          onclick={() => void sendPlayback({ type: 'next' })}
+          disabled={!remoteState?.active || (remoteState?.queueLen ?? 0) < 2 || status.streamOnly}
+          aria-label="Next track on the computer">▶|</button>
+      </div>
+
+      <div class="remote-options">
+        <button
+          class:active={(remoteState?.repeat ?? 'off') !== 'off'}
+          onclick={() => void sendPlayback({ type: 'repeat', mode: nextRemoteRepeat(remoteState?.repeat ?? 'off') })}
+          disabled={status.streamOnly}>
+          <span>Repeat</span><small>{remoteRepeatLabel(remoteState?.repeat ?? 'off')}</small>
+        </button>
+        <button
+          class:active={remoteState?.shuffle === true}
+          onclick={() => void sendPlayback({ type: 'shuffle', enabled: remoteState?.shuffle !== true })}
+          disabled={status.streamOnly}>
+          <span>Shuffle</span><small>{remoteState?.shuffle ? 'On' : 'Off'}</small>
+        </button>
+      </div>
+
+      <label class="remote-volume">
+        <span>Volume</span>
+        <input
+          type="range"
+          min="0"
+          max="100"
+          step="1"
+          value={Math.round((remoteState?.volume ?? 1) * 100)}
+          oninput={(event) => void sendVolume(Number(event.currentTarget.value))}
+          disabled={status.streamOnly}
+        />
+      </label>
+
+      <button
+        class="remote-stop"
+        onclick={() => void sendPlayback({ type: 'stop' })}
+        disabled={status.streamOnly || !remoteState?.active}>Stop on the computer</button>
+
+      <p class="remote-note">
+        {status.streamOnly
+          ? 'This pairing is read only: you can see what is playing there, but not change it.'
+          : 'Your own pairing signs every command. No Nostr keys leave your computer.'}
+      </p>
+    </div>
+  </div>
+{/if}
+
+{#if showReport}
+  <div class="report-view" role="dialog" aria-modal="true" aria-label="Report a cover">
+    <button class="actions-scrim" onclick={() => (showReport = false)} aria-label="Close the report"></button>
+    <div class="actions-panel report-panel">
+      <div class="report-head">
+        <h1>Report this cover</h1>
+        <p>{reportLabel}</p>
+      </div>
+      <div class="actions-divider"></div>
+      {#each reportReasons as reason (reason.value)}
+        <button class:active={reportReason === reason.value} class="actions-row" onclick={() => (reportReason = reason.value)}>
+          <span>{reason.label}</span>
+          {#if reportReason === reason.value}<small>Chosen</small>{/if}
+        </button>
+      {/each}
+      <label class="report-note">
+        <span>Anything to add? (optional)</span>
+        <textarea bind:value={reportNote} rows="3" maxlength="500" placeholder="Say what is wrong with this cover"></textarea>
+      </label>
+      {#if reportError}<p class="report-error">{reportError}</p>{/if}
+      <p class="remote-note">
+        Signed by {status.desktopName || 'your computer'} as a NIP-56 report. It tells other clients which cover to distrust.
+      </p>
+      <button class="report-send" onclick={() => void submitCoverReport()} disabled={reportBusy || !status.connected}>
+        {reportBusy ? 'Sending…' : 'Send report'}
+      </button>
+    </div>
+  </div>
+{/if}
+
+{#if showActions && menuTrack}
+  <div class="actions-view" role="dialog" aria-modal="true" aria-label="Track options">
+    <button class="actions-scrim" onclick={closeActions} aria-label="Close the track options"></button>
+    <div class="actions-panel">
+      <div class="actions-head">
+        <TrackArtwork track={menuTrack} lookup />
+        <div class="actions-head-copy"><strong>{title(menuTrack)}</strong><small>{artist(menuTrack)}</small></div>
+      </div>
+      <div class="actions-divider"></div>
+
+      {#if showSleepOptions}
+        <button class="actions-row back" onclick={() => (showSleepOptions = false)}>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14.5 5 8 12l6.5 7" /></svg>
+          <span>Sleep timer</span><small>{sleepSummary()}</small>
+        </button>
+        {#each SLEEP_OPTIONS as option (option.value)}
+          <button class:active={sleepValue === option.value} class="actions-row" onclick={() => chooseSleep(option)}>
+            <span>{option.label}</span>
+            {#if sleepValue === option.value}<small>On</small>{/if}
+          </button>
+        {/each}
+      {:else}
+        <button class="actions-row" onclick={() => void shareTrack(menuTrack)}>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4" /><path d="M8 7.5 12 3.5l4 4" /><path d="M5 14v6h14v-6" /></svg>
+          <span>Share</span><small>{trackUri(menuTrack)}</small>
+        </button>
+        <button class="actions-row" onclick={() => toggleTrackLike(menuTrack)}>
+          <svg class:filled={isTrackLiked(menuTrack)} viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20.3c-1.4-1-7.2-5.2-7.2-9.4A4.2 4.2 0 0 1 12 8.2a4.2 4.2 0 0 1 7.2 2.7c0 4.2-5.8 8.4-7.2 9.4z" /></svg>
+          <span>{isTrackLiked(menuTrack) ? 'Remove from Liked Songs' : 'Add to Liked Songs'}</span>
+        </button>
+        <button class="actions-row" disabled>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6.5h11" /><path d="M4 12h11" /><path d="M4 17.5h7" /><path d="M17 14v6" /><path d="M14 17h6" /></svg>
+          <span>Add to playlist</span><small>Coming soon</small>
+        </button>
+        <button class="actions-row" onclick={() => void goToAlbum(menuTrack)}>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8" /><circle class="filled" cx="12" cy="12" r="2.4" /></svg>
+          <span>Go to album</span>
+        </button>
+        <button class="actions-row" disabled={!menuTrack.artist.trim()} onclick={() => goToArtist(menuTrack.artist)}>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8.2" r="3.4" /><path d="M5.6 19.6a6.5 6.5 0 0 1 12.8 0" /></svg>
+          <span>Go to artist</span>
+        </button>
+        <button class="actions-row" disabled={!remoteAvailable()} onclick={() => openCoverReport(menuTrack)}>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4.8 21 20H3z" /><path d="M12 10.6v4" /><circle class="filled" cx="12" cy="17.4" r="0.9" /></svg>
+          <span>Report this cover</span><small>{remoteAvailable() ? '' : 'Needs a connection'}</small>
+        </button>
+        <button class="actions-row" onclick={() => (showSleepOptions = true)}>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8" /><path d="M12 7.4V12l3.1 2" /></svg>
+          <span>Sleep timer</span><small>{sleepSummary()}</small>
+        </button>
+      {/if}
+    </div>
+  </div>
 {/if}
 
 <audio

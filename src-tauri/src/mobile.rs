@@ -5,9 +5,9 @@ use crate::{
 use chrono::Utc;
 use iroh::{endpoint::presets, Endpoint, SecretKey};
 use napstr_remote_protocol::{
-    ClientRequest, PairingTicket, RemoteAlbumCover, RemoteAudiobook, RemoteAudiobookSummary,
-    RemoteSource, RemoteTrack, RemoteTransfer, ServerResponse, ALPN, MAX_CONTROL_FRAME_BYTES,
-    MAX_COVER_KEYS, MAX_PAGE_SIZE, PROTOCOL_VERSION,
+    ClientRequest, CoverReportResult, PairingTicket, RemoteAlbumCover, RemoteAudiobook,
+    RemoteAudiobookSummary, RemoteSource, RemoteTrack, RemoteTransfer, ServerResponse, ALPN,
+    MAX_CONTROL_FRAME_BYTES, MAX_COVER_KEYS, MAX_PAGE_SIZE, PROTOCOL_VERSION,
 };
 use qrcode::{render::svg, QrCode};
 use rusqlite::{params, OptionalExtension};
@@ -79,6 +79,7 @@ pub struct MobileService {
     db_path: PathBuf,
     key_path: PathBuf,
     network: Arc<crate::network::NetworkService>,
+    playback: Arc<crate::playback_bridge::PlaybackBridge>,
     endpoint: tokio::sync::RwLock<Option<Endpoint>>,
     start_lock: tokio::sync::Mutex<()>,
     pairing: Mutex<Vec<PairingSession>>,
@@ -95,12 +96,14 @@ impl MobileService {
         db_path: PathBuf,
         app_data: PathBuf,
         network: Arc<crate::network::NetworkService>,
+        playback: Arc<crate::playback_bridge::PlaybackBridge>,
     ) -> Result<Arc<Self>, String> {
         initialise_schema(&db_path)?;
         Ok(Arc::new(Self {
             db_path,
             key_path: app_data.join("iroh-identity"),
             network,
+            playback,
             endpoint: tokio::sync::RwLock::new(None),
             start_lock: tokio::sync::Mutex::new(()),
             pairing: Mutex::new(Vec::new()),
@@ -240,9 +243,7 @@ impl MobileService {
                 stream_only,
             });
         }
-        let desktop_name = open_connection(&self.db_path)
-            .and_then(|connection| crate::get_setting(&connection, "display_name"))
-            .unwrap_or_else(|_| "Napstr".into());
+        let desktop_name = self.desktop_name();
         let ticket = PairingTicket {
             version: PROTOCOL_VERSION,
             endpoint_id: endpoint.id().to_string(),
@@ -281,6 +282,13 @@ impl MobileService {
             updates.remove(endpoint_id);
         }
         Ok(())
+    }
+
+    /// The name shown to a phone. One place, so every answer agrees.
+    fn desktop_name(&self) -> String {
+        open_connection(&self.db_path)
+            .and_then(|connection| crate::get_setting(&connection, "display_name"))
+            .unwrap_or_else(|_| "Napstr".into())
     }
 
     fn remember_error(&self, message: String) -> String {
@@ -459,7 +467,7 @@ impl MobileService {
     }
 
     async fn serve_request(
-        &self,
+        self: &Arc<Self>,
         remote_id: &str,
         request: ClientRequest,
         send: &mut iroh::endpoint::SendStream,
@@ -475,9 +483,7 @@ impl MobileService {
                 send,
                 &ServerResponse::Paired {
                     stream_only,
-                    desktop_name: open_connection(&self.db_path)
-                        .and_then(|connection| crate::get_setting(&connection, "display_name"))
-                        .unwrap_or_else(|_| "Napstr".into()),
+                    desktop_name: self.desktop_name(),
                 },
             )
             .await;
@@ -733,6 +739,66 @@ impl MobileService {
                 )
                 .await
             }
+            ClientRequest::Playback { command } => {
+                let state = self.playback.apply(&self.db_path, command)?;
+                write_response(send, &ServerResponse::Playback { state }).await
+            }
+            ClientRequest::PlaybackState => {
+                write_response(
+                    send,
+                    &ServerResponse::Playback {
+                        state: self.playback.state(&self.db_path),
+                    },
+                )
+                .await
+            }
+            ClientRequest::ReadOnlyTicket => {
+                // Only a read-only code can come out of here, which is what lets
+                // a phone with write access lend its access on without ever
+                // widening it: whoever scans this browses and plays, no more.
+                let offer = self.create_pairing(true).await?;
+                let desktop_name = self.desktop_name();
+                let mut qr_svg = offer.qr_svg;
+                let candidate = ServerResponse::ReadOnlyTicket {
+                    uri: offer.ticket.clone(),
+                    qr_svg: qr_svg.clone(),
+                    expires_at: offer.expires_at,
+                    desktop_name: desktop_name.clone(),
+                };
+                if serde_json::to_vec(&candidate)
+                    .map(|encoded| encoded.len())
+                    .unwrap_or(usize::MAX)
+                    > MAX_CONTROL_FRAME_BYTES
+                {
+                    // The QR is around a hundred kilobytes of path data. Drop
+                    // the image rather than failing the request that carries
+                    // the code itself.
+                    qr_svg.clear();
+                }
+                write_response(
+                    send,
+                    &ServerResponse::ReadOnlyTicket {
+                        uri: offer.ticket,
+                        qr_svg,
+                        expires_at: offer.expires_at,
+                        desktop_name,
+                    },
+                )
+                .await
+            }
+            ClientRequest::ReportCover { key, reason, note } => {
+                let report_id = self.network.report_cover(key, reason, note).await?;
+                write_response(
+                    send,
+                    &ServerResponse::CoverReported {
+                        report: CoverReportResult {
+                            report_id,
+                            queued: false,
+                        },
+                    },
+                )
+                .await
+            }
             ClientRequest::Ping => write_response(send, &ServerResponse::Pong).await,
             ClientRequest::Pair { .. } => unreachable!(),
         }
@@ -836,8 +902,19 @@ fn check_request_permission(stream_only: bool, request: &ClientRequest) -> Resul
         | ClientRequest::FetchAudio { .. }
         | ClientRequest::Available { .. }
         | ClientRequest::AlbumCovers { .. }
+        // Seeing what the computer is playing is not a way of changing it.
+        | ClientRequest::PlaybackState
         | ClientRequest::Status
         | ClientRequest::Ping => Ok(()),
+        ClientRequest::Playback { .. } => Err(
+            "This phone has read-only access, so it cannot control Napstr on the computer.".into(),
+        ),
+        ClientRequest::ReadOnlyTicket => Err(
+            "This phone has read-only access, so it cannot lend access to another device.".into(),
+        ),
+        ClientRequest::ReportCover { .. } => Err(
+            "This phone has read-only access, so it cannot publish reports.".into(),
+        ),
         _ => Err("This phone has read-only access. Downloads on the Napstr host are not permitted.".into()),
     }
 }

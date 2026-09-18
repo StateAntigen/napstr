@@ -4,7 +4,12 @@
   import { clearCoverEvents, coverEvents, subscribeCoverEvents, type CoverEvent } from './coverDebug';
   import type { CompanionStatus, RemoteTrack } from './types';
 
-  let { tracks = [], status }: { tracks?: RemoteTrack[]; status: CompanionStatus } = $props();
+  let { tracks = [], status, embedded = false }: {
+    tracks?: RemoteTrack[];
+    status: CompanionStatus;
+    /** Rendered inside Settings as a row rather than as a floating pill. */
+    embedded?: boolean;
+  } = $props();
 
   let open = $state(false);
   let events = $state<CoverEvent[]>(coverEvents());
@@ -37,8 +42,9 @@
   }
 </script>
 
-<button class="cover-debug-pill" class:active={open} onclick={() => (open = !open)} aria-label="Cover art debug">
-  ☰ art
+<button class:embedded class="cover-debug-open" onclick={() => (open = true)}>
+  <span>Cover art diagnostics</span>
+  {#if embedded}<small>{counts.requests} asked · {counts.answers} answered · {counts.errors} failed</small>{:else}☰ art{/if}
 </button>
 
 {#if open}

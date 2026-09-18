@@ -1,8 +1,10 @@
 use futures_util::StreamExt;
 use iroh::{endpoint::presets, Endpoint, EndpointAddr, EndpointId, SecretKey};
 use napstr_remote_protocol::{
-    ClientRequest, PairingTicket, RemoteAlbumCover, RemoteAudiobook, RemoteAudiobookSummary,
-    RemoteTrack, RemoteTransfer, ServerResponse, ALPN, MAX_CONTROL_FRAME_BYTES, MAX_COVER_KEYS,
+    ClientRequest, PairingTicket, PlaybackCommand, RemoteAlbumCover, RemoteAudiobook,
+    RemoteAudiobookSummary, RemotePlaybackState, RemoteTrack, RemoteTransfer, ServerResponse,
+    ALPN, MAX_CONTROL_FRAME_BYTES, MAX_COVER_KEYS, MAX_QR_SVG_BYTES, MAX_REPORT_NOTE_CHARS,
+    REPORT_REASONS,
 };
 use quick_xml::{events::Event, Reader};
 use serde::{Deserialize, Serialize};
@@ -87,6 +89,26 @@ struct AudiobookLibraryPage {
 struct CachedAudio {
     url: String,
     track: RemoteTrack,
+}
+
+/// A read-only pairing code, minted by the host, for this phone to show.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReadOnlyTicketOffer {
+    uri: String,
+    /// Empty when the host drew no QR, or drew something this app is not willing
+    /// to insert into its own page.
+    qr_svg: String,
+    expires_at: i64,
+    desktop_name: String,
+}
+
+/// What the host signed and published on this phone's behalf.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CoverReport {
+    report_id: String,
+    queued: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1430,6 +1452,17 @@ impl RemoteClient {
         Err(last_error)
     }
 
+    /// True when this pairing may only browse and play, which is what keeps the
+    /// phone from offering controls the host would refuse anyway.
+    async fn stream_only(&self) -> bool {
+        self.desktop
+            .read()
+            .await
+            .as_ref()
+            .map(|desktop| desktop.stream_only)
+            .unwrap_or(false)
+    }
+
     async fn status(&self) -> CompanionStatus {
         let desktop = self.desktop.read().await.clone();
         if desktop.is_none() {
@@ -1911,6 +1944,121 @@ fn normalise_cover_key(value: &str) -> Option<String> {
     (key.chars().count() <= 300).then_some(key)
 }
 
+/// What the paired Napstr desktop is playing, if anything.
+///
+/// A read-only pairing may ask this too: seeing what the computer is doing is
+/// not a way of changing it.
+#[tauri::command]
+async fn remote_playback_state(
+    state: State<'_, AppState>,
+) -> Result<RemotePlaybackState, String> {
+    let response = state
+        .remote
+        .request(ClientRequest::PlaybackState)
+        .await
+        .map_err(|error| friendly_if_missing(error, PLAYBACK_UNAVAILABLE))?;
+    match response {
+        ServerResponse::Playback { state: playing } => Ok(playing),
+        response => Err(unexpected_response(&response)),
+    }
+}
+
+/// Drive the desktop's own player from this phone.
+#[tauri::command]
+async fn remote_playback(
+    command: PlaybackCommand,
+    state: State<'_, AppState>,
+) -> Result<RemotePlaybackState, String> {
+    // Refuse the nonsense here rather than letting the host guess: a seek past a
+    // day, or a volume over 100%, is a bug in the caller and not a preference.
+    match &command {
+        PlaybackCommand::Seek { position_ms } if *position_ms > MAX_SEEK_MS => {
+            return Err("That position is out of range".into());
+        }
+        PlaybackCommand::Volume { percent } if *percent > 100 => {
+            return Err("Volume is a percentage".into());
+        }
+        _ => {}
+    }
+    if state.remote.stream_only().await {
+        return Err("This pairing is read only. It cannot control the computer.".into());
+    }
+    let response = state
+        .remote
+        .request(ClientRequest::Playback { command })
+        .await
+        .map_err(|error| friendly_if_missing(error, PLAYBACK_UNAVAILABLE))?;
+    match response {
+        ServerResponse::Playback { state: playing } => Ok(playing),
+        response => Err(unexpected_response(&response)),
+    }
+}
+
+/// Ask the host for a read-only pairing code to hand to another device.
+///
+/// Only a host that knows this phone has write access will mint one, and what it
+/// mints is read-only, so access can be lent on but never widened.
+#[tauri::command]
+async fn remote_read_only_ticket(
+    state: State<'_, AppState>,
+) -> Result<ReadOnlyTicketOffer, String> {
+    let response = state
+        .remote
+        .request(ClientRequest::ReadOnlyTicket)
+        .await
+        .map_err(|error| friendly_if_missing(error, READ_ONLY_CODE_UNAVAILABLE))?;
+    match response {
+        ServerResponse::ReadOnlyTicket {
+            uri,
+            qr_svg,
+            expires_at,
+            desktop_name,
+        } => Ok(ReadOnlyTicketOffer {
+            uri,
+            qr_svg: safe_qr_svg(&qr_svg),
+            expires_at,
+            desktop_name,
+        }),
+        response => Err(unexpected_response(&response)),
+    }
+}
+
+/// Ask the host to sign and publish a NIP-56 `1984` report about an album cover.
+///
+/// This app holds no Nostr keys, and that is worth keeping: the report is the
+/// user's words, but the signature is the host's to make.
+#[tauri::command]
+async fn remote_report_cover(
+    key: String,
+    reason: String,
+    note: String,
+    state: State<'_, AppState>,
+) -> Result<CoverReport, String> {
+    let key = normalise_cover_key(&key).ok_or("That album has no cover key")?;
+    let reason = reason.trim().to_lowercase();
+    if !REPORT_REASONS.contains(&reason.as_str()) {
+        return Err("Choose a reason for the report".into());
+    }
+    let note = note.trim().to_string();
+    if note.chars().count() > MAX_REPORT_NOTE_CHARS {
+        return Err(format!(
+            "Keep the note under {MAX_REPORT_NOTE_CHARS} characters"
+        ));
+    }
+    let response = state
+        .remote
+        .request(ClientRequest::ReportCover { key, reason, note })
+        .await
+        .map_err(|error| friendly_if_missing(error, REPORT_UNAVAILABLE))?;
+    match response {
+        ServerResponse::CoverReported { report } => Ok(CoverReport {
+            report_id: report.report_id,
+            queued: report.queued,
+        }),
+        response => Err(unexpected_response(&response)),
+    }
+}
+
 #[tauri::command]
 async fn reconcile_audio_cache(
     protected_file_ids: Vec<String>,
@@ -2303,6 +2451,81 @@ fn chrono_timestamp() -> i64 {
         .as_secs() as i64
 }
 
+/// The message an older Napstr answers with when it cannot parse a request it
+/// has never heard of.
+const UNKNOWN_REQUEST: &str = "invalid Napstrfy request";
+/// The longest seek that can be meant: nothing Napstr plays is a day long.
+const MAX_SEEK_MS: u64 = 24 * 60 * 60 * 1000;
+const PLAYBACK_UNAVAILABLE: &str =
+    "This Napstr cannot be driven from a phone yet. Update Napstr on your computer.";
+const READ_ONLY_CODE_UNAVAILABLE: &str =
+    "This Napstr cannot create read-only codes yet. Update Napstr on your computer.";
+const REPORT_UNAVAILABLE: &str =
+    "This Napstr cannot publish reports yet. Update Napstr on your computer.";
+
+/// A host that does not know a request answers with a parse error, which says
+/// nothing useful to the person holding the phone.
+fn friendly_if_missing(error: String, suggestion: &str) -> String {
+    if error.contains(UNKNOWN_REQUEST) || error.contains("unknown variant") {
+        suggestion.to_string()
+    } else {
+        error
+    }
+}
+
+/// Accept only the elements a QR renderer emits.
+///
+/// The markup is drawn by the host, but it arrives over the network and is about
+/// to be inserted into this app's own page, so anything with a script, a link or
+/// an event handler in it is dropped. The caller falls back to the code as text.
+fn safe_qr_svg(value: &str) -> String {
+    let trimmed = value.trim();
+    // The renderer prefixes an XML prolog, which means nothing once the markup
+    // is part of a page, so drop it before looking at the rest.
+    let body = match trimmed.strip_prefix("<?xml") {
+        Some(_) => match trimmed.find("?>") {
+            Some(end) => trimmed[end + 2..].trim_start(),
+            None => return String::new(),
+        },
+        None => trimmed,
+    };
+    if body.is_empty()
+        || body.len() > MAX_QR_SVG_BYTES
+        || !body.starts_with("<svg")
+        || !body.ends_with("</svg>")
+    {
+        return String::new();
+    }
+    let lowercase = body.to_lowercase();
+    if ["<script", "<!--", "href", "xlink", " on", "&#"]
+        .iter()
+        .any(|forbidden| lowercase.contains(forbidden))
+    {
+        return String::new();
+    }
+    let mut rest = body;
+    while let Some(start) = rest.find('<') {
+        rest = &rest[start + 1..];
+        let Some(end) = rest.find('>') else {
+            return String::new();
+        };
+        let name = rest[..end]
+            .trim_start_matches('/')
+            .split(|character: char| character.is_whitespace() || character == '/')
+            .next()
+            .unwrap_or("")
+            .to_lowercase();
+        if !matches!(
+            name.as_str(),
+            "svg" | "path" | "rect" | "g" | "circle" | "polygon" | "polyline"
+        ) {
+            return String::new();
+        }
+        rest = &rest[end + 1..];
+    }
+    body.to_string()
+}
+
 fn unexpected_response(response: &ServerResponse) -> String {
     match response {
         ServerResponse::Error { message } => message.clone(),
@@ -2399,6 +2622,10 @@ pub fn run() {
             remote_library,
             cached_library,
             remote_covers,
+            remote_playback_state,
+            remote_playback,
+            remote_read_only_ticket,
+            remote_report_cover,
             reconcile_audio_cache,
             remote_search,
             remote_audiobooks,
@@ -2421,6 +2648,33 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The QR the host draws has to survive the sanitiser, and nothing that
+    /// could run in this page may.
+    #[test]
+    fn only_qr_markup_reaches_the_page() {
+        // The hash in a colour literal needs a two-hash raw string: `"#` would
+        // otherwise end it early.
+        let drawn = r##"<?xml version="1.0" standalone="yes"?><svg xmlns="http://www.w3.org/2000/svg" version="1.1" width="4" height="4" viewBox="0 0 4 4" shape-rendering="crispEdges"><rect x="0" y="0" width="4" height="4" fill="#ffffff"/><path fill="#000000" d="M0 0h1v1H0V0"/></svg>"##;
+        let accepted = safe_qr_svg(drawn);
+        assert!(accepted.starts_with("<svg"));
+        assert!(accepted.ends_with("</svg>"));
+        assert!(!accepted.contains("<?xml"));
+        assert!(safe_qr_svg(
+            r#"<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>"#
+        )
+        .is_empty());
+        assert!(safe_qr_svg(
+            r#"<svg xmlns="http://www.w3.org/2000/svg"><path onload="x" d=""/></svg>"#
+        )
+        .is_empty());
+        assert!(safe_qr_svg(
+            r#"<svg xmlns="http://www.w3.org/2000/svg"><a href="https://x">y</a></svg>"#
+        )
+        .is_empty());
+        assert!(safe_qr_svg("<html></html>").is_empty());
+        assert!(safe_qr_svg("").is_empty());
+    }
 
     #[test]
     fn read_only_playback_caches_verified_audio_and_works_offline() {

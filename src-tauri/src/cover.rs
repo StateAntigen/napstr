@@ -319,6 +319,62 @@ fn is_bracket_character(character: char) -> bool {
 // Event validation
 // ---------------------------------------------------------------------------
 
+/// Everything needed to assert a cover this host resolved itself.
+#[derive(Debug, Clone, Default)]
+pub struct CoverClaimFields {
+    pub key: String,
+    pub art: String,
+    pub thumb: String,
+    pub mbid: String,
+    pub year: String,
+    pub genre: String,
+    pub collection: String,
+    pub source: String,
+}
+
+/// Build and sign the kind `30427` event that asserts `fields`.
+///
+/// This is the publishing half of the same contract [`cover_claim`] reads, so
+/// the two sit side by side: a claim this host would refuse to parse is a claim
+/// no other client should have to read either.
+pub fn cover_event(fields: &CoverClaimFields, keys: &Keys) -> Result<Event, String> {
+    let key = normalise_cover_key(&fields.key).ok_or("invalid album cover key")?;
+    if !valid_cover_key(&key) {
+        return Err("invalid album cover key".into());
+    }
+    let art = fields.art.trim().to_string();
+    if !valid_cover_art_url(&art) {
+        return Err("a cover claim needs an HTTPS image URL".into());
+    }
+    let content = CoverContent {
+        protocol: "napstr/1".into(),
+        art,
+        mbid: claim_text(&fields.mbid),
+        year: claim_text(&fields.year),
+        genre: claim_text(&fields.genre),
+        collection: claim_text(&fields.collection),
+        source: claim_text(&fields.source),
+        deleted: false,
+    };
+    let encoded = serde_json::to_string(&content).map_err(|error| error.to_string())?;
+    if encoded.len() > COVER_CONTENT_BYTE_LIMIT {
+        return Err("this cover claim is too large to publish".into());
+    }
+    let mut tags = vec![
+        Tag::parse(["d", key.as_str()]).map_err(|error| error.to_string())?,
+        Tag::parse(["t", COVER_MARKER]).map_err(|error| error.to_string())?,
+    ];
+    // A thumbnail is optional, and only worth publishing when it too is HTTPS.
+    let thumb = fields.thumb.trim();
+    if !thumb.is_empty() && valid_cover_art_url(thumb) {
+        tags.push(Tag::parse(["thumb", thumb]).map_err(|error| error.to_string())?);
+    }
+    EventBuilder::new(Kind::from(COVER_KIND), encoded)
+        .tags(tags)
+        .sign_with_keys(keys)
+        .map_err(|error| error.to_string())
+}
+
 /// Validate a kind `30427` event and turn it into a claim filed under `key`.
 ///
 /// `key` is the verbatim key the caller wants answered. A claim published under

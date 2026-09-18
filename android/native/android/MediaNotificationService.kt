@@ -9,6 +9,7 @@ import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.os.Build
+import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
@@ -32,6 +33,8 @@ class MediaNotificationService : Service() {
   private var duration = 0L
   private var canPrevious = false
   private var canNext = false
+  private var liked = false
+  private var looping = false
   private var foregroundStarted = false
   private var screenWakeLock: PowerManager.WakeLock? = null
   private var artworkUrl = ""
@@ -54,6 +57,17 @@ class MediaNotificationService : Service() {
         override fun onSeekTo(pos: Long) {
           MediaControlBridge.dispatch("seek:${pos.coerceAtLeast(0L)}")
         }
+
+        /**
+         * Buttons the system media controls draw itself - the lock screen, the
+         * quick settings player, Android Auto - arrive here, not through the
+         * notification's pending intents, because they come from the session.
+         */
+        override fun onCustomAction(action: String?, extras: Bundle?) {
+          when (action) {
+            ACTION_LIKE, ACTION_REPEAT -> dispatch(action)
+          }
+        }
       })
       isActive = true
     }
@@ -68,7 +82,7 @@ class MediaNotificationService : Service() {
         stopSelf()
         return START_NOT_STICKY
       }
-      ACTION_PLAY, ACTION_PAUSE, ACTION_PREVIOUS, ACTION_NEXT -> {
+      ACTION_PLAY, ACTION_PAUSE, ACTION_PREVIOUS, ACTION_NEXT, ACTION_LIKE, ACTION_REPEAT -> {
         dispatch(intent.action!!)
         return START_NOT_STICKY
       }
@@ -90,6 +104,8 @@ class MediaNotificationService : Service() {
     duration = intent.getLongExtra(EXTRA_DURATION, 0L).coerceAtLeast(0L)
     canPrevious = intent.getBooleanExtra(EXTRA_CAN_PREVIOUS, false)
     canNext = intent.getBooleanExtra(EXTRA_CAN_NEXT, false)
+    liked = intent.getBooleanExtra(EXTRA_LIKED, false)
+    looping = intent.getBooleanExtra(EXTRA_LOOPING, false)
     updateArtwork(intent.getStringExtra(EXTRA_ARTWORK).orEmpty())
     updateScreenWakeLock()
   }
@@ -160,9 +176,17 @@ class MediaNotificationService : Service() {
       PlaybackStateCompat.ACTION_SEEK_TO
     if (canPrevious) actions = actions or PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS
     if (canNext) actions = actions or PlaybackStateCompat.ACTION_SKIP_TO_NEXT
+    // The notification's own buttons are only drawn in the shade. Everything
+    // that renders the session itself - the lock screen, Android Auto, the
+    // media output picker - only ever sees what is published here, so like and
+    // repeat have to be declared as custom actions as well.
     mediaSession.setPlaybackState(
       PlaybackStateCompat.Builder()
         .setActions(actions)
+        .addCustomAction(customAction(ACTION_LIKE, likeLabel(), likeIcon()))
+        .addCustomAction(
+          customAction(ACTION_REPEAT, repeatLabel(), R.drawable.ic_napstrfy_loop)
+        )
         .setState(
           if (playing) PlaybackStateCompat.STATE_PLAYING else PlaybackStateCompat.STATE_PAUSED,
           position,
@@ -172,10 +196,24 @@ class MediaNotificationService : Service() {
     )
   }
 
+  private fun likeLabel() = if (liked) "Remove from Liked Songs" else "Add to Liked Songs"
+
+  private fun likeIcon() = if (liked) R.drawable.ic_napstrfy_liked else R.drawable.ic_napstrfy_like
+
+  private fun repeatLabel() = if (looping) "Turn repeat off" else "Repeat"
+
+  private fun customAction(
+    action: String,
+    name: String,
+    icon: Int
+  ): PlaybackStateCompat.CustomAction = PlaybackStateCompat.CustomAction.Builder(action, name, icon).build()
+
   private fun buildNotification(): Notification {
     val previous = actionPendingIntent(ACTION_PREVIOUS, 1)
     val playPause = actionPendingIntent(if (playing) ACTION_PAUSE else ACTION_PLAY, 2)
     val next = actionPendingIntent(ACTION_NEXT, 3)
+    val like = actionPendingIntent(ACTION_LIKE, 4)
+    val repeat = actionPendingIntent(ACTION_REPEAT, 5)
     val launch = packageManager.getLaunchIntentForPackage(packageName)?.let {
       PendingIntent.getActivity(this, 0, it, pendingFlags())
     }
@@ -197,6 +235,16 @@ class MediaNotificationService : Service() {
         playPause
       )
       .addAction(android.R.drawable.ic_media_next, "Next", next)
+      .addAction(
+        likeIcon(),
+        likeLabel(),
+        like
+      )
+      .addAction(
+        R.drawable.ic_napstrfy_loop,
+        repeatLabel(),
+        repeat
+      )
       .setStyle(MediaStyle().setMediaSession(mediaSession.sessionToken).setShowActionsInCompactView(0, 1, 2))
       .build()
   }
@@ -218,6 +266,9 @@ class MediaNotificationService : Service() {
       ACTION_PAUSE -> MediaControlBridge.dispatch("pause")
       ACTION_PREVIOUS -> if (canPrevious) MediaControlBridge.dispatch("previous")
       ACTION_NEXT -> if (canNext) MediaControlBridge.dispatch("next")
+      // The notification toggles repeat; the three-way choice stays in the app.
+      ACTION_LIKE -> MediaControlBridge.dispatch("like")
+      ACTION_REPEAT -> MediaControlBridge.dispatch("repeat")
     }
   }
 
@@ -258,6 +309,8 @@ class MediaNotificationService : Service() {
     const val ACTION_PAUSE = "net.napstr.nostrfy.media.PAUSE"
     const val ACTION_PREVIOUS = "net.napstr.nostrfy.media.PREVIOUS"
     const val ACTION_NEXT = "net.napstr.nostrfy.media.NEXT"
+    const val ACTION_LIKE = "net.napstr.nostrfy.media.LIKE"
+    const val ACTION_REPEAT = "net.napstr.nostrfy.media.REPEAT"
     const val EXTRA_TITLE = "title"
     const val EXTRA_ARTIST = "artist"
     const val EXTRA_ARTWORK = "artwork"
@@ -266,6 +319,8 @@ class MediaNotificationService : Service() {
     const val EXTRA_DURATION = "duration"
     const val EXTRA_CAN_PREVIOUS = "canPrevious"
     const val EXTRA_CAN_NEXT = "canNext"
+    const val EXTRA_LIKED = "liked"
+    const val EXTRA_LOOPING = "looping"
     private const val CHANNEL_ID = "napstrfy_playback"
     private const val NOTIFICATION_ID = 7302
   }
