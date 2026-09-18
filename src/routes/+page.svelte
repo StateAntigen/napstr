@@ -913,11 +913,17 @@
     current: string;
     message: string;
   };
-  let coverCandidates = $state<CoverCandidate[]>([]);
-  let coverStatus = $state<CoverScanStatus | null>(null);
-  let coverLoading = $state(false);
-  let coverError = $state('');
-  let coverLimit = $state(20);
+  // Deliberately plain `let`s, like every other variable in this file. A single
+  // rune anywhere in the component compiles the whole thing in runes mode, which
+  // silently makes every plain `let` here non-reactive - including the
+  // `desktopRuntime` gate that draws the window. The result is a blank white
+  // screen with no error in the console, which is exactly what a stray `$state`
+  // in this file cost once already.
+  let coverCandidates: CoverCandidate[] = [];
+  let coverStatus: CoverScanStatus | null = null;
+  let coverLoading = false;
+  let coverError = '';
+  let coverLimit = 20;
 
   async function refreshCoverCandidates() {
     coverLoading = true;
