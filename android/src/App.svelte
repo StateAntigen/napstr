@@ -2925,6 +2925,13 @@
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 9.5 12 16l7-6.5" /></svg>
         </button>
         <div class="now-sheet-top-buttons">
+          {#if status.paired}
+            <button class="now-sheet-icon" onclick={openSourcePicker} aria-label={`Play on: ${playbackTargetLabel()}`} title="Play on">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M6 9.6v4.8h3.2L14 18V6l-4.8 3.6z" /><path d="M17 9.4a4 4 0 0 1 0 5.2" />
+              </svg>
+            </button>
+          {/if}
           <button class="now-sheet-icon" onclick={() => openActions(null)} aria-label="Track options">
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <circle class="filled" cx="12" cy="5.6" r="1.7" /><circle class="filled" cx="12" cy="12" r="1.7" /><circle class="filled" cx="12" cy="18.4" r="1.7" />
