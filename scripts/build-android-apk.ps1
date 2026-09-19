@@ -37,6 +37,20 @@
 .PARAMETER PreflightOnly
     Check the toolchain and free space, then stop. No build, no signing.
 
+.PARAMETER ResetGradle
+    Stop the Gradle daemon and drop its transform cache before building.
+
+    This is the remedy for a build that fails during configuration with
+    "Could not read workspace metadata from ...transforms\<hash>\metadata.bin",
+    naming a dozen different hashes, in a few seconds. The hashes are derived
+    from the transform inputs, so they are stable across runs and the same list
+    comes back every time - which makes it look like leftover corruption when the
+    real cause is a daemon that is still alive.
+
+    The order below is the whole trick. A daemon that outlives the cache being
+    cleared keeps serving its own references to the deleted directories, so
+    clearing the cache first achieves nothing: stop the daemon, then clear.
+
 .EXAMPLE
     pwsh -File scripts/build-android-apk.ps1
     Builds the release APK, aligns and signs it, verifies the signature, and
@@ -53,7 +67,8 @@ param(
     [switch]$Debug,
     [switch]$NoSign,
     [switch]$Install,
-    [switch]$PreflightOnly
+    [switch]$PreflightOnly,
+    [switch]$ResetGradle
 )
 
 Set-StrictMode -Version Latest
@@ -121,11 +136,15 @@ if ($devMode -ne 1) {
 Write-Host '  ok  Developer Mode'
 
 # Fail here rather than fifteen minutes into a Rust build that runs out of room.
-# A cold Android build reaches several GB; a warm one needs far less.
+# Only a cold Rust build needs several GB; once the library is built, what is
+# left is Gradle's, which needs far less. Demanding the cold figure every time
+# would refuse to finish a build that is already most of the way done.
+$rustLib = Join-Path $android 'src-tauri\target\aarch64-linux-android\release\libnostrfy_lib.so'
+$floorGb = if (Test-Path -LiteralPath $rustLib) { 1.5 } else { 3 }
 $freeGb = (Get-PSDrive C).Free / 1GB
-Write-Host ('  free space: {0:N2} GB' -f $freeGb)
-if ($freeGb -lt 3) {
-    throw ('Only {0:N2} GB free. A cold Android Rust build needs several GB, so free space before starting.' -f $freeGb)
+Write-Host ('  free space: {0:N2} GB (this build needs about {1:N1} GB)' -f $freeGb, $floorGb)
+if ($freeGb -lt $floorGb) {
+    throw ('Only {0:N2} GB free, and this build needs about {1:N1} GB. Free space before starting.' -f $freeGb, $floorGb)
 }
 
 if ($PreflightOnly) {
@@ -141,6 +160,25 @@ $env:NDK_HOME = $ndk
 # Keeps the debug library slim - 368 MB becomes 82 MB. Only affects the dev
 # profile, so it is harmless for a release build.
 $env:CARGO_PROFILE_DEV_DEBUG = '0'
+
+if ($ResetGradle) {
+    Write-Step 'Resetting Gradle state'
+    # The daemon goes first, and this order is the point: a daemon that outlives
+    # the cache being cleared keeps its own references to the deleted entries and
+    # then fails in seconds with the same hashes, which reads as the fix not
+    # working. Every transforms directory is dropped, not just the named hashes,
+    # because Gradle truncates the failure list after twelve.
+    # Left unredirected on purpose: gradlew writes a deprecation notice to stderr,
+    # and piping that through 2>&1 would turn native stderr into error records,
+    # which $ErrorActionPreference = 'Stop' would then abort on. Its "1 Daemon
+    # stopped" line is worth seeing in the log anyway.
+    & (Join-Path $project 'gradlew.bat') --project-dir $project --stop
+    Get-ChildItem -LiteralPath (Join-Path $env:USERPROFILE '.gradle\caches') -Directory -ErrorAction SilentlyContinue |
+        ForEach-Object {
+            Remove-Item -LiteralPath (Join-Path $_.FullName 'transforms') -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    Write-Host '  stopped the daemon, then dropped the transform cache'
+}
 
 $variant = if ($Debug) { 'debug' } else { 'release' }
 
@@ -158,7 +196,10 @@ if ($Debug) { $buildArgs = @('--debug') + $buildArgs }
 Push-Location $android
 try {
     & npm run android:build -- @buildArgs
-    if ($LASTEXITCODE -ne 0) { throw "The APK build failed with exit code $LASTEXITCODE." }
+    if ($LASTEXITCODE -ne 0) {
+        throw ("The APK build failed with exit code $LASTEXITCODE. If it failed during configuration " +
+            'with "Could not read workspace metadata", re-run with -ResetGradle.')
+    }
 }
 finally {
     Pop-Location
