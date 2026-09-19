@@ -2928,7 +2928,9 @@
           {#if status.paired}
             <button class="now-sheet-icon" onclick={openSourcePicker} aria-label={`Play on: ${playbackTargetLabel()}`} title="Play on">
               <svg viewBox="0 0 24 24" aria-hidden="true">
-                <path d="M6 9.6v4.8h3.2L14 18V6l-4.8 3.6z" /><path d="M17 9.4a4 4 0 0 1 0 5.2" />
+                <rect x="3.4" y="5.2" width="17.2" height="12.6" rx="2" />
+                <circle class="filled" cx="4.9" cy="16.9" r="1.1" />
+                <path d="M7.4 16.9A2.5 2.5 0 0 0 4.9 14.4" /><path d="M9.6 16.9A4.7 4.7 0 0 0 4.9 12.2" />
               </svg>
             </button>
           {/if}
@@ -3335,7 +3337,7 @@
           <span>Report this cover</span><small>{remoteAvailable() ? '' : 'Needs a connection'}</small>
         </button>
         <button class="actions-row" onclick={openSourcePicker}>
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9.6v4.8h3.2L14 18V6l-4.8 3.6z" /><path d="M17 9.4a4 4 0 0 1 0 5.2" /></svg>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.4" y="5.2" width="17.2" height="12.6" rx="2" /><circle class="filled" cx="4.9" cy="16.9" r="1.1" /><path d="M7.4 16.9A2.5 2.5 0 0 0 4.9 14.4" /><path d="M9.6 16.9A4.7 4.7 0 0 0 4.9 12.2" /></svg>
           <span>Play on</span><small>{playbackTargetLabel()}</small>
         </button>
         <button class="actions-row" onclick={() => (showSleepOptions = true)}>
