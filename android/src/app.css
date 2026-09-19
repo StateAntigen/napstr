@@ -35,8 +35,9 @@ audio { display: none; }
 .status-chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .status-chip.offline { color: #d8bd9e; }.status-chip.offline i { background: #ff9b3f; box-shadow: 0 0 6px #ff9b3f; }
 .header-icon { width: 40px; height: 40px; padding: 0; flex: 0 0 auto; display: grid; place-items: center; color: #b9b9c4; background: transparent; border: 0; }
-.header-icon svg, .nav-icon svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
-.bottom-nav button .nav-icon { display: grid; place-items: center; height: 23px; }
+.header-icon svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.nav-icon svg { width: 28px; height: 28px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.bottom-nav button .nav-icon { display: grid; place-items: center; height: 28px; }
 
 /* The field sticks under the header on the tabs that have one. The chips are a
    plain sibling below it, not a child, so they scroll away as the results move
@@ -74,6 +75,12 @@ audio { display: none; }
 .podcast-grid { min-height: 250px; padding: 0 14px 25px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px 13px; }.podcast-grid > .loading-list, .podcast-grid > .empty-library { grid-column: 1 / -1; }.podcast-card { position: relative; min-width: 0; padding: 0; color: white; background: transparent; text-align: left; }.podcast-open { width: 100%; min-width: 0; padding: 0; color: white; background: transparent; border: 0; text-align: left; }.podcast-open img, .podcast-open > .podcast-art-fallback { width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 10px; box-shadow: 0 6px 16px rgba(0,0,0,.36); }.podcast-open span { display: block; min-width: 0; }.podcast-open strong, .podcast-open small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.podcast-open strong { margin-top: 8px; font-size: 14px; }.podcast-open small { margin-top: 3px; color: #92929b; font-size: 11px; }.podcast-like { position: absolute; top: 6px; right: 6px; color: white; background: rgba(8,8,11,.72); box-shadow: 0 2px 8px rgba(0,0,0,.4); }.podcast-like.liked { color: #ff5576; background: rgba(24,8,13,.82); }
 
 .now-playing { --art-size: var(--bar-height); position: fixed; z-index: 5; right: 8px; bottom: calc(69px + env(safe-area-inset-bottom)); left: 8px; height: var(--art-size); padding: 0; display: grid; grid-template-columns: var(--art-size) minmax(0, 1fr) 54px; align-items: stretch; overflow: hidden; border-radius: 12px; box-shadow: 0 0 0 1px #285154, 0 10px 35px rgba(0,0,0,.62); backdrop-filter: blur(16px); background: linear-gradient(120deg, #17383a, #132d30 58%, #1b222b); transform: translateY(var(--bar-shift, 0px)); opacity: var(--bar-opacity, 1); transition: transform .18s ease-out, opacity .18s ease-out; }
+/* The bar wears the cover the way the album view and the drawer do: a stretched,
+   blurred copy behind everything with a teal scrim over it to keep the words
+   legible. Both are inert when there is no art, so an empty bar is unchanged.
+   `--bar-art` and `--bar-scrim` come from the element's own style attribute. */
+.now-playing::before { content: ''; position: absolute; z-index: 0; inset: -40%; background-image: var(--bar-art, none); background-position: center; background-size: cover; filter: blur(18px) saturate(1.5) brightness(.82); }
+.now-playing::after { content: ''; position: absolute; z-index: 0; inset: 0; opacity: var(--bar-scrim, 0); background: linear-gradient(120deg, rgba(16,47,49,.76), rgba(14,34,38,.62) 58%, rgba(22,26,34,.78)); }
 .now-playing.dragging { z-index: 35; transition: none; }.now-playing.empty { opacity: .9; }.empty-art, .podcast-player-art, .now-open .artwork.large { position: absolute; top: 0; bottom: 0; left: 0; width: var(--art-size); height: auto; border-radius: 12px 0 0 12px; }.empty-art { display: grid; place-items: center; color: #8db0b1; background: #254346; font-size: 26px; }.podcast-player-art { object-fit: cover; }
 .now-copy { min-width: 0; flex: 1; padding: 0 12px; display: flex; flex-direction: column; justify-content: center; gap: 3px; }
 .now-title { overflow: hidden; }
@@ -81,13 +88,13 @@ audio { display: none; }
 .now-title-row > span { display: inline-block; flex: 0 0 auto; }
 .now-title-row.marquee > span { padding-right: 30px; animation: marquee 13s linear infinite; }
 .now-copy small { overflow: hidden; color: #aabbbb; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
-.now-fill { position: absolute; top: 0; right: 0; bottom: 0; left: var(--art-size); pointer-events: none; }
-.now-fill::before { content: ''; position: absolute; top: 0; bottom: 0; left: 0; width: calc(100% * var(--bar-progress, 0)); background: rgba(122,222,206,.20); }.now-copy strong, .now-copy small { display: block; }.now-copy strong { font-size: 14px; }.now-copy small { margin-top: 3px; color: #aabbbb; font-size: 11px; }.now-play { grid-column: 3; padding: 0; display: grid; place-items: center; color: #eef7f7; background: transparent; border: 0; font-size: 24px; }.now-play:disabled { color: #5d6b6d; }
+.now-fill { position: absolute; z-index: 1; top: 0; right: 0; bottom: 0; left: var(--art-size); pointer-events: none; }
+.now-fill::before { content: ''; position: absolute; top: 0; bottom: 0; left: 0; width: calc(100% * var(--bar-progress, 0)); background: rgba(122,222,206,.20); }.now-copy strong, .now-copy small { display: block; }.now-copy strong { font-size: 14px; }.now-copy small { margin-top: 3px; color: #aabbbb; font-size: 11px; }.now-play { grid-column: 3; position: relative; z-index: 1; padding: 0; display: grid; place-items: center; color: #eef7f7; background: transparent; border: 0; font-size: 24px; }.now-play:disabled { color: #5d6b6d; }
 .icon-play { display: block; width: 0; height: 0; border-left: 0.6em solid currentColor; border-top: 0.35em solid transparent; border-bottom: 0.35em solid transparent; }
 .icon-pause { display: block; width: 0.6em; height: 0.72em; border-right: 0.19em solid currentColor; border-left: 0.19em solid currentColor; }
 .icon-busy { display: block; width: 0.6em; height: 0.6em; border: 0.08em solid rgba(255,255,255,.25); border-top-color: currentColor; border-radius: 50%; animation: spin .8s linear infinite; }
 .bottom-nav { position: fixed; z-index: 35; right: 0; bottom: 0; left: 0; height: calc(69px + env(safe-area-inset-bottom)); padding: 6px 10px env(safe-area-inset-bottom); display: flex; align-items: center; justify-content: space-around; background: rgba(8,8,10,.96); border-top: 1px solid #29292f; transform: translateY(calc(var(--nav-shift, 0) * 100%)); transition: transform .28s cubic-bezier(.22,.61,.36,1); }
-.bottom-nav.dragging { transition: none; }.bottom-nav button { min-width: 58px; height: 55px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; color: #72727b; background: transparent; border: 0; font-size: 10px; }.bottom-nav button span { font-size: 23px; }.bottom-nav button.active { color: white; }
+.bottom-nav.dragging { transition: none; }.bottom-nav button { min-width: 58px; height: 55px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; color: #72727b; background: transparent; border: 0; font-size: 10px; }.bottom-nav button span { font-size: 29px; line-height: 1; }.bottom-nav button.active { color: white; }
 
 @keyframes spin { to { transform: rotate(360deg); } }
 @keyframes marquee { from { transform: translateX(0); } to { transform: translateX(-100%); } }
@@ -100,7 +107,7 @@ audio { display: none; }
 
 /* Expandable now-playing sheet. The bar's artwork and title open it; dragging
    the header down collapses it again. */
-.now-open { grid-column: 1 / 3; min-width: 0; padding: 0 0 0 var(--art-size); display: flex; align-items: center; color: inherit; background: transparent; border: 0; text-align: left; touch-action: none; }
+.now-open { grid-column: 1 / 3; position: relative; z-index: 1; min-width: 0; padding: 0 0 0 var(--art-size); display: flex; align-items: center; color: inherit; background: transparent; border: 0; text-align: left; touch-action: none; }
 .now-open:disabled { color: inherit; }.now-open .now-copy { flex: 1; }
 .now-sheet { position: fixed; z-index: 30; inset: 0; display: flex; flex-direction: column; overflow: hidden; background: #000; touch-action: pan-y; transform: translateY(var(--sheet-drag, 0px)); transition: transform .28s cubic-bezier(.22,.61,.36,1); }
 .now-sheet.entering, .now-sheet.closing { transform: translateY(100%); }.now-sheet.dragging { transition: none; }

@@ -269,6 +269,18 @@
   );
   /** The track the bar draws, which is the computer's when it is the source. */
   let barTrack = $derived(playbackTarget === 'desktop' ? desktopTrackFromState() : null);
+  /** The cover the bar stretches behind itself, or '' when there is none. */
+  let barArtwork = $derived(
+    playbackTarget === 'desktop'
+      ? sheetCoverUrl()
+      : activeMedia === 'podcast'
+        ? currentPodcast?.image ?? ''
+        : sheetCoverUrl()
+  );
+  /** The custom properties its stretched cover needs, inert when there is none. */
+  let barArtStyle = $derived(
+    barArtwork ? `--bar-art:url(${barArtwork}); --bar-scrim:1` : '--bar-art:none; --bar-scrim:0'
+  );
   /** True when the bar has nothing to show, whichever player it is showing. */
   let barEmpty = $derived(
     playbackTarget === 'desktop'
@@ -2844,7 +2856,7 @@
 
     <section
       class:dragging={barDragging}
-      style={`--bar-shift:${barShift}px; --bar-opacity:${barFade}; --bar-progress:${barProgress}`}
+      style={`--bar-shift:${barShift}px; --bar-opacity:${barFade}; --bar-progress:${barProgress}; ${barArtStyle}`}
       class:empty={barEmpty}
       class="now-playing"
     >
@@ -3028,9 +3040,7 @@
         </button>
         <button onclick={() => (showQueue = true)} disabled={playbackTarget === 'desktop' && remoteQueue.length === 0} aria-label="Open the playlist" title="Playlist">
           <svg viewBox="0 0 24 24" aria-hidden="true">
-            <path d="M4 6.5h16" /><path d="M4 12h16" /><path d="M4 17.5h9" />
-            <path class="filled" d="M19.4 15.4a1.5 1.5 0 1 1-3 0 1.5 1.5 0 0 1 3 0z" />
-            <path d="M16.4 15.4v-3.6l3-.7" />
+            <path d="M4 6.5h16" /><path d="M4 12h16" /><path d="M4 17.5h16" />
           </svg>
         </button>
         <button disabled aria-label="Smart playlists, coming soon" title="Smart playlists, coming soon">
