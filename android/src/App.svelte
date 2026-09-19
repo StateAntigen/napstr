@@ -142,6 +142,9 @@
   let showNowPlaying = $state(false);
   let nowCover = $state<AlbumCover | null>(null);
   let nowArtFailed = $state(false);
+  /** The track the resolved cover belongs to, so a new object for the same one
+   *  does not throw the artwork away and fetch it again. */
+  let nowCoverKey = '';
   let sheetDragY = $state(0);
   let sheetDragging = $state(false);
   let sheetDragPending = $state(false);
@@ -169,11 +172,31 @@
   /** File ids held in this phone's audio cache, for the storage badge. */
   let cachedFileIds = $state<Set<string>>(new Set());
   let showSettings = $state(false);
-  /** The computer's own player, when this phone is allowed to drive it. */
-  let showRemote = $state(false);
+  /** The computer's player, drawn by the same drawer as this phone's. */
   let remoteState = $state<RemotePlaybackState | null>(null);
   let remoteBusy = $state(false);
   let remoteError = $state('');
+  /**
+   * The list this phone sent the last time it asked the computer to play. The
+   * wire carries only the queue's length and position, so this is a best-effort
+   * copy of what is queued over there: it is what the drawer draws, and its
+   * playing row is only marked while its length still matches what the computer
+   * reports.
+   */
+  let remoteQueue = $state<RemoteTrack[]>([]);
+  /**
+   * The computer's volume while it is being changed from here. -1 means "ask the
+   * computer"; a burst of volume-key presses accumulates in here so that holding
+   * the key becomes one request rather than one per key event.
+   */
+  let remoteVolume = $state(-1);
+  let remoteVolumeTimer = 0;
+  /**
+   * The track a sleep timer set to "end of track" is waiting on, when the
+   * computer is the one playing. The phone cannot hear a remote track end, so a
+   * different file being reported is what counts as the end.
+   */
+  let sleepRemoteFileId = '';
   /**
    * The computer's position is only known when it answers, so between answers it
    * is carried forward from here. This tick is what makes the bar move.
@@ -255,8 +278,51 @@
         : !currentPodcast
   );
   let barPlaying = $derived(playbackTarget === 'desktop' ? remoteState?.playing === true : playing);
-  /** Whichever track the open menu applies to: the chosen one, else the current. */
-  let menuTrack = $derived(actionTrack ?? (activeMedia === 'music' ? current : null));
+  /**
+   * The player the bar, the drawer and the system's media controls are all
+   * describing. They share one set of values so the three cannot disagree about
+   * what is playing or how far into it they are.
+   */
+  let shownTrack = $derived(playbackTarget === 'desktop' ? desktopTrackFromState() : current);
+  let shownPlaying = $derived(playbackTarget === 'desktop' ? remoteState?.playing === true : playing);
+  let shownPosition = $derived(playbackTarget === 'desktop' ? remotePositionMs() / 1000 : currentTime);
+  let shownDuration = $derived(playbackTarget === 'desktop' ? (remoteState?.durationMs ?? 0) / 1000 : duration);
+  /** Whether the player on screen has a neighbour to move to. */
+  let shownCanSkip = $derived(
+    playbackTarget === 'desktop' ? (remoteState?.queueLen ?? 0) > 1 : playerQueue.length > 1
+  );
+  /** The playlist the drawer would open: this phone's, or the copy of theirs. */
+  let shownQueue = $derived(playbackTarget === 'desktop' ? remoteQueue : playerQueue);
+  /** The row the playlist marks as playing, or -1 when that cannot be trusted. */
+  let shownQueueIndex = $derived(
+    playbackTarget === 'desktop'
+      ? remoteQueue.length === (remoteState?.queueLen ?? 0)
+        ? remoteState?.queueIndex ?? -1
+        : -1
+      : playerIndex
+  );
+  let shownShuffle = $derived(playbackTarget === 'desktop' ? remoteState?.shuffle === true : shuffle);
+  let shownLoopActive = $derived(
+    playbackTarget === 'desktop' ? (remoteState?.repeat ?? 'off') !== 'off' : loopMode !== 'off'
+  );
+  let shownLoopLabel = $derived(
+    playbackTarget === 'desktop' ? `Repeat: ${remoteRepeatLabel(remoteState?.repeat ?? 'off')}` : LOOP_LABELS[loopMode]
+  );
+  let shownLiked = $derived(shownTrack ? isTrackLiked(shownTrack) : false);
+  let shownLoopOne = $derived(playbackTarget === 'desktop' ? remoteState?.repeat === 'one' : loopMode === 'one');
+  /**
+   * Whichever track the open menu applies to: the chosen one, else the one the
+   * drawer is showing. With the computer as the source that is its track, so the
+   * menu still has a subject before this phone has played anything.
+   */
+  let menuTrack = $derived(
+    actionTrack ??
+      (playbackTarget === 'desktop'
+        ? desktopTrackFromState()
+        : activeMedia === 'music'
+          ? current
+          : null)
+  );
   let nowTitle = $derived(
     playbackTarget === 'desktop'
       ? remoteState?.title || (remoteState?.active ? 'Unknown track' : 'Nothing is playing there')
@@ -304,6 +370,8 @@
   let playedAlbums = $state<PlayedAlbum[]>(readPlayedAlbums());
   let audio: HTMLAudioElement;
   let lastSystemMediaSync = 0;
+  /** True while the system's media controls have been told to show nothing. */
+  let systemMediaEmpty = false;
 
   type AndroidMediaBridge = {
     update(payload: string): void;
@@ -328,8 +396,9 @@
       showReport = false;
       return;
     }
-    if (showRemote) {
-      showRemote = false;
+    // The source picker standing on its own, rather than inside the track menu.
+    if (showSourceOptions && !showActions) {
+      showSourceOptions = false;
       return;
     }
     if (showSettings) {
@@ -486,6 +555,32 @@
     resetRandomOrder();
     savePlaySettings();
     syncSystemMedia(true);
+  }
+
+  /** Repeat on whichever player the drawer is showing. */
+  function cycleShownRepeat() {
+    if (playbackTarget === 'desktop') {
+      if (status.streamOnly) return;
+      void sendPlayback({ type: 'repeat', mode: nextRemoteRepeat(remoteState?.repeat ?? 'off') });
+      return;
+    }
+    cycleLoopMode();
+  }
+
+  /** Shuffle on whichever player the drawer is showing. */
+  function toggleShownShuffle() {
+    if (playbackTarget === 'desktop') {
+      if (status.streamOnly) return;
+      void sendPlayback({ type: 'shuffle', enabled: remoteState?.shuffle !== true });
+      return;
+    }
+    toggleShuffle();
+  }
+
+  /** The heart is this phone's own list for either player; see `syncSystemMedia`. */
+  function toggleShownLike() {
+    const track = shownTrack;
+    if (track) toggleTrackLike(track);
   }
 
   function readableSize(size: number) {
@@ -941,7 +1036,10 @@
   function togglePlayer() {
     // The bar's button belongs to whichever player the bar is showing.
     if (playbackTarget === 'desktop') {
-      if (remoteState?.active) void sendPlayback({ type: 'toggle' });
+      if (remoteBusy || status.streamOnly) return;
+      // Nothing loaded over there: the computer decides what "play" means, and
+      // the host asks its own window to pick up where it left off.
+      void sendPlayback(remoteState?.active ? { type: 'toggle' } : { type: 'play' });
       return;
     }
     if (!current && !currentPodcast) return;
@@ -949,13 +1047,67 @@
     else audio.pause();
   }
 
+  /**
+   * Tell Android what its media controls should be showing.
+   *
+   * The lock screen, the notification, Android Auto and every Bluetooth button
+   * speak this one session, so it has to describe the player the user is
+   * actually listening to: the computer when it is the source, this phone
+   * otherwise. Position and duration go over in seconds.
+   */
   function syncSystemMedia(force = false) {
     const bridge = androidMediaBridge();
+    if (!bridge) return;
+
+    if (playbackTarget === 'desktop') {
+      const state = remoteState;
+      if (!state?.active) {
+        // Nothing playing over there means nothing to show: this phone stopped
+        // its own playback when the computer took the source over.
+        if (systemMediaEmpty) return;
+        systemMediaEmpty = true;
+        bridge.clear();
+        return;
+      }
+      const now = performance.now();
+      if (!force && now - lastSystemMediaSync < 900) return;
+      lastSystemMediaSync = now;
+      systemMediaEmpty = false;
+      bridge.update(JSON.stringify({
+        title: state.title || 'Unknown track',
+        artist: state.artist || status.desktopName || 'The computer',
+        artwork: sheetCoverUrl(),
+        playing: state.playing,
+        position: remotePositionMs() / 1000,
+        duration: (state.durationMs ?? 0) / 1000,
+        canPrevious: state.queueLen > 1,
+        canNext: state.queueLen > 1,
+        // The heart is still this phone's own list, exactly as it is for local
+        // playback: liking something never reaches the computer.
+        liked: shownTrack ? isTrackLiked(shownTrack) : false,
+        looping: state.repeat !== 'off',
+        volume: remoteVolumePercent(),
+        // Not this phone's audio: the service must not hold the screen for it,
+        // and its volume keys belong to the computer's player instead.
+        remote: true
+      }));
+      return;
+    }
+
     const media = activeMedia === 'podcast' ? currentPodcast : current;
-    if (!bridge || !media) return;
+    if (!media) {
+      // This phone has nothing to describe either, so the session must stop
+      // describing the computer's track rather than leaving it on the lock
+      // screen after the source has moved back here.
+      if (systemMediaEmpty) return;
+      systemMediaEmpty = true;
+      bridge.clear();
+      return;
+    }
     const now = performance.now();
     if (!force && now - lastSystemMediaSync < 900) return;
     lastSystemMediaSync = now;
+    systemMediaEmpty = false;
     bridge.update(JSON.stringify({
       title: activeMedia === 'podcast' ? currentPodcast?.title : current ? title(current) : '',
       artist: activeMedia === 'podcast' ? currentPodcast?.feedTitle : current ? artist(current) : '',
@@ -968,12 +1120,33 @@
       canPrevious: activeMedia === 'music' && playerQueue.length > 1 && (!shuffle || randomHistoryIndex > 0),
       canNext: activeMedia === 'music' && playerQueue.length > 1,
       liked: activeMedia === 'music' && !!current && isTrackLiked(current),
-      looping: activeMedia === 'music' && loopMode !== 'off'
+      looping: activeMedia === 'music' && loopMode !== 'off',
+      volume: Math.round(volume * 100),
+      remote: false
     }));
   }
 
   function handleSystemMediaAction(event: Event) {
     const action = (event as CustomEvent<string>).detail;
+
+    // The computer is the player, so every button belongs to it. This phone's
+    // audio has been stopped since it handed the source over.
+    if (playbackTarget === 'desktop') {
+      if (action === 'play') void sendPlayback({ type: 'play' });
+      else if (action === 'pause') void sendPlayback({ type: 'pause' });
+      else if (action === 'previous') void moveTrackBy(-1);
+      else if (action === 'next') void moveTrackBy(1);
+      else if (action === 'like') toggleShownLike();
+      else if (action === 'repeat') cycleShownRepeat();
+      else if (action === 'volumeUp') adjustRemoteVolume(1);
+      else if (action === 'volumeDown') adjustRemoteVolume(-1);
+      else if (action.startsWith('seek:')) {
+        const milliseconds = Number(action.slice(5));
+        if (Number.isFinite(milliseconds)) void seekShown(milliseconds / 1000);
+      }
+      return;
+    }
+
     if (!audio) return;
     if (action === 'play') {
       if (audio.paused) audio.play().catch((nextError) => (error = String(nextError)));
@@ -1005,20 +1178,25 @@
     currentTime = value;
   }
 
-  // Track the sheet's cover alongside playback. The batched cache means this is
-  // free when the library list already resolved the same album.
+  // Track the drawer's cover alongside whichever player it is showing. The
+  // batched cache means this is free when the library list already resolved the
+  // same album.
   $effect(() => {
-    const track = current;
+    const track = shownTrack;
+    // Key on the fields the lookup uses: a fresh object for the same track (the
+    // computer reports a new one every few seconds) must not drop the art.
+    const key = track ? `${track.fileId}\n${track.artist}\n${track.album}` : '';
+    if (key === nowCoverKey) return;
+    nowCoverKey = key;
     nowArtFailed = false;
-    if (!track) {
-      nowCover = null;
-      return;
-    }
-    // Drop the previous album's cover straight away: the notification reads
-    // this value, and a stale cover is worse than none.
     nowCover = null;
+    if (!track) return;
     let alive = true;
-    void coverFor(track).then((cover) => { if (alive) nowCover = cover; });
+    void coverFor(track).then((cover) => {
+      if (!alive) return;
+      nowCover = cover;
+      syncSystemMedia(true);
+    });
     return () => { alive = false; };
   });
 
@@ -1086,11 +1264,11 @@
   $effect(() => {
     androidBackBridge()?.setDrawerOpen(
       showSettings ||
-        showRemote ||
         showReport ||
         showActions ||
         showAlbumView ||
         showQueue ||
+        showSourceOptions ||
         (showNowPlaying && !sheetClosing)
     );
   });
@@ -1140,6 +1318,15 @@
     selected = track;
     resetRandomOrder();
     await playTrack(track);
+  }
+
+  /** Play a row of the playlist on whichever player it belongs to. */
+  async function playQueueRow(index: number) {
+    if (playbackTarget === 'desktop') {
+      await playFromRemoteQueue(index);
+      return;
+    }
+    await playFromQueue(index);
   }
 
   function startSheetDrag(event: PointerEvent) {
@@ -1239,19 +1426,25 @@
       barSwallowClick = false;
       return;
     }
-    // The bar opens whichever player it is showing.
-    if (playbackTarget === 'desktop') {
-      openRemote();
-      return;
-    }
     openNowPlaying();
   }
 
-  /** Seek by a relative amount, staying inside the track. */
-  function nudge(seconds: number) {
-    if (!current && !currentPodcast) return;
-    const limit = duration > 0 ? duration : Number.POSITIVE_INFINITY;
-    seek(Math.min(Math.max(0, currentTime + seconds), limit));
+  /** Seek by a relative amount on whichever player the drawer is showing. */
+  async function nudgeShown(seconds: number) {
+    const limit = shownDuration > 0 ? shownDuration : Number.POSITIVE_INFINITY;
+    await seekShown(Math.min(Math.max(0, shownPosition + seconds), limit));
+  }
+
+  /** Seek on whichever player the drawer is showing. */
+  async function seekShown(seconds: number) {
+    if (playbackTarget === 'desktop') {
+      if (status.streamOnly) return;
+      const limit = (remoteState?.durationMs ?? 0) / 1000;
+      const target = limit > 0 ? Math.min(Math.max(0, seconds), limit) : Math.max(0, seconds);
+      await sendPlayback({ type: 'seek', positionMs: Math.round(target * 1000) });
+      return;
+    }
+    seek(seconds);
   }
 
   /** Albums among the loaded tracks, grouped by the key covers are addressed by. */
@@ -1435,7 +1628,17 @@
     const known =
       tracks.find((item) => item.fileId === playing.fileId) ??
       likedMusic.find((item) => item.fileId === playing.fileId);
-    if (known) return known;
+    // The library copy brings the artwork lookup and the badges; the computer's
+    // own words win where it has them, so the bar, the drawer and the lock
+    // screen cannot describe the same track differently.
+    if (known) {
+      return {
+        ...known,
+        title: playing.title || known.title,
+        artist: playing.artist || known.artist,
+        album: playing.album || known.album
+      };
+    }
     return {
       fileId: playing.fileId,
       filename: '',
@@ -1469,42 +1672,63 @@
   }
 
   function openSourcePicker() {
-    showActions = false;
     showSleepOptions = false;
-    showRemote = false;
     showSourceOptions = true;
+  }
+
+  /** Opened from Settings, where there is no track menu to nest the rows in. */
+  function openSourcePickerAlone() {
+    showSettings = false;
+    showActions = false;
+    actionTrack = null;
+    openSourcePicker();
   }
 
   function choosePlaybackTarget(target: PlaybackTarget) {
     playbackTarget = target;
     showSourceOptions = false;
-    // The now playing screen describes this phone, so it has no place once the
-    // computer is the one playing.
-    if (target === 'desktop' && showNowPlaying) closeNowPlaying();
-    if (target !== 'desktop') return;
-    // One player at a time: handing over stops this phone.
-    audio?.pause();
-    playing = false;
-    void refreshRemote();
+    remoteVolume = -1;
+    // One player at a time: handing over stops this phone. The drawer stays
+    // open, because from here on it is showing the computer's player instead.
+    if (target === 'desktop') {
+      audio?.pause();
+      playing = false;
+      void refreshRemote();
+    }
+    syncSystemMedia(true);
   }
 
   /**
    * Play a track, and the list around it, on the computer.
    *
    * The list is what makes "next" mean over there what it means here, so it is
-   * sent whole and capped only by what one request can carry.
+   * sent whole and capped only by what one request can carry. It is also the
+   * only copy of the computer's queue this phone will ever have, which is why it
+   * is kept.
    */
   async function playOnDesktop(track: RemoteTrack) {
     if (!desktopTargetAvailable()) return;
     audio?.pause();
     playing = false;
     selected = track;
-    const queue = visibleQueue(track)
-      .map((item) => item.fileId)
-      .slice(0, MAX_DESKTOP_QUEUE);
-    await sendPlayback({ type: 'playTrack', fileId: track.fileId, queue });
+    const queue = visibleQueue(track).slice(0, MAX_DESKTOP_QUEUE);
+    remoteQueue = queue.length > 0 ? queue : [track];
+    await sendPlayback({ type: 'playTrack', fileId: track.fileId, queue: remoteQueue.map((item) => item.fileId) });
     // The answer describes the computer as it was when the command arrived, so
     // it is asked again once it has had time to open the track.
+    window.setTimeout(() => void refreshRemote(), 900);
+  }
+
+  /** Play a row of the copy of the computer's queue, keeping the rest of it. */
+  async function playFromRemoteQueue(index: number) {
+    const track = remoteQueue[index];
+    if (!track || !desktopTargetAvailable()) return;
+    selected = track;
+    await sendPlayback({
+      type: 'playTrack',
+      fileId: track.fileId,
+      queue: remoteQueue.map((item) => item.fileId)
+    });
     window.setTimeout(() => void refreshRemote(), 900);
   }
 
@@ -1519,11 +1743,6 @@
     } finally {
       remoteFetching = false;
     }
-  }
-
-  function openRemote() {
-    showRemote = true;
-    void refreshRemote();
   }
 
   /** Every transport button lands here, so the view never has to guess. */
@@ -1563,6 +1782,64 @@
     if (state.fileId !== remoteState?.fileId) remoteEndedFileId = '';
     remoteState = state;
     remoteStateAt = Date.now();
+    // A sleep timer waiting for the end of a track over there. This phone has no
+    // audio to listen to, so a different file being reported is the end of it.
+    if (sleepValue === 'track') {
+      if (!sleepRemoteFileId && state.fileId) sleepRemoteFileId = state.fileId;
+      else if (sleepRemoteFileId && state.fileId !== sleepRemoteFileId) {
+        sleepRemoteFileId = '';
+        finishSleepTimer();
+        return;
+      }
+    }
+    syncSystemMedia();
+  }
+
+  /** The sleep timer is done: nothing anywhere should still be making a sound. */
+  function finishSleepTimer() {
+    sleepValue = '';
+    sleepEndsAt = 0;
+    sleepClock = '';
+    pauseEverything();
+    notice = 'Sleep timer finished';
+  }
+
+  /**
+   * Silence both players. A sleep timer means no sound from anywhere, so this
+   * stops the phone and asks the computer to stop too when it is the one playing.
+   */
+  function pauseEverything() {
+    audio?.pause();
+    playing = false;
+    if (remoteState?.playing && desktopTargetAvailable()) void sendPlayback({ type: 'pause' });
+  }
+
+  /** The computer's volume as a percentage, whether or not the last change landed. */
+  function remoteVolumePercent() {
+    return remoteVolume >= 0 ? remoteVolume : Math.round((remoteState?.volume ?? 1) * 100);
+  }
+
+  /**
+   * Set the computer's volume, from the drawer's slider or from a volume key.
+   * A drag and a held key both arrive as a burst, so the request waits for the
+   * burst to stop rather than becoming one request per event.
+   */
+  function setRemoteVolume(percent: number) {
+    if (!desktopTargetAvailable()) return;
+    remoteVolume = Math.min(100, Math.max(0, Math.round(percent)));
+    syncSystemMedia(true);
+    window.clearTimeout(remoteVolumeTimer);
+    remoteVolumeTimer = window.setTimeout(() => {
+      const value = remoteVolume;
+      remoteVolumeTimer = 0;
+      // Back to following the computer once it has been told.
+      void sendVolume(value).then(() => { if (!remoteVolumeTimer) remoteVolume = -1; });
+    }, 160);
+  }
+
+  /** One press of a volume key: the step Android leaves to the app. */
+  function adjustRemoteVolume(direction: number) {
+    setRemoteVolume(remoteVolumePercent() + (direction > 0 ? 5 : -5));
   }
 
   /**
@@ -1595,10 +1872,6 @@
     if (remoteEndedFileId === state.fileId) return;
     remoteEndedFileId = state.fileId;
     void refreshRemote();
-  }
-
-  function remoteClock(milliseconds: number) {
-    return clock(Math.max(0, milliseconds) / 1000);
   }
 
   /** Ask the computer for a code this phone can hand to another device. */
@@ -1687,12 +1960,14 @@
   function openActions(track: RemoteTrack | null) {
     actionTrack = track;
     showSleepOptions = false;
+    showSourceOptions = false;
     showActions = true;
   }
 
   function closeActions() {
     showActions = false;
     showSleepOptions = false;
+    showSourceOptions = false;
     actionTrack = null;
   }
 
@@ -1731,6 +2006,9 @@
     if (option.endsTrack) {
       sleepEndsAt = 0;
       sleepClock = '';
+      // Over on the computer this phone cannot hear the track end, so the file
+      // it is on now is what the timer waits to see change.
+      sleepRemoteFileId = playbackTarget === 'desktop' ? remoteState?.fileId ?? '' : '';
       return;
     }
     const total = (option.minutes ?? 0) * 60;
@@ -1841,6 +2119,16 @@
     playerIndex = next;
     selected = playerQueue[next];
     await playTrack(playerQueue[next]);
+  }
+
+  /** Move one track on whichever player the drawer is showing. */
+  async function moveTrackBy(direction: -1 | 1) {
+    if (playbackTarget === 'desktop') {
+      if (status.streamOnly || !shownCanSkip) return;
+      await sendPlayback({ type: direction === 1 ? 'next' : 'previous' });
+      return;
+    }
+    await moveTrack(direction);
   }
 
   function handleTrackEnded() {
@@ -2196,6 +2484,8 @@
       if (document.hidden || playbackTarget !== 'desktop') return;
       remoteTick = Date.now();
       noteRemotePlaybackTick();
+      // The lock screen's progress has no audio events to ride on out here.
+      syncSystemMedia();
     }, 500);
     const transferTimer = window.setInterval(() => {
       if (!document.hidden && pending.size > 0) void refreshTransfers();
@@ -2207,11 +2497,7 @@
       if (!sleepEndsAt) return;
       const remaining = sleepEndsAt - Date.now();
       if (remaining <= 0) {
-        sleepValue = '';
-        sleepEndsAt = 0;
-        sleepClock = '';
-        audio?.pause();
-        notice = 'Sleep timer finished';
+        finishSleepTimer();
         return;
       }
       const seconds = Math.ceil(remaining / 1000);
@@ -2225,6 +2511,7 @@
       // Unlocking after a while away should show what is playing now, not what
       // was playing when the screen went off.
       if (playbackTarget === 'desktop') void refreshRemote();
+      syncSystemMedia(true);
     };
     document.addEventListener('visibilitychange', foreground);
     window.addEventListener('napstrfy-media-action', handleSystemMediaAction);
@@ -2268,6 +2555,34 @@
     {/each}
     {#if showLoadMore && tracks.length < total}<button class="load-more" onclick={() => loadLibrary(true)} disabled={loadingMore}>{loadingMore ? 'Loading…' : `Load more · ${tracks.length} of ${total}`}</button>{/if}
   </section>
+{/snippet}
+
+{#snippet playbackTargetRows()}
+  <button class:active={playbackTarget === 'phone'} class="actions-row" onclick={() => choosePlaybackTarget('phone')}>
+    <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="2.8" width="10" height="18.4" rx="2.2" /><path d="M11 18.4h2" /></svg>
+    <span>This phone</span>
+    {#if playbackTarget === 'phone'}<small>Playing here</small>{/if}
+  </button>
+  <button
+    class:active={playbackTarget === 'desktop'}
+    class="actions-row"
+    disabled={!desktopTargetAvailable()}
+    onclick={() => choosePlaybackTarget('desktop')}
+  >
+    <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4.4" width="18" height="12.2" rx="1.8" /><path d="M8.5 20h7" /><path d="M12 16.6V20" /></svg>
+    <span>{status.desktopName || 'The computer'}</span>
+    <small>
+      {!status.paired
+        ? 'Not paired'
+        : !status.connected
+          ? 'Not reachable'
+          : status.streamOnly
+            ? 'Read-only pairing'
+            : playbackTarget === 'desktop'
+              ? 'Playing there'
+              : 'Play its library here'}
+    </small>
+  </button>
 {/snippet}
 
 {#if !status.paired && activeTab !== 'podcasts'}
@@ -2569,14 +2884,14 @@
   </main>
 {/if}
 
-{#if showNowPlaying && current && activeMedia === 'music'}
+{#if showNowPlaying && (playbackTarget === 'desktop' ? remoteAvailable() : !!current && activeMedia === 'music')}
   <div
     class="now-sheet"
     class:entering={sheetEntering}
     class:closing={sheetClosing}
     class:dragging={sheetDragging}
     bind:this={sheetElement}
-    style={`--sheet-drag:${sheetDragY}px; --cover-hue:${artworkHue(current.fileId)}`}
+    style={`--sheet-drag:${sheetDragY}px; --cover-hue:${artworkHue(shownTrack?.fileId ?? '')}`}
     role="dialog"
     aria-modal="true"
     tabindex="-1"
@@ -2598,13 +2913,6 @@
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 9.5 12 16l7-6.5" /></svg>
         </button>
         <div class="now-sheet-top-buttons">
-          {#if remoteAvailable()}
-            <button class="now-sheet-icon" onclick={openRemote} aria-label="Control the computer">
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <rect x="3" y="4.6" width="18" height="12" rx="2" /><path d="M12 16.6V20" /><path d="M9 20h6" />
-              </svg>
-            </button>
-          {/if}
           <button class="now-sheet-icon" onclick={() => openActions(null)} aria-label="Track options">
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <circle class="filled" cx="12" cy="5.6" r="1.7" /><circle class="filled" cx="12" cy="12" r="1.7" /><circle class="filled" cx="12" cy="18.4" r="1.7" />
@@ -2620,60 +2928,105 @@
     </div>
 
     <div class="now-sheet-body" bind:this={sheetScroller}>
+      {#if playbackTarget === 'desktop' && (remoteError || remoteState?.error)}
+        <p class="sheet-error">{remoteState?.error || remoteError}</p>
+      {/if}
+
       <div class="now-sheet-timeline">
-        <input type="range" min="0" max={duration || 0} step="0.1" value={currentTime} oninput={(event) => seek(Number(event.currentTarget.value))} aria-label="Seek" />
+        <input
+          type="range"
+          min="0"
+          max={shownDuration || 0}
+          step="0.1"
+          value={shownPosition}
+          oninput={(event) => { if (playbackTarget !== 'desktop') void seekShown(Number(event.currentTarget.value)); }}
+          onchange={(event) => { if (playbackTarget === 'desktop') void seekShown(Number(event.currentTarget.value)); }}
+          disabled={playbackTarget === 'desktop' && (status.streamOnly || !remoteState?.active)}
+          aria-label="Seek"
+        />
       </div>
 
       <div class="now-sheet-meta">
-        <span>{clock(currentTime)}</span>
-        <span class="now-sheet-speed">Speed: 1x</span>
-        <span>{clock(duration)}</span>
+        <span>{clock(shownPosition)}</span>
+        <span class="now-sheet-speed">
+          {playbackTarget === 'desktop'
+            ? `${remoteState?.queueLen ?? 0} ${(remoteState?.queueLen ?? 0) === 1 ? 'track' : 'tracks'} there`
+            : 'Speed: 1x'}
+        </span>
+        <span>{clock(shownDuration)}</span>
       </div>
 
-      <div class="now-sheet-copy">
-        <h1>{title(current)}</h1>
-        <p>{artist(current)}</p>
-        {#if current.album}<small>{current.album}</small>{/if}
-        {#if fileSummary(current)}<em>{fileSummary(current)}</em>{/if}
-      </div>
+      {#if playbackTarget === 'desktop' && !remoteState?.active}
+        <div class="now-sheet-copy">
+          <h1>Nothing is playing there</h1>
+          <p>
+            {status.streamOnly
+              ? 'This pairing is read only, so it cannot start anything.'
+              : 'Napstr will pick up from wherever the computer left off.'}
+          </p>
+        </div>
+      {:else if shownTrack}
+        <div class="now-sheet-copy">
+          <h1>{title(shownTrack)}</h1>
+          <p>{artist(shownTrack)}</p>
+          {#if shownTrack.album}<small>{shownTrack.album}</small>{/if}
+          {#if playbackTarget !== 'desktop' && fileSummary(shownTrack)}<em>{fileSummary(shownTrack)}</em>{/if}
+        </div>
+      {/if}
 
       <div class="now-sheet-actions">
-        <button onclick={() => moveTrack(-1)} disabled={playerQueue.length < 2 || (shuffle && randomHistoryIndex <= 0)} aria-label="Previous track">|◀</button>
-        <button class="skip-button" onclick={() => nudge(-10)} aria-label="Back 10 seconds">
+        <button onclick={() => void moveTrackBy(-1)} disabled={!shownCanSkip || (playbackTarget === 'phone' && shuffle && randomHistoryIndex <= 0)} aria-label="Previous track">|◀</button>
+        <button class="skip-button" onclick={() => void nudgeShown(-10)} aria-label="Back 10 seconds">
           <svg viewBox="0 0 24 24" aria-hidden="true">
             <circle cx="12" cy="12" r="7.4" />
             <path class="filled" d="M12 1.9 8.4 5.2l3.6 3.3z" />
             <text class="filled" x="12" y="15.1" text-anchor="middle" font-size="8.4" font-weight="700">10</text>
           </svg>
         </button>
-        <button class="play-main" class:square={playing} onclick={togglePlayer} disabled={caching} aria-label={playing ? 'Pause' : 'Play'}>
-          {#if caching}<span class="icon-busy"></span>{:else if playing}<span class="icon-pause"></span>{:else}<span class="icon-play"></span>{/if}
+        <button class="play-main" class:square={shownPlaying} onclick={togglePlayer} disabled={playbackTarget === 'desktop' ? remoteBusy || status.streamOnly : caching} aria-label={shownPlaying ? 'Pause' : 'Play'}>
+          {#if playbackTarget === 'desktop' ? remoteBusy : caching}<span class="icon-busy"></span>{:else if shownPlaying}<span class="icon-pause"></span>{:else}<span class="icon-play"></span>{/if}
         </button>
-        <button class="skip-button" onclick={() => nudge(10)} aria-label="Forward 10 seconds">
+        <button class="skip-button" onclick={() => void nudgeShown(10)} aria-label="Forward 10 seconds">
           <svg viewBox="0 0 24 24" aria-hidden="true">
             <circle cx="12" cy="12" r="7.4" />
             <path class="filled" d="M12 1.9 15.6 5.2 12 8.5z" />
             <text class="filled" x="12" y="15.1" text-anchor="middle" font-size="8.4" font-weight="700">10</text>
           </svg>
         </button>
-        <button onclick={() => moveTrack(1)} disabled={playerQueue.length < 2} aria-label="Next track">▶|</button>
+        <button onclick={() => void moveTrackBy(1)} disabled={!shownCanSkip} aria-label="Next track">▶|</button>
       </div>
 
+      {#if playbackTarget === 'desktop' && remoteState?.active}
+        <label class="sheet-volume">
+          <span>Volume</span>
+          <input
+            type="range"
+            min="0"
+            max="100"
+            step="1"
+            value={remoteVolumePercent()}
+            oninput={(event) => setRemoteVolume(Number(event.currentTarget.value))}
+            disabled={status.streamOnly}
+            aria-label="Volume on the computer"
+          />
+        </label>
+      {/if}
+
       <div class="now-sheet-modes">
-        <button class:active={loopMode !== 'off'} onclick={cycleLoopMode} aria-label={LOOP_LABELS[loopMode]} title={LOOP_LABELS[loopMode]}>
+        <button class:active={shownLoopActive} onclick={cycleShownRepeat} aria-label={shownLoopLabel} title={shownLoopLabel}>
           <svg viewBox="0 0 24 24" aria-hidden="true">
             <path d="M4.5 9.2A4.7 4.7 0 0 1 9.2 4.5H18" /><path d="M15.6 1.8 18.6 4.5 15.6 7.2" />
             <path d="M19.5 14.8a4.7 4.7 0 0 1-4.7 4.7H6" /><path d="M8.4 22.2 5.4 19.5 8.4 16.8" />
-            {#if loopMode === 'one'}<path d="M11.7 11.4 12.9 10.3v5.2" /><path d="M11.2 15.5h3.4" />{/if}
+            {#if shownLoopOne}<path d="M11.7 11.4 12.9 10.3v5.2" /><path d="M11.2 15.5h3.4" />{/if}
           </svg>
         </button>
-        <button class:active={shuffle} onclick={toggleShuffle} aria-label={shuffle ? 'Shuffle on' : 'Shuffle off'} title="Shuffle">
+        <button class:active={shownShuffle} onclick={toggleShownShuffle} aria-label={shownShuffle ? 'Shuffle on' : 'Shuffle off'} title="Shuffle">
           <svg viewBox="0 0 24 24" aria-hidden="true">
             <path d="M3.5 6.5h3.2l10.1 11h4" /><path d="M18.3 3.7 21 6.5l-2.7 2.8" />
             <path d="M3.5 17.5h3.2l10.1-11h4" /><path d="M18.3 14.7 21 17.5l-2.7 2.8" />
           </svg>
         </button>
-        <button onclick={() => (showQueue = true)} aria-label="Open the playlist" title="Playlist">
+        <button onclick={() => (showQueue = true)} disabled={playbackTarget === 'desktop' && remoteQueue.length === 0} aria-label="Open the playlist" title="Playlist">
           <svg viewBox="0 0 24 24" aria-hidden="true">
             <path d="M4 6.5h16" /><path d="M4 12h16" /><path d="M4 17.5h9" />
             <path class="filled" d="M19.4 15.4a1.5 1.5 0 1 1-3 0 1.5 1.5 0 0 1 3 0z" />
@@ -2685,7 +3038,7 @@
             <path d="M12 12h.01" /><path d="M8.4 8.4a5.1 5.1 0 0 0 0 7.2" /><path d="M15.6 8.4a5.1 5.1 0 0 1 0 7.2" />
           </svg>
         </button>
-        <button class="now-mode-like" class:liked={current ? isTrackLiked(current) : false} onclick={() => current && toggleTrackLike(current)} aria-label="Like this track" disabled={!current}>
+        <button class="now-mode-like" class:liked={shownLiked} onclick={toggleShownLike} aria-label="Like this track" disabled={!shownTrack}>
           <svg viewBox="0 0 24 24" aria-hidden="true">
             <path d="M12 20.3c-1.4-1-7.2-5.2-7.2-9.4A4.2 4.2 0 0 1 12 8.2a4.2 4.2 0 0 1 7.2 2.7c0 4.2-5.8 8.4-7.2 9.4z" />
           </svg>
@@ -2695,24 +3048,27 @@
   </div>
 {/if}
 
-{#if showQueue && activeMedia === 'music'}
+{#if showQueue && (playbackTarget === 'desktop' || activeMedia === 'music')}
   <div class="queue-view" role="dialog" aria-modal="true" aria-label="Playlist">
     <header class="queue-head">
       <div>
-        <p>{shuffle ? 'SHUFFLED' : 'PLAYING NEXT'}</p>
-        <h1>{playerQueue.length === 1 ? '1 track' : `${playerQueue.length} tracks`}</h1>
+        <p>{playbackTarget === 'desktop' ? `ON ${(status.desktopName || 'the computer').toUpperCase()}` : shuffle ? 'SHUFFLED' : 'PLAYING NEXT'}</p>
+        <h1>{shownQueue.length === 1 ? '1 track' : `${shownQueue.length} tracks`}</h1>
       </div>
       <button class="queue-close" onclick={() => (showQueue = false)} aria-label="Close the playlist">×</button>
     </header>
     <div class="queue-list">
-      {#each playerQueue as track, index (track.fileId)}
-        <button class:playing={index === playerIndex} class="queue-row" onclick={() => playFromQueue(index)}>
-          <span class="queue-index">{index === playerIndex ? '▶' : index + 1}</span>
+      {#each shownQueue as track, index (track.fileId)}
+        <button class:playing={index === shownQueueIndex} class="queue-row" onclick={() => void playQueueRow(index)}>
+          <span class="queue-index">{index === shownQueueIndex ? '▶' : index + 1}</span>
           <TrackArtwork track={track} lookup={index < 12} />
           <span class="queue-copy"><strong>{title(track)}</strong><small>{artist(track)}</small></span>
         </button>
       {/each}
-      {#if playerQueue.length === 0}<p class="queue-empty">Nothing is queued yet.</p>{/if}
+      {#if shownQueue.length === 0}<p class="queue-empty">Nothing is queued yet.</p>{/if}
+      {#if playbackTarget === 'desktop' && shownQueue.length > 0 && shownQueueIndex < 0}
+        <p class="queue-note">This is the list this phone sent. The computer is playing something else now.</p>
+      {/if}
     </div>
   </div>
 {/if}
@@ -2750,10 +3106,10 @@
 
       {#if status.paired}
         <div class="settings-section">
-          <p>The computer</p>
-          <button class="settings-row" onclick={() => { showSettings = false; openRemote(); }} disabled={!status.connected}>
-            <span>Control its player</span>
-            <small>{status.connected ? (status.streamOnly ? 'See what it is playing' : 'Play, pause, skip and set the volume') : 'Offline'}</small>
+          <p>Playback</p>
+          <button class="settings-row" onclick={openSourcePickerAlone}>
+            <span>Play on</span>
+            <small>{playbackTargetLabel()}</small>
           </button>
         </div>
       {/if}
@@ -2863,128 +3219,6 @@
   </div>
 {/if}
 
-{#if showRemote}
-  <div
-    class="remote-view"
-    role="dialog"
-    aria-modal="true"
-    aria-label={`Playing on ${status.desktopName || 'the computer'}`}
-  >
-    <header class="view-head">
-      <div class="remote-head-copy">
-        <p>PLAYING ON</p>
-        <h1>{status.desktopName || 'Napstr'}</h1>
-      </div>
-      <div class="now-sheet-top-buttons">
-        <button class="view-icon" onclick={() => void refreshRemote()} aria-label="Refresh what the computer is playing">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.4 12a8.4 8.4 0 1 1-2.7-6.2" /><path d="M20.4 4.4v5.4H15" /></svg>
-        </button>
-        <button class="view-icon" onclick={() => (showRemote = false)} aria-label="Close">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6.5 6.5 17.5 17.5" /><path d="M17.5 6.5 6.5 17.5" /></svg>
-        </button>
-      </div>
-    </header>
-
-    <div class="remote-scroll">
-      {#if remoteError}<div class="error-card"><span>{remoteError}</span></div>{/if}
-      {#if remoteState?.error}<div class="error-card"><span>{remoteState.error}</span></div>{/if}
-
-      {#if remoteState?.active}
-        <div class="remote-now">
-          <h2>{remoteState.title || 'Unknown track'}</h2>
-          <p>{remoteState.artist || 'Unknown artist'}</p>
-          {#if remoteState.album}<small>{remoteState.album}</small>{/if}
-        </div>
-        <input
-          class="remote-seek"
-          type="range"
-          min="0"
-          max={remoteState.durationMs || 0}
-          step="1000"
-          value={remoteState.positionMs}
-          onchange={(event) => void sendPlayback({ type: 'seek', positionMs: Number(event.currentTarget.value) })}
-          disabled={status.streamOnly}
-          aria-label="Seek on the computer"
-        />
-        <div class="remote-times">
-          <span>{remoteClock(remotePositionMs())}</span>
-          <span>{remoteState.queueLen > 0 ? `Queue: ${remoteState.queueLen}` : 'One track'}</span>
-          <span>{remoteClock(remoteState.durationMs)}</span>
-        </div>
-      {:else}
-        <div class="remote-now">
-          <h2>Nothing is playing there</h2>
-          <p>
-            {status.streamOnly
-              ? 'This pairing is read only, so it cannot start anything.'
-              : 'Napstr will pick up from wherever the computer left off.'}
-          </p>
-        </div>
-      {/if}
-
-      <div class="remote-transport">
-        <button
-          onclick={() => void sendPlayback({ type: 'previous' })}
-          disabled={!remoteState?.active || (remoteState?.queueLen ?? 0) < 2 || status.streamOnly}
-          aria-label="Previous track on the computer">|◀</button>
-        <button
-          class="remote-main"
-          onclick={() => void sendPlayback(remoteState?.active ? { type: 'toggle' } : { type: 'play' })}
-          disabled={remoteBusy || status.streamOnly}
-          aria-label={remoteState?.playing ? 'Pause on the computer' : 'Play on the computer'}>
-          {#if remoteBusy}<span class="icon-busy"></span>{:else if remoteState?.playing}<span class="icon-pause"></span>{:else}<span class="icon-play"></span>{/if}
-        </button>
-        <button
-          onclick={() => void sendPlayback({ type: 'next' })}
-          disabled={!remoteState?.active || (remoteState?.queueLen ?? 0) < 2 || status.streamOnly}
-          aria-label="Next track on the computer">▶|</button>
-      </div>
-
-      <div class="remote-options">
-        <button
-          class:active={(remoteState?.repeat ?? 'off') !== 'off'}
-          onclick={() => void sendPlayback({ type: 'repeat', mode: nextRemoteRepeat(remoteState?.repeat ?? 'off') })}
-          disabled={status.streamOnly}>
-          <span>Repeat</span><small>{remoteRepeatLabel(remoteState?.repeat ?? 'off')}</small>
-        </button>
-        <button
-          class:active={remoteState?.shuffle === true}
-          onclick={() => void sendPlayback({ type: 'shuffle', enabled: remoteState?.shuffle !== true })}
-          disabled={status.streamOnly}>
-          <span>Shuffle</span><small>{remoteState?.shuffle ? 'On' : 'Off'}</small>
-        </button>
-        <button onclick={openSourcePicker}>
-          <span>Play on</span><small>{playbackTargetLabel()}</small>
-        </button>
-      </div>
-
-      <label class="remote-volume">
-        <span>Volume</span>
-        <input
-          type="range"
-          min="0"
-          max="100"
-          step="1"
-          value={Math.round((remoteState?.volume ?? 1) * 100)}
-          oninput={(event) => void sendVolume(Number(event.currentTarget.value))}
-          disabled={status.streamOnly}
-        />
-      </label>
-
-      <button
-        class="remote-stop"
-        onclick={() => void sendPlayback({ type: 'stop' })}
-        disabled={status.streamOnly || !remoteState?.active}>Stop on the computer</button>
-
-      <p class="remote-note">
-        {status.streamOnly
-          ? 'This pairing is read only: you can see what is playing there, but not change it.'
-          : 'Your own pairing signs every command. No Nostr keys leave your computer.'}
-      </p>
-    </div>
-  </div>
-{/if}
-
 {#if showReport}
   <div class="report-view" role="dialog" aria-modal="true" aria-label="Report a cover">
     <button class="actions-scrim" onclick={() => (showReport = false)} aria-label="Close the report"></button>
@@ -3015,7 +3249,7 @@
   </div>
 {/if}
 
-{#if showSourceOptions}
+{#if showSourceOptions && !showActions}
   <div class="actions-view" role="dialog" aria-modal="true" aria-label="Where to play">
     <button class="actions-scrim" onclick={() => (showSourceOptions = false)} aria-label="Close the source picker"></button>
     <div class="actions-panel">
@@ -3026,32 +3260,7 @@
         </div>
       </div>
       <div class="actions-divider"></div>
-
-      <button class:active={playbackTarget === 'phone'} class="actions-row" onclick={() => choosePlaybackTarget('phone')}>
-        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="2.8" width="10" height="18.4" rx="2.2" /><path d="M11 18.4h2" /></svg>
-        <span>This phone</span>
-        {#if playbackTarget === 'phone'}<small>Playing here</small>{/if}
-      </button>
-      <button
-        class:active={playbackTarget === 'desktop'}
-        class="actions-row"
-        disabled={!desktopTargetAvailable()}
-        onclick={() => choosePlaybackTarget('desktop')}
-      >
-        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4.4" width="18" height="12.2" rx="1.8" /><path d="M8.5 20h7" /><path d="M12 16.6V20" /></svg>
-        <span>{status.desktopName || 'The computer'}</span>
-        <small>
-          {!status.paired
-            ? 'Not paired'
-            : !status.connected
-              ? 'Not reachable'
-              : status.streamOnly
-                ? 'Read-only pairing'
-                : playbackTarget === 'desktop'
-                  ? 'Playing there'
-                  : ''}
-        </small>
-      </button>
+      {@render playbackTargetRows()}
     </div>
   </div>
 {/if}
@@ -3077,6 +3286,12 @@
             {#if sleepValue === option.value}<small>On</small>{/if}
           </button>
         {/each}
+      {:else if showSourceOptions}
+        <button class="actions-row back" onclick={() => (showSourceOptions = false)}>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14.5 5 8 12l6.5 7" /></svg>
+          <span>Play on</span><small>{playbackTargetLabel()}</small>
+        </button>
+        {@render playbackTargetRows()}
       {:else}
         <button class="actions-row" onclick={() => void shareTrack(menuTrack)}>
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4" /><path d="M8 7.5 12 3.5l4 4" /><path d="M5 14v6h14v-6" /></svg>

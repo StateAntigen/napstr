@@ -29,6 +29,10 @@ class MediaControlBridge(private val activity: MainActivity) {
       putExtra(MediaNotificationService.EXTRA_CAN_NEXT, state.optBoolean("canNext"))
       putExtra(MediaNotificationService.EXTRA_LIKED, state.optBoolean("liked"))
       putExtra(MediaNotificationService.EXTRA_LOOPING, state.optBoolean("looping"))
+      // The state describes the computer's player rather than this phone's, and
+      // volume is a percentage of the computer's volume.
+      putExtra(MediaNotificationService.EXTRA_REMOTE, state.optBoolean("remote"))
+      putExtra(MediaNotificationService.EXTRA_VOLUME, state.optInt("volume", 0))
     }
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) activity.startForegroundService(intent)
     else activity.startService(intent)
@@ -55,7 +59,9 @@ class MediaControlBridge(private val activity: MainActivity) {
     }
 
     fun dispatch(action: String) {
-      if (action !in setOf("play", "pause", "previous", "next", "like", "repeat") &&
+      if (action !in setOf(
+          "play", "pause", "previous", "next", "like", "repeat", "volumeUp", "volumeDown"
+        ) &&
         !action.startsWith("seek:")
       ) {
         return

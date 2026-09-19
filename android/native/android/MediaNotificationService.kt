@@ -8,6 +8,7 @@ import android.app.Service
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.media.AudioManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -20,6 +21,7 @@ import android.support.v4.media.session.PlaybackStateCompat
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.media.app.NotificationCompat.MediaStyle
+import androidx.media.VolumeProviderCompat
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.Executors
@@ -35,6 +37,23 @@ class MediaNotificationService : Service() {
   private var canNext = false
   private var liked = false
   private var looping = false
+  /** True while the session describes the computer's player, not this phone's. */
+  private var remote = false
+  private var volumeLevel = 0
+  /**
+   * Where the system's volume keys go while the computer is the player. Relative
+   * control means Android asks for a step and this app decides its size; the
+   * webview turns the step into a volume command for the computer.
+   */
+  private val remoteVolume = object : VolumeProviderCompat(
+    VolumeProviderCompat.VOLUME_CONTROL_RELATIVE,
+    100,
+    0
+  ) {
+    override fun onAdjustVolume(direction: Int) {
+      MediaControlBridge.dispatch(if (direction > 0) "volumeUp" else "volumeDown")
+    }
+  }
   private var foregroundStarted = false
   private var screenWakeLock: PowerManager.WakeLock? = null
   private var artworkUrl = ""
@@ -106,6 +125,8 @@ class MediaNotificationService : Service() {
     canNext = intent.getBooleanExtra(EXTRA_CAN_NEXT, false)
     liked = intent.getBooleanExtra(EXTRA_LIKED, false)
     looping = intent.getBooleanExtra(EXTRA_LOOPING, false)
+    remote = intent.getBooleanExtra(EXTRA_REMOTE, false)
+    volumeLevel = intent.getIntExtra(EXTRA_VOLUME, 0).coerceIn(0, 100)
     updateArtwork(intent.getStringExtra(EXTRA_ARTWORK).orEmpty())
     updateScreenWakeLock()
   }
@@ -141,7 +162,9 @@ class MediaNotificationService : Service() {
 
   @Suppress("DEPRECATION")
   private fun updateScreenWakeLock() {
-    if (playing) {
+    // Only this phone's own audio is a reason to keep the screen on: a track
+    // playing on the computer must not hold this phone's display awake.
+    if (playing && !remote) {
       if (screenWakeLock == null) {
         val powerManager = getSystemService(POWER_SERVICE) as PowerManager
         screenWakeLock = powerManager.newWakeLock(
@@ -170,6 +193,15 @@ class MediaNotificationService : Service() {
       metadata.putBitmap(MediaMetadataCompat.METADATA_KEY_ART, it)
     }
     mediaSession.setMetadata(metadata.build())
+    if (remote) {
+      // The volume keys and the system's own volume panel belong to the
+      // computer's player while it is the one playing. The phone has no local
+      // audio to turn down, so nothing is lost by handing them over.
+      if (remoteVolume.currentVolume != volumeLevel) remoteVolume.currentVolume = volumeLevel
+      mediaSession.setPlaybackToRemote(remoteVolume)
+    } else {
+      mediaSession.setPlaybackToLocal(AudioManager.STREAM_MUSIC)
+    }
     var actions = PlaybackStateCompat.ACTION_PLAY or
       PlaybackStateCompat.ACTION_PAUSE or
       PlaybackStateCompat.ACTION_PLAY_PAUSE or
@@ -321,6 +353,8 @@ class MediaNotificationService : Service() {
     const val EXTRA_CAN_NEXT = "canNext"
     const val EXTRA_LIKED = "liked"
     const val EXTRA_LOOPING = "looping"
+    const val EXTRA_REMOTE = "remote"
+    const val EXTRA_VOLUME = "volume"
     private const val CHANNEL_ID = "napstrfy_playback"
     private const val NOTIFICATION_ID = 7302
   }

@@ -277,33 +277,14 @@ svg .filled { fill: currentColor; stroke: none; }
 .ticket-actions button { min-height: 38px; padding: 6px 14px; flex: 1; color: #ececf1; background: #1d1d23; border: 1px solid #34343d; border-radius: 10px; font-size: 13px; }
 .ticket-actions button:first-child { color: #0d1a1c; background: #8fe0cf; border-color: #8fe0cf; font-weight: 700; }
 
-/* Driving the computer's own player. */
-.remote-view { position: fixed; z-index: 41; inset: 0; display: flex; flex-direction: column; background: #0b0b0e; animation: queue-in .22s ease-out; }
-.remote-view .view-head { position: static; padding: calc(env(safe-area-inset-top) + 12px) 14px 12px 18px; gap: 12px; align-items: center; border-bottom: 1px solid #1c1c22; }
-.remote-head-copy { min-width: 0; }
-.remote-head-copy p { margin: 0; color: #8b8b96; font-size: 10px; letter-spacing: .16em; }
-.remote-head-copy h1 { margin: 3px 0 0; font-size: 19px; letter-spacing: -.02em; overflow-wrap: anywhere; }
-.remote-scroll { min-height: 0; padding: 18px 18px calc(28px + env(safe-area-inset-bottom)); flex: 1; display: flex; flex-direction: column; gap: 14px; overflow-y: auto; overscroll-behavior-y: contain; }
-.remote-now { min-width: 0; }
-.remote-now h2 { margin: 0; font-size: 24px; line-height: 1.14; letter-spacing: -.03em; overflow-wrap: anywhere; }
-.remote-now p { margin: 7px 0 0; color: #b6b6c0; font-size: 15px; }
-.remote-now small { display: block; margin-top: 5px; color: #85858f; font-size: 12px; }
-.remote-seek { width: 100%; height: 4px; accent-color: #8fe0cf; }
-.remote-times { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: #85858f; font-size: 11px; font-variant-numeric: tabular-nums; }
-.remote-transport { display: flex; align-items: center; justify-content: center; gap: 18px; }
-.remote-transport button { width: 52px; height: 52px; padding: 0; display: grid; place-items: center; color: #e8e8ec; background: transparent; border: 0; border-radius: 50%; font-size: 24px; }
-.remote-transport .remote-main { width: 68px; height: 68px; color: #0d0d10; background: #f5f5f6; }
-.remote-transport button:disabled { opacity: .35; }
-.remote-options { display: flex; gap: 10px; }
-.remote-options button { min-height: 52px; padding: 8px 14px; flex: 1; display: flex; flex-direction: column; align-items: flex-start; gap: 3px; color: #b9b9c4; background: #14141a; border: 1px solid #26262f; border-radius: 12px; text-align: left; }
-.remote-options button.active { color: #8fe0cf; border-color: #2f5c53; }
-.remote-options button:disabled { opacity: .45; }
-.remote-options span { font-size: 14px; font-weight: 600; }
-.remote-options small { color: #85858f; font-size: 11px; }
-.remote-volume { display: grid; grid-template-columns: 68px minmax(0, 1fr); align-items: center; gap: 10px; color: #b6b6c0; font-size: 13px; }
-.remote-volume input { width: 100%; height: 4px; accent-color: #8fe0cf; }
-.remote-stop { min-height: 48px; padding: 8px 14px; color: #ff9aa6; background: transparent; border: 1px solid #46323a; border-radius: 12px; font-size: 14px; }
-.remote-stop:disabled { opacity: .45; }
+/* The computer's player is the same drawer as this phone's player: the source
+   picker, the transport, the modes and the playlist are all the same controls
+   pointed at the other device. Only the volume row, its errors and a note the
+   report panel shares are styles of their own. */
+.sheet-error { margin: 0; padding: 9px 12px; color: #ffd9db; background: #3d1419; border: 1px solid #7d2831; border-radius: 10px; font-size: 12px; line-height: 1.4; overflow-wrap: anywhere; }
+.sheet-volume { display: grid; grid-template-columns: 68px minmax(0, 1fr); align-items: center; gap: 10px; color: #b6b6c0; font-size: 13px; }
+.sheet-volume input { width: 100%; height: 4px; accent-color: #8fe0cf; }
+.queue-note { margin: 12px 2px 0; color: #77777f; font-size: 11px; line-height: 1.45; }
 .remote-note { margin: 0; color: #7d7d87; font-size: 11px; line-height: 1.5; }
 
 /* Reporting a cover: a second page of the track menu. */
