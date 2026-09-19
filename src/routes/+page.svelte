@@ -18,6 +18,21 @@
   type View = 'Search' | 'Downloads' | 'Shared' | 'Profile' | 'Settings' | 'Trollbox' | 'Mobile' | 'Covers';
   type PlayerMode = 'single' | 'folder' | 'all';
   type PlayerOrigin = 'search' | 'downloads' | 'shared' | 'audiobook' | 'direct';
+  /** Repeat, as the phone offers it and this window now plays it. */
+  type RemoteRepeat = 'off' | 'all' | 'one';
+  /**
+   * A transport instruction a phone sent, forwarded by the playback bridge.
+   * Commands the native player carries out on its own - pause, stop, seek and
+   * volume - never reach the window, so only these arrive here.
+   */
+  type RemotePlaybackCommand =
+    | { type: 'play' }
+    | { type: 'toggle' }
+    | { type: 'next' }
+    | { type: 'previous' }
+    | { type: 'repeat'; mode: RemoteRepeat }
+    | { type: 'shuffle'; enabled: boolean }
+    | { type: 'playTrack'; fileId: string; queue: string[] };
   type WindowResizeDirection = 'East' | 'North' | 'NorthEast' | 'NorthWest' | 'South' | 'SouthEast' | 'SouthWest' | 'West';
   type Result = {
     id: number;
@@ -180,6 +195,24 @@
   let activePlayerAudiobook: Audiobook | null = null;
   let playerQueue: PlayerTrack[] = [];
   let playerQueueIndex = -1;
+  /**
+   * The queue in the order it was chosen, so shuffle can be undone. Kept apart
+   * from `playerQueue` because a shuffled queue is the same tracks in another
+   * order, not a different queue.
+   */
+  let playerQueueOrder: PlayerTrack[] = [];
+  /** True while the queue came from a phone rather than from this window. */
+  let playerQueueRemote = false;
+  let playerRepeat: RemoteRepeat = 'off';
+  let playerShuffle = false;
+  /** What the bridge was last told, so a change is the only thing that is sent. */
+  let publishedQueueFacts = '';
+  let queueFacts: { len: number; index: number; repeat: RemoteRepeat; shuffle: boolean } = {
+    len: 0,
+    index: -1,
+    repeat: 'off',
+    shuffle: false
+  };
   let currentTrack: PlayerTrack | null = null;
   let playerPlaying = false;
   let playerLoading = false;
@@ -661,7 +694,9 @@
     activePlayerAudiobook = null;
     playerOrigin = origin;
     playerMode = indexed ? mode : 'single';
-    playerQueue = queueForTrack(track, playerMode, playerOrigin);
+    playerQueueRemote = false;
+    playerQueueOrder = queueForTrack(track, playerMode, playerOrigin);
+    playerQueue = playerShuffle ? shuffledQueue(playerQueueOrder, fileId) : playerQueueOrder;
     const index = Math.max(0, playerQueue.findIndex((item) => item.fileId === fileId));
     await loadPlayerTrack(index);
   }
@@ -708,17 +743,141 @@
   async function playerTrackEnded() {
     playerPlaying = false;
     playerEnded = true;
+    // Repeating one track is the whole answer: the queue is irrelevant.
+    if (playerRepeat === 'one') {
+      await loadPlayerTrack(playerQueueIndex);
+      return;
+    }
     if (playerMode !== 'single' && playerQueueIndex + 1 < playerQueue.length) {
       await loadPlayerTrack(playerQueueIndex + 1);
+      return;
     }
+    // The end of the queue, which is only the end when repeat says it is.
+    if (playerRepeat === 'all' && playerQueue.length > 1) await loadPlayerTrack(0);
   }
 
   function changePlayerMode() {
     window.localStorage.setItem('napstr-player-mode', playerMode);
     if (!currentTrack) return;
-    playerQueue = queueForTrack(currentTrack, playerMode, playerOrigin);
+    // A queue a phone chose is not a function of this window's mode, so it is
+    // left exactly as the phone sent it.
+    if (!playerQueueRemote) playerQueueOrder = queueForTrack(currentTrack, playerMode, playerOrigin);
+    applyPlayerQueueOrder();
+  }
+
+  /** Lay the chosen order out for playing, honouring shuffle. */
+  function applyPlayerQueueOrder() {
+    if (!currentTrack) return;
+    playerQueue = playerShuffle
+      ? shuffledQueue(playerQueueOrder, currentTrack.fileId)
+      : playerQueueOrder;
     playerQueueIndex = Math.max(0, playerQueue.findIndex((item) => item.fileId === currentTrack?.fileId));
   }
+
+  /** The track being played first, everything else shuffled after it. */
+  function shuffledQueue(order: PlayerTrack[], fileId: string) {
+    const playing = order.find((item) => item.fileId === fileId);
+    if (!playing) return shuffled(order);
+    return [playing, ...shuffled(order.filter((item) => item.fileId !== fileId))];
+  }
+
+  /**
+   * Play the track a phone asked for, from the list the phone was looking at.
+   *
+   * The list arrives as file ids in the phone's order and is used in that order.
+   * Tracks this computer does not hold are dropped, exactly as they are from its
+   * own search results: it can only play what it has, and a queue that stops on
+   * something unplayable is worse than a shorter one.
+   */
+  async function playRemoteQueue(fileId: string, fileIds: string[]) {
+    const order: PlayerTrack[] = [];
+    for (const id of fileIds) {
+      const file = sharedFiles.find((candidate) => candidate.fileId === id);
+      if (file) order.push(toPlayerTrack(file));
+    }
+    if (!order.some((item) => item.fileId === fileId)) {
+      activityMessage = 'That phone asked for a track this computer does not have';
+      return;
+    }
+    activePlayerAudiobook = null;
+    playerOrigin = 'direct';
+    playerQueueRemote = true;
+    // A list was asked for, so it is meant to play through. Leaving "Stop" in
+    // force would end playback after the first track, which contradicts what the
+    // phone just asked for, so the mode moves with it — and is written down so
+    // the window's own select does not show a mode that is not in force.
+    if (order.length > 1 && playerMode === 'single') {
+      playerMode = 'all';
+      window.localStorage.setItem('napstr-player-mode', playerMode);
+    }
+    playerQueueOrder = order;
+    playerQueue = playerShuffle ? shuffledQueue(order, fileId) : order;
+    await loadPlayerTrack(Math.max(0, playerQueue.findIndex((item) => item.fileId === fileId)));
+  }
+
+  /**
+   * Carry out a transport command a phone sent.
+   *
+   * Only what the native player cannot manage alone arrives here, which is why
+   * there is nothing to do for pause, stop, seek or volume.
+   */
+  async function handleRemoteCommand(command: RemotePlaybackCommand) {
+    switch (command.type) {
+      case 'play':
+        if (!playerPlaying) await togglePlayer();
+        break;
+      case 'toggle':
+        await togglePlayer();
+        break;
+      case 'next':
+        await nextPlayerTrack();
+        break;
+      case 'previous':
+        await previousPlayerTrack();
+        break;
+      case 'repeat':
+        playerRepeat = command.mode;
+        break;
+      case 'shuffle':
+        playerShuffle = command.enabled;
+        applyPlayerQueueOrder();
+        break;
+      case 'playTrack':
+        await playRemoteQueue(command.fileId, command.queue);
+        break;
+    }
+  }
+
+  /**
+   * Tell the bridge what the queue looks like. It cannot see any of this, and a
+   * phone shows a queue length and enables "next" from it.
+   */
+  async function publishPlayerQueueFacts(facts: {
+    len: number;
+    index: number;
+    repeat: RemoteRepeat;
+    shuffle: boolean;
+  }) {
+    const key = `${facts.len}:${facts.index}:${facts.repeat}:${facts.shuffle}`;
+    if (key === publishedQueueFacts) return;
+    publishedQueueFacts = key;
+    try {
+      await invoke('publish_playback_state', { snapshot: facts });
+    } catch {
+      // A phone that hears nothing simply sees no queue, as it did before.
+    }
+  }
+
+  // Re-runs whenever the queue or its state changes. The facts are assembled in
+  // the statement rather than inside the call, because a function that reads the
+  // variables itself never makes this depend on them.
+  $: queueFacts = {
+    len: playerQueue.length,
+    index: playerQueueIndex,
+    repeat: playerRepeat,
+    shuffle: playerShuffle
+  };
+  $: if (nativeReady) void publishPlayerQueueFacts(queueFacts);
 
   async function seekPlayer(event: Event) {
     try {
@@ -2262,6 +2421,12 @@
     });
     void listen('napstr-library-changed', () => {
       void refreshLocalLibrary();
+    }).then((unlisten) => {
+      if (destroyed) unlisten();
+      else eventUnlisteners.push(unlisten);
+    });
+    void listen<RemotePlaybackCommand>('napstr-remote-playback', ({ payload }) => {
+      void handleRemoteCommand(payload);
     }).then((unlisten) => {
       if (destroyed) unlisten();
       else eventUnlisteners.push(unlisten);

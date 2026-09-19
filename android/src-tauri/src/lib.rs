@@ -3,7 +3,8 @@ use iroh::{endpoint::presets, Endpoint, EndpointAddr, EndpointId, SecretKey};
 use napstr_remote_protocol::{
     ClientRequest, PairingTicket, PlaybackCommand, RemoteAlbumCover, RemoteAudiobook,
     RemoteAudiobookSummary, RemotePlaybackState, RemoteTrack, RemoteTransfer, ServerResponse,
-    ALPN, MAX_CONTROL_FRAME_BYTES, MAX_COVER_KEYS, MAX_QR_SVG_BYTES, MAX_REPORT_NOTE_CHARS,
+    ALPN, MAX_CONTROL_FRAME_BYTES, MAX_COVER_KEYS, MAX_PLAY_QUEUE, MAX_QR_SVG_BYTES,
+    MAX_REPORT_NOTE_CHARS,
     REPORT_REASONS,
 };
 use quick_xml::{events::Event, Reader};
@@ -1983,13 +1984,17 @@ async fn remote_playback(
     state: State<'_, AppState>,
 ) -> Result<RemotePlaybackState, String> {
     // Refuse the nonsense here rather than letting the host guess: a seek past a
-    // day, or a volume over 100%, is a bug in the caller and not a preference.
+    // day, a volume over 100%, or more of a queue than one request carries, is a
+    // bug in the caller and not a preference.
     match &command {
         PlaybackCommand::Seek { position_ms } if *position_ms > MAX_SEEK_MS => {
             return Err("That position is out of range".into());
         }
         PlaybackCommand::Volume { percent } if *percent > 100 => {
             return Err("Volume is a percentage".into());
+        }
+        PlaybackCommand::PlayTrack { queue, .. } if queue.len() > MAX_PLAY_QUEUE => {
+            return Err("That is more tracks than the computer can take at once".into());
         }
         _ => {}
     }

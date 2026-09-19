@@ -7,9 +7,12 @@
 //!   seek, volume, stop - are applied directly to [`NativePlayer`];
 //! * anything that needs to know what comes next - next, previous, repeat,
 //!   shuffle, or playing at all when nothing is loaded - is forwarded to the
-//!   frontend as a [`REMOTE_PLAYBACK_EVENT`];
+//!   frontend as a [`REMOTE_PLAYBACK_EVENT`]. Playing one particular track goes
+//!   the same way and for the same reason: the window owns the queue, and it is
+//!   the only side that knows whether this computer holds a track at all;
 //! * the frontend reports its queue back through `publish_queue`, which is the
-//!   only reason this module knows how long the queue is.
+//!   only reason this module knows how long the queue is, and which is what
+//!   lets a phone show a queue length and enable "next" for it.
 //!
 //! Nothing here decides what a phone may ask for. That is
 //! `mobile::check_request_permission`, which refuses the whole request when the
@@ -157,7 +160,8 @@ impl PlaybackBridge {
             PlaybackCommand::Next
             | PlaybackCommand::Previous
             | PlaybackCommand::Repeat { .. }
-            | PlaybackCommand::Shuffle { .. } => {
+            | PlaybackCommand::Shuffle { .. }
+            | PlaybackCommand::PlayTrack { .. } => {
                 self.forward(&command)?;
             }
         }

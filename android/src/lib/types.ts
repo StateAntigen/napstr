@@ -98,7 +98,9 @@ export type PlaybackCommand =
   | { type: 'seek'; positionMs: number }
   | { type: 'volume'; percent: number }
   | { type: 'repeat'; mode: RemoteRepeat }
-  | { type: 'shuffle'; enabled: boolean };
+  | { type: 'shuffle'; enabled: boolean }
+  /** Play one track, with the list the phone was showing as the queue. */
+  | { type: 'playTrack'; fileId: string; queue: string[] };
 
 export type RemotePlaybackState = {
   active: boolean;

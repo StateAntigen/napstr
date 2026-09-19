@@ -8,6 +8,10 @@ pub const MAX_PAGE_SIZE: usize = 200;
 /// Album covers per request. Bounded so a full answer always fits in one
 /// control frame even when every URL is at its maximum length.
 pub const MAX_COVER_KEYS: usize = 40;
+/// Longest queue a phone may hand to the host when it asks the host to play
+/// something. 200 file ids of the 64 characters a SHA-256 takes is about 13 KB,
+/// so a full queue always fits in one control frame.
+pub const MAX_PLAY_QUEUE: usize = 200;
 /// NIP-56 report types a cover report may use. `other` exists so a phone is
 /// never forced to mislabelled something to be able to report it at all.
 pub const REPORT_REASONS: [&str; 7] = [
@@ -179,6 +183,15 @@ pub enum PlaybackCommand {
     },
     Shuffle {
         enabled: bool,
+    },
+    /// Play one particular track on the host, adopting the list the phone was
+    /// showing as the queue so that "next" goes where the phone would have
+    /// gone. The host finds `file_id` inside `queue`; an empty queue means
+    /// "this track on its own".
+    PlayTrack {
+        file_id: String,
+        #[serde(default)]
+        queue: Vec<String>,
     },
 }
 
@@ -577,6 +590,10 @@ mod tests {
                 mode: RemoteRepeat::One,
             },
             PlaybackCommand::Shuffle { enabled: true },
+            PlaybackCommand::PlayTrack {
+                file_id: "a".repeat(64),
+                queue: vec!["b".repeat(64), "c".repeat(64)],
+            },
         ] {
             let request = ClientRequest::Playback {
                 command: command.clone(),
@@ -671,6 +688,26 @@ mod tests {
         assert!(
             payload.len() <= MAX_CONTROL_FRAME_BYTES,
             "a full cover answer is {} bytes, over the {MAX_CONTROL_FRAME_BYTES} byte frame limit",
+            payload.len()
+        );
+    }
+
+    /// A phone may hand the desktop the whole list it was showing, and that
+    /// request still has to fit in one control frame.
+    #[test]
+    fn a_full_play_queue_fits_in_one_control_frame() {
+        let request = ClientRequest::Playback {
+            command: PlaybackCommand::PlayTrack {
+                file_id: "a".repeat(64),
+                queue: (0..MAX_PLAY_QUEUE)
+                    .map(|index| format!("{index:064x}"))
+                    .collect(),
+            },
+        };
+        let payload = serde_json::to_vec(&request).unwrap();
+        assert!(
+            payload.len() <= MAX_CONTROL_FRAME_BYTES,
+            "a full play queue is {} bytes, over the {MAX_CONTROL_FRAME_BYTES} byte frame limit",
             payload.len()
         );
     }

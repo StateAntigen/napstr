@@ -6,9 +6,10 @@ use crate::{
 use chrono::Utc;
 use iroh::{endpoint::presets, Endpoint, SecretKey};
 use napstr_remote_protocol::{
-    ClientRequest, CoverReportResult, PairingTicket, RemoteAlbumCover, RemoteAudiobook,
-    RemoteAudiobookSummary, RemoteSource, RemoteTrack, RemoteTransfer, ServerResponse, ALPN,
-    MAX_CONTROL_FRAME_BYTES, MAX_COVER_KEYS, MAX_PAGE_SIZE, PROTOCOL_VERSION,
+    ClientRequest, CoverReportResult, PairingTicket, PlaybackCommand, RemoteAlbumCover,
+    RemoteAudiobook, RemoteAudiobookSummary, RemoteSource, RemoteTrack, RemoteTransfer,
+    ServerResponse, ALPN, MAX_CONTROL_FRAME_BYTES, MAX_COVER_KEYS, MAX_PAGE_SIZE, MAX_PLAY_QUEUE,
+    PROTOCOL_VERSION,
 };
 use qrcode::{render::svg, QrCode};
 use rusqlite::{params, OptionalExtension};
@@ -785,7 +786,9 @@ impl MobileService {
                 .await
             }
             ClientRequest::Playback { command } => {
-                let state = self.playback.apply(&self.db_path, command)?;
+                let state = self
+                    .playback
+                    .apply(&self.db_path, bounded_playback(command)?)?;
                 write_response(send, &ServerResponse::Playback { state }).await
             }
             ClientRequest::PlaybackState => {
@@ -966,6 +969,36 @@ fn check_request_permission(stream_only: bool, request: &ClientRequest) -> Resul
 
 fn is_sha256_file_id(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// A playback command with anything a phone should not be able to say removed.
+///
+/// A queue a phone sends is a list it built from what it could see, so entries
+/// that are not file ids are dropped rather than refused: the queue still makes
+/// sense without them, and refusing the whole request would be a worse answer
+/// than playing the part of it that does. The track being asked for is not
+/// dropped, because a request that cannot play its own track is a broken one.
+fn bounded_playback(command: PlaybackCommand) -> Result<PlaybackCommand, String> {
+    match command {
+        PlaybackCommand::PlayTrack { file_id, queue } => {
+            if !is_sha256_file_id(&file_id) {
+                return Err("That is not a track this computer can look up".into());
+            }
+            if queue.len() > MAX_PLAY_QUEUE {
+                return Err(format!(
+                    "A queue of more than {MAX_PLAY_QUEUE} tracks is more than one request can carry"
+                ));
+            }
+            Ok(PlaybackCommand::PlayTrack {
+                file_id,
+                queue: queue
+                    .into_iter()
+                    .filter(|candidate| is_sha256_file_id(candidate))
+                    .collect(),
+            })
+        }
+        other => Ok(other),
+    }
 }
 
 /// Trim the host's bookkeeping (event ids, timestamps) from a resolved cover
@@ -1455,6 +1488,42 @@ mod tests {
             }
         )
         .is_ok());
+    }
+
+    #[test]
+    fn a_play_queue_is_bounded_and_filtered_to_file_ids() {
+        let track = "a".repeat(64);
+        let queued = "b".repeat(64);
+        let PlaybackCommand::PlayTrack { file_id, queue } = bounded_playback(
+            PlaybackCommand::PlayTrack {
+                file_id: track.clone(),
+                queue: vec![queued.clone(), "not-a-file".into(), String::new()],
+            },
+        )
+        .unwrap()
+        else {
+            panic!("a play command must stay a play command")
+        };
+        assert_eq!(file_id, track);
+        assert_eq!(queue, vec![queued]);
+
+        // The track being asked for is never quietly swapped for another.
+        assert!(bounded_playback(PlaybackCommand::PlayTrack {
+            file_id: "nope".into(),
+            queue: Vec::new(),
+        })
+        .is_err());
+        assert!(bounded_playback(PlaybackCommand::PlayTrack {
+            file_id: track,
+            queue: vec!["c".repeat(64); MAX_PLAY_QUEUE + 1],
+        })
+        .is_err());
+
+        // Anything that is not about a queue passes through untouched.
+        assert_eq!(
+            bounded_playback(PlaybackCommand::Next).unwrap(),
+            PlaybackCommand::Next
+        );
     }
 
     #[test]
