@@ -27,6 +27,9 @@
   const BAR_FLING_SPEED = 0.35;
   /** Movement below this is a tap on the bar, not a pull. */
   const BAR_DRAG_SLOP = 6;
+  /** How long a notice stays up. Its fade-out animation (`.toast`) ends just
+   *  before this, so the element is unmounted after it has already gone. */
+  const NOTICE_VISIBLE_MS = 4200;
   /** Temporary: cover-art diagnostics overlay. Delete with CoverDebug.svelte. */
   const COVER_DEBUG = true;
   /** The host caps a library page at 200, so one album always fits. */
@@ -1068,6 +1071,15 @@
   $effect(() => {
     document.body.style.overflow = showNowPlaying ? 'hidden' : '';
     return () => { document.body.style.overflow = ''; };
+  });
+
+  // A notice is a toast, not a banner: it says what just happened and then takes
+  // itself away, so nothing accumulates at the top of a long session. A second
+  // message restarts the clock rather than queueing behind the first.
+  $effect(() => {
+    if (!notice) return;
+    const timer = window.setTimeout(() => { notice = ''; }, NOTICE_VISIBLE_MS);
+    return () => window.clearTimeout(timer);
   });
 
   // The drawer, and every view above it, own the hardware back button.
@@ -2299,7 +2311,7 @@
     </header>
 
     {#if error}<button class="error-banner" onclick={() => (error = '')}>{error}<span>×</span></button>{/if}
-    {#if notice}<button class="notice-banner" onclick={() => (notice = '')}>{notice}<span>×</span></button>{/if}
+    {#if notice}{#key notice}<div class="toast" role="status">{notice}</div>{/key}{/if}
 
     {#if activeTab === 'search'}
       <section class="search-area">
@@ -2308,8 +2320,8 @@
           {#if loading}<i class="search-spinner" role="status" aria-label="Searching"></i>{/if}
           {#if query}<button type="button" class="clear-search" onclick={() => searchTracks('')}>×</button>{/if}
         </form>
-        <div class="chips"><button class:active={showingLikedMusic} onclick={showLikedTracks}>♥ Liked</button>{#each musicChips as chip}<button class:active={!showingLikedMusic && query.toLocaleLowerCase() === chip.toLocaleLowerCase()} onclick={() => selectChip(chip)}>{chip}</button>{/each}</div>
       </section>
+      <div class="chips-row"><div class="chips"><button class:active={showingLikedMusic} onclick={showLikedTracks}>♥ Liked</button>{#each musicChips as chip}<button class:active={!showingLikedMusic && query.toLocaleLowerCase() === chip.toLocaleLowerCase()} onclick={() => selectChip(chip)}>{chip}</button>{/each}</div></div>
 
       {#if searching && (resultArtists.length > 0 || libraryAlbums.length > 0)}
         <section class="album-shelves">
@@ -2414,8 +2426,8 @@
           <span>⌕</span><input bind:value={podcastQuery} placeholder="Search podcasts" aria-label="Search podcasts" />
           {#if podcastQuery}<button type="button" class="clear-search" onclick={() => { podcastQuery = ''; void loadTrendingPodcasts(); }}>×</button>{/if}
         </form>
-        <div class="chips podcast-genres"><button class:active={showingLikedPodcasts} onclick={showLikedPodcastList}>♥ Liked</button>{#each podcastGenres as genre}<button class:active={!showingLikedPodcasts && podcastGenre === genre} onclick={() => selectPodcastGenre(genre)}>{genre}</button>{/each}</div>
       </section>
+      <div class="chips-row"><div class="chips podcast-genres"><button class:active={showingLikedPodcasts} onclick={showLikedPodcastList}>♥ Liked</button>{#each podcastGenres as genre}<button class:active={!showingLikedPodcasts && podcastGenre === genre} onclick={() => selectPodcastGenre(genre)}>{genre}</button>{/each}</div></div>
 
       {#if selectedPodcast}
         <section class="podcast-show-heading">
