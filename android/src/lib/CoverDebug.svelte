@@ -28,7 +28,8 @@
     answers: events.filter((event) => event.kind === 'answer').length,
     errors: events.filter((event) => event.kind === 'error').length,
     skips: events.filter((event) => event.kind === 'skip').length,
-    cached: events.filter((event) => event.kind === 'cached').length
+    cached: events.filter((event) => event.kind === 'cached').length,
+    refreshes: events.filter((event) => event.kind === 'refresh').length
   });
 
   function stamp(at: number) {
@@ -56,12 +57,13 @@
 
     <p class="cover-debug-status">
       {status.paired ? status.desktopName || 'paired' : 'not paired'} ·
-      {status.connected ? 'connected' : 'offline'} · {status.streamOnly ? 'read-only' : 'full access'}
+      {status.connected ? 'connected' : 'offline'} · {status.streamOnly ? 'read-only' : 'full access'} ·
+      art rev {status.coverRevision}
     </p>
 
     <p class="cover-debug-counts">
       {counts.requests} requests · {counts.answers} answers · {counts.errors} errors ·
-      {counts.cached} cached · {counts.skips} no-key
+      {counts.cached} cached · {counts.skips} no-key · {counts.refreshes} host art changes
     </p>
 
     <div class="cover-debug-actions">

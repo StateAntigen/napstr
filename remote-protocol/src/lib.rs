@@ -370,6 +370,12 @@ pub enum ServerResponse {
     },
     Status {
         library_revision: u64,
+        /// Moves whenever what the host would report about album art changes.
+        /// A companion caches covers - including "the host has none" - so this
+        /// is what tells it a cached answer may be stale. An older host omits
+        /// it, which reads as `0` and simply never invalidates.
+        #[serde(default)]
+        cover_revision: u64,
         #[serde(default)]
         stream_only: bool,
     },
@@ -400,6 +406,7 @@ mod tests {
                 .unwrap(),
             ServerResponse::Status {
                 library_revision: 1,
+                cover_revision: 0,
                 stream_only: false
             }
         );
@@ -435,12 +442,31 @@ mod tests {
     fn library_status_round_trips() {
         let response = ServerResponse::Status {
             library_revision: 42,
+            cover_revision: 9,
             stream_only: true,
         };
         let json = serde_json::to_string(&response).unwrap();
         assert_eq!(
             serde_json::from_str::<ServerResponse>(&json).unwrap(),
             response
+        );
+    }
+
+    #[test]
+    fn a_host_without_a_cover_revision_reports_none() {
+        // An older desktop sends no `coverRevision`. Reading it as zero is what
+        // lets a newer phone treat "never invalidated" as the status quo rather
+        // than an answer that keeps changing underneath it.
+        assert_eq!(
+            serde_json::from_str::<ServerResponse>(
+                r#"{"type":"status","libraryRevision":3,"streamOnly":true}"#
+            )
+            .unwrap(),
+            ServerResponse::Status {
+                library_revision: 3,
+                cover_revision: 0,
+                stream_only: true,
+            }
         );
     }
 

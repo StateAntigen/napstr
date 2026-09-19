@@ -39,6 +39,8 @@ export type CompanionStatus = {
   desktopName: string;
   endpointId: string;
   libraryRevision: number;
+  /** Moves when the host's album art changes, so cached covers are re-asked. */
+  coverRevision: number;
   error: string;
 };
 

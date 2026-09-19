@@ -9,7 +9,7 @@ export type CoverEvent = {
   /** Monotonic, so the log can be keyed without depending on its text. */
   id: number;
   at: number;
-  kind: 'request' | 'answer' | 'error' | 'cached' | 'skip';
+  kind: 'request' | 'answer' | 'error' | 'cached' | 'skip' | 'refresh';
   detail: string;
 };
 

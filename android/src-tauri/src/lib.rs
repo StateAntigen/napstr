@@ -45,6 +45,9 @@ struct CompanionStatus {
     desktop_name: String,
     endpoint_id: String,
     library_revision: u64,
+    /// Moves when the host's art changes, so cached covers - including "the host
+    /// has none" - are asked about again instead of being trusted forever.
+    cover_revision: u64,
     error: String,
 }
 
@@ -1473,6 +1476,7 @@ impl RemoteClient {
                 desktop_name: String::new(),
                 endpoint_id: String::new(),
                 library_revision: 0,
+                cover_revision: 0,
                 error: String::new(),
             };
         }
@@ -1487,10 +1491,12 @@ impl RemoteClient {
                 desktop_name: desktop.desktop_name,
                 endpoint_id: desktop.endpoint_id,
                 library_revision: 0,
+                cover_revision: 0,
                 error: "Napstr did not answer yet".into(),
             },
             Ok(Ok(ServerResponse::Status {
                 library_revision,
+                cover_revision,
                 stream_only,
             })) => {
                 if stream_only != desktop.stream_only {
@@ -1510,6 +1516,7 @@ impl RemoteClient {
                     desktop_name: desktop.desktop_name,
                     endpoint_id: desktop.endpoint_id,
                     library_revision,
+                    cover_revision,
                     error: String::new(),
                 }
             }
@@ -1523,6 +1530,7 @@ impl RemoteClient {
                 desktop_name: desktop.desktop_name,
                 endpoint_id: desktop.endpoint_id,
                 library_revision: 0,
+                cover_revision: 0,
                 error: unexpected_response(&other),
             },
             Ok(Err(error)) => CompanionStatus {
@@ -1532,6 +1540,7 @@ impl RemoteClient {
                 desktop_name: desktop.desktop_name,
                 endpoint_id: desktop.endpoint_id,
                 library_revision: 0,
+                cover_revision: 0,
                 error,
             },
         }
@@ -1547,6 +1556,7 @@ impl RemoteClient {
                 desktop_name: desktop.desktop_name,
                 endpoint_id: desktop.endpoint_id,
                 library_revision: 0,
+                cover_revision: 0,
                 error: String::new(),
             },
             Ok(Ok(other)) => CompanionStatus {
@@ -1556,6 +1566,7 @@ impl RemoteClient {
                 desktop_name: desktop.desktop_name,
                 endpoint_id: desktop.endpoint_id,
                 library_revision: 0,
+                cover_revision: 0,
                 error: unexpected_response(&other),
             },
             Ok(Err(error)) => CompanionStatus {
@@ -1565,6 +1576,7 @@ impl RemoteClient {
                 desktop_name: desktop.desktop_name,
                 endpoint_id: desktop.endpoint_id,
                 library_revision: 0,
+                cover_revision: 0,
                 error,
             },
             Err(_) => CompanionStatus {
@@ -1574,6 +1586,7 @@ impl RemoteClient {
                 desktop_name: desktop.desktop_name,
                 endpoint_id: desktop.endpoint_id,
                 library_revision: 0,
+                cover_revision: 0,
                 error: "Napstr did not answer yet".into(),
             },
         }

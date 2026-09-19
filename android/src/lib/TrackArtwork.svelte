@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { artworkHue, coverFor } from './artwork';
+  import { artworkHue, coverFor, coverRevision } from './artwork';
   import type { RemoteTrack } from './types';
 
   let { track, lookup = false, large = false }: { track: RemoteTrack; lookup?: boolean; large?: boolean } = $props();
@@ -8,6 +8,10 @@
   let hue = $derived(artworkHue(track.fileId));
 
   $effect(() => {
+    // Reading the revision subscribes this tile to it: when the host says its
+    // art has changed, an album it had nothing for a moment ago is asked about
+    // again, so art appears here as the desktop finds it.
+    void $coverRevision;
     let alive = true;
     image = '';
     failed = false;

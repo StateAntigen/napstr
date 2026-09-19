@@ -3721,6 +3721,30 @@ pub fn initialise_network_schema(connection: &Connection) -> Result<(), String> 
            cover_key TEXT PRIMARY KEY, checked_at TEXT NOT NULL, hit INTEGER NOT NULL DEFAULT 0
          );"
     ).map_err(|error| error.to_string())
+    .and_then(|_| {
+        // A claim somebody signed is the other half of what this computer would
+        // report about art, so the revision is declared next to the table it
+        // watches. The `album_art_lookups` half, and the table both halves move,
+        // is declared in `cover::initialise_cover_schema`.
+        connection
+            .execute_batch(&format!(
+                "{cover_revision_table}
+                 CREATE TRIGGER IF NOT EXISTS album_covers_cover_revision
+                 AFTER INSERT ON album_covers BEGIN
+                   UPDATE cover_state SET revision = revision + 1 WHERE id = 1;
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS album_covers_cover_revision_updated
+                 AFTER UPDATE ON album_covers BEGIN
+                   UPDATE cover_state SET revision = revision + 1 WHERE id = 1;
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS album_covers_cover_revision_deleted
+                 AFTER DELETE ON album_covers BEGIN
+                   UPDATE cover_state SET revision = revision + 1 WHERE id = 1;
+                 END;",
+                cover_revision_table = cover::COVER_REVISION_TABLE
+            ))
+            .map_err(|error| error.to_string())
+    })
     .and_then(|_| super::ensure_column(connection, "remote_catalogue", "description", "TEXT NOT NULL DEFAULT ''"))
     .and_then(|_| super::ensure_column(connection, "remote_catalogue", "tags", "TEXT NOT NULL DEFAULT ''"))
     .and_then(|_| super::ensure_column(connection, "published_catalogue", "fingerprint", "TEXT NOT NULL DEFAULT ''"))

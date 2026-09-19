@@ -736,6 +736,15 @@ increasing local-library revision. A companion MAY poll it and should reload
 library pages only when it changes. The revision check carries no catalogue
 rows and does not affect active audio streams.
 
+It also contains `coverRevision`, which moves whenever the album art the
+desktop would report changes: a claim that arrived from a relay, or art the
+desktop resolved for itself. Artwork is requested album by album, so a
+companion that caches covers — including the albums the desktop had none for —
+MUST ask again about the ones it was told were missing when this changes,
+because an album with no art a moment ago may have art now. A desktop that has
+no cover support reports `0`, which a companion MUST read as "never
+invalidated" rather than as a revision of zero.
+
 For `fetchAudio`, an `audioReady` control frame is immediately followed on the
 same receive stream by exactly `track.size` raw bytes and then stream finish.
 The desktop MUST serve only an indexed supported-audio path contained by the

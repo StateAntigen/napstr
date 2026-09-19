@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
+import { writable } from 'svelte/store';
 import { recordCoverEvent } from './coverDebug';
 import type { RemoteTrack } from './types';
 
@@ -41,8 +42,24 @@ const INVOKE_KEY_LIMIT = 160;
  * answered once is not permanent. Asking is a local call to the host.
  */
 const STORED_COVER_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+/**
+ * How long "the host has no cover for this" is trusted on its own.
+ *
+ * The host reports a revision whenever its art changes, which is the accurate
+ * signal; this is what still works against a host too old to report one.
+ */
+const NEGATIVE_TTL_MS = 60 * 1000;
 /** A page composes in stages: gather its keys briefly before asking. */
 const BATCH_DELAY_MS = 40;
+
+/**
+ * Bumped when there is a cached "no cover" worth asking about again, so
+ * artwork already on screen asks instead of waiting for a re-render. Read as
+ * `$coverRevision` by the components that draw art.
+ */
+export const coverRevision = writable(0);
+/** The host revision this phone has already acted on. */
+let appliedCoverRevision = 0;
 
 type Waiter = (cover: AlbumCover | null) => void;
 
@@ -53,6 +70,12 @@ type Waiter = (cover: AlbumCover | null) => void;
  * across launches only ever delays artwork that has since been published.
  */
 const sessionCovers = new Map<string, AlbumCover | null>();
+/**
+ * When the host last said it had no cover for a key. Absence is not permanent —
+ * the host is looking albums up as they are shown here — so a "no" that has
+ * stood for `NEGATIVE_TTL_MS` is asked about again rather than kept.
+ */
+const negativeAt = new Map<string, number>();
 const pending = new Map<string, Waiter[]>();
 let flushHandle: number | null = null;
 
@@ -63,11 +86,23 @@ let flushHandle: number | null = null;
  */
 function cachedCover(key: string): AlbumCover | null | undefined {
   const known = sessionCovers.get(key);
-  if (known !== undefined) return known;
+  if (known !== undefined) {
+    if (known !== null || !expiredNegative(key)) return known;
+    // Falling through asks again, which is the point of an expiry.
+  }
   const stored = readStoredCover(key);
   if (stored === undefined) return undefined;
   sessionCovers.set(key, stored);
   return stored;
+}
+
+/** Forget a "the host has none" that has been trusted for long enough. */
+function expiredNegative(key: string): boolean {
+  const asked = negativeAt.get(key) ?? 0;
+  if (Date.now() - asked <= NEGATIVE_TTL_MS) return false;
+  sessionCovers.delete(key);
+  negativeAt.delete(key);
+  return true;
 }
 
 function readStoredCover(key: string): AlbumCover | undefined {
@@ -92,11 +127,13 @@ function readStoredCover(key: string): AlbumCover | undefined {
 function rememberCover(key: string, cover: AlbumCover | null) {
   sessionCovers.set(key, cover);
   if (!cover) {
+    negativeAt.set(key, Date.now());
     // A claim can be withdrawn, so a stored cover must go when the host says
     // there is none rather than linger until its own expiry.
     dropStoredCover(key);
     return;
   }
+  negativeAt.delete(key);
   try {
     window.localStorage.setItem(CACHE_PREFIX + key, JSON.stringify({ at: Date.now(), cover }));
   } catch {
@@ -244,10 +281,38 @@ export function debugCoverState(tracks: RemoteTrack[]) {
   });
 }
 
+/**
+ * Ask again about every album the host said it had no art for, once the host's
+ * own art has changed.
+ *
+ * Art already drawn is left alone: replacing a picture that is on screen costs
+ * a flash of the fallback for no gain, and a claim that supersedes another is
+ * rare enough to wait for the stored copy to age out. The case worth acting on
+ * at once is the album with nothing at all, because this phone asked before the
+ * host knew — which is exactly the art that turns up a moment later.
+ */
+export function invalidateCoverNegatives(revision: number) {
+  if (revision === appliedCoverRevision) return;
+  appliedCoverRevision = revision;
+  let dropped = 0;
+  for (const [key, cover] of sessionCovers) {
+    if (cover !== null) continue;
+    sessionCovers.delete(key);
+    negativeAt.delete(key);
+    dropped += 1;
+  }
+  // Nothing was known to be missing, so nothing on screen needs to move.
+  if (dropped === 0) return;
+  recordCoverEvent('refresh', `host art changed at revision ${revision}; re-asking ${dropped}`);
+  coverRevision.update((value) => value + 1);
+}
+
 /** Temporary: drop every cached cover so the next render asks again. */
 export function clearCoverCache() {
   sessionCovers.clear();
+  negativeAt.clear();
   pending.clear();
+  coverRevision.update((value) => value + 1);
   try {
     const stale: string[] = [];
     for (let index = 0; index < window.localStorage.length; index += 1) {

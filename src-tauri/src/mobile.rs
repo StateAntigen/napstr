@@ -1,6 +1,7 @@
 use crate::{
-    build_local_audiobooks, build_local_audiobooks_from_files, load_files, load_files_by_id,
-    load_transfers, open_connection, search_matches,
+    build_local_audiobooks, build_local_audiobooks_from_files, cover_publish::CoverAlbumNote,
+    cover_publish::CoverPublisher, load_files, load_files_by_id, load_transfers, open_connection,
+    search_matches,
 };
 use chrono::Utc;
 use iroh::{endpoint::presets, Endpoint, SecretKey};
@@ -79,6 +80,11 @@ pub struct MobileService {
     db_path: PathBuf,
     key_path: PathBuf,
     network: Arc<crate::network::NetworkService>,
+    /// The cover worker, so a phone's own results join the queue the window
+    /// fills. The phone has no MusicBrainz client and resolves art only from
+    /// kind `30427`, so an album that only it has shown would otherwise never be
+    /// looked up at all.
+    covers: Arc<CoverPublisher>,
     playback: Arc<crate::playback_bridge::PlaybackBridge>,
     endpoint: tokio::sync::RwLock<Option<Endpoint>>,
     start_lock: tokio::sync::Mutex<()>,
@@ -96,6 +102,7 @@ impl MobileService {
         db_path: PathBuf,
         app_data: PathBuf,
         network: Arc<crate::network::NetworkService>,
+        covers: Arc<CoverPublisher>,
         playback: Arc<crate::playback_bridge::PlaybackBridge>,
     ) -> Result<Arc<Self>, String> {
         initialise_schema(&db_path)?;
@@ -103,6 +110,7 @@ impl MobileService {
             db_path,
             key_path: app_data.join("iroh-identity"),
             network,
+            covers,
             playback,
             endpoint: tokio::sync::RwLock::new(None),
             start_lock: tokio::sync::Mutex::new(()),
@@ -563,6 +571,26 @@ impl MobileService {
                         .then_with(|| left.filename.cmp(&right.filename))
                 });
                 tracks.truncate(MAX_PAGE_SIZE);
+                // Hand the albums this phone is about to see to the cover worker,
+                // which is what lets a phone get art by proxy. It has no
+                // MusicBrainz client of its own, so an album that only this phone
+                // has shown is never looked up unless the search says so here.
+                // Reporting is a local write and does nothing while both cover
+                // switches are off; a failure to queue must not fail the search.
+                // It is still said out loud, because a queue write that fails
+                // silently is exactly how a phone ends up with no art and no
+                // reason why.
+                if let Err(error) = self.covers.note_visible(
+                    &tracks
+                        .iter()
+                        .map(|track| CoverAlbumNote {
+                            artist: track.artist.clone(),
+                            album: track.album.clone(),
+                        })
+                        .collect::<Vec<_>>(),
+                ) {
+                    eprintln!("Could not queue the albums a phone searched for: {error}");
+                }
                 write_response(send, &ServerResponse::Search { tracks }).await
             }
             ClientRequest::Audiobooks { query } => {
@@ -750,6 +778,7 @@ impl MobileService {
                     send,
                     &ServerResponse::Status {
                         library_revision: library_revision(&self.db_path)?,
+                        cover_revision: cover_revision(&self.db_path)?,
                         stream_only,
                     },
                 )
@@ -1161,6 +1190,16 @@ fn library_revision(db_path: &Path) -> Result<u64, String> {
         })
         .map_err(|error| error.to_string())?;
     Ok(revision.max(0) as u64)
+}
+
+/// How many times the art this host would report has changed.
+///
+/// A phone caches covers, including "this host has none", so this is what tells
+/// it that a cached answer may be stale rather than making it guess or ask
+/// again on every render.
+fn cover_revision(db_path: &Path) -> Result<u64, String> {
+    let connection = open_connection(db_path)?;
+    crate::cover::cover_revision(&connection)
 }
 
 fn local_track(db_path: &Path, file_id: &str) -> Result<RemoteTrack, String> {

@@ -11,7 +11,7 @@
   import TrackArtwork from './lib/TrackArtwork.svelte';
   import TrackBadge from './lib/TrackBadge.svelte';
   import CoverDebug from './lib/CoverDebug.svelte';
-  import { artworkHue, coverFor, coverKey, type AlbumCover } from './lib/artwork';
+  import { artworkHue, coverFor, coverKey, invalidateCoverNegatives, type AlbumCover } from './lib/artwork';
   import { reportReasons } from './lib/types';
   import type { AudiobookLibraryPage, CachedAudio, CompanionStatus, CoverReport, LibraryPage, PlaybackCommand, PodcastDownload, PodcastEpisode, PodcastFeed, ReadOnlyTicketOffer, RemoteAudiobook, RemoteAudiobookSummary, RemotePlaybackState, RemoteRepeat, RemoteTrack, RemoteTransfer, ReportReason } from './lib/types';
 
@@ -75,7 +75,7 @@
     more: AlbumShelf[];
   };
   let activeTab = $state<AppTab>('music');
-  let status = $state<CompanionStatus>({ streamOnly: false, paired: false, connected: false, desktopName: '', endpointId: '', libraryRevision: 0, error: '' });
+  let status = $state<CompanionStatus>({ streamOnly: false, paired: false, connected: false, desktopName: '', endpointId: '', libraryRevision: 0, coverRevision: 0, error: '' });
   let statusLoading = $state(true);
   let statusPending = $state(false);
   let pairingCode = $state('');
@@ -461,6 +461,10 @@
       if (showError && status.error) error = status.error;
       if (status.connected) {
         void reconcileAudioCache();
+        // Covers are cached here, the albums the host had nothing for included,
+        // so the host's own count of how often its art changed is what tells
+        // this phone to ask again instead of trusting an answer that has aged.
+        invalidateCoverNegatives(status.coverRevision);
         if (syncLibrary && (!wasConnected || (status.libraryRevision > 0
           && loadedLibraryRevision > 0 && status.libraryRevision !== loadedLibraryRevision))) {
           void refreshLibrarySilently(status.libraryRevision);
@@ -590,7 +594,7 @@
   async function forgetDesktop() {
     if (!window.confirm('Disconnect this phone from Napstr? You will need to scan a new QR code.')) return;
     await invoke('forget_desktop');
-    status = { streamOnly: false, paired: false, connected: false, desktopName: '', endpointId: '', libraryRevision: 0, error: '' };
+    status = { streamOnly: false, paired: false, connected: false, desktopName: '', endpointId: '', libraryRevision: 0, coverRevision: 0, error: '' };
     tracks = [];
     current = null;
     audio?.pause();

@@ -2301,17 +2301,20 @@ pub fn run() {
             let player = Arc::new(player::NativePlayer::default());
             let playback =
                 playback_bridge::PlaybackBridge::new(player.clone(), app.handle().clone());
-            let mobile = mobile::MobileService::new(
-                db_path.clone(),
-                app_data.clone(),
-                network.clone(),
-                playback.clone(),
-            )?;
+            // Created before the phone service, because a phone's search results
+            // join the same cover queue the window fills.
             let covers = cover_publish::CoverPublisher::new(
                 db_path.clone(),
                 network.clone(),
                 app.handle().clone(),
             );
+            let mobile = mobile::MobileService::new(
+                db_path.clone(),
+                app_data.clone(),
+                network.clone(),
+                covers.clone(),
+                playback.clone(),
+            )?;
             // The worker runs for the life of the process. The switches are
             // stored, so nudging it here resumes whatever was left on when the
             // window last closed — which is also what keeps a paired phone's

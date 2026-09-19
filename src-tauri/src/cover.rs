@@ -575,6 +575,27 @@ const COVER_COLUMNS: &str = "cover_key,source_pubkey,art,thumb,mbid,year,genre,c
 pub(crate) const COVER_MISS_LIFETIME_SECONDS: i64 = 30 * 60;
 pub(crate) const COVER_HIT_LIFETIME_SECONDS: i64 = 6 * 60 * 60;
 
+/// The table counting every change to what this computer would answer about
+/// album art.
+///
+/// A companion caches covers, including "this computer has none", so it needs
+/// one number that tells it a cached answer may be stale. Asking again on every
+/// render would cost a round trip each time, and never asking again is what
+/// leaves a phone showing no art for an album this computer found art for
+/// minutes earlier.
+///
+/// Declared next to whichever half of the schema creates the table the trigger
+/// watches, because the two halves may run in either order and neither may
+/// depend on the other. The second declaration and its seed row are no-ops.
+/// Triggers move the counter rather than callers, so no write path can forget
+/// to move it.
+pub(crate) const COVER_REVISION_TABLE: &str = "\
+  CREATE TABLE IF NOT EXISTS cover_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    revision INTEGER NOT NULL
+  );
+  INSERT OR IGNORE INTO cover_state(id, revision) VALUES (1, 0);";
+
 /// Add the cover columns, indexes, and the album cover tables to an existing
 /// database, then backfill catalogue keys once, when the column is new.
 pub(crate) fn initialise_cover_schema(connection: &Connection) -> Result<(), String> {
@@ -623,6 +644,26 @@ pub(crate) fn initialise_cover_schema(connection: &Connection) -> Result<(), Str
              );
              CREATE INDEX IF NOT EXISTS cover_watch_noted_at ON cover_watch(noted_at);",
         )
+        .map_err(|error| error.to_string())?;
+    // Art this computer resolved for itself is half of what it would report, so
+    // a change here is a change a phone caching covers has to hear about. The
+    // `album_covers` half is declared where that table is created.
+    connection
+        .execute_batch(&format!(
+            "{COVER_REVISION_TABLE}
+             CREATE TRIGGER IF NOT EXISTS album_art_lookups_cover_revision
+             AFTER INSERT ON album_art_lookups BEGIN
+               UPDATE cover_state SET revision = revision + 1 WHERE id = 1;
+             END;
+             CREATE TRIGGER IF NOT EXISTS album_art_lookups_cover_revision_updated
+             AFTER UPDATE ON album_art_lookups BEGIN
+               UPDATE cover_state SET revision = revision + 1 WHERE id = 1;
+             END;
+             CREATE TRIGGER IF NOT EXISTS album_art_lookups_cover_revision_deleted
+             AFTER DELETE ON album_art_lookups BEGIN
+               UPDATE cover_state SET revision = revision + 1 WHERE id = 1;
+             END;"
+        ))
         .map_err(|error| error.to_string())?;
     if backfill {
         backfill_catalogue_cover_keys(connection)?;
@@ -1098,6 +1139,37 @@ pub(crate) fn cover_from_art_lookup(lookup: &ArtLookup) -> AlbumCover {
         created_at: 0,
         seeder: false,
     }
+}
+
+/// How many times what this computer would answer about album art has changed.
+///
+/// A companion compares this against the value it last saw: any difference
+/// means its cached covers — including the albums it was told nobody had art
+/// for — are worth asking about again. Deliberately coarse, so it says "ask
+/// again" rather than which album changed, and stored rather than derived, so
+/// it survives a restart.
+pub(crate) fn cover_revision(connection: &Connection) -> Result<u64, String> {
+    let present = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='cover_state'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if present == 0 {
+        // A database whose cover schema has not been created yet is a host with
+        // nothing to report. It must not be an error, because this is read while
+        // answering a phone's status, and a status that fails reads as an offline
+        // desktop. Zero already means "never invalidated" on the wire.
+        return Ok(0);
+    }
+    let revision = connection
+        .query_row("SELECT revision FROM cover_state WHERE id=1", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .optional()
+        .map_err(|error| error.to_string())?;
+    Ok(revision.unwrap_or(0).max(0) as u64)
 }
 
 /// Resolutions held for `keys`, whatever their age.
@@ -1887,6 +1959,50 @@ mod tests {
             )
             .unwrap();
         assert_eq!(key, "sentinel");
+    }
+
+    #[test]
+    fn the_cover_revision_moves_whenever_the_covers_are_written() {
+        // Coarse on purpose. A needless re-ask costs a phone one batched call;
+        // a change that went unannounced is a phone showing no art with nothing
+        // to tell it why, which is the failure this exists to prevent.
+        let connection = cover_database();
+        let key = "artist|album";
+        let keys = Keys::generate();
+        let event = signed_event(&keys, key, cover_content());
+
+        let settled = cover_revision(&connection).unwrap();
+        store_cover_events(&connection, &[(key.to_string(), event.clone())]).unwrap();
+        let claimed = cover_revision(&connection).unwrap();
+        assert!(claimed > settled, "a stored claim must move the revision");
+
+        // Writing the same claim again changes nothing, and still moves it.
+        store_cover_events(&connection, &[(key.to_string(), event)]).unwrap();
+        assert!(cover_revision(&connection).unwrap() > claimed);
+
+        let claimed = cover_revision(&connection).unwrap();
+        record_art_lookup(
+            &connection,
+            key,
+            ArtLookupOutcome::Found(&art_lookup(
+                key,
+                "https://coverartarchive.org/release/x/1.jpg",
+            )),
+        )
+        .unwrap();
+        assert!(
+            cover_revision(&connection).unwrap() > claimed,
+            "art resolved without being signed must move it too"
+        );
+    }
+
+    #[test]
+    fn an_uninitialised_database_reports_no_cover_revision() {
+        // Read while answering a phone's status, so a missing table has to read
+        // as "nothing to report" rather than as an error: a status that fails
+        // reads as an offline desktop, and zero already means "not invalidated".
+        let connection = Connection::open_in_memory().unwrap();
+        assert_eq!(cover_revision(&connection).unwrap(), 0);
     }
 
     fn art_lookup(key: &str, art: &str) -> ArtLookup {
