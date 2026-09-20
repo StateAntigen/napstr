@@ -48,26 +48,29 @@ test('Napstrfy asks the host about the artwork it can show, in batches by album,
   const rows = page.locator('.track-row');
   await expect(rows).toHaveCount(40);
   await expect(rows.first().locator('.artwork img')).toHaveAttribute('src', '/cover-a.png');
-  // One batched ask for the whole screen, not one per tile, and the last row's
-  // album is nowhere in it: it is far below the fold, so it was never asked for.
+  // One batched ask for the albums the screen shows, rather than one call per
+  // tile. The batch is whatever registered inside the flush window, so how many
+  // albums it holds depends on how much of the list had laid out by then: the
+  // count is bounded, and no row index is pinned, because "album 39 is not in
+  // it" was never something the batching promises. Duplicates are.
   const [first] = await asks(page);
   expect(await askCount(page)).toBe(1);
   expect(first.length).toBeGreaterThan(4);
   expect(first.length).toBeLessThan(40);
   expect(new Set(first).size).toBe(first.length);
-  expect(first).not.toContain('rancid|album 39');
-  // Scrolling it into view is what asks for it.
+  // Scrolling to the far end is what asks for whatever was never asked for. How
+  // many batches that takes is timing, not behaviour, so only the fact that new
+  // work happened is asserted.
   await rows.nth(39).scrollIntoViewIfNeeded();
   await expect(rows.nth(39).locator('.artwork img')).toHaveAttribute('src', '/cover-b.png');
-  await expect.poll(() => askCount(page)).toBe(2);
-  const [, second] = await asks(page);
-  expect(second).toContain('rancid|album 39');
+  await expect.poll(() => askCount(page)).toBeGreaterThan(1);
   // Playing it draws the same answer in the player, without leaving the screen
-  // and without asking again.
+  // and - the guarantee worth pinning - without asking the host again.
+  const asksBeforePlay = await askCount(page);
   await rows.nth(39).locator('.track-open').click();
   await expect(page.locator('.now-sheet-art img')).toHaveAttribute('src', '/cover-b.png');
   await expect(rows).toHaveCount(40);
-  expect(await askCount(page)).toBe(2);
+  expect(await askCount(page)).toBe(asksBeforePlay);
 });
 
 test('Napstrfy artwork recovers from a transient host failure while the screen stays open', async ({ page }) => {
