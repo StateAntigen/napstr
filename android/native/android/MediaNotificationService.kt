@@ -65,7 +65,16 @@ class MediaNotificationService : Service() {
     0
   ) {
     override fun onAdjustVolume(direction: Int) {
-      MediaControlBridge.dispatch(if (direction > 0) "volumeUp" else "volumeDown")
+      // ADJUST_SAME (0) means "show the level, do not change it", and the system
+      // sends it whenever the volume panel is redrawn - which includes the
+      // redraw straight after a real press. Treating anything that is not a
+      // raise as a step down made Volume Up undo itself: the level rose, then
+      // the redraw stepped it back. Volume Down looked correct only because
+      // "lower" and "same" happened to point the same way.
+      when (direction) {
+        AudioManager.ADJUST_RAISE -> MediaControlBridge.dispatch("volumeUp")
+        AudioManager.ADJUST_LOWER -> MediaControlBridge.dispatch("volumeDown")
+      }
     }
   }
   private var foregroundStarted = false
