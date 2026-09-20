@@ -11,6 +11,7 @@ use napstr_remote_protocol::{
     REPORT_REASONS,
 };
 use quick_xml::{events::Event, Reader};
+use qrcode::{render::svg, QrCode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -1992,6 +1993,36 @@ async fn remote_read_only_ticket(
     }
 }
 
+/// A track URI is a scheme, a path and a SHA-256, so anything of this length or
+/// more is not one.
+const MAX_TRACK_URI_BYTES: usize = 256;
+
+/// Draw the code that carries a track's own URI, for another client to scan.
+///
+/// Unlike a pairing code this one never crosses the network: the page builds
+/// the URI and this process draws the markup, so it is trusted by construction.
+/// It still goes through the same sanitiser as a host's code, because that is
+/// what guarantees only a QR renderer's own elements ever reach the page.
+#[tauri::command]
+fn track_code(uri: String) -> Result<String, String> {
+    let trimmed = uri.trim();
+    if trimmed.is_empty() || trimmed.len() > MAX_TRACK_URI_BYTES {
+        return Err("invalid track code".into());
+    }
+    let drawn = QrCode::new(trimmed.as_bytes())
+        .map_err(|error| format!("could not create the track code: {error}"))?
+        .render::<svg::Color>()
+        .min_dimensions(240, 240)
+        .dark_color(svg::Color("#000000"))
+        .light_color(svg::Color("#ffffff"))
+        .build();
+    let safe = safe_qr_svg(&drawn);
+    if safe.is_empty() {
+        return Err("could not draw the track code".into());
+    }
+    Ok(safe)
+}
+
 /// Ask the host to sign and publish a NIP-56 `1984` report about an album cover.
 ///
 /// This app holds no Nostr keys, and that is worth keeping: the report is the
@@ -2573,11 +2604,32 @@ pub fn run() {
     // before Tauri or any Iroh background task can construct a TLS client.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    // Single instance has to be registered before anything else, so that a link
+    // opened while the companion is running reaches that window instead of
+    // starting a second copy of it. The plugin's deep-link feature is what turns
+    // the second launch's `napstrfy://` argument into an open-url event.
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|_app, argv, _cwd| {
+        // The integration has already delivered any link in `argv`; this only
+        // keeps the launch visible while developing.
+        eprintln!("Napstrfy is already running; opened with {argv:?}");
+    }));
+    builder
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_os::init())
         .setup(|app| {
             #[cfg(mobile)]
             app.handle().plugin(tauri_plugin_barcode_scanner::init())?;
+            #[cfg(desktop)]
+            {
+                // A link only reaches an installed app, so registering on every
+                // launch is what makes `napstrfy://` work while developing.
+                use tauri_plugin_deep_link::DeepLinkExt;
+                if let Err(error) = app.deep_link().register_all() {
+                    eprintln!("could not register the napstrfy link scheme: {error}");
+                }
+            }
             let app_data = app
                 .path()
                 .app_data_dir()
@@ -2601,6 +2653,7 @@ pub fn run() {
             remote_playback_state,
             remote_playback,
             remote_read_only_ticket,
+            track_code,
             remote_report_cover,
             reconcile_audio_cache,
             remote_search,
@@ -2650,6 +2703,21 @@ mod tests {
         .is_empty());
         assert!(safe_qr_svg("<html></html>").is_empty());
         assert!(safe_qr_svg("").is_empty());
+    }
+
+    /// A track code is drawn by this process rather than fetched, but it reaches
+    /// the page through the same sanitiser a host's code does, so it has to come
+    /// out of that intact or there would be no code to show.
+    #[test]
+    fn track_codes_are_drawn_and_validated() {
+        let uri = format!("napstrfy://track/{}", "a".repeat(64));
+        let svg = track_code(uri).expect("a track code");
+        assert!(svg.starts_with("<svg"), "the sanitiser kept the markup");
+        assert!(svg.ends_with("</svg>"));
+        assert!(!svg.contains("<?xml"));
+        assert!(track_code(String::new()).is_err());
+        assert!(track_code("   ".to_string()).is_err());
+        assert!(track_code("x".repeat(MAX_TRACK_URI_BYTES + 1)).is_err());
     }
 
     #[test]

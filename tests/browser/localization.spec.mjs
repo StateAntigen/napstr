@@ -13,8 +13,14 @@ async function openSearchTab(page) {
 }
 
 async function openPlayer(page) {
-  if (await page.locator('.now-sheet').count() === 0) await page.locator('.now-open').click();
-  await expect(page.locator('.now-sheet')).toBeVisible();
+  // Resizing the window can hand the pinned desktop column back to the phone's
+  // bar between the count and the click, so the sheet is torn down instead of
+  // opened and the click lands on nothing. Retry the whole decision until the
+  // sheet is actually on screen rather than trusting one count.
+  await expect(async () => {
+    if (await page.locator('.now-sheet').count() === 0) await page.locator('.now-open').click();
+    await expect(page.locator('.now-sheet')).toBeVisible({ timeout: 1000 });
+  }).toPass({ timeout: 15_000 });
 }
 
 for (const platform of ['android', 'linux']) {
@@ -300,7 +306,26 @@ test('Napstrfy desktop pins the player as its own column with artwork, likes and
   await expect(like).toHaveAttribute('aria-pressed', 'false');
   await like.click();
   await expect(like).toHaveAttribute('aria-pressed', 'true');
-  await expect(page.locator('.track-row .like-button')).toHaveAccessibleName('Unlike Search');
+  // A row no longer carries a heart of its own, so the row's menu is what has to
+  // show the track as liked now.
+  await page.locator('.track-row .track-more').first().click();
+  await expect(page.locator('.actions-row', { hasText: 'Remove from Liked Songs' })).toBeVisible();
+  // The row still shows the state at a glance: a liked track's title turns gold
+  // and carries the rule under it, exactly as it does in an album's own list.
+  const likedTitle = page.locator('.track-row.liked .track-copy strong');
+  await expect(likedTitle).toHaveCSS('color', 'rgb(242, 208, 138)');
+  const rule = await likedTitle.evaluate((node) => getComputedStyle(node, '::after'));
+  expect(rule.width).toBe('40px');
+  expect(rule.height).toBe('2px');
+  // The code row carries this app's own scheme, and the code itself is drawn by
+  // the native side rather than by the page.
+  await page.getByRole('button', { name: 'Show Napstrfy Code' }).click();
+  await expect(page.locator('.actions-code-qr svg')).toBeVisible();
+  await expect(page.locator('.actions-code small')).toHaveText(`napstrfy://track/${'a'.repeat(64)}`);
+  // The panel is bottom-anchored and the menu is tall, so the scrim is only
+  // clear of it near the top of the window.
+  await page.getByRole('button', { name: 'Close the track options' }).click({ position: { x: 12, y: 12 } });
+  await expect(page.locator('.actions-panel')).toHaveCount(0);
   // Ours has one button per mode rather than one that cycles through them.
   const shuffle = page.getByRole('button', { name: 'Shuffle off' });
   await shuffle.click();
@@ -331,6 +356,28 @@ test('Napstrfy desktop pins the player as its own column with artwork, likes and
   await expect(page.locator('.now-playing')).toHaveCSS('position', 'fixed');
   await expect(page.locator('audio')).toHaveCount(1);
   expect(await page.evaluate(() => window.calls.filter((call) => call.cmd === 'cache_remote_audio').length)).toBe(1);
+});
+
+test('Napstrfy marks a liked album track with the gold rule under its title', async ({ page }) => {
+  await mockNative(page, { platform: 'linux' });
+  await page.setViewportSize({ width: 1100, height: 900 });
+  await page.goto('http://127.0.0.1:15174');
+  // An album's track list has no per-track cover to ring, so a liked row carries
+  // the gold rule under its title instead: the same signal the library rows
+  // wear as a ring, drawn where this list has room for it.
+  await page.locator('.track-row .track-more').first().click();
+  await page.getByRole('button', { name: 'Add to Liked Songs' }).click();
+  await page.getByRole('button', { name: 'Go to album' }).click();
+  await expect(page.locator('.album-view')).toBeVisible();
+  const title = page.locator('.album-tracks li.liked .album-track-copy strong');
+  await expect(title).toHaveCSS('color', 'rgb(242, 208, 138)');
+  // The rule is a pseudo-element, so it is measured as a box the row lays out
+  // rather than as a computed text style.
+  const rule = await title.evaluate((node) => getComputedStyle(node, '::after'));
+  expect(rule.content).toBe('""');
+  expect(rule.width).toBe('40px');
+  expect(rule.height).toBe('2px');
+  expect(rule.backgroundImage).toContain('linear-gradient');
 });
 
 for (const app of ['napstr', 'napstrfy']) {

@@ -5,6 +5,8 @@
   import '@napstr/i18n/styles.css';
   import { onMount, tick, untrack } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
+  import { getCurrent, onOpenUrl } from '@tauri-apps/plugin-deep-link';
+  import { parseDeepLink } from './lib/deepLink';
   import {
     Format,
     checkPermissions,
@@ -254,6 +256,10 @@
    */
   let playbackTarget = $state<PlaybackTarget>('phone');
   let showSourceOptions = $state(false);
+  /** The track's own code, drawn when that row of the track menu is chosen. */
+  let showTrackCode = $state(false);
+  let trackCodeSvg = $state('');
+  let trackCodeError = $state('');
   /** A read-only code the computer minted for somebody else to scan. */
   let readOnlyTicket = $state<ReadOnlyTicketOffer | null>(null);
   let ticketBusy = $state(false);
@@ -2259,6 +2265,7 @@
     actionTrack = track;
     showSleepOptions = false;
     showSourceOptions = false;
+    showTrackCode = false;
     showActions = true;
   }
 
@@ -2266,12 +2273,29 @@
     showActions = false;
     showSleepOptions = false;
     showSourceOptions = false;
+    showTrackCode = false;
     actionTrack = null;
   }
 
-  /** The track URI other Napstr clients understand. */
+  /** The track URI Napstrfy clients understand, and what a track code carries. */
   function trackUri(track: RemoteTrack) {
-    return `napstr://track/${track.fileId}`;
+    return `napstrfy://track/${track.fileId}`;
+  }
+
+  /**
+   * Draw the code for a track's URI. The native side builds the SVG and decides
+   * whether what it built is safe to insert, so a refusal is shown as text
+   * rather than rendered.
+   */
+  async function openTrackCode(track: RemoteTrack) {
+    showTrackCode = true;
+    trackCodeSvg = '';
+    trackCodeError = '';
+    try {
+      trackCodeSvg = await invoke<string>('track_code', { uri: trackUri(track) });
+    } catch (nextError) {
+      trackCodeError = String(nextError);
+    }
   }
 
   async function shareTrack(track: RemoteTrack) {
@@ -2471,6 +2495,37 @@
 
   function showSearch() {
     activeTab = 'search';
+  }
+
+  /**
+   * Answer a `napstrfy://` link: pair with a computer, look an album up, or play
+   * a track this phone or its computer already knows about.
+   *
+   * A track that neither knows is not something to swallow quietly: the link
+   * names an exact file, so the search tab is opened on that id with a notice
+   * saying it was looked for here and not found.
+   */
+  async function handleDeepLink(value: string) {
+    const link = parseDeepLink(value);
+    if (!link) return;
+    if (link.kind === 'pair') {
+      await pair(link.ticket);
+      return;
+    }
+    if (link.kind === 'album') {
+      showSearch();
+      await searchTracks(link.terms);
+      return;
+    }
+    const known = tracks.find((track) => track.fileId === link.fileId)
+      ?? likedMusic.find((track) => track.fileId === link.fileId);
+    if (known) {
+      await activateTrack(known);
+      return;
+    }
+    showSearch();
+    await searchTracks(link.fileId);
+    notice = $t('That track is not on this phone or its computer yet.');
   }
 
   function normalizeGenre(value: string) {
@@ -2736,6 +2791,19 @@
   // The language is taken from the system the first time this phone runs; the
   // native side learns it through the labels published with the media state.
   onMount(() => initializeLocale(() => osLocale()));
+  // A link can be the reason the app started, and can arrive while it is already
+  // running, so both are asked for. Neither is fatal: a build without the plugin
+  // simply has no links to answer.
+  onMount(() => {
+    void getCurrent()
+      .then((urls) => { for (const url of urls ?? []) void handleDeepLink(url); })
+      .catch(() => {});
+    let stop: (() => void) | undefined;
+    void onOpenUrl((urls) => { for (const url of urls) void handleDeepLink(url); })
+      .then((unlisten) => { stop = unlisten; })
+      .catch(() => {});
+    return () => stop?.();
+  });
   $effect(() => { $locale; untrack(() => syncSystemMedia()); });
   $effect(() => { duration; untrack(() => syncSystemMedia()); });
 
@@ -2852,7 +2920,7 @@
       <div class="empty-library"><img src="/napstr-logo-small.png" alt="" /><h2>{emptyTitle}</h2><p>{emptyHint}</p></div>
     {/if}
     {#each tracks as track (track.fileId)}
-      <div class:selected={selected?.fileId === track.fileId} class:remote={!track.local} class="track-row">
+      <div class:selected={selected?.fileId === track.fileId} class:remote={!track.local} class:liked={isTrackLiked(track)} class="track-row">
         <button class="track-open" disabled={status.streamOnly && !track.local} onclick={() => activateTrack(track)}>
           <TrackArtwork {track} lookup />
           <span class="track-copy">
@@ -2862,7 +2930,14 @@
           </span>
           <TrackBadge {track} cached={cachedFileIds.has(track.fileId)} pending={pending.has(track.fileId)} />
         </button>
-        <button class:liked={isTrackLiked(track)} class="like-button" onclick={() => toggleTrackLike(track)} aria-label={`${isTrackLiked(track) ? 'Unlike' : 'Like'} ${title(track)}`}>{isTrackLiked(track) ? '♥' : '♡'}</button>
+        <!-- The row's own control is the track menu rather than a heart: liking
+             is one of its rows, alongside sharing and the code below, so a
+             second place to press would only compete with it. -->
+        <button class="track-more" onclick={() => openActions(track)} aria-label={$t("Track options")}>
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <circle class="filled" cx="12" cy="5.6" r="1.5" /><circle class="filled" cx="12" cy="12" r="1.5" /><circle class="filled" cx="12" cy="18.4" r="1.5" />
+          </svg>
+        </button>
       </div>
     {/each}
     {#if showLoadMore && tracks.length < total}<button class="load-more" onclick={() => loadLibrary(true)} disabled={loadingMore}>{loadingMore ? 'Loading…' : `Load more · ${tracks.length} of ${total}`}</button>{/if}
@@ -3381,11 +3456,22 @@
     </header>
     <div class="queue-list">
       {#each shownQueue as track, index (track.fileId)}
-        <button class:playing={index === shownQueueIndex} class="queue-row" onclick={() => void playQueueRow(index)}>
-          <span class="queue-index">{index === shownQueueIndex ? '▶' : index + 1}</span>
-          <TrackArtwork track={track} lookup={index < 12} />
-          <span class="queue-copy"><strong>{title(track)}</strong><small>{artist(track)}</small></span>
-        </button>
+        <div class:playing={index === shownQueueIndex} class:liked={isTrackLiked(track)} class="queue-row">
+          <button class="queue-open" onclick={() => void playQueueRow(index)}>
+            <span class="queue-index">{index === shownQueueIndex ? '▶' : index + 1}</span>
+            <TrackArtwork track={track} lookup={index < 12} />
+            <span class="queue-copy"><strong>{title(track)}</strong><small>{artist(track)}</small></span>
+          </button>
+          <!-- Where the track is held, as on the library rows: the menu is the
+               place a download would be asked for, and the badge is what says
+               whether one is needed. -->
+          <TrackBadge {track} cached={cachedFileIds.has(track.fileId)} pending={pending.has(track.fileId)} />
+          <button class="track-more" onclick={() => openActions(track)} aria-label={$t("Track options")}>
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <circle class="filled" cx="12" cy="5.6" r="1.5" /><circle class="filled" cx="12" cy="12" r="1.5" /><circle class="filled" cx="12" cy="18.4" r="1.5" />
+            </svg>
+          </button>
+        </div>
       {/each}
       {#if shownQueue.length === 0}<p class="queue-empty">{$t("Nothing is queued yet.")}</p>{/if}
       {#if playbackTarget === 'desktop' && shownQueue.length > 0 && shownQueueIndex < 0}
@@ -3510,7 +3596,7 @@
 
       <ol class="album-tracks">
         {#each albumView.tracks as track, index (track.fileId)}
-          <li class:playing={current?.fileId === track.fileId}>
+          <li class:playing={current?.fileId === track.fileId} class:liked={isTrackLiked(track)}>
             <button class="album-track" onclick={() => void playAlbumTrack(index)}>
               <span class="album-track-index">{current?.fileId === track.fileId ? '▶' : index + 1}</span>
               <span class="album-track-copy"><strong>{title(track)}</strong><small>{artist(track)}</small></span>
@@ -3619,10 +3705,28 @@
           <span>{$t("Play on")}</span><small>{playbackTargetLabel()}</small>
         </button>
         {@render playbackTargetRows()}
+      {:else if showTrackCode}
+        <button class="actions-row back" onclick={() => (showTrackCode = false)}>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14.5 5 8 12l6.5 7" /></svg>
+          <span>{$t("Show Napstrfy Code")}</span>
+        </button>
+        <div class="actions-code">
+          <img src="/napstr-logo-small.png" alt="" />
+          {#if trackCodeSvg}
+            <div class="actions-code-qr">{@html trackCodeSvg}</div>
+          {:else if trackCodeError}
+            <p class="error">{trackCodeError}</p>
+          {/if}
+          <small>{trackUri(menuTrack)}</small>
+        </div>
       {:else}
         <button class="actions-row" onclick={() => void shareTrack(menuTrack)}>
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4" /><path d="M8 7.5 12 3.5l4 4" /><path d="M5 14v6h14v-6" /></svg>
           <span>{$t("Share")}</span><small>{trackUri(menuTrack)}</small>
+        </button>
+        <button class="actions-row" onclick={() => void openTrackCode(menuTrack)}>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.6" y="3.6" width="6.4" height="6.4" rx="1.2" /><rect x="14" y="3.6" width="6.4" height="6.4" rx="1.2" /><rect x="3.6" y="14" width="6.4" height="6.4" rx="1.2" /><path d="M14 14h2.6v2.6H14z" /><path d="M17.8 18.4h2.6v2H17.8z" /><path d="M14 20.4h1.6" /><path d="M20.4 14v2.6" /></svg>
+          <span>{$t("Show Napstrfy Code")}</span>
         </button>
         <button class="actions-row" onclick={() => toggleTrackLike(menuTrack)}>
           <svg class:filled={isTrackLiked(menuTrack)} viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20.3c-1.4-1-7.2-5.2-7.2-9.4A4.2 4.2 0 0 1 12 8.2a4.2 4.2 0 0 1 7.2 2.7c0 4.2-5.8 8.4-7.2 9.4z" /></svg>
