@@ -13,10 +13,10 @@
         and fails somewhere unrelated.
       * A release APK comes out genuinely unsigned - no META-INF/*.RSA - so it
         cannot be installed as the build leaves it.
-      * apksigner MUST run under JDK 17. The `java` on PATH is Java 8, which
-        cannot read the PKCS12 debug keystore and reports "Invalid keystore
-        format" or fails in PBES2Parameters. Both are the same Java 8 limitation
-        and neither means the keystore is damaged.
+      * apksigner MUST run under JDK 17. Whatever `java` resolves to on PATH is
+        often an older runtime, which cannot read the PKCS12 debug keystore and
+        reports "Invalid keystore format" or fails in PBES2Parameters. Both are
+        the same pre-17 limitation and neither means the keystore is damaged.
       * Windows Developer Mode must be on, or the build dies at the jniLibs step
         with "Creation symbolic link is not allowed for this system".
 
@@ -83,16 +83,95 @@ $project    = Join-Path $android 'src-tauri\gen\android'
 $outputs    = Join-Path $project 'app\build\outputs\apk'
 $configFile = Join-Path $android 'src-tauri\tauri.conf.json'
 
-$local      = $env:LOCALAPPDATA
-$node       = Join-Path $local 'Programs\nodejs\node-v24.19.0-win-x64'
-$jdk        = Join-Path $local 'Programs\jdk-17.0.20.1+1'
-$sdk        = Join-Path $local 'Android\Sdk'
-$ndk        = Join-Path $sdk 'ndk\29.0.13846066'
-$buildTools = Join-Path $sdk 'build-tools\36.0.0'
-$zipalign   = Join-Path $buildTools 'zipalign.exe'
-$apksigner  = Join-Path $buildTools 'lib\apksigner.jar'
+# The toolchain is discovered rather than pinned to one machine's layout. Node
+# can be machine-wide or per-user, JDK 17 can come from any vendor, and the SDK
+# keeps its NDK and build-tools in versioned directories, so a hardcoded path
+# only works on the machine it was written for. Every value below can be pinned
+# with an environment variable when discovery picks the wrong one.
+function Get-FirstExistingPath {
+    param([string[]] $Candidates)
+    foreach ($candidate in $Candidates) {
+        if ($candidate -and (Test-Path -LiteralPath $candidate)) { return $candidate }
+    }
+    return $null
+}
+
+function Get-NewestMatchingDirectory {
+    param([string] $Root, [string] $Pattern)
+    if (-not $Root -or -not (Test-Path -LiteralPath $Root)) { return $null }
+    $match = Get-ChildItem -LiteralPath $Root -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -like $Pattern } |
+        Sort-Object Name -Descending |
+        Select-Object -First 1
+    if ($match) { return $match.FullName }
+    return $null
+}
+
+# Join-Path throws on a null base, and discovery is allowed to come up empty so
+# the preflight below can report it, so every path is built through this.
+function Join-PathOrNull {
+    param([string] $Base, [string] $Child)
+    if (-not $Base) { return $null }
+    return (Join-Path $Base $Child)
+}
+
+# Whatever `node` PATH resolves to is the runtime the developer already builds
+# with, so it wins over guessing between the machine-wide and per-user installs.
+$nodeFromPath = $null
+$nodeCommand = Get-Command node.exe -ErrorAction SilentlyContinue
+if ($nodeCommand) { $nodeFromPath = Split-Path -Parent $nodeCommand.Source }
+$node = Get-FirstExistingPath @(
+    $env:NAPSTR_NODE_DIR,
+    $nodeFromPath,
+    (Get-NewestMatchingDirectory (Join-PathOrNull $env:LOCALAPPDATA 'Programs\nodejs') 'node-v2*'),
+    (Join-PathOrNull $env:ProgramFiles 'nodejs'),
+    (Join-PathOrNull $env:LOCALAPPDATA 'Programs\nodejs')
+)
+
+# JAVA_HOME is only trusted when it really is a 17, because both it and the
+# `java` on PATH routinely point at the older runtime apksigner cannot use.
+$jdkFromJavaHome = $null
+if ($env:JAVA_HOME) {
+    $releaseFile = Join-Path $env:JAVA_HOME 'release'
+    if ((Test-Path -LiteralPath $releaseFile) -and
+        (Select-String -Path $releaseFile -Pattern '^JAVA_VERSION="17' -Quiet)) {
+        $jdkFromJavaHome = $env:JAVA_HOME
+    }
+}
+$jdk = Get-FirstExistingPath @(
+    $env:NAPSTR_JDK17,
+    $jdkFromJavaHome,
+    (Get-NewestMatchingDirectory (Join-PathOrNull $env:ProgramFiles 'Microsoft') 'jdk-17*'),
+    (Get-NewestMatchingDirectory (Join-PathOrNull $env:ProgramFiles 'Eclipse Adoptium') 'jdk-17*'),
+    (Get-NewestMatchingDirectory (Join-PathOrNull $env:ProgramFiles 'Java') 'jdk-17*'),
+    (Get-NewestMatchingDirectory (Join-PathOrNull $env:LOCALAPPDATA 'Programs') 'jdk-17*')
+)
+
+$sdk = Get-FirstExistingPath @(
+    $env:NAPSTR_ANDROID_SDK,
+    $env:ANDROID_HOME,
+    $env:ANDROID_SDK_ROOT,
+    (Join-PathOrNull $env:LOCALAPPDATA 'Android\Sdk')
+)
+
+# The project builds against NDK 29 and build-tools 36, so those are preferred
+# when they are installed and the newest available version is the fallback.
+$ndk = Get-FirstExistingPath @(
+    $env:NDK_HOME,
+    $env:ANDROID_NDK_HOME,
+    (Join-PathOrNull $sdk 'ndk\29.0.13846066'),
+    (Get-NewestMatchingDirectory (Join-PathOrNull $sdk 'ndk') '*')
+)
+
+$buildTools = Get-FirstExistingPath @(
+    $env:NAPSTR_BUILD_TOOLS_DIR,
+    (Join-PathOrNull $sdk 'build-tools\36.0.0'),
+    (Get-NewestMatchingDirectory (Join-PathOrNull $sdk 'build-tools') '3*')
+)
+$zipalign   = Join-PathOrNull $buildTools 'zipalign.exe'
+$apksigner  = Join-PathOrNull $buildTools 'lib\apksigner.jar'
 $keystore   = Join-Path $env:USERPROFILE '.android\debug.keystore'
-$adb        = Join-Path $sdk 'platform-tools\adb.exe'
+$adb        = Join-PathOrNull $sdk 'platform-tools\adb.exe'
 
 function Write-Step($message) {
     Write-Host ''
@@ -102,8 +181,8 @@ function Write-Step($message) {
 Write-Step 'Checking the toolchain'
 
 $required = [ordered]@{
-    'Node v24'          = (Join-Path $node 'node.exe')
-    'JDK 17'            = (Join-Path $jdk 'bin\java.exe')
+    'Node v24'          = (Join-PathOrNull $node 'node.exe')
+    'JDK 17'            = (Join-PathOrNull $jdk 'bin\java.exe')
     'Android SDK'       = $sdk
     'NDK 29.0.13846066' = $ndk
     'zipalign'          = $zipalign
@@ -111,12 +190,17 @@ $required = [ordered]@{
     'debug keystore'    = $keystore
     'generated project' = $project
 }
-$missing = @($required.GetEnumerator() | Where-Object { -not (Test-Path -LiteralPath $_.Value) })
+# A discovered path that came back empty is as missing as one that does not
+# exist, and Test-Path rejects a null path outright, so both are checked here.
+$missing = @($required.GetEnumerator() | Where-Object { -not $_.Value -or -not (Test-Path -LiteralPath $_.Value) })
 if ($missing.Count -gt 0) {
     foreach ($item in $missing) {
-        Write-Host ("  missing: {0}`n           {1}" -f $item.Key, $item.Value) -ForegroundColor Red
+        $where = if ($item.Value) { $item.Value } else { 'not found' }
+        Write-Host ("  missing: {0}`n           {1}" -f $item.Key, $where) -ForegroundColor Red
     }
-    throw 'The Android toolchain is incomplete, so the build would fail partway through.'
+    throw ('The Android toolchain is incomplete, so the build would fail partway through. ' +
+        'Install what is missing above, or point NAPSTR_NODE_DIR, NAPSTR_JDK17, ' +
+        'NAPSTR_ANDROID_SDK, NDK_HOME or NAPSTR_BUILD_TOOLS_DIR at it.')
 }
 foreach ($item in $required.GetEnumerator()) { Write-Host "  ok  $($item.Key)" }
 
