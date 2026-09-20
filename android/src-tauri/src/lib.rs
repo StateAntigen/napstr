@@ -1,3 +1,6 @@
+mod public_http;
+use public_http::{podcast_http_client, safe_public_https_url};
+
 use futures_util::StreamExt;
 use iroh::{endpoint::presets, Endpoint, EndpointAddr, EndpointId, SecretKey};
 use napstr_remote_protocol::{
@@ -791,32 +794,6 @@ impl PodcastStore {
     }
 }
 
-fn podcast_http_client(
-    request_timeout: Duration,
-    read_timeout: Duration,
-) -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        // Iroh enables Reqwest's Hickory resolver for its own networking. Cargo
-        // features are additive, so that would otherwise also make podcast
-        // requests use Hickory's Android/JNI system-configuration path. That
-        // path can block before Reqwest's request timeout starts. The platform
-        // resolver is the reliable choice for ordinary public HTTPS feeds.
-        .no_hickory_dns()
-        .connect_timeout(Duration::from_secs(8))
-        .read_timeout(read_timeout)
-        .timeout(request_timeout)
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            if attempt.previous().len() >= 5 || !safe_public_https_url(attempt.url()) {
-                attempt.stop()
-            } else {
-                attempt.follow()
-            }
-        }))
-        .user_agent("Napstrfy/0.1 (https://napstr.net)")
-        .build()
-        .map_err(|error| error.to_string())
-}
-
 fn public_podcast_feed(feed: PublicPodcastFeed) -> Option<PodcastFeed> {
     let id = feed.collection_id.or(feed.track_id)?;
     let feed_url = normalized_public_https_url(feed.feed_url.as_deref()?, None)?;
@@ -1214,32 +1191,6 @@ fn validate_podcast_episode(episode: &PodcastEpisode) -> Result<(), String> {
     }
     podcast_extension(episode)?;
     Ok(())
-}
-
-fn safe_public_https_url(url: &reqwest::Url) -> bool {
-    if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
-        return false;
-    }
-    let Some(host) = url.host_str() else {
-        return false;
-    };
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    if host == "localhost" || host.ends_with(".localhost") || host.ends_with(".local") {
-        return false;
-    }
-    host.parse::<std::net::IpAddr>()
-        .map(|address| match address {
-            std::net::IpAddr::V4(address) => {
-                !(address.is_private()
-                    || address.is_loopback()
-                    || address.is_link_local()
-                    || address.is_unspecified())
-            }
-            std::net::IpAddr::V6(address) => {
-                !(address.is_loopback() || address.is_unspecified() || address.is_unique_local())
-            }
-        })
-        .unwrap_or(true)
 }
 
 fn normalized_public_https_url(value: &str, base: Option<&reqwest::Url>) -> Option<reqwest::Url> {
@@ -2610,6 +2561,11 @@ fn write_private_key(path: &Path, bytes: &[u8]) -> Result<(), String> {
     }
 }
 
+#[tauri::command]
+fn client_platform() -> &'static str {
+    std::env::consts::OS
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Iroh intentionally uses reqwest's bring-your-own-provider Rustls mode.
@@ -2618,6 +2574,7 @@ pub fn run() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_os::init())
         .setup(|app| {
             #[cfg(mobile)]
             app.handle().plugin(tauri_plugin_barcode_scanner::init())?;
@@ -2634,6 +2591,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            client_platform,
             companion_status,
             pair_desktop,
             forget_desktop,

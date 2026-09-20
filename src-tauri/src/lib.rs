@@ -1975,11 +1975,17 @@ async fn network_browse(
     cursor: Option<network::CatalogueBrowseCursor>,
     limit: Option<usize>,
     cache_limit: Option<usize>,
+    unowned_only: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<network::CatalogueBrowsePage, String> {
     let page = state
         .network
-        .browse(cursor, limit.unwrap_or(500), cache_limit.unwrap_or(10_000))
+        .browse(
+            cursor,
+            limit.unwrap_or(500),
+            cache_limit.unwrap_or(10_000),
+            unowned_only.unwrap_or(false),
+        )
         .await?;
     state.covers.nudge();
     Ok(page)
@@ -2006,9 +2012,10 @@ async fn resolve_catalogue_user(
 
 #[tauri::command]
 async fn get_trollbox_messages(
+    before: Option<network::PublicChatCursor>,
     state: State<'_, AppState>,
 ) -> Result<Vec<network::TrollboxMessage>, String> {
-    state.network.trollbox_messages().await
+    state.network.trollbox_messages(before).await
 }
 
 #[tauri::command]
@@ -2023,11 +2030,12 @@ async fn send_trollbox_message(
 async fn get_track_discussion_messages(
     file_id: String,
     subscribe: bool,
+    before: Option<network::PublicChatCursor>,
     state: State<'_, AppState>,
 ) -> Result<Vec<network::TrollboxMessage>, String> {
     state
         .network
-        .track_discussion_messages(file_id, subscribe)
+        .track_discussion_messages(file_id, subscribe, before)
         .await
 }
 
@@ -2280,6 +2288,7 @@ pub fn run() {
     let shutdown_services = Arc::new(Mutex::new(None::<ShutdownServices>));
     let setup_shutdown_services = shutdown_services.clone();
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
             let app_data = app

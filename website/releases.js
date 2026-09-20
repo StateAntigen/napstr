@@ -1,4 +1,4 @@
-(() => {
+export async function loadLatestRelease(t, locale) {
   const repositoryMeta = document.querySelector('meta[name="github-repository"]');
   const status = document.querySelector('#release-status');
   const releasePage = document.querySelector('#release-page');
@@ -31,7 +31,8 @@
   }
 
   function matchAssets(assets) {
-    const safeAssets = assets.filter(validAsset);
+    const companion = document.body.dataset.releaseProduct === 'napstrfy';
+    const safeAssets = assets.filter(validAsset).filter((asset) => /napstrfy|nostrfy/i.test(asset.name) === companion);
 
     return {
       windows: safeAssets.find((asset) => /\.exe$/i.test(asset.name)),
@@ -51,15 +52,15 @@
     document.querySelectorAll(`[data-release-platform="${platform}"]`).forEach((link) => {
       link.href = asset.browser_download_url;
       link.removeAttribute('aria-disabled');
-      link.title = `${asset.name} — ${(asset.size / 1024 / 1024).toFixed(1)} MB`;
+      link.title = `${asset.name} — ${new Intl.NumberFormat(locale, { maximumFractionDigits: 1 }).format(asset.size / 1024 / 1024)} MB`;
     });
     return true;
   }
 
-  async function loadLatestRelease() {
+  async function load() {
     const repository = githubRepository();
     if (!repository) {
-      status.textContent = 'Set the github-repository meta value when using a custom domain.';
+      status.textContent = t('Release configuration is unavailable.');
       return;
     }
 
@@ -73,26 +74,27 @@
 
     try {
       const response = await fetch(`https://api.github.com/repos/${repository}/releases/latest`, {
-        headers: { Accept: 'application/vnd.github+json' }
+        headers: { Accept: 'application/vnd.github+json' },
+        cache: 'no-store'
       });
       if (!response.ok) throw new Error(`GitHub returned ${response.status}`);
 
       const release = await response.json();
       const version = String(release.tag_name || release.name || 'latest').replace(/^v/i, '');
-      if (typeof release.html_url === 'string') {
+      if (typeof release.html_url === 'string' && release.html_url.startsWith(`https://github.com/${repository}/releases/`)) {
         releasePage.href = release.html_url;
         document.querySelectorAll('[data-release-page]').forEach((link) => {
           link.href = release.html_url;
         });
       }
-      document.querySelectorAll('[data-release-version]').forEach((element) => {
-        element.textContent = version;
-      });
-
       const matched = matchAssets(Array.isArray(release.assets) ? release.assets : []);
+      document.querySelectorAll('[data-release-version]').forEach((element) => {
+        const platform = element.dataset.releaseVersion;
+        element.textContent = !platform || matched[platform] ? version : t('Unavailable');
+      });
       const napstrfyPage = document.body.dataset.releaseProduct === 'napstrfy';
       const expectedPlatforms = napstrfyPage
-        ? ['napstrfy-android']
+        ? ['windows', 'linux', 'macos-arm64', 'macos-intel', 'napstrfy-android']
         : ['windows', 'linux', 'macos-arm64', 'macos-intel'];
       const available = Object.entries(matched)
         .filter(([platform, asset]) => expectedPlatforms.includes(platform) && enableLinks(platform, asset))
@@ -100,17 +102,18 @@
 
       const productName = napstrfyPage ? 'Napstrfy' : 'Napstr';
       if (available.length === expectedPlatforms.length) {
-        status.textContent = `${productName} ${version} downloads are ready.`;
+        status.textContent = t('{product} {version} downloads are ready.', { product: productName, version });
       } else {
-        status.textContent = napstrfyPage
-          ? `${productName} ${version} is published, but its Android installer is not attached yet.`
-          : `${productName} ${version} is published, but one or more installers are still uploading.`;
+        status.textContent = t('{product} {version} is published, but some installers are not available in this release.', { product: productName, version });
       }
     } catch (error) {
-      status.textContent = 'The automatic download list is temporarily unavailable.';
+      document.querySelectorAll('[data-release-version]').forEach((element) => {
+        element.textContent = t('Unavailable');
+      });
+      status.textContent = t('The automatic download list is temporarily unavailable.');
       console.warn('Could not load the latest Napstr release:', error);
     }
   }
 
-  loadLatestRelease();
-})();
+  await load();
+}

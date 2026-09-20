@@ -27,12 +27,22 @@ class MediaControlBridge(private val activity: MainActivity) {
       putExtra(MediaNotificationService.EXTRA_DURATION, state.optDouble("duration").coerceIn(0.0, MAX_SECONDS).toLong() * 1000L)
       putExtra(MediaNotificationService.EXTRA_CAN_PREVIOUS, state.optBoolean("canPrevious"))
       putExtra(MediaNotificationService.EXTRA_CAN_NEXT, state.optBoolean("canNext"))
+      putExtra(MediaNotificationService.EXTRA_CAN_SEEK, state.optBoolean("canSeek"))
       putExtra(MediaNotificationService.EXTRA_LIKED, state.optBoolean("liked"))
       putExtra(MediaNotificationService.EXTRA_LOOPING, state.optBoolean("looping"))
       // The state describes the computer's player rather than this phone's, and
       // volume is a percentage of the computer's volume.
       putExtra(MediaNotificationService.EXTRA_REMOTE, state.optBoolean("remote"))
       putExtra(MediaNotificationService.EXTRA_VOLUME, state.optInt("volume", 0))
+      // Labels are translated by the webview, which owns the chosen language.
+      val labels = state.optJSONObject("labels")
+      for (key in listOf(
+          "previous", "rewind", "play", "pause", "forward", "next", "channel",
+          "like", "unlike", "repeat", "repeatOff"
+        )
+      ) {
+        putExtra("label_$key", safeText(labels?.optString(key).orEmpty(), 100))
+      }
     }
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) activity.startForegroundService(intent)
     else activity.startService(intent)
@@ -60,7 +70,8 @@ class MediaControlBridge(private val activity: MainActivity) {
 
     fun dispatch(action: String) {
       if (action !in setOf(
-          "play", "pause", "previous", "next", "like", "repeat", "volumeUp", "volumeDown"
+          "play", "pause", "previous", "next", "rewind", "forward", "like", "repeat",
+          "volumeUp", "volumeDown"
         ) &&
         !action.startsWith("seek:")
       ) {

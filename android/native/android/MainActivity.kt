@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.view.WindowManager
 import android.webkit.WebSettings
 import android.webkit.WebView
 import androidx.activity.addCallback
@@ -17,6 +18,8 @@ class MainActivity : TauriActivity() {
   override fun onCreate(savedInstanceState: Bundle?) {
     enableEdgeToEdge()
     super.onCreate(savedInstanceState)
+    // Keep Napstrfy visible until the user locks the phone or leaves the app.
+    window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
     // The drawer gets first refusal on back, then the press continues to the
     // system so back still leaves the app when nothing is open.
     onBackPressedDispatcher.addCallback(this) {

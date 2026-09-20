@@ -1,0 +1,214 @@
+name: Build Napstrfy desktop installers
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+  pull_request:
+    paths:
+      - 'android/**'
+      - 'shared/i18n/**'
+      - 'remote-protocol/**'
+      - 'static/**'
+      - '.github/workflows/napstrfy-desktop.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Napstrfy ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux-x64
+            runner: ubuntu-22.04
+            bundles: appimage
+          - name: Windows-x64
+            runner: windows-latest
+            bundles: nsis
+          - name: macOS-Intel
+            runner: macos-15-intel
+            bundles: app
+          - name: macOS-Apple-Silicon
+            runner: macos-15
+            bundles: app
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        working-directory: android
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: android/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux build and audio dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential curl file wget pkg-config patchelf \
+            libwebkit2gtk-4.1-dev libssl-dev librsvg2-dev \
+            gstreamer1.0-tools gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good gstreamer1.0-libav \
+            gstreamer1.0-pulseaudio xauth xvfb
+      - run: npm ci
+      - run: npm run check
+      - run: npm run build
+      - name: Test companion native code
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+      - name: Configure installer version
+        env:
+          BUILD_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: |
+          node --input-type=module <<'JS'
+          import { readFileSync, writeFileSync } from 'node:fs';
+          const tag = process.env.BUILD_TAG;
+          const config = JSON.parse(readFileSync('src-tauri/tauri.conf.json', 'utf8'));
+          if (tag && !/^v\d+\.\d+\.\d+(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?$/.test(tag)) {
+            throw new Error('Invalid release tag');
+          }
+          writeFileSync('src-tauri/tauri.ci.conf.json', JSON.stringify({ version: tag ? tag.slice(1) : config.version }));
+          JS
+      - name: Build installer
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: '1'
+          NO_STRIP: '1'
+        run: npm run bundle -- --verbose --config src-tauri/tauri.ci.conf.json --bundles '${{ matrix.bundles }}' -- --locked
+      - name: Package macOS DMG
+        if: runner.os == 'macOS'
+        run: |
+          # Retry only packaging, without recompiling or skipping verification.
+          # Verbose output exposes hdiutil errors hidden by the default logger.
+          for attempt in 1 2 3; do
+            if npm run tauri -- bundle --verbose --ci --config src-tauri/tauri.ci.conf.json --bundles dmg; then
+              break
+            fi
+            if [[ "$attempt" == 3 ]]; then
+              echo 'Napstrfy DMG packaging failed after three attempts' >&2
+              exit 1
+            fi
+            echo "DMG packaging attempt $attempt failed; retrying in 10 seconds" >&2
+            sleep 10
+          done
+      - name: Prepare and smoke-test AppImage
+        if: runner.os == 'Linux'
+        run: |
+          appimage="$(find src-tauri/target/release/bundle/appimage -maxdepth 1 -name '*.AppImage' -print -quit)"
+          test -n "$appimage"
+          bash scripts/postprocess-appimage.sh "$appimage"
+          smoke_log="$RUNNER_TEMP/napstrfy-startup.log"
+          set +e
+          timeout 20s xvfb-run -a env APPIMAGE_EXTRACT_AND_RUN=1 "$appimage" >"$smoke_log" 2>&1
+          result=$?
+          set -e
+          cat "$smoke_log"
+          if [[ "$result" != 124 ]] || grep -Eqi 'EGL_BAD_PARAMETER|Unable to spawn|error while loading shared libraries|panicked at' "$smoke_log"; then
+            echo 'Napstrfy failed its AppImage startup check' >&2
+            exit 1
+          fi
+      - name: Verify macOS application signature
+        if: runner.os == 'macOS'
+        run: |
+          # A DMG-only build removes the intermediate .app after packaging.
+          # Verify the application users will actually install from the DMG.
+          dmg="$(find src-tauri/target/release/bundle/dmg -maxdepth 1 -name '*.dmg' -print -quit)"
+          if [[ -z "$dmg" ]]; then
+            echo 'Tauri did not produce the expected Napstrfy DMG' >&2
+            exit 1
+          fi
+          mount_point="$(mktemp -d "$RUNNER_TEMP/napstrfy-dmg.XXXXXX")"
+          cleanup_dmg() {
+            hdiutil detach -quiet "$mount_point" >/dev/null 2>&1 || true
+            rmdir "$mount_point" >/dev/null 2>&1 || true
+          }
+          trap cleanup_dmg EXIT
+          hdiutil attach -readonly -nobrowse -mountpoint "$mount_point" "$dmg" >/dev/null
+          app="$mount_point/Napstrfy.app"
+          if [[ ! -f "$app/Contents/MacOS/napstrfy" ]]; then
+            echo 'The finished DMG does not contain the Napstrfy application' >&2
+            exit 1
+          fi
+          codesign --verify --deep --strict --verbose=2 "$app"
+      - name: Collect installers and checksums
+        run: |
+          node --input-type=module <<'JS'
+          import { readdirSync, readFileSync, mkdirSync, copyFileSync, writeFileSync } from 'node:fs';
+          import { join, basename } from 'node:path';
+          import { createHash } from 'node:crypto';
+          const output = 'installers';
+          mkdirSync(output, { recursive: true });
+          const checksums = [];
+          function collect(dir) {
+            for (const entry of readdirSync(dir, { withFileTypes: true })) {
+              const path = join(dir, entry.name);
+              if (entry.isDirectory() && !entry.name.endsWith('.app') && !entry.name.endsWith('.AppDir')) collect(path);
+              else if (entry.isFile() && /\.(AppImage|exe|dmg)$/.test(entry.name)) {
+                const name = basename(path);
+                copyFileSync(path, join(output, name));
+                const checksum = `${createHash('sha256').update(readFileSync(path)).digest('hex')}  ${name}\n`;
+                writeFileSync(join(output, `${name}.sha256`), checksum);
+                checksums.push(checksum);
+              }
+            }
+          }
+          collect('src-tauri/target/release/bundle');
+          if (!checksums.length) throw new Error('No installers were built');
+          JS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Napstrfy-${{ matrix.name }}
+          path: android/installers/
+          if-no-files-found: error
+
+  release:
+    name: Attach Napstrfy desktop installers to release
+    needs: build
+    # Attach verified artifacts from successful platforms even if another fails.
+    # The failed build still leaves the overall workflow red.
+    if: >-
+      !cancelled() && needs.build.result != 'skipped' &&
+      github.ref_type == 'tag' && startsWith(github.ref_name, 'v') &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: Napstrfy-*
+          path: installers
+          merge-multiple: true
+      - name: Create or reuse the draft release and attach installers
+        shell: bash
+        run: |
+          (
+            cd installers
+            sha256sum --check -- *.sha256
+          )
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            notes="$RUNNER_TEMP/napstrfy-release-notes.md"
+            cat > "$notes" <<'NOTES'
+          Napstr and Napstrfy installers.
+
+          The macOS DMGs are ad-hoc-signed, unnotarized community builds. After the first blocked launch, open System Settings → Privacy & Security and choose Open Anyway.
+          NOTES
+            create_args=(release create "$RELEASE_TAG" --verify-tag --draft --title "Napstr $RELEASE_TAG" --notes-file "$notes")
+            if [[ "$RELEASE_TAG" == *-* ]]; then
+              create_args+=(--prerelease)
+            fi
+            # The existing Napstr/Android workflow may create the same draft
+            # concurrently. Reuse it if its creation wins the race.
+            gh "${create_args[@]}" || gh release view "$RELEASE_TAG" >/dev/null
+          fi
+          shopt -s nullglob
+          gh release upload "$RELEASE_TAG" installers/*.AppImage installers/*.exe installers/*.dmg --clobber

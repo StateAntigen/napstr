@@ -7,6 +7,12 @@ html, body, #app { min-width: 320px; min-height: 100%; margin: 0; background: #0
 body { min-height: 100vh; min-height: 100dvh; overflow-x: clip; }
 button, input, textarea { font: inherit; }
 button { color: inherit; }
+/* Reaching the controls without a pointer: a phone can have a keyboard
+   attached, and the desktop build is driven by one. */
+button:not(:disabled), summary { cursor: pointer; }
+button:disabled { cursor: default; }
+:focus-visible { outline: 2px solid #b1a8ff; outline-offset: 4px; }
+.search-area form:focus-within { outline: 2px solid #b1a8ff; outline-offset: 3px; }
 audio { display: none; }
 
 .pair-screen { position: relative; min-height: 100vh; min-height: 100dvh; padding: calc(env(safe-area-inset-top) + 48px) 27px calc(env(safe-area-inset-bottom) + 28px); display: flex; flex-direction: column; align-items: center; justify-content: center; overflow: hidden; text-align: center; background: radial-gradient(circle at 50% 15%, #242058 0, #11111a 36%, #08080a 75%); }
@@ -21,7 +27,18 @@ audio { display: none; }
 .scan-button span { font-size: 28px; }.scan-button:disabled { opacity: .6; }
 .browse-podcasts { margin-top: 14px; padding: 9px 16px; color: #c3beff; background: transparent; border: 0; text-decoration: underline; text-underline-offset: 3px; }
 .manual-pair { width: min(370px, 100%); margin-top: 18px; color: #aaaab3; font-size: 13px; }.manual-pair summary { cursor: pointer; }.manual-pair textarea { width: 100%; min-height: 76px; margin: 12px 0 7px; padding: 10px; color: white; background: #18181d; border: 1px solid #393941; border-radius: 10px; resize: vertical; font: 11px/1.35 monospace; }.manual-pair button { width: 100%; min-height: 42px; background: #29262f; border: 1px solid #4b4852; border-radius: 21px; }
-.pair-security { margin-top: 22px; color: #73737d; }.error-card { width: min(380px, 100%); margin: 0 0 14px; padding: 10px 13px; color: #ffd9db; background: #3d1419; border: 1px solid #7d2831; border-radius: 10px; overflow-wrap: anywhere; }.error-card span { display: block; }.error-card button { min-height: 38px; margin-top: 9px; padding: 7px 14px; color: #fff; background: #72252e; border: 1px solid #a84450; border-radius: 19px; font-weight: 700; }
+.pair-security { margin-top: 22px; color: #73737d; }
+/* The pairing code is typed on a desktop far more often than on a phone, so it
+   is a form there, opened by default, with the words the computer shows beside
+   it. The language picker sits under it: choosing a language is the first thing
+   somebody pairing in a second language needs. */
+.manual-pair p { line-height: 1.6; text-align: left; }
+.manual-pair button:disabled { opacity: .45; }
+.desktop-pair summary { color: #f7f7f8; font-size: 17px; font-weight: 700; }
+.desktop-pair button { min-height: 48px; color: #111; background: #e4dfff; border: 0; font-size: 15px; font-weight: 750; }
+:root .language-select select { color: #000; background: #f4f4f5; color-scheme: light; }
+.pair-screen > .language-select { position: relative; justify-content: center; max-width: 100%; }
+.error-card { width: min(380px, 100%); margin: 0 0 14px; padding: 10px 13px; color: #ffd9db; background: #3d1419; border: 1px solid #7d2831; border-radius: 10px; overflow-wrap: anywhere; }.error-card span { display: block; }.error-card button { min-height: 38px; margin-top: 9px; padding: 7px 14px; color: #fff; background: #72252e; border: 1px solid #a84450; border-radius: 19px; font-weight: 700; }
 
 .app-shell { min-height: 100vh; min-height: 100dvh; padding-bottom: calc(168px + env(safe-area-inset-bottom)); background: linear-gradient(#12121a 0, #0d0d10 190px, #0b0b0d 100%); }
 /* The chrome rides along with the page: the connection chip and the settings
@@ -95,6 +112,15 @@ audio { display: none; }
 .icon-busy { display: block; width: 0.6em; height: 0.6em; border: 0.08em solid rgba(255,255,255,.25); border-top-color: currentColor; border-radius: 50%; animation: spin .8s linear infinite; }
 .bottom-nav { position: fixed; z-index: 35; right: 0; bottom: 0; left: 0; height: calc(69px + env(safe-area-inset-bottom)); padding: 6px 10px env(safe-area-inset-bottom); display: flex; align-items: center; justify-content: space-around; background: rgba(8,8,10,.96); border-top: 1px solid #29292f; transform: translateY(calc(var(--nav-shift, 0) * 100%)); transition: transform .28s cubic-bezier(.22,.61,.36,1); }
 .bottom-nav.dragging { transition: none; }.bottom-nav button { min-width: 58px; height: 55px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; color: #72727b; background: transparent; border: 0; font-size: 10px; }.bottom-nav button span { font-size: 29px; line-height: 1; }.bottom-nav button.active { color: white; }
+/* Translated tab names are longer than "Music" and "Podcasts", so they wrap. */
+.bottom-nav button { overflow-wrap: anywhere; }
+/* Right-to-left languages: the words read the other way, but a transport row
+   and a progress bar do not - swapping them would put "next" where "previous"
+   was and start the bar's fill from the wrong end. */
+[dir="rtl"] .now-sheet-actions, [dir="rtl"] .now-sheet-modes,
+[dir="rtl"] .now-sheet-timeline, [dir="rtl"] .now-playing { direction: ltr; }
+[dir="rtl"] .track-copy, [dir="rtl"] .episode-copy, [dir="rtl"] .audiobook-card > span,
+[dir="rtl"] .now-copy, [dir="rtl"] .now-sheet-copy { text-align: start; }
 
 @keyframes spin { to { transform: rotate(360deg); } }
 @keyframes marquee { from { transform: translateX(0); } to { transform: translateX(-100%); } }
@@ -311,3 +337,57 @@ svg .filled { fill: currentColor; stroke: none; }
 .report-panel .remote-note { padding: 10px 18px 0; }
 .report-send { width: calc(100% - 36px); min-height: 48px; margin: 14px 18px calc(6px + env(safe-area-inset-bottom)); padding: 8px 14px; color: #0d1a1c; background: #8fe0cf; border: 0; border-radius: 12px; font-size: 15px; font-weight: 700; }
 .report-send:disabled { opacity: .5; }
+
+/* A desktop window wide enough for three columns: the tab bar becomes the
+   sidebar, the tab content is the middle column, and the now-playing drawer is
+   pinned as the third one. Below 800px, and on every phone, the drawer keeps
+   working exactly as it does on Android, so this block is the only difference. */
+@media (min-width: 800px) {
+  .app-shell.desktop {
+    --sidebar-width: 190px;
+    min-height: 100dvh;
+    max-width: none;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    display: grid;
+    grid-template-columns: var(--sidebar-width) minmax(0, 1fr) calc(var(--sidebar-width) * 1.5);
+    grid-template-rows: auto minmax(0, 1fr);
+    align-items: start;
+  }
+  .app-shell.desktop > .mobile-header { grid-area: 1 / 2; position: static; height: auto; max-width: none; margin: 0; padding: 20px 28px 8px; background: none; backdrop-filter: none; }
+  .app-shell.desktop > .app-content { grid-area: 2 / 2; min-width: 0; padding: 0 28px 44px; }
+  /* The sidebar keeps the bar's markup, so it only changes direction and shape. */
+  .app-shell.desktop > .bottom-nav { top: 0; bottom: 0; inset-inline-start: 0; width: var(--sidebar-width); height: auto; max-width: none; margin: 0; padding: 20px 12px; flex-direction: column; align-items: stretch; justify-content: flex-start; gap: 8px; border-top: 0; border-inline-end: 1px solid #26252f; background: #0c0c0f; transform: none; }
+  .app-shell.desktop > .bottom-nav button { min-width: 0; height: 48px; padding: 0 14px; flex-direction: row; justify-content: flex-start; gap: 12px; border-radius: 10px; font-size: 14px; font-weight: 650; }
+  .app-shell.desktop > .bottom-nav button span { width: 28px; font-size: 25px; text-align: center; }
+  .app-shell.desktop > .bottom-nav button.active { color: #e7e2ff; background: #282339; }
+  /* Column three. `static` so it is laid out as a column and not overlaid. */
+  .app-shell.desktop > .now-sheet.pinned {
+    grid-area: 1 / 3 / 3 / 4;
+    align-self: stretch;
+    min-height: 100dvh;
+    position: static;
+    transform: none;
+    background: #0b0b0e;
+    border-inline-start: 1px solid #26252f;
+  }
+  .now-sheet.pinned .now-sheet-hero { flex: 0 0 auto; padding: 22px 18px 0; }
+  .now-sheet.pinned .now-sheet-backdrop { inset: 0; }
+  .now-sheet.pinned .now-sheet-art { width: 100%; height: auto; max-height: none; aspect-ratio: 1; }
+  .now-sheet.pinned .now-sheet-body { max-height: calc(100dvh - 360px); padding-bottom: 24px; overflow-y: auto; overscroll-behavior-y: contain; }
+  /* Nothing to drag or dismiss: the column is always there. */
+  .now-sheet.pinned .now-sheet-close { display: none; }
+  /* The column is narrower than the drawer, so the two rows of controls tighten
+     up rather than scrolling sideways. */
+  .now-sheet.pinned .now-sheet-actions { gap: 0; }
+  .now-sheet.pinned .now-sheet-actions button { width: 34px; }
+  .now-sheet.pinned .now-sheet-actions .skip-button { width: 46px; }
+  .now-sheet.pinned .now-sheet-actions .play-main { width: 56px; height: 56px; }
+  .now-sheet.pinned .now-sheet-modes { gap: 0; }
+  .now-sheet.pinned .now-sheet-modes button { width: 44px; }
+  /* A desktop window has room for the mark at full size. */
+  .pair-logo { width: min(480px, 92vw); }
+  .pair-logo img { width: 128px; height: 128px; }
+}
+

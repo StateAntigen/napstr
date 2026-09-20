@@ -1,57 +1,4 @@
-<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="description" content="How Napstr uses private app-session Tor onion services for audio transfers." />
-    <link rel="canonical" href="https://napstr.net/tor.html" />
-    <meta property="og:type" content="website" />
-    <meta property="og:site_name" content="Napstr" />
-    <meta property="og:title" content="How Napstr uses Tor" />
-    <meta property="og:description" content="Private Napstr audio transfers over app-session Tor onion services." />
-    <meta property="og:url" content="https://napstr.net/tor.html" />
-    <meta property="og:image" content="https://napstr.net/assets/preview.png" />
-    <meta property="og:image:width" content="400" />
-    <meta property="og:image:height" content="260" />
-    <meta property="og:image:alt" content="The Napstr homepage and classic desktop music-sharing app" />
-    <meta name="twitter:card" content="summary_large_image" />
-    <meta name="twitter:title" content="How Napstr uses Tor" />
-    <meta name="twitter:description" content="Private Napstr audio transfers over app-session Tor onion services." />
-    <meta name="twitter:image" content="https://napstr.net/assets/preview.png" />
-    <title>Napstr — Tor</title>
-    <link rel="icon" type="image/png" href="assets/favicon.png" />
-    <link rel="stylesheet" href="styles.css" />
-  </head>
-  <body>
-    <div class="site-shell">
-      <header class="masthead download-masthead">
-        <a class="brand" href="index.html" aria-label="Napstr home">
-          <img src="assets/napstr-logo.png" alt="Napstr" />
-        </a>
-        <div class="equalizer" aria-hidden="true">
-          <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
-        </div>
-      </header>
-
-      <div class="page-grid">
-        <aside class="sidebar">
-          <nav aria-label="Main navigation">
-            <a href="index.html">Home</a>
-            <a href="download.html">Download</a>
-            <a href="napstrfy.html">Napstrfy</a>
-            <a href="nostr.html">Nostr</a>
-            <a class="active" href="tor.html">Tor</a>
-          </nav>
-          <div class="sidebar-meta">
-            <span>Private Tor Sessions</span>
-            <span>Verified Files</span>
-            <span>No Direct-IP Mode</span>
-          </div>
-        </aside>
-
-        <main class="content-panel protocol-page">
-          <section class="content-body">
-            <h1>How Napstr Uses Tor</h1>
+<h1>How Napstr Uses Tor</h1>
             <p class="protocol-lead">
               Tor carries every Napstr audio transfer. There is no direct-IP fallback: if a
               valid Tor v3 onion connection cannot be made, the download fails closed.
@@ -114,14 +61,3 @@
                 should be shared.
               </p>
             </section>
-          </section>
-
-          <footer>
-            <div><a href="index.html">home</a> | <a href="download.html">download</a> | <a href="napstrfy.html">napstrfy</a> | <a href="nostr.html">nostr</a> | <a href="tor.html">tor</a></div>
-            <em><a href="https://github.com/lnbits/napstr/blob/main/LICENSE">Napstr is FLOSS — MIT License</a></em>
-          </footer>
-        </main>
-      </div>
-    </div>
-  </body>
-</html>

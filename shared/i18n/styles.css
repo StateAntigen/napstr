@@ -1,0 +1,16 @@
+@import './fonts/fonts.css';
+html:lang(ar), html:lang(ar) *, html:lang(ur), html:lang(ur) * { font-family: 'Noto Sans Arabic Variable', sans-serif; letter-spacing: normal; }
+html:lang(hi), html:lang(hi) * { font-family: 'Noto Sans Devanagari Variable', sans-serif; }
+html:lang(bn), html:lang(bn) * { font-family: 'Noto Sans Bengali Variable', sans-serif; }
+html:lang(zh), html:lang(zh) * { font-family: 'Noto Sans SC Variable', sans-serif; }
+option:lang(ar), option:lang(ur) { font-family: 'Noto Sans Arabic Variable', sans-serif; }
+option:lang(hi) { font-family: 'Noto Sans Devanagari Variable', sans-serif; }
+option:lang(bn) { font-family: 'Noto Sans Bengali Variable', sans-serif; }
+option:lang(zh) { font-family: 'Noto Sans SC Variable', sans-serif; }
+.language-select { display: flex; flex-wrap: wrap; align-items: center; gap: .6rem; margin-block: .75rem; }
+.language-select select { font: inherit; max-width: 100%; min-width: 10rem; padding: .35rem; color: inherit; background: inherit; }
+.language-select option { color: #111; background: #fff; }
+:root { font-synthesis: none; }
+[dir="rtl"] input[type="range"], [dir="rtl"] code, [dir="rtl"] .pairing-code, [dir="rtl"] textarea[spellcheck="false"] { direction: ltr; }
+[dir="rtl"] input[type="url"] { direction: ltr; text-align: left; }
+[dir="rtl"] .number { text-align: end; }

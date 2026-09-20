@@ -1,4 +1,5 @@
 use crate::transfer::{DownloadOffer, TransferService};
+use ::rand::seq::SliceRandom;
 use chrono::Utc;
 use futures_util::{stream, StreamExt};
 use keyring::Entry;
@@ -18,7 +19,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tauri::Emitter;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
 use uuid::Uuid;
 
 use crate::cover;
@@ -34,11 +35,16 @@ const TRACK_DISCUSSION_SUBSCRIPTION: &str = "napstr-track-discussion";
 const PUBLIC_CHAT_EVENT: &str = "napstr-public-chat";
 const TRANSFERS_CHANGED_EVENT: &str = "napstr-transfers-changed";
 const TROLLBOX_CACHE_LIMIT: usize = 200;
+const PUBLIC_CHAT_PAGE_SIZE: usize = 100;
 const LIVE_NOSTR_EVENT_LIMIT: usize = 35_000;
 const MAX_SEEDER_CANDIDATES: usize = 3;
+const DOWNLOAD_QUEUED: &str = "Queued";
+const MAX_ACTIVE_DOWNLOADS: usize = 2;
+pub(crate) const DOWNLOAD_WAITING_FALLBACK: &str = "Waiting for another seeder";
+const DOWNLOAD_REQUESTED: &str = "Requesting Tor seeders";
 const DOWNLOAD_RESTART_PENDING: &str = "Waiting to restart after reconnect";
 const DOWNLOAD_RESTART_REQUESTED: &str = "Restarting · requesting fresh Tor seeders";
-const DOWNLOAD_RESTART_OFFER_TIMEOUT: Duration = Duration::from_secs(120);
+const DOWNLOAD_OFFER_TIMEOUT: Duration = Duration::from_secs(120);
 const CATALOGUE_EVENT_PACE: Duration = Duration::from_millis(75);
 const AVAILABILITY_QUERY_LIMIT: usize = 1_000;
 const AVAILABILITY_FILE_LIMIT: usize = 50_000;
@@ -201,6 +207,13 @@ pub struct TrollboxMessage {
     pub display_name: String,
     pub content: String,
     pub created_at: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicChatCursor {
+    created_at: u64,
+    event_id: EventId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -741,6 +754,7 @@ pub struct NetworkService {
     trollbox_cache_lock: Mutex<()>,
     track_discussion_subscription_lock: Mutex<()>,
     download_restart_lock: Mutex<()>,
+    download_queue_changed: Notify,
     connected: AtomicBool,
     generation: AtomicU64,
     last_error: RwLock<String>,
@@ -772,6 +786,7 @@ impl NetworkService {
             trollbox_cache_lock: Mutex::new(()),
             track_discussion_subscription_lock: Mutex::new(()),
             download_restart_lock: Mutex::new(()),
+            download_queue_changed: Notify::new(),
             connected: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             last_error: RwLock::new(String::new()),
@@ -1029,11 +1044,17 @@ impl NetworkService {
             while recovery.connected.load(Ordering::SeqCst)
                 && recovery.generation.load(Ordering::SeqCst) == generation
             {
-                match recovery.restart_interrupted_downloads(generation).await {
-                    Ok(()) => break,
-                    Err(error) => eprintln!("Could not restart interrupted downloads: {error}"),
+                let delay = match recovery.dispatch_queued_downloads(generation).await {
+                    Ok(()) => Duration::from_secs(1),
+                    Err(error) => {
+                        eprintln!("Could not advance download queue: {error}");
+                        Duration::from_secs(10)
+                    }
+                };
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {},
+                    _ = recovery.download_queue_changed.notified() => {},
                 }
-                tokio::time::sleep(Duration::from_secs(10)).await;
             }
         });
         self.queue_catalogue_publish(true);
@@ -1390,25 +1411,25 @@ impl NetworkService {
         self.publish_profile_with_client(&client, public_key).await
     }
 
-    pub async fn trollbox_messages(&self) -> Result<Vec<TrollboxMessage>, String> {
+    pub async fn trollbox_messages(
+        &self,
+        before: Option<PublicChatCursor>,
+    ) -> Result<Vec<TrollboxMessage>, String> {
         let client = self
             .client
             .read()
             .await
             .clone()
             .ok_or("Nostr is not connected")?;
-        self.public_chat_messages(
-            &client,
-            trollbox_filter(TROLLBOX_CACHE_LIMIT),
-            TROLLBOX_HASHTAG,
-        )
-        .await
+        self.public_chat_messages(&client, TROLLBOX_HASHTAG, before)
+            .await
     }
 
     pub async fn track_discussion_messages(
         &self,
         file_id: String,
         subscribe: bool,
+        before: Option<PublicChatCursor>,
     ) -> Result<Vec<TrollboxMessage>, String> {
         let topic = track_discussion_topic(&file_id)?;
         let client = self
@@ -1429,40 +1450,58 @@ impl NetworkService {
                 .await
                 .map_err(|error| format!("track discussion subscription failed: {error}"))?;
         }
-        self.public_chat_messages(&client, public_chat_filter(&topic, 100), &topic)
-            .await
+        self.public_chat_messages(&client, &topic, before).await
     }
 
     async fn public_chat_messages(
         &self,
         client: &Client,
-        filter: Filter,
         topic: &str,
+        before: Option<PublicChatCursor>,
     ) -> Result<Vec<TrollboxMessage>, String> {
+        let mut filter = public_chat_filter(topic, LIVE_NOSTR_EVENT_LIMIT);
+        if let Some(cursor) = &before {
+            filter = filter.until(Timestamp::from(cursor.created_at));
+        }
         let events = client
             .database()
-            .query(filter)
+            .query(filter.clone())
             .await
             .map_err(|error| format!("could not read the public chat cache: {error}"))?;
         let blocked = blocked_pubkeys(&self.db_path)?;
-        let mut chat_events = events
+        let mut available = events
             .iter()
-            .filter(|event| {
-                event.kind == Kind::from(TROLLBOX_MESSAGE_KIND)
-                    && event
-                        .tags
-                        .iter()
-                        .any(|tag| tag.kind() == TagKind::t() && tag.content() == Some(topic))
-                    && !blocked.contains(&event.pubkey.to_hex())
-                    && !event.content.trim().is_empty()
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        chat_events.sort_by(|left, right| {
-            left.created_at
-                .cmp(&right.created_at)
-                .then_with(|| left.id.cmp(&right.id))
-        });
+            .map(|event| (event.id, event.clone()))
+            .collect::<HashMap<_, _>>();
+        let mut chat_events =
+            public_chat_page(available.values(), topic, &blocked, before.as_ref());
+        // Live subscriptions only retain a recent window. Retrieve older history
+        // from relays when the user reaches the end of the locally cached page.
+        if before.is_some() && chat_events.len() < PUBLIC_CHAT_PAGE_SIZE {
+            let mut limit = PUBLIC_CHAT_PAGE_SIZE * 2;
+            loop {
+                let older = client
+                    .fetch_events(filter.clone().limit(limit), Duration::from_secs(8))
+                    .await
+                    .map_err(|error| format!("could not load older chat messages: {error}"))?;
+                let received = older.len();
+                for event in older.iter() {
+                    let _ = client.database().save_event(event).await;
+                    available.insert(event.id, event.clone());
+                }
+                chat_events =
+                    public_chat_page(available.values(), topic, &blocked, before.as_ref());
+                if chat_events.len() == PUBLIC_CHAT_PAGE_SIZE
+                    || received < limit
+                    || limit == LIVE_NOSTR_EVENT_LIMIT
+                {
+                    break;
+                }
+                // Nostr's `until` is inclusive and only has second precision.
+                // Widen the window if boundary-second or blocked events filled it.
+                limit = (limit * 2).min(LIVE_NOSTR_EVENT_LIMIT);
+            }
+        }
 
         let current_key = self
             .keys
@@ -1777,7 +1816,7 @@ impl NetworkService {
             EMPTY_SEARCH_PAGE_LIMIT,
             EMPTY_SEARCH_RESULT_LIMIT,
         ));
-        self.search_inner(query, browse, None)
+        self.search_inner(query, browse, None, false)
             .await
             .map(|(results, _, _)| results)
     }
@@ -1787,9 +1826,10 @@ impl NetworkService {
         cursor: Option<CatalogueBrowseCursor>,
         limit: usize,
         cache_limit: usize,
+        unowned_only: bool,
     ) -> Result<CatalogueBrowsePage, String> {
         let (results, cursor, total_available) = self
-            .search_inner("", Some((cursor, limit, cache_limit)), None)
+            .search_inner("", Some((cursor, limit, cache_limit)), None, unowned_only)
             .await?;
         Ok(CatalogueBrowsePage {
             results,
@@ -1809,6 +1849,7 @@ impl NetworkService {
                 "",
                 Some((cursor, EMPTY_SEARCH_PAGE_LIMIT, AVAILABILITY_FILE_LIMIT)),
                 Some(author),
+                false,
             )
             .await?;
         Ok(CatalogueBrowsePage {
@@ -2070,6 +2111,7 @@ impl NetworkService {
         query: &str,
         browse: Option<(Option<CatalogueBrowseCursor>, usize, usize)>,
         author: Option<PublicKey>,
+        unowned_only: bool,
     ) -> Result<(Vec<CatalogueResult>, Option<CatalogueBrowseCursor>, usize), String> {
         let client = self
             .client
@@ -2100,7 +2142,7 @@ impl NetworkService {
                 browse.unwrap_or((None, EMPTY_SEARCH_PAGE_LIMIT, EMPTY_SEARCH_RESULT_LIMIT));
             initial_browse_cache_limit = cache_limit.clamp(
                 1,
-                if author.is_some() {
+                if author.is_some() || unowned_only {
                     AVAILABILITY_FILE_LIMIT
                 } else {
                     EMPTY_SEARCH_RESULT_LIMIT
@@ -2138,7 +2180,11 @@ impl NetworkService {
                         for event in events {
                             events_by_id.insert(event.id, event);
                         }
-                        session.pending_file_ids.extend(retry_file_ids);
+                        // Surprise browsing visits each candidate once so missing
+                        // relay metadata cannot keep the button spinning forever.
+                        if !unowned_only {
+                            session.pending_file_ids.extend(retry_file_ids);
+                        }
                     }
                     Err(error) => {
                         for file_id in requested_file_id_order.iter().rev() {
@@ -2241,6 +2287,9 @@ impl NetworkService {
 
         let mut aggregated: HashMap<String, CatalogueResult> = HashMap::new();
         let connection = super::open_connection(&self.db_path)?;
+        if unowned_only {
+            exclude_local_availability(&connection, &mut available_by_file, &mut online)?;
+        }
         let blocked_files = {
             let mut statement = connection
                 .prepare("SELECT file_id FROM blocked_files")
@@ -2294,6 +2343,9 @@ impl NetworkService {
                     .cmp(left_sources)
                     .then_with(|| left_id.cmp(right_id))
             });
+            if unowned_only {
+                ranked_ids.shuffle(&mut ::rand::rng());
+            }
             requested_file_id_order = ranked_ids
                 .into_iter()
                 .take(initial_browse_cache_limit)
@@ -2703,12 +2755,9 @@ impl NetworkService {
         source_pubkeys: Vec<String>,
         destination_folder: Option<String>,
     ) -> Result<String, String> {
-        let client = self
-            .client
-            .read()
-            .await
-            .clone()
-            .ok_or("Nostr is not connected")?;
+        if self.client.read().await.is_none() {
+            return Err("Nostr is not connected".into());
+        }
         let mut unique = source_pubkeys
             .into_iter()
             .collect::<HashSet<_>>()
@@ -2722,10 +2771,6 @@ impl NetworkService {
         if unique.is_empty() {
             return Err("at least one seeder is required".into());
         }
-        let tor = self.transfers.clone();
-        tokio::spawn(async move {
-            let _ = tor.warm_tor().await;
-        });
         let connection = super::open_connection(&self.db_path)?;
         let already_local: bool = connection
             .query_row(
@@ -2798,16 +2843,20 @@ impl NetworkService {
             })
             .filter(|value| !value.is_empty());
         let request_id = Uuid::new_v4().to_string();
-        connection.execute(
-            "INSERT INTO network_downloads (request_id,file_id,source_pubkey,filename,size,progress,status,speed,destination,onion,updated_at,destination_folder) VALUES (?1,?2,?3,?4,?5,0,'Racing responsive Tor seeders','—','','',?6,?7)",
+        let transaction = connection
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
+        transaction.execute(
+            "INSERT INTO network_downloads (request_id,file_id,source_pubkey,filename,size,progress,status,speed,destination,onion,updated_at,destination_folder) VALUES (?1,?2,?3,?4,?5,0,'Queued','Queued','','',?6,?7)",
             params![request_id, file_id, unique[0], filename, size, Utc::now().to_rfc3339(), destination_folder.unwrap_or_default()],
         ).map_err(|error| error.to_string())?;
         for (source, _) in &receivers {
-            connection.execute("INSERT INTO download_sources(request_id,source_pubkey,status,updated_at) VALUES(?1,?2,'Requested',?3)", params![request_id, source, Utc::now().to_rfc3339()]).map_err(|error| error.to_string())?;
+            transaction.execute("INSERT INTO download_sources(request_id,source_pubkey,status,updated_at) VALUES(?1,?2,'Queued',?3)", params![request_id, source, Utc::now().to_rfc3339()]).map_err(|error| error.to_string())?;
         }
-        drop(connection);
-        self.deliver_download_request(client, request_id, file_id, receivers)
-            .await
+        transaction.commit().map_err(|error| error.to_string())?;
+        self.download_queue_changed.notify_one();
+        let _ = self.app_handle.emit(TRANSFERS_CHANGED_EVENT, ());
+        Ok(request_id)
     }
 
     async fn deliver_download_request(
@@ -2846,40 +2895,36 @@ impl NetworkService {
                 Ok(_) => sent += 1,
                 Err(error) => {
                     if let Ok(connection) = super::open_connection(&self.db_path) {
-                        let _ = connection.execute("UPDATE download_sources SET status=?1,updated_at=?2 WHERE request_id=?3 AND source_pubkey=?4", params![format!("Failed: {error}"), Utc::now().to_rfc3339(), request_id, source]);
+                        let _ = connection.execute("UPDATE download_sources SET status=?1,updated_at=?2 WHERE request_id=?3 AND source_pubkey=?4 AND status='Requested'", params![format!("Failed: {error}"), Utc::now().to_rfc3339(), request_id, source]);
                     }
                 }
             }
         }
         if sent == 0 {
-            super::open_connection(&self.db_path)?
+            let changed = super::open_connection(&self.db_path)?
                 .execute(
-                    "UPDATE network_downloads SET status='Failed: NIP-17 request could not be delivered',updated_at=?1 WHERE request_id=?2",
-                    params![Utc::now().to_rfc3339(), request_id],
+                    "UPDATE network_downloads SET status='Failed: NIP-17 request could not be delivered',speed='—',updated_at=?1
+                     WHERE request_id=?2 AND status IN (?3,?4,?5)
+                     AND NOT EXISTS (SELECT 1 FROM download_sources WHERE request_id=?2
+                       AND status NOT LIKE 'Failed:%' AND status NOT LIKE 'Refused:%')",
+                    params![Utc::now().to_rfc3339(), request_id, DOWNLOAD_REQUESTED, DOWNLOAD_RESTART_REQUESTED, DOWNLOAD_WAITING_FALLBACK],
                 )
                 .map_err(|error| error.to_string())?;
+            if changed == 0 {
+                return Ok(request_id);
+            }
             let _ = self.app_handle.emit(TRANSFERS_CHANGED_EVENT, ());
             return Err("NIP-17 request could not be delivered to any seeder".into());
         }
         Ok(request_id)
     }
 
-    async fn restart_interrupted_downloads(&self, generation: u64) -> Result<(), String> {
+    async fn dispatch_queued_downloads(&self, generation: u64) -> Result<(), String> {
         let _guard = self.download_restart_lock.lock().await;
-        let pending =
-            {
-                let connection = super::open_connection(&self.db_path)?;
-                let mut statement = connection.prepare(
-                "SELECT request_id,file_id FROM network_downloads WHERE status=?1 ORDER BY rowid"
-            ).map_err(|error| error.to_string())?;
-                let rows = statement
-                    .query_map([DOWNLOAD_RESTART_PENDING], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                    })
-                    .map_err(|error| error.to_string())?;
-                rows.collect::<Result<Vec<_>, _>>()
-                    .map_err(|error| error.to_string())?
-            };
+        if self.transfers.is_paused() {
+            return Ok(());
+        }
+        let pending = pending_downloads(&super::open_connection(&self.db_path)?)?;
         if pending.is_empty() {
             return Ok(());
         }
@@ -2901,11 +2946,21 @@ impl NetworkService {
         // Tor::start only returns after bootstrap reaches 100%. Do not send
         // requests or start expiry timers while either transport is starting.
         self.transfers.warm_tor().await?;
-        let availability = self.availability_snapshot(&client).await?;
+        let availability = if pending.iter().any(|(_, _, restart)| *restart) {
+            Some(self.availability_snapshot(&client).await?)
+        } else {
+            None
+        };
         let mut delivery_failed = false;
-        for (request_id, file_id) in pending {
+        for (request_id, file_id, restart) in pending {
+            if active_download_count(&super::open_connection(&self.db_path)?)?
+                >= MAX_ACTIVE_DOWNLOADS
+            {
+                break;
+            }
             if self.generation.load(Ordering::SeqCst) != generation
                 || !self.connected.load(Ordering::SeqCst)
+                || self.transfers.is_paused()
             {
                 return Ok(());
             }
@@ -2919,12 +2974,14 @@ impl NetworkService {
             }
             // Signed, unexpired availability announcements identify replacement
             // seeders even when they were not in the original search results.
-            refresh_restart_sources(
-                &self.db_path,
-                &request_id,
-                availability.available_by_file.get(&file_id),
-            )?;
-            let receivers = claim_download_restart(&self.db_path, &request_id, &file_id)?;
+            if let Some(availability) = availability.as_ref().filter(|_| restart) {
+                refresh_restart_sources(
+                    &self.db_path,
+                    &request_id,
+                    availability.available_by_file.get(&file_id),
+                )?;
+            }
+            let receivers = claim_queued_download(&self.db_path, &request_id, &file_id)?;
             let Some(receivers) = receivers else {
                 continue;
             };
@@ -2936,14 +2993,14 @@ impl NetworkService {
                 let db_path = self.db_path.clone();
                 let app_handle = self.app_handle.clone();
                 tokio::spawn(async move {
-                    tokio::time::sleep(DOWNLOAD_RESTART_OFFER_TIMEOUT).await;
+                    tokio::time::sleep(DOWNLOAD_OFFER_TIMEOUT).await;
                     if let Ok(connection) = super::open_connection(&db_path) {
-                        if remove_unavailable_restart(&connection, &request_id).unwrap_or(false) {
+                        if expire_download_request(&connection, &request_id).unwrap_or(false) {
                             let _ = app_handle.emit(TRANSFERS_CHANGED_EVENT, ());
                         }
                     }
                 });
-            } else {
+            } else if restart {
                 delivery_failed = true;
                 super::open_connection(&self.db_path)?.execute(
                     "UPDATE network_downloads SET status=?1 WHERE request_id=?2 AND status='Failed: NIP-17 request could not be delivered'",
@@ -3164,7 +3221,6 @@ impl NetworkService {
                 if !expected {
                     return Err("offer sender did not match a requested seeder".into());
                 }
-                connection.execute("UPDATE download_sources SET status='Connected',updated_at=?1 WHERE request_id=?2 AND source_pubkey=?3", params![Utc::now().to_rfc3339(), offer.request_id, sender.to_hex()]).map_err(|error| error.to_string())?;
                 drop(connection);
                 self.transfers.accept_offer(offer, sender.to_hex()).await?;
             }
@@ -3188,6 +3244,52 @@ impl NetworkService {
         }
         Ok(())
     }
+}
+
+fn exclude_local_availability(
+    connection: &Connection,
+    available: &mut HashMap<String, HashSet<String>>,
+    online: &mut HashSet<(String, String)>,
+) -> Result<(), String> {
+    let mut statement = connection
+        .prepare("SELECT file_id FROM files")
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?;
+    let local = rows
+        .collect::<Result<HashSet<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    available.retain(|file_id, _| !local.contains(file_id));
+    online.retain(|(_, file_id)| !local.contains(file_id));
+    Ok(())
+}
+
+fn public_chat_page<'a>(
+    events: impl Iterator<Item = &'a Event>,
+    topic: &str,
+    blocked: &HashSet<String>,
+    before: Option<&PublicChatCursor>,
+) -> Vec<Event> {
+    let mut events = events
+        .filter(|event| {
+            event.kind == Kind::from(TROLLBOX_MESSAGE_KIND)
+                && event
+                    .tags
+                    .iter()
+                    .any(|tag| tag.kind() == TagKind::t() && tag.content() == Some(topic))
+                && !blocked.contains(&event.pubkey.to_hex())
+                && !sanitise_public_chat_content(&event.content).is_empty()
+                && before.is_none_or(|cursor| {
+                    (event.created_at.as_secs(), event.id) < (cursor.created_at, cursor.event_id)
+                })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    events.sort_by_key(|event| std::cmp::Reverse((event.created_at, event.id)));
+    events.truncate(PUBLIC_CHAT_PAGE_SIZE);
+    events.reverse();
+    events
 }
 
 fn trollbox_filter(limit: usize) -> Filter {
@@ -3568,20 +3670,79 @@ fn refresh_restart_sources(
     transaction.commit().map_err(|error| error.to_string())
 }
 
-fn claim_download_restart(
+pub(crate) fn download_accepts_offers(status: &str) -> bool {
+    !matches!(
+        status,
+        DOWNLOAD_QUEUED | DOWNLOAD_RESTART_PENDING | "Verified · Complete" | "Cancelled"
+    ) && !status.starts_with("Failed")
+        && !status.starts_with("Refused")
+        && !status.starts_with("All seeders refused")
+}
+
+// Count songs, including connection setup and paused transfers, rather than
+// individual seeder connections. Queued songs do not request expiring offers.
+fn active_download_count(connection: &Connection) -> Result<usize, String> {
+    connection.query_row(
+        "SELECT COUNT(*) FROM network_downloads WHERE status NOT IN (?1,?2,'Verified · Complete','Cancelled')
+         AND status NOT LIKE 'Failed%' AND status NOT LIKE 'Refused%' AND status NOT LIKE 'All seeders refused%'",
+        params![DOWNLOAD_QUEUED, DOWNLOAD_RESTART_PENDING], |row| row.get(0),
+    ).map_err(|error| error.to_string())
+}
+
+fn pending_downloads(connection: &Connection) -> Result<Vec<(String, String, bool)>, String> {
+    if active_download_count(connection)? >= MAX_ACTIVE_DOWNLOADS {
+        return Ok(Vec::new());
+    }
+    let mut statement = connection.prepare(
+        "SELECT request_id,file_id,status=?1 FROM network_downloads WHERE status IN (?1,?2) ORDER BY rowid"
+    ).map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map(params![DOWNLOAD_RESTART_PENDING, DOWNLOAD_QUEUED], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .map_err(|error| error.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+fn expire_download_request(connection: &Connection, request_id: &str) -> Result<bool, String> {
+    // Expire unanswered candidates even when another source has connected, so a
+    // later transport failure cannot wait forever for an already silent seeder.
+    connection.execute(
+        "UPDATE download_sources SET status='Failed: no response',updated_at=?1 WHERE request_id=?2 AND status='Requested'",
+        params![Utc::now().to_rfc3339(), request_id],
+    ).map_err(|error| error.to_string())?;
+    if remove_unavailable_restart(connection, request_id)? {
+        return Ok(true);
+    }
+    let changed = connection.execute(
+        "UPDATE network_downloads SET status='Failed: no seeder responded',speed='—',updated_at=?1
+         WHERE request_id=?2 AND status IN (?3,?4)
+         AND NOT EXISTS (SELECT 1 FROM download_sources WHERE request_id=?2
+           AND status NOT IN ('Requested','Pending restart')
+           AND status NOT LIKE 'Refused:%' AND status NOT LIKE 'Failed:%')",
+        params![Utc::now().to_rfc3339(), request_id, DOWNLOAD_REQUESTED, DOWNLOAD_WAITING_FALLBACK],
+    ).map_err(|error| error.to_string())?;
+    Ok(changed > 0)
+}
+
+fn claim_queued_download(
     db_path: &Path,
     request_id: &str,
     file_id: &str,
 ) -> Result<Option<Vec<(String, PublicKey)>>, String> {
-    let connection = super::open_connection(db_path)?;
+    let mut connection = super::open_connection(db_path)?;
     let transaction = connection
-        .unchecked_transaction()
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|error| error.to_string())?;
-    let pending: bool = transaction.query_row(
-        "SELECT EXISTS(SELECT 1 FROM network_downloads WHERE request_id=?1 AND file_id=?2 AND status=?3)",
-        params![request_id, file_id, DOWNLOAD_RESTART_PENDING], |row| row.get(0),
-    ).map_err(|error| error.to_string())?;
-    if !pending {
+    let status: Option<String> = transaction.query_row(
+        "SELECT status FROM network_downloads WHERE request_id=?1 AND file_id=?2 AND status IN (?3,?4)",
+        params![request_id, file_id, DOWNLOAD_RESTART_PENDING, DOWNLOAD_QUEUED], |row| row.get(0),
+    ).optional().map_err(|error| error.to_string())?;
+    let Some(previous_status) = status else {
+        return Ok(None);
+    };
+    if active_download_count(&transaction)? >= MAX_ACTIVE_DOWNLOADS {
         return Ok(None);
     }
     let local: bool = transaction
@@ -3632,9 +3793,11 @@ fn claim_download_restart(
             .collect::<Vec<_>>()
     };
     let status = if blocked || !valid_file_id(file_id) {
-        "Failed: interrupted download is blocked or invalid"
-    } else {
+        "Failed: download is blocked or invalid"
+    } else if previous_status == DOWNLOAD_RESTART_PENDING {
         DOWNLOAD_RESTART_REQUESTED
+    } else {
+        DOWNLOAD_REQUESTED
     };
     if receivers.is_empty() && !status.starts_with("Failed") {
         transaction
@@ -3653,7 +3816,11 @@ fn claim_download_restart(
         return Ok(None);
     }
     if !status.starts_with("Failed") {
-        transaction.execute("DELETE FROM download_sources WHERE request_id=?1", [request_id])
+        transaction
+            .execute(
+                "DELETE FROM download_sources WHERE request_id=?1",
+                [request_id],
+            )
             .map_err(|error| error.to_string())?;
         for (source, _) in &receivers {
             transaction.execute(
@@ -3664,7 +3831,7 @@ fn claim_download_restart(
     }
     transaction
         .execute(
-            "UPDATE network_downloads SET status=?1,updated_at=?2 WHERE request_id=?3",
+            "UPDATE network_downloads SET status=?1,speed='Connecting…',updated_at=?2 WHERE request_id=?3",
             params![status, Utc::now().to_rfc3339(), request_id],
         )
         .map_err(|error| error.to_string())?;
@@ -4061,6 +4228,43 @@ fn mime_for_format(format: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn surprise_candidates_exclude_owned_hashes_before_the_page_limit() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute("CREATE TABLE files(file_id TEXT PRIMARY KEY)", [])
+            .unwrap();
+        let mut available = HashMap::new();
+        let mut online = HashSet::new();
+        for index in 0..130 {
+            let id = format!("{index:064x}");
+            let sources = HashSet::from(["self".to_owned(), "peer".to_owned()]);
+            for source in &sources {
+                online.insert((source.clone(), id.clone()));
+            }
+            available.insert(id.clone(), sources);
+            if index < 80 {
+                connection
+                    .execute("INSERT INTO files VALUES(?1)", [id])
+                    .unwrap();
+            }
+        }
+        exclude_local_availability(&connection, &mut available, &mut online).unwrap();
+        assert_eq!(available.len(), 50);
+        assert_eq!(online.len(), 100);
+        assert!(available
+            .keys()
+            .all(|id| u32::from_str_radix(id, 16).unwrap() >= 80));
+        // A download finishing while Surprise me paginates is excluded too.
+        let completed = format!("{:064x}", 80);
+        connection
+            .execute("INSERT INTO files VALUES(?1)", [&completed])
+            .unwrap();
+        exclude_local_availability(&connection, &mut available, &mut online).unwrap();
+        assert!(!available.contains_key(&completed));
+        assert!(online.iter().all(|(_, id)| id != &completed));
+    }
+
     fn insert_interrupted_download(
         connection: &Connection,
         id: &str,
@@ -4083,8 +4287,181 @@ mod tests {
     }
 
     #[test]
+    fn download_queue_limits_songs_and_advances_in_order_after_completion_failure_and_cancel() {
+        let directory = std::env::temp_dir().join(format!("napstr-queue-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let db = directory.join("napstr.sqlite3");
+        crate::initialise_database(&db, &directory).unwrap();
+        let connection = crate::open_connection(&db).unwrap();
+        let source = Keys::generate().public_key().to_hex();
+        for index in 0..6 {
+            insert_interrupted_download(
+                &connection,
+                &index.to_string(),
+                if index == 2 {
+                    DOWNLOAD_RESTART_PENDING
+                } else {
+                    DOWNLOAD_QUEUED
+                },
+                &source,
+            );
+        }
+        let advance = || {
+            for (id, file_id, _) in pending_downloads(&connection).unwrap() {
+                claim_queued_download(&db, &id, &file_id).unwrap();
+            }
+            assert_eq!(active_download_count(&connection).unwrap(), 2);
+        };
+        advance();
+        let status = |id: &str| {
+            connection
+                .query_row(
+                    "SELECT status FROM network_downloads WHERE request_id=?1",
+                    [id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(status("0"), DOWNLOAD_REQUESTED);
+        assert_eq!(status("1"), DOWNLOAD_REQUESTED);
+        assert_eq!(status("2"), DOWNLOAD_RESTART_PENDING);
+        assert!(pending_downloads(&connection).unwrap().is_empty());
+        // Pausing keeps the slot; additional source candidates are not songs.
+        connection
+            .execute(
+                "UPDATE network_downloads SET status='Paused' WHERE request_id='1'",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO download_sources VALUES('1','backup','Requested','now')",
+                [],
+            )
+            .unwrap();
+        advance();
+        assert_eq!(status("2"), DOWNLOAD_RESTART_PENDING);
+        // A verified completion removes the row in the real transfer worker.
+        connection
+            .execute("DELETE FROM network_downloads WHERE request_id='0'", [])
+            .unwrap();
+        advance();
+        assert_eq!(status("2"), DOWNLOAD_RESTART_REQUESTED);
+        assert_eq!(status("3"), DOWNLOAD_QUEUED);
+        connection.execute("UPDATE network_downloads SET status='Failed: connection lost' WHERE request_id='1'", []).unwrap();
+        advance();
+        assert_eq!(status("3"), DOWNLOAD_REQUESTED);
+        connection
+            .execute("DELETE FROM network_downloads WHERE request_id='2'", [])
+            .unwrap();
+        advance();
+        assert_eq!(status("4"), DOWNLOAD_REQUESTED);
+        assert_eq!(status("5"), DOWNLOAD_QUEUED);
+        drop(connection);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn concurrent_queue_claims_cannot_exceed_two_downloads() {
+        let directory = std::env::temp_dir().join(format!("napstr-queue-race-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let db = directory.join("napstr.sqlite3");
+        crate::initialise_database(&db, &directory).unwrap();
+        let connection = crate::open_connection(&db).unwrap();
+        let source = Keys::generate().public_key().to_hex();
+        for index in 0..8 {
+            insert_interrupted_download(&connection, &index.to_string(), DOWNLOAD_QUEUED, &source);
+        }
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let workers = pending_downloads(&connection)
+            .unwrap()
+            .into_iter()
+            .map(|(id, file, _)| {
+                let db = db.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    claim_queued_download(&db, &id, &file).unwrap().is_some()
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            workers
+                .into_iter()
+                .map(|worker| usize::from(worker.join().unwrap()))
+                .sum::<usize>(),
+            2
+        );
+        assert_eq!(active_download_count(&connection).unwrap(), 2);
+        drop(connection);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn silent_seeders_release_slots_without_expiring_queued_or_connected_songs() {
+        let directory =
+            std::env::temp_dir().join(format!("napstr-queue-timeout-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let db = directory.join("napstr.sqlite3");
+        crate::initialise_database(&db, &directory).unwrap();
+        let connection = crate::open_connection(&db).unwrap();
+        let source = Keys::generate().public_key().to_hex();
+        let silent = insert_interrupted_download(&connection, "silent", DOWNLOAD_QUEUED, &source);
+        let connected =
+            insert_interrupted_download(&connection, "connected", DOWNLOAD_QUEUED, &source);
+        let queued = insert_interrupted_download(&connection, "queued", DOWNLOAD_QUEUED, &source);
+        claim_queued_download(&db, "silent", &silent)
+            .unwrap()
+            .unwrap();
+        claim_queued_download(&db, "connected", &connected)
+            .unwrap()
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE download_sources SET status='Connected' WHERE request_id='connected'",
+                [],
+            )
+            .unwrap();
+        assert!(!expire_download_request(&connection, "queued").unwrap());
+        assert!(!expire_download_request(&connection, "connected").unwrap());
+        assert!(expire_download_request(&connection, "silent").unwrap());
+        assert_eq!(active_download_count(&connection).unwrap(), 1);
+        let status: String = connection
+            .query_row(
+                "SELECT status FROM network_downloads WHERE request_id='silent'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!download_accepts_offers(&status));
+        claim_queued_download(&db, "queued", &queued)
+            .unwrap()
+            .unwrap();
+        assert_eq!(active_download_count(&connection).unwrap(), 2);
+        // A failed primary can wait for other requested offers, but not forever.
+        connection
+            .execute(
+                "UPDATE network_downloads SET status=?1 WHERE request_id='connected'",
+                [DOWNLOAD_WAITING_FALLBACK],
+            )
+            .unwrap();
+        connection.execute("UPDATE download_sources SET status='Failed: connection lost' WHERE request_id='connected'", []).unwrap();
+        connection
+            .execute(
+                "INSERT INTO download_sources VALUES('connected','backup','Requested','now')",
+                [],
+            )
+            .unwrap();
+        assert!(expire_download_request(&connection, "connected").unwrap());
+        assert_eq!(active_download_count(&connection).unwrap(), 1);
+        drop(connection);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn recovery_discovers_new_seeders_and_does_not_recreate_cancelled_rows() {
-        let directory = std::env::temp_dir().join(format!("napstr-fresh-seeders-{}", Uuid::new_v4()));
+        let directory =
+            std::env::temp_dir().join(format!("napstr-fresh-seeders-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&directory).unwrap();
         let db = directory.join("napstr.sqlite3");
         crate::initialise_database(&db, &directory).unwrap();
@@ -4100,11 +4477,12 @@ mod tests {
                 [&blocked],
             )
             .unwrap();
-        let file_id = insert_interrupted_download(&connection, "retry", DOWNLOAD_RESTART_PENDING, &old);
+        let file_id =
+            insert_interrupted_download(&connection, "retry", DOWNLOAD_RESTART_PENDING, &old);
         let mut announced = fresh.clone();
         announced.insert(blocked);
         refresh_restart_sources(&db, "retry", Some(&announced)).unwrap();
-        let receivers = claim_download_restart(&db, "retry", &file_id)
+        let receivers = claim_queued_download(&db, "retry", &file_id)
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -4189,7 +4567,7 @@ mod tests {
                 .unwrap(),
             2
         );
-        let receivers = claim_download_restart(&db, &request_id, &file_id)
+        let receivers = claim_queued_download(&db, &request_id, &file_id)
             .unwrap()
             .unwrap();
         assert_eq!(receivers.len(), 1);
@@ -4204,10 +4582,10 @@ mod tests {
                 .unwrap(),
             "Requested"
         );
-        assert!(claim_download_restart(&db, &request_id, &file_id)
+        assert!(claim_queued_download(&db, &request_id, &file_id)
             .unwrap()
             .is_none());
-        assert!(claim_download_restart(&db, "partial", &file_id)
+        assert!(claim_queued_download(&db, "partial", &file_id)
             .unwrap()
             .is_none());
         queue_interrupted_downloads(&connection).unwrap();
@@ -4224,7 +4602,7 @@ mod tests {
             )
             .unwrap();
         assert_ne!(next_id, request_id);
-        assert!(claim_download_restart(&db, &next_id, &file_id)
+        assert!(claim_queued_download(&db, &next_id, &file_id)
             .unwrap()
             .is_some());
         assert_eq!(
@@ -4283,13 +4661,13 @@ mod tests {
             )
             .unwrap();
         connection.execute("INSERT INTO files(file_id,filename,path,size,format,indexed_at) VALUES(?1,'chapter.flac','local.flac',1000,'FLAC','now')", [&local_file]).unwrap();
-        assert!(claim_download_restart(&db, "blocked-file", &blocked_file)
+        assert!(claim_queued_download(&db, "blocked-file", &blocked_file)
             .unwrap()
             .is_none());
-        assert!(claim_download_restart(&db, "blocked-source", &no_sources)
+        assert!(claim_queued_download(&db, "blocked-source", &no_sources)
             .unwrap()
             .is_none());
-        assert!(claim_download_restart(&db, "local", &local_file)
+        assert!(claim_queued_download(&db, "local", &local_file)
             .unwrap()
             .is_none());
         assert_eq!(
@@ -4302,10 +4680,10 @@ mod tests {
                 .unwrap(),
             0
         );
-        assert!(claim_download_restart(&db, "removed", &local_file)
+        assert!(claim_queued_download(&db, "removed", &local_file)
             .unwrap()
             .is_none());
-        let receivers = claim_download_restart(&db, "mixed", &mixed)
+        let receivers = claim_queued_download(&db, "mixed", &mixed)
             .unwrap()
             .unwrap();
         assert_eq!(receivers.len(), 1);
@@ -4396,7 +4774,7 @@ mod tests {
                 [&other],
             )
             .unwrap();
-        claim_download_restart(&db, "retry", &file_id)
+        claim_queued_download(&db, "retry", &file_id)
             .unwrap()
             .unwrap();
         record_download_refusal(&connection, "retry", &file_id, "unrequested", "missing").unwrap();
@@ -4657,6 +5035,62 @@ mod tests {
         .sign_with_keys(&keys)
         .unwrap();
         assert!(!valid_audiobook_event(&unsafe_event, &unsafe_content));
+    }
+
+    #[test]
+    fn public_chat_pages_keep_same_second_messages_without_duplicates_or_gaps() {
+        let keys = Keys::generate();
+        let blocked_keys = Keys::generate();
+        let blocked = HashSet::from([blocked_keys.public_key().to_hex()]);
+        for topic in [
+            TROLLBOX_HASHTAG.to_owned(),
+            track_discussion_topic(&"ab".repeat(32)).unwrap(),
+        ] {
+            let mut events = (0..250)
+                .map(|index| {
+                    EventBuilder::new(
+                        Kind::from(TROLLBOX_MESSAGE_KIND),
+                        format!("message {index}"),
+                    )
+                    .tag(Tag::hashtag(&topic))
+                    .custom_created_at(Timestamp::from(if index < 230 { 100 } else { 200 }))
+                    .sign_with_keys(&keys)
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+            for index in 0..110 {
+                events.push(
+                    EventBuilder::new(
+                        Kind::from(TROLLBOX_MESSAGE_KIND),
+                        format!("blocked {index}"),
+                    )
+                    .tag(Tag::hashtag(&topic))
+                    .custom_created_at(Timestamp::from(300))
+                    .sign_with_keys(&blocked_keys)
+                    .unwrap(),
+                );
+            }
+            let mut cursor = None;
+            let mut seen = HashSet::new();
+            for expected in [100, 100, 50, 0] {
+                let page = public_chat_page(events.iter(), &topic, &blocked, cursor.as_ref());
+                assert_eq!(page.len(), expected);
+                assert!(page.windows(2).all(
+                    |pair| (pair[0].created_at, pair[0].id) < (pair[1].created_at, pair[1].id)
+                ));
+                for event in &page {
+                    assert!(seen.insert(event.id));
+                    assert_eq!(event.pubkey, keys.public_key());
+                }
+                if let Some(first) = page.first() {
+                    cursor = Some(PublicChatCursor {
+                        created_at: first.created_at.as_secs(),
+                        event_id: first.id,
+                    });
+                }
+            }
+            assert_eq!(seen.len(), 250);
+        }
     }
 
     #[test]

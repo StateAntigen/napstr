@@ -18,6 +18,7 @@ path = "src/main.rs"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+tauri-plugin-os = "2"
 tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-dialog = { version = "2", default-features = false, features = ["xdg-portal"] }
 serde = { version = "1", features = ["derive"] }

@@ -85,6 +85,10 @@ const drawableDirectory = resolve(main, 'res/drawable');
 await mkdir(drawableDirectory, { recursive: true });
 for (const filename of [
   'ic_stat_napstrfy.xml',
+  // Upstream's 15-second skip buttons.
+  'ic_replay_15.xml',
+  'ic_forward_15.xml',
+  // This branch's like and repeat glyphs.
   'ic_napstrfy_like.xml',
   'ic_napstrfy_liked.xml',
   'ic_napstrfy_loop.xml',

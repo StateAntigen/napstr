@@ -12,3 +12,7 @@ android/src-tauri/target/
 android/src-tauri/gen/
 remote-protocol/Cargo.lock
 remote-protocol/target/
+
+website/dist/
+test-results/
+playwright-report/

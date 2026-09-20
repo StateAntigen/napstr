@@ -1,0 +1,19 @@
+{
+  "name": "@napstr/i18n",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./index.js",
+    "./svelte": "./svelte.js",
+    "./LanguageSelect.svelte": {
+      "types": "./LanguageSelect.svelte.d.ts",
+      "svelte": "./LanguageSelect.svelte",
+      "default": "./LanguageSelect.svelte"
+    },
+    "./styles.css": "./styles.css"
+  },
+  "peerDependencies": {
+    "svelte": "^5.20.0"
+  }
+}

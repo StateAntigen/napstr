@@ -1,4 +1,9 @@
 <script lang="ts">
+  import { t, locale, message as msg, initializeLocale, type Message } from '@napstr/i18n/svelte';
+  import LanguageSelect from '@napstr/i18n/LanguageSelect.svelte';
+  import { readStoredPreference } from '@napstr/i18n';
+  import { locale as osLocale } from '@tauri-apps/plugin-os';
+  import '@napstr/i18n/styles.css';
   import { onMount, tick } from 'svelte';
   import { getVersion } from '@tauri-apps/api/app';
   import { invoke } from '@tauri-apps/api/core';
@@ -13,9 +18,10 @@
   let appVersion = '…';
   const SEARCH_PAGE_SIZE = 100;
   const LOCAL_PAGE_SIZE = 100;
+  const CHAT_PAGE_SIZE = 100;
   const VISIBLE_SEEDER_LIMIT = 100;
 
-  type View = 'Search' | 'Downloads' | 'Shared' | 'Profile' | 'Settings' | 'Trollbox' | 'Mobile' | 'Covers';
+  type View = 'Search' | 'Downloads' | 'Shared' | 'Profile' | 'Settings' | 'Trollbox' | 'Napstrfy' | 'Covers';
   type PlayerMode = 'single' | 'folder' | 'all';
   type PlayerOrigin = 'search' | 'downloads' | 'shared' | 'audiobook' | 'direct';
   /** Repeat, as the phone offers it and this window now plays it. */
@@ -72,7 +78,7 @@
     { label: 'Profile', icon: '☺' },
     { label: 'Settings', icon: '⚙' },
     { label: 'Trollbox', icon: '▣' },
-    { label: 'Mobile', icon: '▯' },
+    { label: 'Napstrfy', icon: '▯' },
     { label: 'Covers', icon: '▨' }
   ];
 
@@ -119,6 +125,8 @@
   let clearingTransfers = false;
   let removingTransfers = new Set<number>();
   let downloadGeneration = 0;
+  let nextOptimisticTransferId = Date.now();
+  let downloadLibraryRefreshNeeded = false;
   const pendingDownloadRequests = new Map<Promise<unknown>, string>();
   const downloadAttempts = new Map<string, { cancelled: boolean }>();
   const cancellingFiles = new Set<string>();
@@ -129,10 +137,12 @@
   let blockConfirmation: BlockConfirmation | null = null;
   let blockInProgress = false;
   let startingDownloads = new Set<string>();
-  let clock = '';
+  // Format the clock in the template: a legacy $: declaration here changes
+  // dependency tracking for the entire component and freezes helper-based views.
+  let clockNow = Date.now();
   let desktopRuntime = false;
   let nativeReady = false;
-  let activityMessage = 'Starting Napstr…';
+  let activityMessage: string | Message = msg("Starting Napstr…");
   let napstrFolder = '';
   let nostrRelays = 'wss://relay.damus.io, wss://nos.lol, wss://relay.nostr.com, wss://relay.primal.net, wss://relay.snort.social, wss://nostr.mom, wss://relay.nostr.band';
   let displayName = 'napstr-user';
@@ -152,16 +162,17 @@
   let trollboxDraft = '';
   let trollboxLoading = false;
   let trollboxSending = false;
-  let trollboxError = '';
+  let trollboxError: string | Message = '';
   let trollboxPollPending = false;
   let trollboxRefreshAgain = false;
+  let trollboxHasMore = true;
   let mobileStatusValue: MobileStatus | null = null;
   let mobilePairing: MobilePairingOffer | null = null;
   let mobileStreamPairing: MobilePairingOffer | null = null;
   let mobileStreamOnly = false;
   let mobileLoading = false;
   let mobileStatusPending = false;
-  let mobileError = '';
+  let mobileError: string | Message = '';
   let trollboxLog: HTMLDivElement;
   let trackDiscussionFileId = '';
   let trackDiscussionMessages: TrollboxMessage[] = [];
@@ -171,6 +182,9 @@
   let trackDiscussionError = '';
   let trackDiscussionPollPending = false;
   let trackDiscussionRefreshAgain = false;
+  let trackDiscussionSubscribeAgain = false;
+  let trackDiscussionHasMore = true;
+  let trackDiscussionGeneration = 0;
   let trackDiscussionLog: HTMLDivElement;
   let searchAction: 'search' | 'surprise' | null = null;
   let browseCursor: CatalogueBrowseCursor | null = null;
@@ -390,7 +404,9 @@
   }
 
   function isActiveTransfer(transfer: Pick<Transfer, 'progress' | 'status'>) {
-    return transfer.progress < 100 && !/^(Failed|Cancelled|Refused|All seeders refused)/.test(transfer.status);
+    // Receiving all bytes is not completion: verification and indexing still
+    // need to finish before the download disappears from the native queue.
+    return transfer.status !== 'Verified · Complete' && !/^(Failed|Cancelled|Refused|All seeders refused)/.test(transfer.status);
   }
 
   function isCompleteTransfer(transfer: Transfer) {
@@ -414,6 +430,45 @@
     }));
   }
 
+  function mergePendingTransfers(items: NativeTransfer[]): Transfer[] {
+    const updated = mapTransfers(items);
+    const pending = transfers.filter((transfer) => startingDownloads.has(transfer.fileId)
+      && !updated.some((item) => item.fileId === transfer.fileId));
+    return showAvailableDownloadSlots([...pending, ...updated]);
+  }
+
+  function showAvailableDownloadSlots(items: Transfer[]): Transfer[] {
+    items = items.map((item) => item.status === 'Starting download'
+      ? { ...item, status: 'Queued', speed: 'Queued' } : item);
+    let available = Math.max(0, 2 - items.filter((item) => isActiveTransfer(item)
+      && item.status !== 'Queued' && item.status !== 'Waiting to restart after reconnect').length);
+    // Native rows and optimistic rows are newest first. Reserve free slots for
+    // the oldest queued tracks while the native dispatcher starts their requests.
+    return items.slice().reverse().map((item) => {
+      if (!paused && item.status === 'Queued' && available > 0) {
+        available -= 1;
+        return { ...item, status: 'Starting download', speed: 'Connecting…' };
+      }
+      return item;
+    }).reverse();
+  }
+
+  async function applyTransferUpdate(items: NativeTransfer[]) {
+    const generation = downloadGeneration;
+    const updated = mergePendingTransfers(items);
+    const completed = updated.filter((transfer) => isCompleteTransfer(transfer) && !isLocalFile(transfer.fileId));
+    const vanished = transfers.filter((transfer) => !startingDownloads.has(transfer.fileId)
+      && isActiveTransfer(transfer) && !updated.some((item) => item.fileId === transfer.fileId));
+    transfers = updated;
+    if (completed.length || vanished.length) downloadLibraryRefreshNeeded = true;
+    if (downloadLibraryRefreshNeeded) {
+      if (await refreshLocalLibrary()) downloadLibraryRefreshNeeded = false;
+      if (generation !== downloadGeneration) return;
+      const latest = completed[0] ?? vanished.find((transfer) => isLocalFile(transfer.fileId));
+      if (latest) activityMessage = msg("{p0} downloaded, verified, and ready to play", { p0: latest.name });
+    }
+  }
+
   function isLocalFile(fileId: string) {
     return localFileIds.has(fileId);
   }
@@ -422,15 +477,23 @@
     return folder || '(Napstr folder)';
   }
 
-  function libraryFolders() {
-    return [...new Set(sharedFiles.map((file) => file.folder))]
+  function libraryFolders(files = sharedFiles) {
+    return [...new Set(files.map((file) => file.folder))]
       .sort((left, right) => folderName(left).localeCompare(folderName(right)));
   }
 
-  function visibleSharedFiles() {
-    return libraryFolderView === '*'
-      ? sharedFiles
-      : sharedFiles.filter((file) => file.folder === libraryFolderView);
+  /**
+   * The template reads the shared list through derived values rather than
+   * calling these directly: in legacy mode a template expression that only
+   * names a function is never re-run, so a library that changed underneath it
+   * went on drawing the rows it already had. The defaults keep every existing
+   * call working, and naming the state in the derived statement is what makes
+   * it a dependency.
+   */
+  function visibleSharedFiles(files = sharedFiles, folderView = libraryFolderView) {
+    return folderView === '*'
+      ? files
+      : files.filter((file) => file.folder === folderView);
   }
 
   function audiobookFolderFiles() {
@@ -450,9 +513,8 @@
     return sharedFiles.slice(start, start + LOCAL_PAGE_SIZE);
   }
 
-  function paginatedSharedFiles() {
-    const files = visibleSharedFiles();
-    const start = sharedLibraryPage * LOCAL_PAGE_SIZE;
+  function paginatedSharedFiles(files = visibleSharedFiles(), page = sharedLibraryPage) {
+    const start = page * LOCAL_PAGE_SIZE;
     return files.slice(start, start + LOCAL_PAGE_SIZE);
   }
 
@@ -543,6 +605,10 @@
   $: resultPageItems = paginatedResults(results, resultPage);
   $: resultRangeLabel = resultRange(results, resultPage);
   $: resultAvailableTotal = availableResultTotal(results, browseTotalAvailable);
+  $: sharedVisible = visibleSharedFiles(sharedFiles, libraryFolderView);
+  $: sharedRows = paginatedSharedFiles(sharedVisible, sharedLibraryPage);
+  $: sharedPageCount = localPageCount(sharedVisible);
+  $: sharedFolders = libraryFolders(sharedFiles);
 
   async function changeResultPage(nextPage: number) {
     if (nextPage >= resultPageCount(results) && browseCursor && !browseLoading) {
@@ -575,17 +641,17 @@
       applySnapshot(await invoke<Snapshot>('save_file_tags', { fileId, tags: tagDraft }));
       selectedTagFile = sharedFiles.find((file) => file.fileId === fileId) ?? null;
       tagDraft = selectedTagFile?.tags ?? '';
-      activityMessage = 'Tags saved locally';
+      activityMessage = msg("Tags saved locally");
       if (networkConnected) {
         try {
           await invoke('publish_catalogue');
-          activityMessage = 'Tags saved and queued for Nostr publication';
+          activityMessage = msg("Tags saved and queued for Nostr publication");
         } catch (error) {
-          activityMessage = `Tags saved locally · Nostr publication will retry later: ${String(error)}`;
+          activityMessage = msg("Tags saved locally · Nostr publication will retry later: {p0}", { p0: String(error) });
         }
       }
     } catch (error) {
-      activityMessage = `Could not save tags: ${String(error)}`;
+      activityMessage = msg("Could not save tags: {p0}", { p0: String(error) });
     } finally {
       tagSaving = false;
     }
@@ -674,12 +740,12 @@
     playerEnded = false;
     try {
       applyPlaybackStatus(await invoke<PlaybackStatus>('play_audio', { fileId: track.fileId, volume: playerVolume }));
-      if (!lastPlayerError) activityMessage = `Playing ${track.name}${track.folder ? ` · ${track.folder}` : ''}`;
+      if (!lastPlayerError) activityMessage = msg("Playing {p0}{p1}", { p0: track.name, p1: track.folder ? ` · ${track.folder}` : '' });
     } catch (error) {
       playerPlaying = false;
       playerEnded = true;
       lastPlayerError = String(error);
-      activityMessage = `Playback failed: ${lastPlayerError}`;
+      activityMessage = msg("Playback failed: {p0}", { p0: lastPlayerError });
     } finally {
       playerLoading = false;
     }
@@ -706,7 +772,7 @@
       if (activeView === 'Downloads' && selectedTagFile) await playAudio(selectedTagFile.fileId, selectedTagFile.filename, playerMode, 'downloads');
       else if (activeView === 'Shared' && selectedShared) await playAudio(selectedShared.fileId, selectedShared.filename, playerMode, 'shared');
       else if (activeView === 'Search' && selected && isLocalFile(selected.fileId)) await playAudio(selected.fileId, selected.name, playerMode, 'search');
-      else activityMessage = 'Select a local song to play';
+      else activityMessage = msg("Select a local song to play");
       return;
     }
     if (playerEnded) {
@@ -714,16 +780,16 @@
       return;
     }
     try { applyPlaybackStatus(await invoke<PlaybackStatus>('toggle_audio')); }
-    catch (error) { activityMessage = `Playback failed: ${String(error)}`; }
+    catch (error) { activityMessage = msg("Playback failed: {p0}", { p0: String(error) }); }
   }
 
   async function stopPlayer() {
     try { applyPlaybackStatus(await invoke<PlaybackStatus>('stop_audio')); }
-    catch (error) { activityMessage = `Could not stop playback: ${String(error)}`; return; }
+    catch (error) { activityMessage = msg("Could not stop playback: {p0}", { p0: String(error) }); return; }
     // The native output stream is deliberately released on Stop. Treat the
     // track as reloadable so pressing Play opens it again from the beginning.
     playerEnded = true;
-    if (currentTrack) activityMessage = `Stopped ${currentTrack.name}`;
+    if (currentTrack) activityMessage = msg("Stopped {p0}", { p0: currentTrack.name });
   }
 
   async function nextPlayerTrack() {
@@ -734,7 +800,7 @@
   async function previousPlayerTrack() {
     if (playerCurrentTime > 3 || playerQueueIndex <= 0) {
       try { applyPlaybackStatus(await invoke<PlaybackStatus>('seek_audio', { seconds: 0 })); }
-      catch (error) { activityMessage = `Could not rewind playback: ${String(error)}`; }
+      catch (error) { activityMessage = msg("Could not rewind playback: {p0}", { p0: String(error) }); }
       return;
     }
     await loadPlayerTrack(playerQueueIndex - 1);
@@ -883,7 +949,7 @@
     try {
       applyPlaybackStatus(await invoke<PlaybackStatus>('seek_audio', { seconds: Number((event.currentTarget as HTMLInputElement).value) }));
       playerEnded = false;
-    } catch (error) { activityMessage = `Could not seek in this track: ${String(error)}`; }
+    } catch (error) { activityMessage = msg("Could not seek in this track: {p0}", { p0: String(error) }); }
   }
 
   function changePlayerVolume(event: Event) {
@@ -897,7 +963,7 @@
     if (status.error) {
       playerPlaying = false;
       playerEnded = true;
-      if (status.error !== lastPlayerError) activityMessage = `Playback failed: ${status.error}`;
+      if (status.error !== lastPlayerError) activityMessage = msg("Playback failed: {p0}", { p0: status.error });
       lastPlayerError = status.error;
       return;
     }
@@ -952,7 +1018,7 @@
     selectResult(results[0] ?? null);
     searchedQuery = 'local catalogue';
     transfers = mapTransfers(snapshot.transfers);
-    activityMessage = snapshot.files.length ? `${snapshot.files.length} local file(s) indexed and ready` : 'Choose a Napstr folder to begin';
+    activityMessage = snapshot.files.length ? msg("{p0} local files indexed and ready", { p0: snapshot.files.length }) : msg("Choose a Napstr folder to begin");
   }
 
   async function refreshSnapshot() {
@@ -1021,7 +1087,7 @@
     try {
       await invoke('open_release_url', { url: newRelease.url });
     } catch (error) {
-      activityMessage = `Could not open the release page: ${String(error)}`;
+      activityMessage = msg("Could not open the release page: {p0}", { p0: String(error) });
     }
   }
 
@@ -1030,7 +1096,7 @@
     try {
       await invoke('open_napstrfy_website');
     } catch (error) {
-      activityMessage = `Could not open the Napstrfy website: ${String(error)}`;
+      activityMessage = msg("Could not open the Napstrfy website: {p0}", { p0: String(error) });
     }
   }
 
@@ -1044,24 +1110,52 @@
     return colours[(hash >>> 0) % colours.length];
   }
 
-  async function refreshTrollbox() {
-    if (!nativeReady || !networkConnected) return;
+  function mergeChatMessages(current: TrollboxMessage[], incoming: TrollboxMessage[]) {
+    return [...new Map([...current, ...incoming].map((message) => [message.eventId, message])).values()]
+      .sort((a, b) => a.createdAt - b.createdAt || a.eventId.localeCompare(b.eventId));
+  }
+
+  function openChatLog(node: HTMLDivElement) {
+    let alive = true;
+    void tick().then(() => { if (alive) node.scrollTop = node.scrollHeight; });
+    return { destroy() { alive = false; } };
+  }
+
+  function chatScrollRestorer(node: HTMLDivElement | undefined, initial: boolean, older: boolean) {
+    if (!node) return () => {};
+    const atBottom = node.scrollHeight - node.scrollTop - node.clientHeight < 40;
+    if (initial || (!older && atBottom)) return () => { node.scrollTop = node.scrollHeight; };
+    // Keep the same visible message in place, including if the user moved while
+    // the network request was pending or a loading notice changes height.
+    const anchor = [...node.querySelectorAll<HTMLElement>('.trollbox-message')]
+      .find((item) => item.getBoundingClientRect().bottom > node.getBoundingClientRect().top);
+    const offset = anchor ? anchor.getBoundingClientRect().top - node.getBoundingClientRect().top : 0;
+    return () => {
+      if (anchor?.isConnected) node.scrollTop += anchor.getBoundingClientRect().top - node.getBoundingClientRect().top - offset;
+    };
+  }
+
+  async function refreshTrollbox(older = false) {
+    if (!nativeReady || !networkConnected || (older && (!trollboxHasMore || !trollboxMessages.length))) return;
     if (trollboxPollPending) {
-      trollboxRefreshAgain = true;
+      if (!older) trollboxRefreshAgain = true;
       return;
     }
     trollboxPollPending = true;
-    trollboxLoading = trollboxMessages.length === 0;
-    const stayAtBottom = !trollboxLog || trollboxLog.scrollHeight - trollboxLog.scrollTop - trollboxLog.clientHeight < 45;
+    const initial = trollboxMessages.length === 0;
+    trollboxLoading = initial || older;
+    const first = trollboxMessages[0];
     try {
-      const messages = await invoke<TrollboxMessage[]>('get_trollbox_messages');
-      const changed = messages.length !== trollboxMessages.length || messages.at(-1)?.eventId !== trollboxMessages.at(-1)?.eventId;
-      trollboxMessages = messages;
+      const messages = await invoke<TrollboxMessage[]>('get_trollbox_messages', {
+        before: older ? { createdAt: first.createdAt, eventId: first.eventId } : null
+      });
+      const restoreScroll = chatScrollRestorer(trollboxLog, initial, older);
+      trollboxMessages = mergeChatMessages(trollboxMessages, messages);
+      if (older) trollboxHasMore = messages.length === CHAT_PAGE_SIZE;
       trollboxError = '';
-      if (changed && stayAtBottom) {
-        await tick();
-        trollboxLog?.scrollTo({ top: trollboxLog.scrollHeight });
-      }
+      trollboxLoading = false;
+      await tick();
+      restoreScroll();
     } catch (error) {
       trollboxError = String(error);
     } finally {
@@ -1278,7 +1372,7 @@
   function activateView(view: View) {
     activeView = view;
     if (view === 'Trollbox') void refreshTrollbox();
-    if (view === 'Mobile') void openMobileConnect();
+    if (view === 'Napstrfy') void openMobileConnect();
     if (view === 'Covers') void refreshCovers();
   }
 
@@ -1326,7 +1420,7 @@
   }
 
   async function revokeMobileDevice(device: MobileDevice) {
-    if (!window.confirm(`Remove ${device.name}? It will need a new QR code before it can connect again.`)) return;
+    if (!window.confirm($t("Remove {p0}? It will need a new QR code before it can connect again.", { p0: device.name }))) return;
     try {
       await invoke('revoke_mobile_device', { endpointId: device.endpointId });
       await refreshMobileStatus();
@@ -1337,12 +1431,12 @@
 
   function mobileLastSeen(value: string) {
     const time = Date.parse(value);
-    if (!Number.isFinite(time)) return 'Never';
+    if (!Number.isFinite(time)) return $t("Never");
     const elapsed = Math.max(0, Date.now() - time);
-    if (elapsed < 90_000) return 'Just now';
-    if (elapsed < 3_600_000) return `${Math.floor(elapsed / 60_000)} min ago`;
-    if (elapsed < 86_400_000) return `${Math.floor(elapsed / 3_600_000)} hr ago`;
-    return new Date(time).toLocaleDateString();
+    if (elapsed < 90_000) return $t("Just now");
+    if (elapsed < 3_600_000) return $t("{p0} min ago", { p0: Math.floor(elapsed / 60_000) });
+    if (elapsed < 86_400_000) return $t("{p0} hr ago", { p0: Math.floor(elapsed / 3_600_000) });
+    return new Date(time).toLocaleDateString($locale);
   }
 
   async function sendTrollboxMessage() {
@@ -1375,6 +1469,7 @@
     selected = item;
     if (changed || !preserveSelection) selectedSource = 0;
     if (!item || item.audiobook) {
+      trackDiscussionGeneration += 1;
       trackDiscussionFileId = '';
       trackDiscussionMessages = [];
       trackDiscussionDraft = '';
@@ -1427,57 +1522,70 @@
     let skipped = 0;
     let failed = 0;
     try {
-      for (const target of targets) {
-        if (generation !== downloadGeneration) break;
-        if (!canDownloadResult(target)) { skipped += 1; continue; }
+      // Submit the entire selection immediately. The native queue owns the
+      // two-track limit; a slow request or UI refresh must not block enqueueing.
+      await Promise.all(targets.map(async (target) => {
+        if (generation !== downloadGeneration) return;
+        if (!canDownloadResult(target)) { skipped += 1; return; }
         try {
           if (await startDownload(target)) requested += 1;
           else failed += 1;
         } catch { failed += 1; }
-      }
-      if (generation === downloadGeneration) activityMessage = `Requested ${requested} download${requested === 1 ? '' : 's'}`
-        + (skipped ? ` · ${skipped} already local, queued, or unavailable` : '')
-        + (failed ? ` · ${failed} failed` : '');
+      }));
+      if (generation === downloadGeneration) activityMessage = msg("Downloads requested: {requested} · Skipped: {skipped} · Failed: {failed}", { requested, skipped, failed });
     } finally {
       downloadingSelection = false;
     }
   }
 
-  async function refreshTrackDiscussion(fileId = selected?.fileId ?? '', subscribe = false) {
+  async function refreshTrackDiscussion(fileId = selected?.fileId ?? '', subscribe = false, older = false) {
     if (!fileId || !nativeReady || !networkConnected) return;
     if (trackDiscussionFileId !== fileId) {
+      trackDiscussionGeneration += 1;
       trackDiscussionFileId = fileId;
       trackDiscussionMessages = [];
       trackDiscussionDraft = '';
       trackDiscussionError = '';
+      trackDiscussionHasMore = true;
+      trackDiscussionPollPending = false;
+      trackDiscussionRefreshAgain = false;
+      trackDiscussionSubscribeAgain = false;
       subscribe = true;
     }
-    if (trackDiscussionPollPending && !subscribe) {
-      trackDiscussionRefreshAgain = true;
+    if (older && (!trackDiscussionHasMore || !trackDiscussionMessages.length)) return;
+    if (trackDiscussionPollPending) {
+      if (!older) trackDiscussionRefreshAgain = true;
+      if (subscribe) trackDiscussionSubscribeAgain = true;
       return;
     }
+    const generation = trackDiscussionGeneration;
     trackDiscussionPollPending = true;
-    trackDiscussionLoading = trackDiscussionMessages.length === 0;
-    const stayAtBottom = !trackDiscussionLog || trackDiscussionLog.scrollHeight - trackDiscussionLog.scrollTop - trackDiscussionLog.clientHeight < 35;
+    const initial = trackDiscussionMessages.length === 0;
+    trackDiscussionLoading = initial || older;
+    const first = trackDiscussionMessages[0];
     try {
-      const messages = await invoke<TrollboxMessage[]>('get_track_discussion_messages', { fileId, subscribe });
-      if (selected?.fileId !== fileId || trackDiscussionFileId !== fileId) return;
-      const changed = messages.length !== trackDiscussionMessages.length || messages.at(-1)?.eventId !== trackDiscussionMessages.at(-1)?.eventId;
-      trackDiscussionMessages = messages;
+      const messages = await invoke<TrollboxMessage[]>('get_track_discussion_messages', {
+        fileId, subscribe, before: older ? { createdAt: first.createdAt, eventId: first.eventId } : null
+      });
+      if (generation !== trackDiscussionGeneration || selected?.fileId !== fileId) return;
+      const restoreScroll = chatScrollRestorer(trackDiscussionLog, initial, older);
+      trackDiscussionMessages = mergeChatMessages(trackDiscussionMessages, messages);
+      if (older) trackDiscussionHasMore = messages.length === CHAT_PAGE_SIZE;
       trackDiscussionError = '';
-      if (changed && stayAtBottom) {
-        await tick();
-        trackDiscussionLog?.scrollTo({ top: trackDiscussionLog.scrollHeight });
-      }
+      trackDiscussionLoading = false;
+      await tick();
+      if (generation === trackDiscussionGeneration) restoreScroll();
     } catch (error) {
-      if (selected?.fileId === fileId) trackDiscussionError = String(error);
+      if (generation === trackDiscussionGeneration) trackDiscussionError = String(error);
     } finally {
-      if (selected?.fileId === fileId) {
+      if (generation === trackDiscussionGeneration) {
         trackDiscussionLoading = false;
         trackDiscussionPollPending = false;
         if (trackDiscussionRefreshAgain) {
+          const subscribeAgain = trackDiscussionSubscribeAgain;
           trackDiscussionRefreshAgain = false;
-          void refreshTrackDiscussion(fileId);
+          trackDiscussionSubscribeAgain = false;
+          void refreshTrackDiscussion(fileId, subscribeAgain);
         }
       }
     }
@@ -1526,13 +1634,14 @@
         playerLoading = false;
         playerCurrentTime = 0;
         playerDuration = 0;
-        activityMessage = 'Stopped playback because the file was removed from the Napstr folder';
+        activityMessage = msg("Stopped playback because the file was removed from the Napstr folder");
       } else if (currentTrack) {
         playerQueue = queueForTrack(currentTrack, playerMode);
         playerQueueIndex = playerQueue.findIndex((item) => item.fileId === currentTrack?.fileId);
       }
       syncResultLocality();
-    } catch { /* the next folder-watch or transfer poll will retry */ }
+      return true;
+    } catch { return false; /* the next folder-watch or transfer poll will retry */ }
   }
 
   function mergeIndexBatch(batch: IndexBatch) {
@@ -1560,17 +1669,17 @@
   async function connectNetwork() {
     if (!nativeReady || networkConnectPending) return;
     networkConnectPending = true;
-    activityMessage = 'Connecting to Nostr relays and opening encrypted inbox…';
+    activityMessage = msg("Connecting to Nostr relays and opening encrypted inbox…");
     try {
       const status = await invoke<NetworkStatus>('start_network');
       applyNetworkStatus(status);
-      activityMessage = `Nostr connected · loading the most available audio from ${status.relayCount} relay(s)…`;
+      activityMessage = msg("Nostr connected · loading the most available audio from {p0} relays…", { p0: status.relayCount });
       await search();
-      if (status.torError) activityMessage = `Tor failed: ${status.torError} · click the connection panel to retry`;
+      if (status.torError) activityMessage = msg("Tor failed: {p0} · click the connection panel to retry", { p0: status.torError });
     } catch (error) {
       networkConnected = false;
       networkError = String(error);
-      activityMessage = `Network unavailable: ${String(error)}`;
+      activityMessage = msg("Network unavailable: {p0}", { p0: String(error) });
     } finally {
       networkConnectPending = false;
     }
@@ -1597,18 +1706,18 @@
     playerCurrentTime = 0;
     playerEnded = currentTrack !== null;
     lastPlayerError = '';
-    activityMessage = 'Computer resumed · reconnecting Nostr, Tor, and audio…';
+    activityMessage = msg("Computer resumed · reconnecting Nostr, Tor, and audio…");
     try {
       await invoke('recover_after_sleep');
     } catch (error) {
-      activityMessage = `Resume recovery failed: ${String(error)} · click the connection panel to retry`;
+      activityMessage = msg("Resume recovery failed: {p0} · click the connection panel to retry", { p0: String(error) });
     }
   }
 
   function torStatusLabel() {
     if (torRunning) return 'Tor connected';
     if (torError) return 'Tor failed';
-    if (torStarting && torProgress > 0) return `Tor connecting ${torProgress}%`;
+    if (torStarting && torProgress > 0) return $t("Tor connecting {p0}%", { p0: torProgress });
     return nativeReady ? 'Tor connecting' : 'Tor unavailable';
   }
 
@@ -1682,11 +1791,11 @@
             browseTotalAvailable = page.totalAvailable;
             results = mergeSearchResults(loadedNetworkMatches, []);
           }
-          activityMessage = `${results.length} tracks loaded from ${user.displayName}`;
+          activityMessage = msg("{p0} tracks loaded from {p1}", { p0: results.length, p1: user.displayName });
           selectResult(results[0] ?? null, true);
           if (browseCursor) void loadNextBrowsePage();
         } catch (error) {
-          if (generation === browseGeneration) activityMessage = `Could not browse ${user.displayName}: ${String(error)}`;
+          if (generation === browseGeneration) activityMessage = msg("Could not browse {p0}: {p1}", { p0: user.displayName, p1: String(error) });
         }
         return;
       }
@@ -1698,13 +1807,13 @@
             if (generation !== browseGeneration) return;
             results = mergeAudiobooks([], loadedNetworkAudiobooks, trimmedQuery);
             resultsAreNetwork = true;
-            activityMessage = `${results.length} audiobook collection(s) found`;
+            activityMessage = msg("{p0} audiobook collections found", { p0: results.length });
           } catch (error) {
             if (generation !== browseGeneration) return;
             loadedNetworkAudiobooks = [];
             results = mergeAudiobooks([], [], trimmedQuery);
             resultsAreNetwork = false;
-            activityMessage = `Global audiobook search failed: ${String(error)} · showing ${results.length} local collection(s)`;
+            activityMessage = msg("Global audiobook search failed: {p0} · showing {p1} local collections", { p0: String(error), p1: results.length });
           }
         } else {
         const includeAudiobooks = /^audiobooks?$/i.test(trimmedQuery);
@@ -1737,14 +1846,14 @@
         resultsAreNetwork = networkOutcome.status === 'fulfilled';
         if (networkOutcome.status === 'rejected') {
           activityMessage = localOutcome.status === 'fulfilled'
-            ? `Global search failed: ${String(networkOutcome.reason)} · showing ${results.length} local match(es)`
-            : `Search failed: ${String(networkOutcome.reason)}`;
+            ? msg("Global search failed: {p0} · showing {p1} local matches", { p0: String(networkOutcome.reason), p1: results.length })
+            : msg("Search failed: {p0}", { p0: String(networkOutcome.reason) });
         } else {
           activityMessage = format === 'Audiobooks'
-            ? `${results.length} audiobook collection(s) found`
+            ? msg("{p0} audiobook collections found", { p0: results.length })
             : !trimmedQuery
-            ? `${results.length} loaded of ${availableResultTotal(results, browseTotalAvailable)} currently available file ID(s), ranked by active seeders`
-            : `${results.length} available file ID(s), ranked by active seeders`;
+            ? msg("{p0} loaded of {p1} currently available file IDs, ranked by active seeders", { p0: results.length, p1: availableResultTotal(results, browseTotalAvailable) })
+            : msg("{p0} available file IDs, ranked by active seeders", { p0: results.length });
         }
         // Audiobook manifests are additive. Let ordinary track results render
         // as soon as they are ready instead of making every search wait for a
@@ -1760,10 +1869,10 @@
           resultPage = 0;
           reconcileResultSelection(true);
           activityMessage = format === 'Audiobooks'
-            ? `${results.length} audiobook collection(s) found`
+            ? msg("{p0} audiobook collections found", { p0: results.length })
             : !trimmedQuery
-            ? `${results.length} loaded of ${availableResultTotal(results, browseTotalAvailable)} currently available file ID(s), ranked by active seeders`
-            : `${results.length} available file ID(s), ranked by active seeders`;
+            ? msg("{p0} loaded of {p1} currently available file IDs, ranked by active seeders", { p0: results.length, p1: availableResultTotal(results, browseTotalAvailable) })
+            : msg("{p0} available file IDs, ranked by active seeders", { p0: results.length });
         });
         }
       } else if (nativeReady) {
@@ -1772,8 +1881,8 @@
           if (generation !== browseGeneration) return;
           results = mergeAudiobooks(mapFiles(matches.filter((item) => minimumSources <= 1 && item.size <= maximumBytes() && matchesType(item.mime, item.format))), [], query.trim());
           resultsAreNetwork = false;
-          activityMessage = `${results.length} local match(es) found`;
-        } catch (error) { if (generation === browseGeneration) activityMessage = `Search failed: ${String(error)}`; }
+          activityMessage = msg("{p0} local matches found", { p0: results.length });
+        } catch (error) { if (generation === browseGeneration) activityMessage = msg("Search failed: {p0}", { p0: String(error) }); }
       }
       resultPage = 0;
       selectResult(results[0] ?? null, true);
@@ -1791,7 +1900,7 @@
     if (!cursor || browseLoading || (!user && query.trim())) return;
     const generation = browseGeneration;
     browseLoading = true;
-    activityMessage = `${results.length} available file ID(s) loaded · fetching the next relay page…`;
+    activityMessage = msg("{p0} available file IDs loaded · fetching the next relay page…", { p0: results.length });
     try {
       const page = user
         ? await invoke<CatalogueBrowsePage>('network_browse_user', { pubkey: user.pubkey, cursor })
@@ -1804,10 +1913,10 @@
       resultsAreNetwork = true;
       reconcileResultSelection();
       activityMessage = user
-        ? `${results.length} loaded of ${availableResultTotal(results, browseTotalAvailable)} tracks shared by ${user.displayName}`
-        : `${results.length} loaded of ${availableResultTotal(results, browseTotalAvailable)} currently available file ID(s), ranked by active seeders`;
+        ? msg("{p0} loaded of {p1} tracks shared by {p2}", { p0: results.length, p1: availableResultTotal(results, browseTotalAvailable), p2: user.displayName })
+        : msg("{p0} loaded of {p1} currently available file IDs, ranked by active seeders", { p0: results.length, p1: availableResultTotal(results, browseTotalAvailable) });
     } catch (error) {
-      if (generation === browseGeneration) activityMessage = `Could not load the next catalogue page: ${String(error)}`;
+      if (generation === browseGeneration) activityMessage = msg("Could not load the next catalogue page: {p0}", { p0: String(error) });
     } finally {
       if (generation === browseGeneration) browseLoading = false;
     }
@@ -1816,7 +1925,7 @@
   async function surpriseMe() {
     if (searchAction) return;
     if (!networkConnected) {
-      activityMessage = 'Connect to Nostr before asking for a surprise';
+      activityMessage = msg("Connect to Nostr before asking for a surprise");
       return;
     }
     const generation = ++browseGeneration;
@@ -1830,27 +1939,32 @@
     resultUser = null;
     matchingUsers = [];
     searchedQuery = 'Surprise me';
-    activityMessage = 'Finding 50 random downloadable tracks…';
+    query = '';
+    format = 'Audio only';
+    minimumSources = 1;
+    maximumSize = '';
+    activityMessage = msg("Finding 50 random downloadable tracks…");
     try {
-      const page = await invoke<CatalogueBrowsePage>('network_browse', { cursor: null, limit: 50, cacheLimit: 50 });
-      if (generation !== browseGeneration) return;
-      let matches = page.results;
-      if (matches.length < 50 && page.cursor) {
-        const missing = await invoke<CatalogueBrowsePage>('network_browse', { cursor: page.cursor, limit: 50, cacheLimit: 50 });
+      let cursor: CatalogueBrowseCursor | null = null;
+      let downloadable: NetworkResult[] = [];
+      do {
+        const page: CatalogueBrowsePage = await invoke('network_browse', {
+          cursor, limit: 100, cacheLimit: 50000, unownedOnly: true
+        });
         if (generation !== browseGeneration) return;
-        matches = mergeNetworkPages(matches, missing.results);
-      }
-      const downloadable = eligibleNetworkMatches(matches)
-        .filter((item) => !isLocalFile(item.fileId) && item.sources.length > 0);
+        downloadable = eligibleNetworkMatches(mergeNetworkPages(downloadable, page.results))
+          .filter((item) => !isLocalFile(item.fileId) && item.sources.length > 0);
+        cursor = page.cursor;
+      } while (downloadable.length < 50 && cursor);
       results = mapNetworkFiles(shuffled(downloadable).slice(0, 50));
       resultsAreNetwork = true;
       resultPage = 0;
       selectResult(results[0] ?? null, true);
       activityMessage = results.length
-        ? `${results.length} random downloadable track${results.length === 1 ? '' : 's'} found`
-        : 'No downloadable tracks are currently available';
+        ? msg("Random downloadable tracks found: {p0}", { p0: results.length })
+        : msg("No downloadable tracks are currently available");
     } catch (error) {
-      if (generation === browseGeneration) activityMessage = `Surprise search failed: ${String(error)}`;
+      if (generation === browseGeneration) activityMessage = msg("Surprise search failed: {p0}", { p0: String(error) });
     } finally {
       if (generation === browseGeneration) searchAction = null;
     }
@@ -1877,40 +1991,40 @@
     }
     const activeTransfer = transfers.find((item) => item.fileId === target.fileId && isActiveTransfer(item));
     if (activeTransfer || startingDownloads.has(target.fileId)) {
-      activityMessage = `${target.name} is already downloading`;
+      activityMessage = msg("{p0} is already downloading", { p0: target.name });
       return false;
     }
     if (nativeReady) {
       const sources = target.sourceDetails ?? [];
-      if (!sources.length) { activityMessage = 'No seeder is available for this file'; return false; }
+      if (!sources.length) { activityMessage = msg("No seeder is available for this file"); return false; }
       startingDownloads = new Set(startingDownloads).add(target.fileId);
       const attempt = { cancelled: false };
       downloadAttempts.set(target.fileId, attempt);
-      transfers = [{
-        id: Date.now(), fileId: target.fileId, name: target.name, size: target.size,
-        speed: 'Contacting seeders…', progress: 0, status: 'Sending encrypted NIP-17 request', destination: ''
-      }, ...transfers];
+      transfers = showAvailableDownloadSlots([{
+        id: ++nextOptimisticTransferId, fileId: target.fileId, name: target.name, size: target.size,
+        speed: 'Queued', progress: 0, status: 'Queued', destination: ''
+      }, ...transfers]);
       const candidateCount = Math.min(sources.length, 3);
-      activityMessage = `Racing ${candidateCount} seeder${candidateCount === 1 ? '' : 's'} for the fastest Tor connection…`;
+      activityMessage = msg("Finding the fastest Tor connection. Seeders: {p0}…", { p0: candidateCount });
       try {
         await requestNetworkDownload({ fileId: target.fileId, sourcePubkeys: sources.map((source) => source.pubkey) });
         if (generation !== downloadGeneration || attempt.cancelled) return false;
         const updated = await invoke<NativeTransfer[]>('get_transfers');
         if (generation !== downloadGeneration || attempt.cancelled) return false;
-        transfers = mapTransfers(updated);
-        activityMessage = 'Seeder race started · the fastest responsive source will stream the file';
+        await applyTransferUpdate(updated);
+        activityMessage = msg("Seeder race started · the fastest responsive source will stream the file");
         return true;
       } catch (error) {
         if (generation !== downloadGeneration || attempt.cancelled) return false;
         try {
           const updated = await invoke<NativeTransfer[]>('get_transfers');
           if (generation !== downloadGeneration || attempt.cancelled) return false;
-          transfers = mapTransfers(updated);
+          await applyTransferUpdate(updated);
         } catch {
           if (generation !== downloadGeneration || attempt.cancelled) return false;
           transfers = transfers.filter((item) => item.fileId !== target.fileId);
         }
-        activityMessage = `Request failed: ${String(error)}`;
+        activityMessage = msg("Request failed: {p0}", { p0: String(error) });
       } finally {
         downloadAttempts.delete(target.fileId);
         const nextStarting = new Set(startingDownloads);
@@ -1958,10 +2072,10 @@
         narrator: audiobookNarrator
       });
       audiobookEditorOpen = false;
-      activityMessage = `${audiobookTitle.trim()} grouped and queued for Nostr publication`;
+      activityMessage = msg("{p0} grouped and queued for Nostr publication", { p0: audiobookTitle.trim() });
       syncResultLocality();
     } catch (error) {
-      activityMessage = `Could not group audiobook: ${String(error)}`;
+      activityMessage = msg("Could not group audiobook: {p0}", { p0: String(error) });
     } finally {
       audiobookSaving = false;
     }
@@ -1974,10 +2088,10 @@
     try {
       localAudiobooks = await invoke<Audiobook[]>('remove_audiobook', { folder: existing.localFolder });
       audiobookEditorOpen = false;
-      activityMessage = `${existing.title} is now published as individual tracks only`;
+      activityMessage = msg("{p0} is now published as individual tracks only", { p0: existing.title });
       syncResultLocality();
     } catch (error) {
-      activityMessage = `Could not remove audiobook grouping: ${String(error)}`;
+      activityMessage = msg("Could not remove audiobook grouping: {p0}", { p0: String(error) });
     } finally {
       audiobookSaving = false;
     }
@@ -1986,7 +2100,7 @@
   async function playAudiobook(book: Audiobook) {
     const firstReadyChapter = book.chapters.find((chapter) => isLocalFile(chapter.fileId));
     if (!firstReadyChapter) {
-      activityMessage = 'Download at least the first chapter before playing this audiobook';
+      activityMessage = msg("Download at least the first chapter before playing this audiobook");
       return;
     }
     await playAudiobookChapter(book, firstReadyChapter.fileId);
@@ -1999,7 +2113,7 @@
     });
     const index = queue.findIndex((chapter) => chapter.fileId === fileId);
     if (index < 0) {
-      activityMessage = 'That chapter has not finished downloading yet';
+      activityMessage = msg("That chapter has not finished downloading yet");
       return;
     }
     activePlayerAudiobook = book;
@@ -2024,7 +2138,7 @@
       const missing = queue.chapters.filter((chapter) => !isLocalFile(chapter.fileId)).length;
       if (missing) {
         audiobookDownloads = audiobookDownloads.filter((item) => item.audiobookId !== audiobookId);
-        activityMessage = `${queue.title} finished with ${missing} missing chapter${missing === 1 ? '' : 's'} · select the book to retry`;
+        activityMessage = msg("{p0} · Missing chapters: {p1}. Select the book to retry.", { p0: queue.title, p1: missing });
         return;
       }
       if (queue.destinationFolder) {
@@ -2039,7 +2153,7 @@
         } catch { /* downloaded chapters remain valid and can be grouped manually */ }
       }
       audiobookDownloads = audiobookDownloads.filter((item) => item.audiobookId !== audiobookId);
-      activityMessage = `${queue.title} downloaded and ready to play`;
+      activityMessage = msg("{p0} downloaded and ready to play", { p0: queue.title });
       return;
     }
     const chapter = queue.chapters[queue.nextIndex];
@@ -2053,15 +2167,15 @@
         destinationFolder: queue.destinationFolder
       });
       if (!audiobookDownloads.includes(queue)) return;
-      transfers = mapTransfers(await invoke<NativeTransfer[]>('get_transfers'));
-      activityMessage = `Downloading ${queue.title} · chapter ${queue.nextIndex + 1} of ${queue.chapters.length}`;
+      await applyTransferUpdate(await invoke<NativeTransfer[]>('get_transfers'));
+      activityMessage = msg("Downloading {p0} · chapter {p1} of {p2}", { p0: queue.title, p1: queue.nextIndex + 1, p2: queue.chapters.length });
     } catch (error) {
       if (!audiobookDownloads.includes(queue)) return;
       queue.failed += 1;
       queue.nextIndex += 1;
       queue.activeFileId = '';
       audiobookDownloads = [...audiobookDownloads];
-      activityMessage = `Chapter ${queue.nextIndex} could not start: ${String(error)} · continuing with the book`;
+      activityMessage = msg("Chapter {p0} could not start: {p1} · continuing with the book", { p0: queue.nextIndex, p1: String(error) });
       void requestNextAudiobookChapter(audiobookId);
     } finally {
       const nextStarting = new Set(startingDownloads);
@@ -2095,11 +2209,11 @@
       return;
     }
     if (!book.sources.length) {
-      activityMessage = 'No complete audiobook seeder is currently available';
+      activityMessage = msg("No complete audiobook seeder is currently available");
       return;
     }
     if (audiobookDownloads.some((item) => item.audiobookId === book.audiobookId)) {
-      activityMessage = `${book.title} is already in the download queue`;
+      activityMessage = msg("{p0} is already in the download queue", { p0: book.title });
       return;
     }
     audiobookDownloads = [...audiobookDownloads, {
@@ -2176,10 +2290,10 @@
     try {
       if (target.kind === 'file') {
         await invoke('block_file', { fileId: target.fileId });
-        activityMessage = 'File hash blocked locally';
+        activityMessage = msg("File hash blocked locally");
       } else {
         await invoke('block_user', { pubkey: target.pubkey });
-        activityMessage = 'Nostr publisher blocked locally';
+        activityMessage = msg("Nostr publisher blocked locally");
       }
       blockConfirmation = null;
       if (activeView === 'Trollbox') {
@@ -2189,7 +2303,7 @@
         await search();
       }
     } catch (error) {
-      activityMessage = `Could not block ${target.kind}: ${String(error)}`;
+      activityMessage = msg("Could not block {p0}: {p1}", { p0: target.kind, p1: String(error) });
     } finally {
       blockInProgress = false;
     }
@@ -2207,7 +2321,7 @@
       if (attempt) attempt.cancelled = true;
     }
     const pending = [...pendingDownloadRequests].filter(([, file]) => file === fileId).map(([request]) => request);
-    activityMessage = 'Stopping download and cleaning partial files…';
+    activityMessage = msg("Stopping download and cleaning partial files…");
     try {
       if (nativeReady) {
         // Optimistic UI IDs are not database IDs. Find the actual row, and
@@ -2225,9 +2339,9 @@
         if (pending.length) await removeRows();
       }
       transfers = transfers.filter((transfer) => transfer.id !== id && !(pending.length && fileId && transfer.fileId === fileId && isActiveTransfer(transfer)));
-      activityMessage = 'Transfer removed; completed audio kept';
+      activityMessage = msg("Transfer removed; completed audio kept");
     } catch (error) {
-      activityMessage = `Could not remove transfer: ${String(error)}`;
+      activityMessage = msg("Could not remove transfer: {p0}", { p0: String(error) });
     } finally {
       if (fileId) cancellingFiles.delete(fileId);
       removingTransfers = new Set([...removingTransfers].filter((value) => value !== id));
@@ -2240,7 +2354,7 @@
     downloadGeneration += 1;
     audiobookDownloads = [];
     const pending = [...pendingDownloadRequests.keys()];
-    activityMessage = 'Stopping downloads and cleaning partial files…';
+    activityMessage = msg("Stopping downloads and cleaning partial files…");
     try {
       if (nativeReady) {
         await invoke('clear_all_transfers');
@@ -2249,9 +2363,9 @@
         if (pending.length) await invoke('clear_all_transfers');
         transfers = mapTransfers(await invoke<NativeTransfer[]>('get_transfers'));
       } else transfers = [];
-      activityMessage = 'All transfers cleared; partial downloads removed and completed audio kept';
+      activityMessage = msg("All transfers cleared; partial downloads removed and completed audio kept");
     } catch (error) {
-      activityMessage = `Could not clear all transfers: ${String(error)}`;
+      activityMessage = msg("Could not clear all transfers: {p0}", { p0: String(error) });
     } finally {
       clearingTransfers = false;
     }
@@ -2267,49 +2381,49 @@
         if (nativeReady) await invoke('remove_transfer', { id: transfer.id });
         removed.add(transfer.id);
       } catch (error) {
-        activityMessage = `Could not clear every finished transfer: ${String(error)}`;
+        activityMessage = msg("Could not clear every finished transfer: {p0}", { p0: String(error) });
         break;
       }
     }
     transfers = transfers.filter((transfer) => !removed.has(transfer.id));
-    if (removed.size === finished.length) activityMessage = `Cleared ${removed.size} finished transfer${removed.size === 1 ? '' : 's'}`;
+    if (removed.size === finished.length) activityMessage = msg("Finished transfers cleared: {p0}", { p0: removed.size });
     if (nativeReady) await refreshLocalLibrary();
   }
 
   async function togglePause() {
     paused = !paused;
     if (nativeReady) {
-      try { await invoke('set_downloads_paused', { paused }); activityMessage = paused ? 'All active downloads paused' : 'Downloads resumed'; }
-      catch (error) { activityMessage = `Could not change download state: ${String(error)}`; }
+      try { await invoke('set_downloads_paused', { paused }); activityMessage = paused ? msg("All active downloads paused") : msg("Downloads resumed"); }
+      catch (error) { activityMessage = msg("Could not change download state: {p0}", { p0: String(error) }); }
     }
   }
 
   async function chooseNapstrFolder() {
-    if (!nativeReady) { activityMessage = 'Folder selection is available in the packaged desktop app'; return; }
+    if (!nativeReady) { activityMessage = msg("Folder selection is available in the packaged desktop app"); return; }
     try {
-      const selectedPath = await open({ directory: true, multiple: false, title: 'Choose the folder Napstr uses for downloads and sharing', defaultPath: napstrFolder || undefined });
+      const selectedPath = await open({ directory: true, multiple: false, title: $t("Choose the folder Napstr uses for downloads and sharing"), defaultPath: napstrFolder || undefined });
       if (!selectedPath || Array.isArray(selectedPath)) return;
-      activityMessage = 'Indexing files and calculating SHA-256 hashes…';
+      activityMessage = msg("Indexing files and calculating SHA-256 hashes…");
       const report = await invoke<{ fileCount: number; totalBytes: number; errors: string[]; errorCount: number; changedFiles: number }>('set_napstr_folder', { path: selectedPath });
-      activityMessage = `Indexed ${report.fileCount} file(s), ${readableSize(report.totalBytes)}${report.errorCount ? ` · ${report.errorCount} skipped` : ''}`;
-    } catch (error) { activityMessage = `Folder selection failed: ${String(error)}`; }
+      activityMessage = msg("Indexed {p0} files, {p1}{p2}", { p0: report.fileCount, p1: readableSize(report.totalBytes), p2: report.errorCount ? ` · ${report.errorCount} skipped` : '' });
+    } catch (error) { activityMessage = msg("Folder selection failed: {p0}", { p0: String(error) }); }
   }
 
   async function openNapstrFolder() {
     if (!nativeReady) return;
     try { await invoke('open_napstr_folder'); }
-    catch (error) { activityMessage = `Could not open Napstr folder: ${String(error)}`; }
+    catch (error) { activityMessage = msg("Could not open Napstr folder: {p0}", { p0: String(error) }); }
   }
 
   async function rescanSharedFolder() {
     if (!nativeReady || rescanPending) return;
     rescanPending = true;
-    activityMessage = 'Rescanning Napstr folder…';
+    activityMessage = msg("Rescanning Napstr folder…");
     try {
       const report = await invoke<{ fileCount: number; totalBytes: number; changedFiles: number }>('rescan_napstr_folder');
-      activityMessage = `Indexed ${report.fileCount} file(s), ${readableSize(report.totalBytes)}`;
+      activityMessage = msg("Indexed {p0} files, {p1}", { p0: report.fileCount, p1: readableSize(report.totalBytes) });
     } catch (error) {
-      activityMessage = `Rescan failed: ${String(error)}`;
+      activityMessage = msg("Rescan failed: {p0}", { p0: String(error) });
     } finally {
       rescanPending = false;
     }
@@ -2319,9 +2433,9 @@
     if (!nativeReady || !indexing) return;
     try {
       await invoke('cancel_library_scan');
-      activityMessage = 'Cancelling the library scan…';
+      activityMessage = msg("Cancelling the library scan…");
     } catch (error) {
-      activityMessage = `Could not cancel indexing: ${String(error)}`;
+      activityMessage = msg("Could not cancel indexing: {p0}", { p0: String(error) });
     }
   }
 
@@ -2330,8 +2444,8 @@
     try {
       applySnapshot(await invoke<Snapshot>('save_settings', { settings: { napstrFolder, nostrRelays, displayName, profileAbout, profilePicture } }));
       if (networkConnected) await invoke('publish_profile');
-      activityMessage = networkConnected ? 'Settings saved and profile published' : 'Settings saved';
-    } catch (error) { activityMessage = `Could not save settings: ${String(error)}`; }
+      activityMessage = networkConnected ? msg("Settings saved and profile published") : msg("Settings saved");
+    } catch (error) { activityMessage = msg("Could not save settings: {p0}", { p0: String(error) }); }
   }
 
   const windowCommand = async (command: 'minimise_window' | 'toggle_maximise' | 'close_window') => {
@@ -2385,14 +2499,16 @@
     event.preventDefault();
   }
 
+  onMount(() => initializeLocale(() => osLocale()));
+
   onMount(() => {
     desktopRuntime = '__TAURI_INTERNALS__' in window;
     if (!desktopRuntime) return;
-    const savedPlayerMode = window.localStorage.getItem('napstr-player-mode');
+    const savedPlayerMode = readStoredPreference('napstr-player-mode');
     if (savedPlayerMode === 'single' || savedPlayerMode === 'folder' || savedPlayerMode === 'all') playerMode = savedPlayerMode;
-    const savedPlayerVolume = Number(window.localStorage.getItem('napstr-player-volume'));
+    const savedPlayerVolume = Number(readStoredPreference('napstr-player-volume'));
     if (Number.isFinite(savedPlayerVolume) && savedPlayerVolume >= 0 && savedPlayerVolume <= 1) playerVolume = savedPlayerVolume;
-    const savedTransferHeight = Number(window.localStorage.getItem('napstr-transfer-pane-height'));
+    const savedTransferHeight = Number(readStoredPreference('napstr-transfer-pane-height'));
     setTransferPaneHeight(Number.isFinite(savedTransferHeight) && savedTransferHeight > 0 ? savedTransferHeight : window.innerHeight < 700 ? 94 : 119);
     const clampTransferPane = () => setTransferPaneHeight(transferPaneHeight);
     window.addEventListener('resize', clampTransferPane);
@@ -2433,7 +2549,11 @@
     });
     void listen('napstr-transfers-changed', () => {
       void invoke<NativeTransfer[]>('get_transfers')
-        .then((items) => { transfers = mapTransfers(items); })
+        .then(async (items) => {
+          if (clearingTransfers || removingTransfers.size) return;
+          await applyTransferUpdate(items);
+          if (audiobookDownloads.length) await advanceAudiobookDownloads();
+        })
         .catch(() => {});
     }).then((unlisten) => {
       if (destroyed) unlisten();
@@ -2468,7 +2588,7 @@
       else eventUnlisteners.push(unlisten);
     });
     const updateClock = () => {
-      clock = new Intl.DateTimeFormat('en-GB', { hour: '2-digit', minute: '2-digit' }).format(new Date());
+      clockNow = Date.now();
     };
     updateClock();
     const clockTimer = window.setInterval(updateClock, 30000);
@@ -2499,9 +2619,9 @@
         const wasConnected = networkConnected;
         applyNetworkStatus(status);
         if (status.torError && status.torError !== previousTorError) {
-          activityMessage = `Tor failed: ${status.torError} · click the connection panel to retry`;
+          activityMessage = msg("Tor failed: {p0} · click the connection panel to retry", { p0: status.torError });
         } else if (!wasConnected && status.connected) {
-          activityMessage = 'Nostr reconnected · refreshing the catalogue';
+          activityMessage = msg("Nostr reconnected · refreshing the catalogue");
           void search();
           if (activeView === 'Trollbox') void refreshTrollbox();
         } else if (!status.connected && !networkConnectPending) {
@@ -2513,6 +2633,7 @@
     let transferPollPending = false;
     const transferTimer = window.setInterval(async () => {
       const transferWorkPending =
+        downloadLibraryRefreshNeeded ||
         startingDownloads.size > 0 ||
         audiobookDownloads.length > 0 ||
         transfers.some(isActiveTransfer);
@@ -2521,17 +2642,7 @@
       try {
         const items = await invoke<NativeTransfer[]>('get_transfers');
         if (clearingTransfers || removingTransfers.size) return;
-        const previouslyComplete = new Set(transfers.filter(isCompleteTransfer).map((transfer) => transfer.fileId));
-        const updated = mapTransfers(items);
-        const newlyComplete = updated.filter((transfer) => isCompleteTransfer(transfer) && !previouslyComplete.has(transfer.fileId));
-        const vanishedActive = transfers.filter((transfer) => !startingDownloads.has(transfer.fileId) && isActiveTransfer(transfer) && !updated.some((item) => item.id === transfer.id));
-        const optimistic = transfers.filter((transfer) => startingDownloads.has(transfer.fileId) && !updated.some((item) => item.fileId === transfer.fileId));
-        transfers = [...optimistic, ...updated];
-        if (newlyComplete.length || vanishedActive.length) {
-          await refreshLocalLibrary();
-          const latest = newlyComplete[0] ?? vanishedActive.find((transfer) => isLocalFile(transfer.fileId));
-          if (latest) activityMessage = `${latest.name} downloaded, verified, and ready to play`;
-        }
+        await applyTransferUpdate(items);
         if (audiobookDownloads.length) await advanceAudiobookDownloads();
       } catch { /* the next transfer poll retries */ }
       finally { transferPollPending = false; }
@@ -2547,7 +2658,7 @@
     const mobileTimer = window.setInterval(() => {
       if (mobilePairing && mobilePairing.expiresAt <= Math.floor(Date.now() / 1000)) mobilePairing = null;
       if (mobileStreamPairing && mobileStreamPairing.expiresAt <= Math.floor(Date.now() / 1000)) mobileStreamPairing = null;
-      if (activeView === 'Mobile') void refreshMobileStatus();
+      if (activeView === 'Napstrfy') void refreshMobileStatus();
     }, 3000);
     return () => {
       destroyed = true;
@@ -2567,81 +2678,81 @@
   });
 </script>
 
-<svelte:head><title>Napstr - own your music again</title></svelte:head>
+<svelte:head><title>{$t("Napstr - own your music again")}</title></svelte:head>
 
 {#if desktopRuntime}
 <main class="desktop">
-  <section class="app-window" style={`--transfer-height: ${transferPaneHeight}px`} aria-label="Napstr application window">
-    <button class="window-resize-handle resize-n" aria-label="Resize window from top" onpointerdown={(event) => beginWindowResize(event, 'North')}></button>
-    <button class="window-resize-handle resize-e" aria-label="Resize window from right" onpointerdown={(event) => beginWindowResize(event, 'East')}></button>
-    <button class="window-resize-handle resize-s" aria-label="Resize window from bottom" onpointerdown={(event) => beginWindowResize(event, 'South')}></button>
-    <button class="window-resize-handle resize-w" aria-label="Resize window from left" onpointerdown={(event) => beginWindowResize(event, 'West')}></button>
-    <button class="window-resize-handle resize-ne" aria-label="Resize window from top right" onpointerdown={(event) => beginWindowResize(event, 'NorthEast')}></button>
-    <button class="window-resize-handle resize-se" aria-label="Resize window from bottom right" onpointerdown={(event) => beginWindowResize(event, 'SouthEast')}></button>
-    <button class="window-resize-handle resize-sw" aria-label="Resize window from bottom left" onpointerdown={(event) => beginWindowResize(event, 'SouthWest')}></button>
-    <button class="window-resize-handle resize-nw" aria-label="Resize window from top left" onpointerdown={(event) => beginWindowResize(event, 'NorthWest')}></button>
+  <section class="app-window" style={`--transfer-height: ${transferPaneHeight}px`} aria-label={$t("Napstr application window")}>
+    <button class="window-resize-handle resize-n" aria-label={$t("Resize window from top")} onpointerdown={(event) => beginWindowResize(event, 'North')}></button>
+    <button class="window-resize-handle resize-e" aria-label={$t("Resize window from right")} onpointerdown={(event) => beginWindowResize(event, 'East')}></button>
+    <button class="window-resize-handle resize-s" aria-label={$t("Resize window from bottom")} onpointerdown={(event) => beginWindowResize(event, 'South')}></button>
+    <button class="window-resize-handle resize-w" aria-label={$t("Resize window from left")} onpointerdown={(event) => beginWindowResize(event, 'West')}></button>
+    <button class="window-resize-handle resize-ne" aria-label={$t("Resize window from top right")} onpointerdown={(event) => beginWindowResize(event, 'NorthEast')}></button>
+    <button class="window-resize-handle resize-se" aria-label={$t("Resize window from bottom right")} onpointerdown={(event) => beginWindowResize(event, 'SouthEast')}></button>
+    <button class="window-resize-handle resize-sw" aria-label={$t("Resize window from bottom left")} onpointerdown={(event) => beginWindowResize(event, 'SouthWest')}></button>
+    <button class="window-resize-handle resize-nw" aria-label={$t("Resize window from top left")} onpointerdown={(event) => beginWindowResize(event, 'NorthWest')}></button>
 
     <header class="titlebar" data-tauri-drag-region>
-      <div class="title-left"><span class="app-icon"><img src="/napstr-logo.png" alt="" /></span><span>Napstr - own your music again</span></div>
+      <div class="title-left"><span class="app-icon"><img src="/napstr-logo.png" alt="" /></span><span>{$t("Napstr - own your music again")}</span></div>
       <div class="window-controls" aria-hidden="true">
         <button tabindex="-1" onclick={() => windowCommand('minimise_window')}>_</button><button tabindex="-1" onclick={() => windowCommand('toggle_maximise')}>□</button><button tabindex="-1" onclick={() => windowCommand('close_window')}>×</button>
       </div>
     </header>
 
     <div class="toolbar">
-      <div class="toolbar-brand" title="Napstr home">
+      <div class="toolbar-brand" title={$t("Napstr home")}>
         <img src="/napstr-logo.png" alt="Napstr" />
       </div>
       <div class="toolbar-separator"></div>
       {#each views as view}
         <button class:active={activeView === view.label} class="tool-button" onclick={() => activateView(view.label)}>
           <span class="tool-icon icon-{view.label.toLowerCase()}">{view.icon}</span>
-          <span>{view.label}</span>
+          <span>{$t(view.label)}</span>
         </button>
       {/each}
       <div class="toolbar-spacer"></div>
       {#if newRelease}
-        <button class="release-button" onclick={openNewRelease} title={`Open Napstr ${newRelease.version} on GitHub`}>
+        <button class="release-button" onclick={openNewRelease} title={$t("Open Napstr {p0} on GitHub", { p0: newRelease.version })}>
           <span class="release-arrow">⇧</span>
-          <span><strong>New release</strong><small>{newRelease.version} available</small></span>
+          <span><strong>{$t("New release")}</strong><small>{newRelease.version} {$t("available")}</small></span>
         </button>
       {/if}
-      <button class="connection-box" onclick={connectNetwork} title={torError || networkError || 'Reconnect Nostr and Tor'}>
-        <span class="connection-status"><i class:amber={!networkConnected} class="led"></i><strong>{networkConnected ? 'Nostr connected' : 'Connect Nostr'}</strong></span>
-        <span class="connection-status"><i class:amber={!torRunning} class:error={Boolean(torError)} class="led"></i><strong>{torStatusLabel()}</strong></span>
+      <button class="connection-box" onclick={connectNetwork} title={torError || networkError || $t("Reconnect Nostr and Tor")}>
+        <span class="connection-status"><i class:amber={!networkConnected} class="led"></i><strong>{networkConnected ? $t("Nostr connected") : $t("Connect Nostr")}</strong></span>
+        <span class="connection-status"><i class:amber={!torRunning} class:error={Boolean(torError)} class="led"></i><strong>{$t(torStatusLabel())}</strong></span>
       </button>
-      <button class="tool-button help-button" onclick={() => (aboutOpen = true)}><span class="tool-icon">?</span><span>About</span></button>
+      <button class="tool-button help-button" onclick={() => (aboutOpen = true)}><span class="tool-icon">?</span><span>{$t("About")}</span></button>
     </div>
 
     <div class="network-strip">
       <span class="network-pulse">▥</span>
-      <span>{activityMessage}</span>
+      <span>{$t(activityMessage)}</span>
       <span class="strip-right"><button class="user-name" disabled={!identityNpub} onclick={() => browseUser(ownCatalogueUser())}>{displayName}</button> <i class:amber={!nativeReady} class="led"></i></span>
     </div>
 
-    <section class="player-bar" aria-label="Napstr audio player">
+    <section class="player-bar" aria-label={$t("Napstr audio player")}>
       <div class="player-display">
         <span class:playing={playerPlaying} class="player-led">{playerLoading ? '···' : playerPlaying ? '▶' : '■'}</span>
-        <div><strong>{currentTrack?.name ?? 'No track selected'}</strong><small>{currentTrack ? `${currentTrack.artist || 'Unknown artist'} · ${folderName(currentTrack.folder)}` : 'Choose a local song to begin'}</small></div>
+        <div><strong>{currentTrack?.name ?? $t("No track selected")}</strong><small>{currentTrack ? `${currentTrack.artist || 'Unknown artist'} · ${folderName(currentTrack.folder)}` : $t("Choose a local song to begin")}</small></div>
       </div>
       <div class="player-controls">
-        <button onclick={previousPlayerTrack} disabled={!currentTrack || playerLoading} title="Previous track">|◀</button>
-        <button class="player-primary" onclick={togglePlayer} disabled={playerLoading} title={playerPlaying ? 'Pause' : 'Play'}>{playerLoading ? '…' : playerPlaying ? 'Ⅱ' : '▶'}</button>
-        <button onclick={stopPlayer} disabled={!currentTrack || playerLoading} title="Stop">■</button>
-        <button onclick={nextPlayerTrack} disabled={playerLoading || playerQueueIndex < 0 || playerQueueIndex + 1 >= playerQueue.length} title="Next track">▶|</button>
+        <button onclick={previousPlayerTrack} disabled={!currentTrack || playerLoading} title={$t("Previous track")}>|◀</button>
+        <button class="player-primary" onclick={togglePlayer} disabled={playerLoading} title={playerPlaying ? $t("Pause") : $t("Play")}>{playerLoading ? '…' : playerPlaying ? 'Ⅱ' : '▶'}</button>
+        <button onclick={stopPlayer} disabled={!currentTrack || playerLoading} title={$t("Stop")}>■</button>
+        <button onclick={nextPlayerTrack} disabled={playerLoading || playerQueueIndex < 0 || playerQueueIndex + 1 >= playerQueue.length} title={$t("Next track")}>▶|</button>
       </div>
       <div class="player-seek">
-        <input aria-label="Track position" type="range" min="0" max={Math.max(0, playerDuration || 0)} step="0.1" value={playerCurrentTime} oninput={seekPlayer} disabled={!currentTrack} />
+        <input aria-label={$t("Track position")} type="range" min="0" max={Math.max(0, playerDuration || 0)} step="0.1" value={playerCurrentTime} oninput={seekPlayer} disabled={!currentTrack} />
         <span>{formatPlayerTime(playerCurrentTime)} / {formatPlayerTime(playerDuration)}</span>
       </div>
-      <label class="player-mode">After track
+      <label class="player-mode">{$t("After track")}
         <select bind:value={playerMode} onchange={changePlayerMode}>
-          <option value="single">Stop</option>
-          <option value="folder">Play folder</option>
-          <option value="all">Play all</option>
+          <option value="single">{$t("Stop")}</option>
+          <option value="folder">{$t("Play folder")}</option>
+          <option value="all">{$t("Play all")}</option>
         </select>
       </label>
-      <label class="player-volume">Vol <input aria-label="Volume" type="range" min="0" max="1" step="0.05" value={playerVolume} oninput={changePlayerVolume} /></label>
+      <label class="player-volume">{$t("Vol")} <input aria-label={$t("Volume")} type="range" min="0" max="1" step="0.05" value={playerVolume} oninput={changePlayerVolume} /></label>
     </section>
 
     {#if coverPicker}
@@ -2666,44 +2777,44 @@
     <div class="workspace">
       {#if activeView === 'Search'}
         <section class="panel search-panel">
-          <div class="panel-title"><span></span><b>Search the Napstr network</b><span></span></div>
+          <div class="panel-title"><span></span><b>{$t("Search the Napstr network")}</b><span></span></div>
           <form class="search-form" onsubmit={(e) => { e.preventDefault(); search(); }}>
-            <label for="search-query">Search:</label>
-            <input id="search-query" bind:value={query} placeholder="punk, rock, jazz, audiobook" />
-            <label for="format">File type:</label>
-            <select id="format" bind:value={format} disabled={searchAction !== null} onchange={() => void search()}><option>Audio only</option><option>Audiobooks</option></select>
+            <label for="search-query">{$t("Search:")}</label>
+            <input id="search-query" bind:value={query} placeholder={$t("punk, rock, jazz, audiobook")} />
+            <label for="format">{$t("File type:")}</label>
+            <select id="format" bind:value={format} disabled={searchAction !== null} onchange={() => void search()}><option value="Audio only">{$t("Audio only")}</option><option value="Audiobooks">{$t("Audiobooks")}</option></select>
             <button class="classic-button primary search-button" type="submit" disabled={searchAction !== null} aria-busy={searchAction === 'search'}>
               {#if searchAction === 'search'}<span class="search-spinner" aria-hidden="true"></span>{/if}
-              {searchAction === 'search' ? 'Searching' : 'Search'}
+              {searchAction === 'search' ? $t("Searching") : $t("Search")}
             </button>
             <button class="classic-button surprise-button" type="button" onclick={surpriseMe} disabled={searchAction !== null || !networkConnected} aria-busy={searchAction === 'surprise'}>
               {#if searchAction === 'surprise'}<span class="search-spinner" aria-hidden="true"></span>{/if}
-              {searchAction === 'surprise' ? 'Choosing…' : 'Surprise me'}
+              {searchAction === 'surprise' ? $t("Choosing…") : $t("Surprise me")}
             </button>
           </form>
           {#if resultUser}
-            <div class="user-search-status"><span>Shared by <b>{resultUser.displayName}</b> <code title={resultUser.npub}>{resultUser.npub.slice(0, 18)}…</code></span><button class="classic-button" disabled={searchAction !== null} onclick={() => { query = ''; searchUser = null; void search(); }}>Clear user filter</button></div>
+            <div class="user-search-status"><span>{$t("Shared by")} <b>{resultUser.displayName}</b> <code title={resultUser.npub}>{resultUser.npub.slice(0, 18)}…</code></span><button class="classic-button" disabled={searchAction !== null} onclick={() => { query = ''; searchUser = null; void search(); }}>{$t("Clear user filter")}</button></div>
           {:else if matchingUsers.length > 1}
-            <div class="user-search-status"><span>Several users have this name. Choose whose songs to browse:</span>{#each matchingUsers as user}<button class="classic-button" title={user.npub} onclick={() => browseUser(user)}>{user.displayName} · {user.npub.slice(0, 18)}…</button>{/each}</div>
+            <div class="user-search-status"><span>{$t("Several users have this name. Choose whose songs to browse:")}</span>{#each matchingUsers as user}<button class="classic-button" title={user.npub} onclick={() => browseUser(user)}>{user.displayName} · {user.npub.slice(0, 18)}…</button>{/each}</div>
           {/if}
-          <button class="advanced-toggle" onclick={() => (advanced = !advanced)}><span>{advanced ? '▼' : '▶'}</span> {advanced ? 'Hide' : 'Show'} advanced search options</button>
+          <button class="advanced-toggle" onclick={() => (advanced = !advanced)}><span>{advanced ? '▼' : '▶'}</span> {advanced ? $t("Hide advanced search options") : $t("Show advanced search options")}</button>
           {#if advanced}
-            <div class="advanced-row"><label>Minimum seeders: <input type="number" bind:value={minimumSources} min="1" /></label><label>Maximum size: <input bind:value={maximumSize} placeholder="e.g. 2 GB" /></label><label><input type="checkbox" checked disabled /> Online seeders only</label></div>
+            <div class="advanced-row"><label>{$t("Minimum seeders:")} <input type="number" bind:value={minimumSources} min="1" /></label><label>{$t("Maximum size:")} <input bind:value={maximumSize} placeholder={$t("e.g. 2 GB")} /></label><label><input type="checkbox" checked disabled /> {$t("Online seeders only")}</label></div>
           {/if}
         </section>
 
         <div class="split-content">
-          <section class="results-pane" aria-label="Search results">
+          <section class="results-pane" aria-label={$t("Search results")}>
             <div class="section-caption">
-              <span>Search results for “{searchedQuery}”</span>
+              <span>{$t("Results for “{p0}”", { p0: ["All audio", "All audiobooks", "local catalogue", "Surprise me"].includes(searchedQuery) ? $t(searchedQuery) : searchedQuery })}</span>
               <div class="results-caption-tools">
-                <small>{format === 'Audiobooks' ? `${results.length} audiobook${results.length === 1 ? '' : 's'} found` : browseTotalAvailable ? `${results.length} loaded of ${resultAvailableTotal} available` : `${results.length} file IDs found`}</small>
-                <button type="button" class="view-toggle" class:active={resultsView === 'list'} title="Show these results as a list" aria-pressed={resultsView === 'list'} onclick={() => setResultsView('list')}>▤</button>
-                <button type="button" class="view-toggle" class:active={resultsView === 'thumb'} title="Show these results as thumbnails, with album art" aria-pressed={resultsView === 'thumb'} onclick={() => setResultsView('thumb')}>▦</button>
+                <small>{format === 'Audiobooks' ? $t("Audiobooks found: {p0}", { p0: results.length }) : browseTotalAvailable ? $t("{p0} loaded of {p1} available", { p0: results.length, p1: resultAvailableTotal }) : $t("{p0} file IDs found", { p0: results.length })}</small>
+                <button type="button" class="view-toggle" class:active={resultsView === 'list'} title={$t("Show these results as a list")} aria-pressed={resultsView === 'list'} onclick={() => setResultsView('list')}>▤</button>
+                <button type="button" class="view-toggle" class:active={resultsView === 'thumb'} title={$t("Show these results as thumbnails, with album art")} aria-pressed={resultsView === 'thumb'} onclick={() => setResultsView('thumb')}>▦</button>
               </div>
             </div>
             {#if resultsView === 'thumb'}
-              <div class="result-grid" aria-label="Search results as thumbnails">
+              <div class="result-grid" aria-label={$t("Search results as thumbnails")}>
                 {#each resultPageItems as item}
                   <button
                     type="button"
@@ -2719,24 +2830,24 @@
                       <CoverArt artist={item.artist ?? ''} album={item.album ?? ''} preferThumb size="medium" revision={coverRevision} />
                     {/if}
                     <b title={item.name}>{item.name}</b>
-                    <small title={item.artist || undefined}>{item.artist || 'Unknown artist'}</small>
+                    <small title={item.artist || undefined}>{item.artist || $t('Unknown artist')}</small>
                     <small class="result-card-album" title={item.album || undefined}>{item.album || '—'}</small>
-                    <span class="result-card-meta"><i class="source-dot"></i>{item.sources} {item.sources === 1 ? 'seeder' : 'seeders'} · {item.size}</span>
+                    <span class="result-card-meta"><i class="source-dot"></i>{item.sources} {item.sources === 1 ? $t('seeder') : $t('seeders')} · {item.size}</span>
                   </button>
                 {/each}
-                {#if results.length === 0}<p class="empty-state">Nothing to show yet.</p>{/if}
+                {#if results.length === 0}<p class="empty-state">{$t("Nothing to show yet.")}</p>{/if}
               </div>
             {:else}
             <div class="table-wrap">
               <table class="file-table search-results-table">
-                <thead><tr><th class="name-col">Name</th><th>Type</th><th class="number">Size</th><th class="number">Seeders</th><th>Line speed</th><th>Length</th></tr></thead>
+                <thead><tr><th class="name-col">{$t("Name")}</th><th>{$t("Type")}</th><th class="number">{$t("Size")}</th><th class="number">{$t("Seeders")}</th><th>{$t("Line speed")}</th><th>{$t("Length")}</th></tr></thead>
                 <tbody>
                   {#each resultPageItems as item}
                     <tr class:selected={selectedResultIds.has(item.fileId)} aria-selected={selectedResultIds.has(item.fileId)} tabindex="0"
                       onclick={(event) => selectResultRange(item, event)}
                       onkeydown={(event) => { if (event.key === ' ' || event.key === 'Enter') { event.preventDefault(); selectResultRange(item, event); } }}
                       ondblclick={(event) => { if (!event.shiftKey) void activateSelected(); }}>
-                      <td><span class:audiobook-icon={Boolean(item.audiobook)} class="file-icon">{item.audiobook ? '▥' : '▶'}</span>{item.name}</td><td>{item.format}</td><td class="number">{item.size}</td><td class="number"><span class="source-dot"></span>{item.sources}</td><td>{item.speed}</td><td>{item.length}</td>
+                      <td><span class:audiobook-icon={Boolean(item.audiobook)} class="file-icon">{item.audiobook ? '▥' : '▶'}</span>{item.name}</td><td>{item.format}</td><td class="number">{item.size}</td><td class="number"><span class="source-dot"></span>{item.sources}</td><td>{$t(item.speed)}</td><td>{item.length}</td>
                     </tr>
                   {/each}
                 </tbody>
@@ -2744,185 +2855,185 @@
             </div>
             {/if}
             <div class="results-pager">
-              <button onclick={() => void changeResultPage(resultPage - 1)} disabled={resultPage === 0}>◀ Previous</button>
-              <span>{resultRangeLabel} of {results.length} loaded{browseTotalAvailable ? ` · ${resultAvailableTotal} available` : ''} · Page {resultPage + 1} of {resultPageTotal}{browseCursor ? '+' : ''}</span>
-              <button onclick={() => void changeResultPage(resultPage + 1)} disabled={browseLoading || (resultPage + 1 >= resultPageTotal && !browseCursor)}>{browseLoading ? 'Loading…' : 'Next ▶'}</button>
+              <button onclick={() => void changeResultPage(resultPage - 1)} disabled={resultPage === 0}>{$t("◀ Previous")}</button>
+              <span>{$t("Showing {range} of {count} loaded", { range: resultRangeLabel, count: results.length })}{browseTotalAvailable ? $t(" · {p0} available", { p0: resultAvailableTotal }) : ''} · {$t("Page {page} of {pages}", { page: resultPage + 1, pages: resultPageTotal })}{browseCursor ? '+' : ''}</span>
+              <button onclick={() => void changeResultPage(resultPage + 1)} disabled={browseLoading || (resultPage + 1 >= resultPageTotal && !browseCursor)}>{browseLoading ? $t("Loading…") : $t("Next ▶")}</button>
             </div>
           </section>
 
           <aside class="details-pane">
-            <div class="section-caption"><span>File details</span></div>
+            <div class="section-caption"><span>{$t("File details")}</span></div>
             {#if selected}
               {#if selectedResultIds.size > 1}
                 <div class="selected-file">
                   <div class="large-file-icon">♫</div>
-                  <div><strong>{selectedResultIds.size} tracks selected</strong><span>Click a track, then Shift-click another to select a range.</span></div>
+                  <div><strong>{$t("Selected tracks: {p0}", { p0: selectedResultIds.size })}</strong><span>{$t("Click a track, then Shift-click another to select a range.")}</span></div>
                 </div>
-                <div class="detail-actions"><button class="classic-button primary" onclick={downloadSelectedResults} disabled={!nativeReady || downloadingSelection || !selectedResults().some(canDownloadResult)} aria-busy={downloadingSelection}>{downloadingSelection ? '… Requesting' : '⇩ Download All'}</button></div>
-                <p class="privacy-note"><span>♜</span> Downloads use Tor. Tracks already on this computer, queued, or without seeders are skipped.</p>
+                <div class="detail-actions"><button class="classic-button primary" onclick={downloadSelectedResults} disabled={!nativeReady || downloadingSelection || !selectedResults().some(canDownloadResult)} aria-busy={downloadingSelection}>{downloadingSelection ? $t("… Requesting") : $t("⇩ Download All")}</button></div>
+                <p class="privacy-note"><span>♜</span> {$t("Downloads use Tor. Tracks already on this computer, queued, or without seeders are skipped.")}</p>
               {:else if selected.audiobook}
                 <div class="selected-file audiobook-selected">
                   <div class="large-file-icon">▥</div>
-                  <div><strong>{selected.audiobook.title}</strong><span>Audiobook · {selected.audiobook.chapters.length} chapters · {selected.size}</span><small>Edition ID: {selected.audiobook.audiobookId}</small></div>
+                  <div><strong>{selected.audiobook.title}</strong><span>{$t("Audiobook ·")} {selected.audiobook.chapters.length} {$t("chapters ·")} {selected.size}</span><small>{$t("Edition ID:")} {selected.audiobook.audiobookId}</small></div>
                 </div>
-                <div class="file-metadata"><p><b>{selected.audiobook.author || 'Unknown author'}</b>{selected.audiobook.narrator ? ` · Narrated by ${selected.audiobook.narrator}` : ''}</p><small>Chapters are ordered and each file is independently SHA-256 verified.</small></div>
-                <div class="audiobook-chapters" aria-label="Audiobook chapters">
+                <div class="file-metadata"><p><b>{selected.audiobook.author || $t("Unknown author")}</b>{selected.audiobook.narrator ? $t(" · Narrated by {p0}", { p0: selected.audiobook.narrator }) : ''}</p><small>{$t("Chapters are ordered and each file is independently SHA-256 verified.")}</small></div>
+                <div class="audiobook-chapters" aria-label={$t("Audiobook chapters")}>
                   {#each selected.audiobook.chapters as chapter}
                     <button
                       type="button"
                       class:chapter-local={isLocalFile(chapter.fileId)}
                       class:chapter-playing={currentTrack?.fileId === chapter.fileId}
                       disabled={!isLocalFile(chapter.fileId)}
-                      title={isLocalFile(chapter.fileId) ? `Play ${chapter.title}` : `${chapter.title} has not downloaded yet`}
+                      title={isLocalFile(chapter.fileId) ? $t("Play {p0}", { p0: chapter.title }) : $t("{p0} has not downloaded yet", { p0: chapter.title })}
                       onclick={() => playAudiobookChapter(selected!.audiobook!, chapter.fileId)}
-                    ><span>{String(chapter.position).padStart(2, '0')}</span><b>{chapter.title}</b><small>{readableSize(chapter.size)}</small><i>{audiobookChapterStatus(selected.audiobook!, chapter)}</i></button>
+                    ><span>{String(chapter.position).padStart(2, '0')}</span><b>{chapter.title}</b><small>{readableSize(chapter.size)}</small><i>{$t(audiobookChapterStatus(selected.audiobook!, chapter))}</i></button>
                   {/each}
                 </div>
-                <div class="detail-actions">{#if selectedAudiobookComplete()}<button class="classic-button primary" onclick={playSelectedAudiobook}>▶ Play book</button><button class="classic-button" onclick={openNapstrFolder}>Open folder</button>{:else}<button class="classic-button primary" disabled={selectedAudiobookDownloading()} onclick={downloadSelectedAudiobook}>⇩ {selectedAudiobookDownloading() ? 'Downloading…' : 'Download book'}</button>{/if}</div>
-                {#if !selected.audiobook.local}<p class="privacy-note"><span>♜</span> Chapters download first-to-last through private Tor onion services. Play each chapter as soon as it shows Ready.</p>{:else}<p class="privacy-note"><span>♬</span> This complete audiobook is ready to play.</p>{/if}
+                <div class="detail-actions">{#if selectedAudiobookComplete()}<button class="classic-button primary" onclick={playSelectedAudiobook}>{$t("▶ Play book")}</button><button class="classic-button" onclick={openNapstrFolder}>{$t("Open folder")}</button>{:else}<button class="classic-button primary" disabled={selectedAudiobookDownloading()} onclick={downloadSelectedAudiobook}>⇩ {selectedAudiobookDownloading() ? $t("Downloading…") : $t("Download book")}</button>{/if}</div>
+                {#if !selected.audiobook.local}<p class="privacy-note"><span>♜</span> {$t("Chapters download first-to-last through private Tor onion services. Play each chapter as soon as it shows Ready.")}</p>{:else}<p class="privacy-note"><span>♬</span> {$t("This complete audiobook is ready to play.")}</p>{/if}
               {:else}
               <div class="detail-cover">
                 <CoverArt artist={selected.artist ?? ''} album={selected.album ?? ''} size="large" revision={coverRevision} />
               </div>
               {#if selected.artist && selected.album}
-                <div class="detail-actions"><button class="classic-button" onclick={() => void openCoverPicker(selected?.artist ?? '', selected?.album ?? '')}>Fix album art…</button><button class="classic-button" title="Report the cover published for this album as a NIP-56 report" onclick={() => openCoverReport(selected?.artist ?? '', selected?.album ?? '')}>Report cover…</button></div>
+                <div class="detail-actions"><button class="classic-button" onclick={() => void openCoverPicker(selected?.artist ?? '', selected?.album ?? '')}>{$t("Fix album art…")}</button><button class="classic-button" title={$t("Report the cover published for this album as a NIP-56 report")} onclick={() => openCoverReport(selected?.artist ?? '', selected?.album ?? '')}>{$t("Report cover…")}</button></div>
               {/if}
               <div class="selected-file">
                 <div class="large-file-icon">▶</div>
-                <div><strong>{selected.name}</strong><span>{selected.format} · {selected.size} · {selected.length}</span><small>File ID: {selected.fileId}</small></div>
+                <div><strong>{selected.name}</strong><span>{selected.format} · {selected.size} · {selected.length}</span><small>{$t("File ID:")} {selected.fileId}</small></div>
               </div>
-              {#if selected.artist || selected.album}<div class="file-metadata"><small>{selected.artist ? `Artist: ${selected.artist}` : ''}{selected.artist && selected.album ? ' · ' : ''}{selected.album ? `Album: ${selected.album}` : ''}</small></div>{/if}
-              {#if selected.tags}<div class="file-metadata"><small>Tags: {selected.tags}</small></div>{/if}
-              <fieldset><legend>Seeders</legend>
+              {#if selected.artist || selected.album}<div class="file-metadata"><small>{selected.artist ? $t("Artist: {p0}", { p0: selected.artist }) : ''}{selected.artist && selected.album ? ' · ' : ''}{selected.album ? $t("Album: {p0}", { p0: selected.album }) : ''}</small></div>{/if}
+              {#if selected.tags}<div class="file-metadata"><small>{$t("Tags:")} {selected.tags}</small></div>{/if}
+              <fieldset><legend>{$t("Seeders")}</legend>
                 <div class="sources-list">
                   {#if !isLocalFile(selected.fileId)}
                     {#each (selected.sourceDetails ?? []).slice(0, VISIBLE_SEEDER_LIMIT) as source, index}
-                      <div class:selected-source={selectedSource === index} class="source-row"><button class="user-icon source-select" title={`Select ${source.displayName} for profile and moderation actions`} onclick={() => (selectedSource = index)}>☺</button><button class="user-name" title={`Browse songs shared by ${source.displayName}`} onclick={() => browseUser(source)}>{source.displayName}</button><small>{source.npub.slice(0, 12)}…</small><span class="online"><i></i> Seeding</span></div>
+                      <div class:selected-source={selectedSource === index} class="source-row"><button class="user-icon source-select" title={$t("Select {p0} for profile and moderation actions", { p0: source.displayName })} onclick={() => (selectedSource = index)}>☺</button><button class="user-name" title={$t("Browse songs shared by {p0}", { p0: source.displayName })} onclick={() => browseUser(source)}>{source.displayName}</button><small>{source.npub.slice(0, 12)}…</small><span class="online"><i></i> {$t("Seeding")}</span></div>
                     {/each}
                   {:else}
-                    <div><span class="user-icon">☺</span><b>This computer</b><small>Local</small><span class="online"><i></i> Ready</span></div>
+                    <div><span class="user-icon">☺</span><b>{$t("This computer")}</b><small>{$t("Local")}</small><span class="online"><i></i> {$t("Ready")}</span></div>
                   {/if}
                 </div>
               </fieldset>
-              <div class="detail-actions">{#if !isLocalFile(selected.fileId)}<button class="classic-button primary" disabled={startingDownloads.has(selected.fileId)} onclick={() => startDownload()}>{startingDownloads.has(selected.fileId) ? '… Requesting' : '⇩ Download'}</button><button class="classic-button" onclick={() => (sourceProfile = selected?.sourceDetails?.[selectedSource] ?? null)}>View profile</button>{:else}<button class="classic-button primary" onclick={playSelectedAudio}>▶ Play</button><button class="classic-button" onclick={openNapstrFolder}>Open folder</button>{/if}</div>
-              {#if !isLocalFile(selected.fileId)}<div class="detail-actions moderation-actions"><button class="classic-button" onclick={blockSelectedFile}>Block file</button><button class="classic-button" onclick={blockSelectedUser}>Block user</button></div>{/if}
-              {#if !isLocalFile(selected.fileId)}<p class="privacy-note"><span>♜</span> Transfer will use the seeder’s private, app-session Tor onion service.</p>{:else}<p class="privacy-note"><span>♬</span> Downloaded and verified · ready to play from your Napstr folder.</p>{/if}
-              <section class="track-discussion" aria-label={`Discussion for ${selected.name}`}>
-                <div class="track-discussion-title"><b>Track discussion</b><small>Public · Nostr</small></div>
-                <div class="track-discussion-log" bind:this={trackDiscussionLog} aria-live="polite">
-                  {#if trackDiscussionLoading}<p class="trollbox-notice">Loading comments…</p>{/if}
-                  {#if !trackDiscussionLoading && trackDiscussionMessages.length === 0 && !trackDiscussionError}<p class="trollbox-notice">No comments yet.</p>{/if}
+              <div class="detail-actions">{#if !isLocalFile(selected.fileId)}<button class="classic-button primary" disabled={startingDownloads.has(selected.fileId)} onclick={() => startDownload()}>{startingDownloads.has(selected.fileId) ? $t("… Requesting") : $t("⇩ Download")}</button><button class="classic-button" onclick={() => (sourceProfile = selected?.sourceDetails?.[selectedSource] ?? null)}>{$t("View profile")}</button>{:else}<button class="classic-button primary" onclick={playSelectedAudio}>{$t("▶ Play")}</button><button class="classic-button" onclick={openNapstrFolder}>{$t("Open folder")}</button>{/if}</div>
+              {#if !isLocalFile(selected.fileId)}<div class="detail-actions moderation-actions"><button class="classic-button" onclick={blockSelectedFile}>{$t("Block file")}</button><button class="classic-button" onclick={blockSelectedUser}>{$t("Block user")}</button></div>{/if}
+              {#if !isLocalFile(selected.fileId)}<p class="privacy-note"><span>♜</span> {$t("Transfer will use the seeder’s private, app-session Tor onion service.")}</p>{:else}<p class="privacy-note"><span>♬</span> {$t("Downloaded and verified · ready to play from your Napstr folder.")}</p>{/if}
+              <section class="track-discussion" aria-label={$t("Discussion for {p0}", { p0: selected.name })}>
+                <div class="track-discussion-title"><b>{$t("Track discussion")}</b><small>{$t(trackDiscussionLoading ? "Loading…" : "Public · Nostr")}</small></div>
+                <div class="track-discussion-log" use:openChatLog bind:this={trackDiscussionLog} aria-live="polite" aria-busy={trackDiscussionLoading} onscroll={(event) => { if (event.currentTarget.scrollTop < 32) void refreshTrackDiscussion(selected?.fileId, false, true); }}>
+                  {#if trackDiscussionLoading && !trackDiscussionMessages.length}<p class="trollbox-notice">{$t("Loading comments…")}</p>{/if}
+                  {#if !trackDiscussionLoading && trackDiscussionMessages.length === 0 && !trackDiscussionError}<p class="trollbox-notice">{$t("No comments yet.")}</p>{/if}
                   {#each trackDiscussionMessages as message (message.eventId)}
-                    <div class="trollbox-message"><button class="trollbox-name" style:color={chatNameColor(message.npub)} title={`Browse songs shared by ${message.displayName} · ${message.npub}`} onclick={() => browseUser(message)}>{message.displayName}:</button><span>{message.content}</span>{#if message.npub !== identityNpub}<button class="chat-block" aria-label={`Block ${message.displayName}`} onclick={() => blockTrollboxUser(message)}>Block</button>{/if}</div>
+                    <div class="trollbox-message"><button class="trollbox-name" style:color={chatNameColor(message.npub)} title={$t("Browse songs shared by {p0} · {p1}", { p0: message.displayName, p1: message.npub })} onclick={() => browseUser(message)}>{message.displayName}:</button><span>{message.content}</span>{#if message.npub !== identityNpub}<button class="chat-block" aria-label={$t("Block {p0}", { p0: message.displayName })} onclick={() => blockTrollboxUser(message)}>{$t("Block")}</button>{/if}</div>
                   {/each}
                 </div>
                 {#if trackDiscussionError}<div class="track-discussion-error">{trackDiscussionError}</div>{/if}
                 <div class="track-discussion-compose">
-                  <input bind:value={trackDiscussionDraft} maxlength="500" autocomplete="off" placeholder={networkConnected ? 'Comment on this track…' : 'Connect to Nostr to comment'} disabled={!networkConnected || trackDiscussionSending} aria-label="Track discussion comment" onkeydown={(event) => { if (event.key === 'Enter') { event.preventDefault(); void sendTrackDiscussionMessage(); } }} />
-                  <button class="classic-button primary" type="button" disabled={!networkConnected || trackDiscussionSending || !trackDiscussionDraft.trim()} onclick={() => void sendTrackDiscussionMessage()}>{trackDiscussionSending ? '…' : 'Send'}</button>
+                  <input bind:value={trackDiscussionDraft} maxlength="500" autocomplete="off" placeholder={networkConnected ? $t("Comment on this track…") : $t("Connect to Nostr to comment")} disabled={!networkConnected || trackDiscussionSending} aria-label={$t("Track discussion comment")} onkeydown={(event) => { if (event.key === 'Enter') { event.preventDefault(); void sendTrackDiscussionMessage(); } }} />
+                  <button class="classic-button primary" type="button" disabled={!networkConnected || trackDiscussionSending || !trackDiscussionDraft.trim()} onclick={() => void sendTrackDiscussionMessage()}>{trackDiscussionSending ? '…' : $t("Send")}</button>
                 </div>
               </section>
               {/if}
-            {:else}<p class="empty-state">Select a result to see active seeders.</p>{/if}
+            {:else}<p class="empty-state">{$t("Select a result to see active seeders.")}</p>{/if}
           </aside>
         </div>
       {:else if activeView === 'Downloads'}
         <section class="full-panel downloads-view">
-          <div class="panel-title"><span></span><b>Download Manager</b><span></span></div>
-          <div class="actionbar"><button class="classic-button" onclick={togglePause}>{paused ? '▶ Resume all' : 'Ⅱ Pause all'}</button><button class="classic-button" onclick={openNapstrFolder}>Open Napstr folder</button><button class="classic-button" onclick={clearFinishedTransfers} disabled={clearingTransfers || !transfers.some(isFinishedTransfer)}>Clear finished</button><button class="classic-button" onclick={clearAllTransfers} disabled={clearingTransfers || removingTransfers.size > 0 || (!transfers.length && !audiobookDownloads.length && !startingDownloads.size)}>{clearingTransfers ? 'Clearing…' : 'Clear all'}</button><div class="spacer"></div><span>{transfers.filter(isActiveTransfer).length} active · {transfers.filter(isCompleteTransfer).length} ready to play</span></div>
+          <div class="panel-title"><span></span><b>{$t("Download Manager")}</b><span></span></div>
+          <div class="actionbar"><button class="classic-button" onclick={togglePause}>{paused ? $t("▶ Resume all") : $t("Ⅱ Pause all")}</button><button class="classic-button" onclick={openNapstrFolder}>{$t("Open Napstr folder")}</button><button class="classic-button" onclick={clearFinishedTransfers} disabled={clearingTransfers || !transfers.some(isFinishedTransfer)}>{$t("Clear finished")}</button><button class="classic-button" onclick={clearAllTransfers} disabled={clearingTransfers || removingTransfers.size > 0 || (!transfers.length && !audiobookDownloads.length && !startingDownloads.size)}>{clearingTransfers ? $t("Clearing…") : $t("Clear all")}</button><div class="spacer"></div><span>{transfers.filter(isActiveTransfer).length} {$t("active ·")} {transfers.filter(isCompleteTransfer).length} {$t("ready to play")}</span></div>
           <div class="download-queue">
             {#each audiobookDownloads as book}
-              <div class="audiobook-download-row"><span class="audiobook-glyph">▥</span><b>{book.title}</b><div class="progress"><span style={`width:${book.chapters.length ? (book.nextIndex / book.chapters.length) * 100 : 0}%`}></span><b>{book.nextIndex}/{book.chapters.length}</b></div><span>{book.activeFileId ? `Downloading chapter ${book.nextIndex + 1}` : 'Preparing next chapter'}</span></div>
+              <div class="audiobook-download-row"><span class="audiobook-glyph">▥</span><b>{book.title}</b><div class="progress"><span style={`width:${book.chapters.length ? (book.nextIndex / book.chapters.length) * 100 : 0}%`}></span><b>{book.nextIndex}/{book.chapters.length}</b></div><span>{book.activeFileId ? $t("Downloading chapter {p0}", { p0: book.nextIndex + 1 }) : $t("Preparing next chapter")}</span></div>
             {/each}
-            <table class="file-table download-table"><thead><tr><th>Download order</th><th>Progress</th><th>Size</th><th>Speed</th><th>Status</th><th></th></tr></thead><tbody>
+            <table class="file-table download-table"><thead><tr><th>{$t("Download order")}</th><th>{$t("Progress")}</th><th>{$t("Size")}</th><th>{$t("Speed")}</th><th>{$t("Status")}</th><th></th></tr></thead><tbody>
               {#each transfers as transfer}
-                <tr class:transfer-complete={isCompleteTransfer(transfer)} ondblclick={() => { if (isCompleteTransfer(transfer)) playAudio(transfer.fileId, transfer.name, playerMode, 'downloads'); }}><td><span class="download-arrow">{isCompleteTransfer(transfer) ? '▶' : '⇩'}</span>{transfer.name}</td><td><div class="progress"><span style={`width:${transfer.progress}%`}></span><b>{Math.round(transfer.progress)}%</b></div></td><td>{transfer.size}</td><td>{isCompleteTransfer(transfer) ? 'Local' : transfer.speed}</td><td>{isCompleteTransfer(transfer) ? 'Ready to play' : transfer.status}</td><td class="transfer-actions">{#if isCompleteTransfer(transfer)}<button class="classic-button transfer-play" onclick={(event) => { event.stopPropagation(); playAudio(transfer.fileId, transfer.name, playerMode, 'downloads'); }} title="Play verified audio">▶ Play</button>{/if}<button class="tiny-button" disabled={clearingTransfers || removingTransfers.has(transfer.id)} onclick={(event) => { event.stopPropagation(); removeTransfer(transfer.id); }} aria-label={`Remove transfer: ${transfer.name}`} title="Cancel and clear entry; keep completed audio">×</button></td></tr>
+                <tr class:transfer-complete={isCompleteTransfer(transfer)} ondblclick={() => { if (isCompleteTransfer(transfer)) playAudio(transfer.fileId, transfer.name, playerMode, 'downloads'); }}><td><span class="download-arrow">{isCompleteTransfer(transfer) ? '▶' : '⇩'}</span>{transfer.name}</td><td><div class="progress"><span style={`width:${transfer.progress}%`}></span><b>{Math.round(transfer.progress)}%</b></div></td><td>{transfer.size}</td><td>{isCompleteTransfer(transfer) ? $t("Local") : transfer.speed}</td><td>{isCompleteTransfer(transfer) ? $t("Ready to play") : transfer.status}</td><td class="transfer-actions">{#if isCompleteTransfer(transfer)}<button class="classic-button transfer-play" onclick={(event) => { event.stopPropagation(); playAudio(transfer.fileId, transfer.name, playerMode, 'downloads'); }} title={$t("Play verified audio")}>{$t("▶ Play")}</button>{/if}<button class="tiny-button" disabled={clearingTransfers || removingTransfers.has(transfer.id)} onclick={(event) => { event.stopPropagation(); removeTransfer(transfer.id); }} aria-label={$t("Remove transfer: {p0}", { p0: transfer.name })} title={$t("Cancel and clear entry; keep completed audio")}>×</button></td></tr>
               {/each}
             </tbody></table>
-            {#if transfers.length === 0}<p class="empty-state compact">There are no downloads in the queue.</p>{/if}
+            {#if transfers.length === 0}<p class="empty-state compact">{$t("There are no downloads in the queue.")}</p>{/if}
           </div>
-          <div class="panel-title"><span></span><b>Track Tags</b><span></span></div>
+          <div class="panel-title"><span></span><b>{$t("Track Tags")}</b><span></span></div>
           <div class="tag-editor">
-            <b>{selectedTagFile?.filename ?? 'Select a local track below'}</b>
-            <input bind:value={tagDraft} disabled={!selectedTagFile || tagSaving} maxlength="256" placeholder="punk, live, audiobook" onkeydown={(event) => { if (event.key === 'Enter') saveTags(); }} />
-            <button class="classic-button primary" onclick={saveTags} disabled={!selectedTagFile || tagSaving}>{tagSaving ? 'Saving…' : 'Save tags'}</button>
-            <small>Comma-separated · published with your signed catalogue</small>
+            <b>{selectedTagFile?.filename ?? $t("Select a local track below")}</b>
+            <input bind:value={tagDraft} disabled={!selectedTagFile || tagSaving} maxlength="256" placeholder={$t("punk, live, audiobook")} onkeydown={(event) => { if (event.key === 'Enter') saveTags(); }} />
+            <button class="classic-button primary" onclick={saveTags} disabled={!selectedTagFile || tagSaving}>{tagSaving ? $t("Saving…") : $t("Save tags")}</button>
+            <small>{$t("Comma-separated · published with your signed catalogue")}</small>
           </div>
           <div class="tag-library">
-            <table class="file-table tags-table"><thead><tr><th>Name</th><th>Folder</th><th>Tags</th></tr></thead><tbody>
+            <table class="file-table tags-table"><thead><tr><th>{$t("Name")}</th><th>{$t("Folder")}</th><th>{$t("Tags")}</th></tr></thead><tbody>
               {#each paginatedTagFiles() as file}
-                <tr class:selected={selectedTagFile?.fileId === file.fileId} onclick={() => selectTagFile(file)} ondblclick={() => playAudio(file.fileId, file.filename, playerMode, 'downloads')}><td><button type="button" class="file-icon file-play-button" title={`Play ${file.filename}`} aria-label={`Play ${file.filename}`} onclick={(event) => { event.stopPropagation(); selectTagFile(file); playAudio(file.fileId, file.filename, playerMode, 'downloads'); }}>▶</button>{file.filename}</td><td>{folderName(file.folder)}</td><td>{file.tags || '—'}</td></tr>
+                <tr class:selected={selectedTagFile?.fileId === file.fileId} onclick={() => selectTagFile(file)} ondblclick={() => playAudio(file.fileId, file.filename, playerMode, 'downloads')}><td><button type="button" class="file-icon file-play-button" title={$t("Play {p0}", { p0: file.filename })} aria-label={$t("Play {p0}", { p0: file.filename })} onclick={(event) => { event.stopPropagation(); selectTagFile(file); playAudio(file.fileId, file.filename, playerMode, 'downloads'); }}>▶</button>{file.filename}</td><td>{folderName(file.folder)}</td><td>{file.tags || '—'}</td></tr>
               {/each}
             </tbody></table>
-            {#if sharedFiles.length === 0}<p class="empty-state compact">Downloaded and shared tracks will appear here.</p>{/if}
+            {#if sharedFiles.length === 0}<p class="empty-state compact">{$t("Downloaded and shared tracks will appear here.")}</p>{/if}
           </div>
-          {#if sharedFiles.length > LOCAL_PAGE_SIZE}<div class="results-pager"><button disabled={downloadLibraryPage === 0} onclick={() => changeDownloadLibraryPage(downloadLibraryPage - 1)}>◀ Previous</button><span>{localPageRange(downloadLibraryPage, sharedFiles.length)} of {sharedFiles.length} · Page {downloadLibraryPage + 1} of {localPageCount(sharedFiles)}</span><button disabled={downloadLibraryPage + 1 >= localPageCount(sharedFiles)} onclick={() => changeDownloadLibraryPage(downloadLibraryPage + 1)}>Next ▶</button></div>{/if}
+          {#if sharedFiles.length > LOCAL_PAGE_SIZE}<div class="results-pager"><button disabled={downloadLibraryPage === 0} onclick={() => changeDownloadLibraryPage(downloadLibraryPage - 1)}>{$t("◀ Previous")}</button><span>{$t("Showing {range} of {count} loaded", { range: localPageRange(downloadLibraryPage, sharedFiles.length), count: sharedFiles.length })} · {$t("Page {page} of {pages}", { page: downloadLibraryPage + 1, pages: localPageCount(sharedFiles) })}</span><button disabled={downloadLibraryPage + 1 >= localPageCount(sharedFiles)} onclick={() => changeDownloadLibraryPage(downloadLibraryPage + 1)}>{$t("Next ▶")}</button></div>{/if}
         </section>
       {:else if activeView === 'Shared'}
         <section class="full-panel">
-          <div class="panel-title"><span></span><b>My Shared Files</b><span></span></div>
-          <div class="actionbar"><button class="classic-button" onclick={indexing ? cancelLibraryScan : rescanSharedFolder}>{indexing ? '× Cancel scan' : rescanPending ? '… Rescanning' : '↻ Rescan'}</button><button class="classic-button" onclick={openNapstrFolder}>Open folder</button><button class="classic-button" onclick={playSelectedSharedAudio} disabled={!selectedShared}>▶ Play</button><button class="classic-button" onclick={playSelectedFolder} disabled={!selectedShared}>▶ Play folder</button><button class="classic-button primary" onclick={playAllSongs} disabled={!sharedFiles.length}>▶ Play all</button><button class="classic-button audiobook-button" onclick={openAudiobookEditor} disabled={libraryFolderView === '*' || audiobookFolderFiles().length < 1}>▥ {currentFolderAudiobook() ? 'Edit audiobook' : 'Group as audiobook…'}</button><div class="spacer"></div><span>Sharing {sharedFiles.length} files · {readableSize(indexedBytes)}</span></div>
-          <div class="folder-path"><b>Napstr folder:</b><input value={napstrFolder || 'No folder selected'} readonly /><button class="classic-button" onclick={chooseNapstrFolder}>Browse…</button></div>
+          <div class="panel-title"><span></span><b>{$t("My Shared Files")}</b><span></span></div>
+          <div class="actionbar"><button class="classic-button" onclick={indexing ? cancelLibraryScan : rescanSharedFolder}>{indexing ? $t("× Cancel scan") : rescanPending ? $t("… Rescanning") : $t("↻ Rescan")}</button><button class="classic-button" onclick={openNapstrFolder}>{$t("Open folder")}</button><button class="classic-button" onclick={playSelectedSharedAudio} disabled={!selectedShared}>{$t("▶ Play")}</button><button class="classic-button" onclick={playSelectedFolder} disabled={!selectedShared}>{$t("▶ Play folder")}</button><button class="classic-button primary" onclick={playAllSongs} disabled={!sharedFiles.length}>{$t("▶ Play all")}</button><button class="classic-button audiobook-button" onclick={openAudiobookEditor} disabled={libraryFolderView === '*' || audiobookFolderFiles().length < 1}>▥ {currentFolderAudiobook() ? $t("Edit audiobook") : $t("Group as audiobook…")}</button><div class="spacer"></div><span>{$t("Sharing")} {sharedFiles.length} {$t("files ·")} {readableSize(indexedBytes)}</span></div>
+          <div class="folder-path"><b>{$t("Napstr folder:")}</b><input value={napstrFolder || 'No folder selected'} readonly /><button class="classic-button" onclick={chooseNapstrFolder}>{$t("Browse…")}</button></div>
           <div class="library-filter">
-            <span class="library-filter-label">View folder:</span>
+            <span class="library-filter-label">{$t("View folder:")}</span>
             <div class="folder-picker" use:containLibraryFolderMenu>
-              <button type="button" class="folder-picker-toggle" aria-haspopup="listbox" aria-expanded={libraryFolderMenuOpen} onclick={() => (libraryFolderMenuOpen = !libraryFolderMenuOpen)} title={libraryFolderView === '*' ? 'All folders' : folderName(libraryFolderView)}>
-                <span>{libraryFolderView === '*' ? 'All folders' : folderName(libraryFolderView)}</span><i aria-hidden="true">▼</i>
+              <button type="button" class="folder-picker-toggle" aria-haspopup="listbox" aria-expanded={libraryFolderMenuOpen} onclick={() => (libraryFolderMenuOpen = !libraryFolderMenuOpen)} title={libraryFolderView === '*' ? $t("All folders") : folderName(libraryFolderView)}>
+                <span>{libraryFolderView === '*' ? $t("All folders") : folderName(libraryFolderView)}</span><i aria-hidden="true">▼</i>
               </button>
               {#if libraryFolderMenuOpen}
-                <div class="folder-picker-menu" role="listbox" aria-label="View folder">
-                  <button type="button" role="option" aria-selected={libraryFolderView === '*'} class:selected={libraryFolderView === '*'} onclick={() => selectLibraryFolder('*')}>All folders</button>
-                  {#each libraryFolders() as folder}
+                <div class="folder-picker-menu" role="listbox" aria-label={$t("View folder")}>
+                  <button type="button" role="option" aria-selected={libraryFolderView === '*'} class:selected={libraryFolderView === '*'} onclick={() => selectLibraryFolder('*')}>{$t("All folders")}</button>
+                  {#each sharedFolders as folder}
                     <button type="button" role="option" aria-selected={libraryFolderView === folder} class:selected={libraryFolderView === folder} onclick={() => selectLibraryFolder(folder)} title={folderName(folder)}>{folderName(folder)}</button>
                   {/each}
                 </div>
               {/if}
             </div>
-            <span class="library-song-count">{visibleSharedFiles().length} song{visibleSharedFiles().length === 1 ? '' : 's'} shown</span>
+            <span class="library-song-count">{$t("Songs shown: {p0}", { p0: sharedVisible.length })}</span>
           </div>
-          {#if !currentFolderAudiobook() && libraryFolderView.toLowerCase().includes('audiobook') && audiobookFolderFiles().length >= 1}<div class="audiobook-folder-banner"><span class="audiobook-glyph">▥</span><div><b>Possible audiobook detected</b><small>Review the natural chapter order before making the collection public.</small></div><button class="classic-button primary" onclick={openAudiobookEditor}>Group as audiobook…</button></div>{/if}
-          {#if currentFolderAudiobook()}<div class="audiobook-folder-banner"><span class="audiobook-glyph">▥</span><div><b>{currentFolderAudiobook()?.title}</b><small>{currentFolderAudiobook()?.author || 'Unknown author'} · {currentFolderAudiobook()?.chapters.length} ordered chapters · published as one audiobook</small></div><button class="classic-button primary" onclick={() => playAudiobook(currentFolderAudiobook()!)}>▶ Play book</button></div>{/if}
-          <table class="file-table shared-table"><thead><tr><th>Name</th><th>Folder</th><th>Size</th><th>Catalogue</th><th>Active peers</th></tr></thead><tbody>{#each paginatedSharedFiles() as file}<tr class:selected={selectedShared?.fileId === file.fileId} onclick={() => (selectedShared = { ...file })} ondblclick={() => playAudio(file.fileId, file.name, playerMode, 'shared')}><td><span class="file-icon">▶</span>{file.name}</td><td>{folderName(file.folder)}</td><td>{file.readableSize}</td><td><span class:amber={!networkConnected} class="led"></span>{networkConnected ? 'Published' : 'Indexed'}</td><td>{file.peers}</td></tr>{/each}</tbody></table>
-          {#if visibleSharedFiles().length > LOCAL_PAGE_SIZE}<div class="results-pager"><button disabled={sharedLibraryPage === 0} onclick={() => changeSharedLibraryPage(sharedLibraryPage - 1)}>◀ Previous</button><span>{localPageRange(sharedLibraryPage, visibleSharedFiles().length)} of {visibleSharedFiles().length} · Page {sharedLibraryPage + 1} of {localPageCount(visibleSharedFiles())}</span><button disabled={sharedLibraryPage + 1 >= localPageCount(visibleSharedFiles())} onclick={() => changeSharedLibraryPage(sharedLibraryPage + 1)}>Next ▶</button></div>{/if}
-          <p class="privacy-note wide"><span>♜</span> Only validated MP3, FLAC, WAV, Ogg Vorbis, and Opus audio is indexed recursively. Put book folders or complete one-file books inside Audiobooks for automatic grouping. Existing contents are never replaced. Folder names remain local and embedded cover artwork is allowed.</p>
+          {#if !currentFolderAudiobook() && libraryFolderView.toLowerCase().includes('audiobook') && audiobookFolderFiles().length >= 1}<div class="audiobook-folder-banner"><span class="audiobook-glyph">▥</span><div><b>{$t("Possible audiobook detected")}</b><small>{$t("Review the natural chapter order before making the collection public.")}</small></div><button class="classic-button primary" onclick={openAudiobookEditor}>{$t("Group as audiobook…")}</button></div>{/if}
+          {#if currentFolderAudiobook()}<div class="audiobook-folder-banner"><span class="audiobook-glyph">▥</span><div><b>{currentFolderAudiobook()?.title}</b><small>{currentFolderAudiobook()?.author || $t("Unknown author")} · {currentFolderAudiobook()?.chapters.length} {$t("ordered chapters · published as one audiobook")}</small></div><button class="classic-button primary" onclick={() => playAudiobook(currentFolderAudiobook()!)}>{$t("▶ Play book")}</button></div>{/if}
+          <table class="file-table shared-table"><thead><tr><th>{$t("Name")}</th><th>{$t("Folder")}</th><th>{$t("Size")}</th><th>{$t("Catalogue")}</th><th>{$t("Active peers")}</th></tr></thead><tbody>{#each sharedRows as file}<tr class:selected={selectedShared?.fileId === file.fileId} onclick={() => (selectedShared = { ...file })} ondblclick={() => playAudio(file.fileId, file.name, playerMode, 'shared')}><td><span class="file-icon">▶</span>{file.name}</td><td>{folderName(file.folder)}</td><td>{file.readableSize}</td><td><span class:amber={!networkConnected} class="led"></span>{networkConnected ? $t("Published") : $t("Indexed")}</td><td>{file.peers}</td></tr>{/each}</tbody></table>
+          {#if sharedVisible.length > LOCAL_PAGE_SIZE}<div class="results-pager"><button disabled={sharedLibraryPage === 0} onclick={() => changeSharedLibraryPage(sharedLibraryPage - 1)}>{$t("◀ Previous")}</button><span>{$t("Showing {range} of {count} loaded", { range: localPageRange(sharedLibraryPage, sharedVisible.length), count: sharedVisible.length })} · {$t("Page {page} of {pages}", { page: sharedLibraryPage + 1, pages: sharedPageCount })}</span><button disabled={sharedLibraryPage + 1 >= sharedPageCount} onclick={() => changeSharedLibraryPage(sharedLibraryPage + 1)}>{$t("Next ▶")}</button></div>{/if}
+          <p class="privacy-note wide"><span>♜</span> {$t("Only validated MP3, FLAC, WAV, Ogg Vorbis, and Opus audio is indexed recursively. Put book folders or complete one-file books inside Audiobooks for automatic grouping. Existing contents are never replaced. Folder names remain local and embedded cover artwork is allowed.")}</p>
         </section>
       {:else if activeView === 'Trollbox'}
         <section class="full-panel trollbox-view">
-          <div class="panel-title"><span></span><b>Napstr Trollbox</b><span></span></div>
-          <div class="trollbox-status"><span><i class:amber={!networkConnected} class="led"></i> Public Nostr chat: <b>#napstr-trollbox</b></span><small>NIP-C7 messages are public and signed by your Napstr Nostr identity.</small></div>
-          <div class="trollbox-log" bind:this={trollboxLog} aria-live="polite" aria-label="Napstr public chat messages">
-            {#if trollboxLoading}<p class="trollbox-notice">Connecting to the trollbox…</p>{/if}
-            {#if !trollboxLoading && trollboxMessages.length === 0 && !trollboxError}<p class="trollbox-notice">No messages yet. Say hello.</p>{/if}
+          <div class="panel-title"><span></span><b>{$t("Napstr Trollbox")}</b><span></span></div>
+          <div class="trollbox-status"><span><i class:amber={!networkConnected} class="led"></i> {$t("Public Nostr chat:")} <b>#napstr-trollbox</b></span><small>{$t(trollboxLoading ? "Loading…" : "NIP-C7 messages are public and signed by your Napstr Nostr identity.")}</small></div>
+          <div class="trollbox-log" use:openChatLog bind:this={trollboxLog} aria-live="polite" aria-busy={trollboxLoading} onscroll={(event) => { if (event.currentTarget.scrollTop < 32) void refreshTrollbox(true); }} aria-label={$t("Napstr public chat messages")}>
+            {#if trollboxLoading && !trollboxMessages.length}<p class="trollbox-notice">{$t("Connecting to the trollbox…")}</p>{/if}
+            {#if !trollboxLoading && trollboxMessages.length === 0 && !trollboxError}<p class="trollbox-notice">{$t("No messages yet. Say hello.")}</p>{/if}
             {#each trollboxMessages as message (message.eventId)}
-              <div class="trollbox-message"><button class="trollbox-name" style:color={chatNameColor(message.npub)} title={`Browse songs shared by ${message.displayName} · ${message.npub}`} onclick={() => browseUser(message)}>{message.displayName}:</button><span>{message.content}</span>{#if message.npub !== identityNpub}<button class="chat-block" aria-label={`Block ${message.displayName}`} onclick={() => blockTrollboxUser(message)}>Block</button>{/if}</div>
+              <div class="trollbox-message"><button class="trollbox-name" style:color={chatNameColor(message.npub)} title={$t("Browse songs shared by {p0} · {p1}", { p0: message.displayName, p1: message.npub })} onclick={() => browseUser(message)}>{message.displayName}:</button><span>{message.content}</span>{#if message.npub !== identityNpub}<button class="chat-block" aria-label={$t("Block {p0}", { p0: message.displayName })} onclick={() => blockTrollboxUser(message)}>{$t("Block")}</button>{/if}</div>
             {/each}
           </div>
-          {#if trollboxError}<div class="trollbox-error">{trollboxError}</div>{/if}
+          {#if trollboxError}<div class="trollbox-error">{$t(trollboxError)}</div>{/if}
           <div class="trollbox-compose">
-            <input bind:value={trollboxDraft} maxlength="500" autocomplete="off" placeholder={networkConnected ? 'Type a public message…' : 'Connect to Nostr to chat'} disabled={!networkConnected || trollboxSending} aria-label="Trollbox message" onkeydown={(event) => { if (event.key === 'Enter') { event.preventDefault(); void sendTrollboxMessage(); } }} />
-            <button class="classic-button primary" type="button" disabled={!networkConnected || trollboxSending || !trollboxDraft.trim()} onclick={() => void sendTrollboxMessage()}>{trollboxSending ? 'Sending…' : 'Send'}</button>
+            <input bind:value={trollboxDraft} maxlength="500" autocomplete="off" placeholder={networkConnected ? $t("Type a public message…") : $t("Connect to Nostr to chat")} disabled={!networkConnected || trollboxSending} aria-label={$t("Trollbox message")} onkeydown={(event) => { if (event.key === 'Enter') { event.preventDefault(); void sendTrollboxMessage(); } }} />
+            <button class="classic-button primary" type="button" disabled={!networkConnected || trollboxSending || !trollboxDraft.trim()} onclick={() => void sendTrollboxMessage()}>{trollboxSending ? $t("Sending…") : $t("Send")}</button>
           </div>
         </section>
       {:else if activeView === 'Covers'}
         <section class="full-panel cover-scan-view">
-          <div class="panel-title"><span></span><b>Album covers</b><span></span></div>
-          <p class="privacy-note wide"><span>i</span> Napstr finds album art in two steps. Reading the kind <code>30427</code> claims other people published needs nothing switched on: it is an ordinary relay query, and it happens by itself as results appear. The two switches below are the steps that leave Napstr. Napstr acts on them on its own — there is nothing else to press — and they are stored, so leaving one on means it carries on after a restart.</p>
+          <div class="panel-title"><span></span><b>{$t("Album covers")}</b><span></span></div>
+          <p class="privacy-note wide"><span>i</span> {$t("Napstr finds album art in two steps. Reading the kind")} <code>30427</code> {$t("claims other people published needs nothing switched on: it is an ordinary relay query, and it happens by itself as results appear. The two switches below are the steps that leave Napstr. Napstr acts on them on its own — there is nothing else to press — and they are stored, so leaving one on means it carries on after a restart.")}</p>
 
           <div class="cover-scan-controls">
             <label class="cover-scan-toggle">
               <input type="checkbox" checked={coverStatus?.lookupExternal ?? false} onchange={(event) => void setCoverPreferences(event.currentTarget.checked, coverStatus?.publishClaims ?? false)} />
-              <span>Look up art automatically<small>Asks MusicBrainz and the Cover Art Archive about every album without a cover: the ones on this computer, and the albums the results pane has shown you</small></span>
+              <span>{$t("Look up art automatically")}<small>{$t("Asks MusicBrainz and the Cover Art Archive about every album without a cover: the ones on this computer, and the albums the results pane has shown you")}</small></span>
             </label>
             <label class="cover-scan-toggle">
               <input type="checkbox" checked={coverStatus?.publishClaims ?? false} onchange={(event) => void setCoverPreferences(coverStatus?.lookupExternal ?? false, event.currentTarget.checked)} />
-              <span>Sign and publish the covers I resolve<small>A kind <code>30427</code> claim signed with your own identity and sent to your relays, as fast as they can be signed</small></span>
+              <span>{$t("Sign and publish the covers I resolve")}<small>{$t("A kind")} <code>30427</code> {$t("claim signed with your own identity and sent to your relays, as fast as they can be signed")}</small></span>
             </label>
             {#if coverStatus?.running}
-              <button class="classic-button" onclick={() => void stopCoverPass()}>Stop</button>
+              <button class="classic-button" onclick={() => void stopCoverPass()}>{$t("Stop")}</button>
             {:else}
-              <button class="classic-button" onclick={() => void lookForCoversNow()} disabled={!coverOptIn(coverStatus)}>Look now</button>
+              <button class="classic-button" onclick={() => void lookForCoversNow()} disabled={!coverOptIn(coverStatus)}>{$t("Look now")}</button>
             {/if}
-            <button class="classic-button" onclick={() => void refreshCovers()} disabled={coverLoading}>Refresh</button>
+            <button class="classic-button" onclick={() => void refreshCovers()} disabled={coverLoading}>{$t("Refresh")}</button>
           </div>
 
           {#if coverError}<div class="trollbox-error">{coverError}</div>{/if}
@@ -2930,14 +3041,14 @@
           {#if coverStatus}
             <div class="cover-scan-status">
               <span><b>{coverStatus.running ? coverStatus.remaining : coverStatus.pending}</b> {coverStatus.running ? 'left in this pass' : 'in the last pass'}</span>
-              <span><b>{coverStatus.published}</b> published</span>
-              <span><b>{coverStatus.resolved}</b> resolved, not signed</span>
-              <span><b>{coverStatus.alreadyCovered}</b> covered by others</span>
-              <span><b>{coverStatus.noArt}</b> no art anywhere</span>
-              {#if coverStatus.failed}<span><b>{coverStatus.failed}</b> failed</span>{/if}
-              {#if coverStatus.backedOff}<span><b>{coverStatus.backedOff}</b> throttled waits</span>{/if}
+              <span><b>{coverStatus.published}</b> {$t("published")}</span>
+              <span><b>{coverStatus.resolved}</b> {$t("resolved, not signed")}</span>
+              <span><b>{coverStatus.alreadyCovered}</b> {$t("covered by others")}</span>
+              <span><b>{coverStatus.noArt}</b> {$t("no art anywhere")}</span>
+              {#if coverStatus.failed}<span><b>{coverStatus.failed}</b> {$t("failed")}</span>{/if}
+              {#if coverStatus.backedOff}<span><b>{coverStatus.backedOff}</b> {$t("throttled waits")}</span>{/if}
             </div>
-            {#if coverStatus.current}<p class="cover-scan-current">Working on {coverStatus.current}</p>{/if}
+            {#if coverStatus.current}<p class="cover-scan-current">{$t("Working on")} {coverStatus.current}</p>{/if}
             {#if coverStatus.message}<p class="cover-scan-message">{coverStatus.message}</p>{/if}
           {/if}
 
@@ -2947,8 +3058,8 @@
                 <div><b>{candidate.album}</b><small>{candidate.artist}</small></div>
                 <span>{candidate.trackCount} {candidate.trackCount === 1 ? 'track' : 'tracks'} · {candidate.source}</span>
                 <code title={candidate.key}>{candidate.key}</code>
-                <button class="classic-button" onclick={() => void openCoverPicker(candidate.artist, candidate.album)}>Find art…</button>
-                <button class="classic-button" title="Report the cover published for this album" onclick={() => openCoverReport(candidate.artist, candidate.album)}>Report</button>
+                <button class="classic-button" onclick={() => void openCoverPicker(candidate.artist, candidate.album)}>{$t("Find art…")}</button>
+                <button class="classic-button" title={$t("Report the cover published for this album")} onclick={() => openCoverReport(candidate.artist, candidate.album)}>{$t("Report")}</button>
               </div>
             {/each}
             {#if !coverLoading && coverQueue.length === 0}
@@ -2956,70 +3067,71 @@
             {/if}
           </div>
         </section>
-      {:else if activeView === 'Mobile'}
+      {:else if activeView === 'Napstrfy'}
         <section class="full-panel mobile-connect-view">
-          <div class="panel-title"><span></span><b>Mobile connect</b><span></span></div>
+          <div class="panel-title"><span></span><b>{$t("Napstrfy")}</b><span></span></div>
           <div class="mobile-connect-status">
-            <span><i class:amber={!mobileStatusValue?.online} class:error={Boolean(mobileStatusValue?.error)} class="led"></i><b>{mobileStatusValue?.online ? 'Iroh ready' : mobileStatusValue?.running ? 'Iroh connecting…' : 'Iroh unavailable'}</b></span>
-            <small>Napstr stays in control of discovery and Tor downloads.</small>
+            <span><i class:amber={!mobileStatusValue?.online} class:error={Boolean(mobileStatusValue?.error)} class="led"></i><b>{mobileStatusValue?.online ? $t("Iroh ready") : mobileStatusValue?.running ? $t("Iroh connecting…") : $t("Iroh unavailable")}</b></span>
+            <small>{$t("Napstr stays in control of discovery and Tor downloads.")}</small>
           </div>
-          {#if mobileError}<div class="trollbox-error">{mobileError}</div>{/if}
+          {#if mobileError}<div class="trollbox-error">{$t(mobileError)}</div>{/if}
           <div class="mobile-connect-grid">
             <section class="pair-phone-card">
-              <h2>Pair Napstrfy</h2>
-              <div class="pairing-tabs" role="tablist" aria-label="Pairing access">
+              <h2>{$t("Pair Napstrfy")}</h2>
+              <div class="pairing-tabs" role="tablist" aria-label={$t("Pairing access")}>
                 {#each [false, true] as streamOnly}
-                  <button type="button" role="tab" id={`pairing-tab-${streamOnly ? 'stream' : 'full'}`} aria-controls={`pairing-panel-${streamOnly ? 'stream' : 'full'}`} aria-selected={mobileStreamOnly === streamOnly} tabindex={mobileStreamOnly === streamOnly ? 0 : -1} onclick={() => (mobileStreamOnly = streamOnly)} onkeydown={navigatePairingTabs}>{streamOnly ? 'uncle jim' : 'Full access'}</button>
+                  <button type="button" role="tab" id={`pairing-tab-${streamOnly ? 'stream' : 'full'}`} aria-controls={`pairing-panel-${streamOnly ? 'stream' : 'full'}`} aria-selected={mobileStreamOnly === streamOnly} tabindex={mobileStreamOnly === streamOnly ? 0 : -1} onclick={() => (mobileStreamOnly = streamOnly)} onkeydown={navigatePairingTabs}>{streamOnly ? $t("uncle jim") : $t("Full access")}</button>
                 {/each}
               </div>
             {#each [false, true] as streamOnly}
               {@const offer = streamOnly ? mobileStreamPairing : mobilePairing}
               <div role="tabpanel" id={`pairing-panel-${streamOnly ? 'stream' : 'full'}`} aria-labelledby={`pairing-tab-${streamOnly ? 'stream' : 'full'}`} hidden={mobileStreamOnly !== streamOnly} tabindex="0">
-                <p>{streamOnly ? 'Read-only, listen to and cache your local music and audiobooks. The connection cannot ask Napstr to download new songs.' : 'Browse, listen, save songs for offline listening, and ask Napstr to download tracks over Tor.'}</p>
-                <p>Scan in <a href="https://napstr.net/napstrfy.html" onclick={openNapstrfyWebsite}>Napstrfy</a>. Keep Napstr open while streaming.</p>
+                <p>{streamOnly ? $t("Read-only, listen to and cache your local music and audiobooks. The connection cannot ask Napstr to download new songs.") : $t("Browse, listen, save songs for offline listening, and ask Napstr to download tracks over Tor.")}</p>
+                <p>{$t("Scan in")} <a href="https://napstr.net/napstrfy.html" onclick={openNapstrfyWebsite}>Napstrfy</a>{$t(". Keep Napstr open while streaming.")}</p>
                 {#if offer}
-                  <div class="pairing-qr" aria-label={streamOnly ? 'Read-only Napstrfy pairing QR code' : 'Full-access Napstrfy pairing QR code'}>{@html offer.qrSvg}</div>
-                  <p class="pairing-expiry">One use · expires {new Date(offer.expiresAt * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</p>
-                  <details><summary>Pair without a camera</summary><textarea readonly value={offer.ticket} aria-label={streamOnly ? 'Manual read-only pairing code' : 'Manual full-access pairing code'}></textarea></details>
-                  <button class="classic-button" onclick={() => createMobilePairing(streamOnly)} disabled={mobileLoading}>{mobileLoading ? 'Preparing…' : 'Create a new code'}</button>
+                  <div class="pairing-qr" aria-label={streamOnly ? $t("Read-only Napstrfy pairing QR code") : $t("Full-access Napstrfy pairing QR code")}>{@html offer.qrSvg}</div>
+                  <p class="pairing-expiry">{$t("One use · expires")} {new Date(offer.expiresAt * 1000).toLocaleTimeString($locale, { hour: '2-digit', minute: '2-digit' })}</p>
+                  <details><summary>{$t("Pair without a camera")}</summary><textarea readonly value={offer.ticket} aria-label={streamOnly ? $t("Manual read-only pairing code") : $t("Manual full-access pairing code")}></textarea></details>
+                  <button class="classic-button" onclick={() => createMobilePairing(streamOnly)} disabled={mobileLoading}>{mobileLoading ? $t("Preparing…") : $t("Create a new code")}</button>
                 {:else}
-                  <button class="classic-button primary" onclick={() => createMobilePairing(streamOnly)} disabled={mobileLoading}>{mobileLoading ? 'Preparing Iroh…' : 'Create pairing code'}</button>
-                  <div class="pairing-placeholder"><span>▦</span><b>Your one-use QR code will appear here</b></div>
+                  <button class="classic-button primary" onclick={() => createMobilePairing(streamOnly)} disabled={mobileLoading}>{mobileLoading ? $t("Preparing Iroh…") : $t("Create pairing code")}</button>
+                  <div class="pairing-placeholder"><span>▦</span><b>{$t("Your one-use QR code will appear here")}</b></div>
                 {/if}
               </div>
             {/each}
             </section>
             <section class="paired-devices-card">
-              <p>Napstrfy creates a private, encrypted tunnel from your phone to Napstr, letting you listen to your catalogue by connecting directly to your Napstr instance. Only for your own use and for people you trust.</p>
-              <h2>Paired phones</h2>
-              <p>Each phone keeps the access granted by its pairing code. Scan a new code to change its access.</p>
+              <p>{$t("Napstrfy creates a private, encrypted tunnel from your phone to Napstr, letting you listen to your catalogue by connecting directly to your Napstr instance. Only for your own use and for people you trust.")}</p>
+              <h2>{$t("Paired phones")}</h2>
+              <p>{$t("Each phone keeps the access granted by its pairing code. Scan a new code to change its access.")}</p>
               <div class="paired-device-list">
                 {#each mobileStatusValue?.devices ?? [] as device (device.endpointId)}
                   <div class="paired-device">
                     <span class="phone-glyph">▯</span>
-                    <div><b>{device.name}</b><small>{device.streamOnly ? 'Read only' : 'Full access'}</small><small>Last connected {mobileLastSeen(device.lastSeen)}</small><code title={device.endpointId}>{device.endpointId}</code></div>
-                    <button class="classic-button" onclick={() => revokeMobileDevice(device)}>Remove</button>
+                    <div><b>{device.name}</b><small>{device.streamOnly ? $t("Read only") : $t("Full access")}</small><small>{$t("Last connected")} {mobileLastSeen(device.lastSeen)}</small><code title={device.endpointId}>{device.endpointId}</code></div>
+                    <button class="classic-button" onclick={() => revokeMobileDevice(device)}>{$t("Remove")}</button>
                   </div>
                 {/each}
-                {#if (mobileStatusValue?.devices.length ?? 0) === 0}<p class="empty-state compact">No phones are paired yet.</p>{/if}
+                {#if (mobileStatusValue?.devices.length ?? 0) === 0}<p class="empty-state compact">{$t("No phones are paired yet.")}</p>{/if}
               </div>
-              <p class="privacy-note wide"><span>i</span> The QR secret is random, expires after five minutes, and is invalidated by the first successful pairing. Removing a phone immediately revokes future connections.</p>
+              <p class="privacy-note wide"><span>i</span> {$t("The QR secret is random, expires after five minutes, and is invalidated by the first successful pairing. Removing a phone immediately revokes future connections.")}</p>
             </section>
           </div>
         </section>
       {:else if activeView === 'Profile'}
         <section class="full-panel profile-view">
-          <div class="panel-title"><span></span><b>Napstr Profile</b><span></span></div>
-          <div class="profile-card"><div class="avatar"><img src="/napstr-logo.png" alt="Napstr mascot" /></div><div><h2><button class="user-name" disabled={!identityNpub} onclick={() => browseUser(ownCatalogueUser())}>{displayName}</button></h2><p>Your dedicated Napstr Nostr identity.</p><code>{identityNpub || 'Connect to create identity'}</code><div class="profile-stats"><span><b>{sharedFiles.length}</b> shared files</span><span><b>{transfers.length}</b> transfers</span><span><b>{networkConnected ? 'Nostr online' : 'Offline'}</b></span></div></div></div>
-          <fieldset class="edit-profile"><legend>Profile</legend><label>Display name <input bind:value={displayName} /></label><label>About <input bind:value={profileAbout} /></label><label>Picture URL <input bind:value={profilePicture} placeholder="https://…" /></label><button class="classic-button primary" onclick={persistSettings}>Save profile</button></fieldset>
-          <p class="privacy-note wide"><span>i</span> Your profile and shared catalogue are public on Nostr. Transfer addresses and credentials are never published.</p>
+          <div class="panel-title"><span></span><b>{$t("Napstr Profile")}</b><span></span></div>
+          <div class="profile-card"><div class="avatar"><img src="/napstr-logo.png" alt={$t("Napstr mascot")} /></div><div><h2><button class="user-name" disabled={!identityNpub} onclick={() => browseUser(ownCatalogueUser())}>{displayName}</button></h2><p>{$t("Your dedicated Napstr Nostr identity.")}</p><code>{identityNpub || $t("Connect to create identity")}</code><div class="profile-stats"><span><b>{sharedFiles.length}</b> {$t("shared files")}</span><span><b>{transfers.length}</b> {$t("transfers")}</span><span><b>{networkConnected ? $t("Nostr online") : $t("Offline")}</b></span></div></div></div>
+          <fieldset class="edit-profile"><legend>{$t("Profile")}</legend><label>{$t("Display name")} <input bind:value={displayName} /></label><label>{$t("About")} <input bind:value={profileAbout} /></label><label>{$t("Picture URL")} <input bind:value={profilePicture} placeholder="https://…" /></label><button class="classic-button primary" onclick={persistSettings}>{$t("Save profile")}</button></fieldset>
+          <p class="privacy-note wide"><span>i</span> {$t("Your profile and shared catalogue are public on Nostr. Transfer addresses and credentials are never published.")}</p>
         </section>
       {:else}
         <section class="full-panel settings-view">
-          <div class="panel-title"><span></span><b>Napstr Settings</b><span></span></div>
-          <fieldset><legend>Network</legend><label><input type="checkbox" checked disabled /> Connect automatically at startup</label><label>Nostr relays <input bind:value={nostrRelays} /></label><label>Tor <input value="Bundled, managed automatically" readonly /></label></fieldset>
-          <fieldset><legend>Files</legend><label>Downloads and shared audio <input value={napstrFolder} readonly /><button class="classic-button" onclick={chooseNapstrFolder}>Browse…</button></label><label>Transfer mode <select disabled><option>Whole file</option></select></label><label><input type="checkbox" checked disabled /> Downloaded audio is automatically shared</label><label><input type="checkbox" checked disabled /> Verify the complete file with SHA-256</label></fieldset>
-          <div class="settings-actions"><button class="classic-button primary" onclick={persistSettings}>OK</button><button class="classic-button" onclick={refreshSnapshot}>Cancel</button><button class="classic-button" onclick={persistSettings}>Apply</button></div>
+          <div class="panel-title"><span></span><b>{$t("Napstr Settings")}</b><span></span></div>
+          <fieldset><legend>{$t("Language")}</legend><LanguageSelect /><small>{$t("Saved automatically on this device.")}</small></fieldset>
+          <fieldset><legend>{$t("Network")}</legend><label><input type="checkbox" checked disabled /> {$t("Connect automatically at startup")}</label><label>{$t("Nostr relays")} <input bind:value={nostrRelays} /></label><label>Tor <input value={$t("Bundled, managed automatically")} readonly /></label></fieldset>
+          <fieldset><legend>{$t("Files")}</legend><label>{$t("Downloads and shared audio")} <input value={napstrFolder} readonly /><button class="classic-button" onclick={chooseNapstrFolder}>{$t("Browse…")}</button></label><label>{$t("Transfer mode")} <select disabled><option>{$t("Whole file")}</option></select></label><label><input type="checkbox" checked disabled /> {$t("Downloaded audio is automatically shared")}</label><label><input type="checkbox" checked disabled /> {$t("Verify the complete file with SHA-256")}</label></fieldset>
+          <div class="settings-actions"><button class="classic-button primary" onclick={persistSettings}>{$t("OK")}</button><button class="classic-button" onclick={refreshSnapshot}>{$t("Cancel")}</button><button class="classic-button" onclick={persistSettings}>{$t("Apply")}</button></div>
         </section>
       {/if}
     </div>
@@ -3028,72 +3140,72 @@
       <button
         type="button"
         class="dock-resizer"
-        aria-label="Resize Transfer Manager"
-        title="Drag to resize Transfer Manager · double-click to reset"
+        aria-label={$t("Resize Transfer Manager")}
+        title={$t("Drag to resize Transfer Manager · double-click to reset")}
         onpointerdown={beginTransferResize}
         onkeydown={resizeTransferWithKeyboard}
         ondblclick={() => setTransferPaneHeight(window.innerHeight < 700 ? 94 : 119, true)}
       ></button>
-      <div class="dock-title"><span></span><b>Transfer Manager</b><span></span><button class="dock-clear" onclick={clearFinishedTransfers} disabled={clearingTransfers || !transfers.some(isFinishedTransfer)}>Clear finished</button><button class="dock-clear" onclick={clearAllTransfers} disabled={clearingTransfers || removingTransfers.size > 0 || (!transfers.length && !audiobookDownloads.length && !startingDownloads.size)}>{clearingTransfers ? 'Clearing…' : 'Clear all'}</button><button onclick={() => (activeView = 'Downloads')} title="Open Download Manager">□</button></div>
+      <div class="dock-title"><span></span><b>{$t("Transfer Manager")}</b><span></span><button class="dock-clear" onclick={clearFinishedTransfers} disabled={clearingTransfers || !transfers.some(isFinishedTransfer)}>{$t("Clear finished")}</button><button class="dock-clear" onclick={clearAllTransfers} disabled={clearingTransfers || removingTransfers.size > 0 || (!transfers.length && !audiobookDownloads.length && !startingDownloads.size)}>{clearingTransfers ? $t("Clearing…") : $t("Clear all")}</button><button onclick={() => (activeView = 'Downloads')} title={$t("Open Download Manager")}>□</button></div>
       <div class="mini-transfers">
         {#each audiobookDownloads as book}
-          <div class="mini-row audiobook-mini-row"><span class="audiobook-glyph">▥</span><span class="mini-name">{book.title} · chapter {Math.min(book.nextIndex + 1, book.chapters.length)} of {book.chapters.length}</span><div class="progress"><span style={`width:${book.chapters.length ? (book.nextIndex / book.chapters.length) * 100 : 0}%`}></span></div><span>{readableSize(book.chapters.reduce((sum, chapter) => sum + chapter.size, 0))}</span><span>Book</span></div>
+          <div class="mini-row audiobook-mini-row"><span class="audiobook-glyph">▥</span><span class="mini-name">{book.title} {$t("· chapter")} {Math.min(book.nextIndex + 1, book.chapters.length)} {$t("of")} {book.chapters.length}</span><div class="progress"><span style={`width:${book.chapters.length ? (book.nextIndex / book.chapters.length) * 100 : 0}%`}></span></div><span class="mini-size">{readableSize(book.chapters.reduce((sum, chapter) => sum + chapter.size, 0))}</span><span class="mini-status">{$t("Book")}</span></div>
         {/each}
         {#each transfers as transfer}
-          <div class:transfer-complete={isCompleteTransfer(transfer)} class="mini-row">{#if isCompleteTransfer(transfer)}<button class="mini-play" onclick={() => playAudio(transfer.fileId, transfer.name, playerMode, 'downloads')} title="Play verified audio">▶</button>{:else}<span class="download-arrow">⇩</span>{/if}<span class="mini-name">{transfer.name}</span><div class="progress"><span style={`width:${transfer.progress}%`}></span></div><span>{transfer.size}</span><span>{isCompleteTransfer(transfer) ? 'Ready' : transfer.speed}</span><button class="tiny-button mini-cancel" onclick={() => removeTransfer(transfer.id)} disabled={clearingTransfers || removingTransfers.has(transfer.id)} aria-label={`${isActiveTransfer(transfer) ? 'Cancel download' : 'Clear entry'}: ${transfer.name}`} title={isActiveTransfer(transfer) ? 'Cancel download and remove partial file' : 'Clear entry; keep completed audio'}>×</button></div>
+          <div class:transfer-complete={isCompleteTransfer(transfer)} class="mini-row">{#if isCompleteTransfer(transfer)}<button class="mini-play" onclick={() => playAudio(transfer.fileId, transfer.name, playerMode, 'downloads')} title={$t("Play verified audio")}>▶</button>{:else}<span class="download-arrow">⇩</span>{/if}<span class="mini-name">{transfer.name}</span><div class="progress"><span style={`width:${transfer.progress}%`}></span></div><span class="mini-size">{transfer.size}</span><span class="mini-status" title={isCompleteTransfer(transfer) ? $t("Ready") : transfer.status}>{isCompleteTransfer(transfer) ? $t("Ready") : transfer.speed}</span><button class="tiny-button mini-cancel" onclick={() => removeTransfer(transfer.id)} disabled={clearingTransfers || removingTransfers.has(transfer.id)} aria-label={`${isActiveTransfer(transfer) ? 'Cancel download' : 'Clear entry'}: ${transfer.name}`} title={isActiveTransfer(transfer) ? $t("Cancel download and remove partial file") : $t("Clear entry; keep completed audio")}>×</button></div>
         {/each}
       </div>
     </section>
 
-    <footer class="statusbar"><span>{activityMessage}</span><span><i class:amber={!networkConnected} class="led"></i> Nostr {networkConnected ? 'online' : 'offline'}</span><span title={torError}>♜ Tor: {torRunning ? 'ready' : torError ? 'failed' : torStarting && torProgress > 0 ? `${torProgress}%` : 'starting'}</span><span class="status-clock">{clock}</span></footer>
+    <footer class="statusbar"><span>{$t(activityMessage)}</span><span><i class:amber={!networkConnected} class="led"></i> Nostr {networkConnected ? $t("online") : $t("offline")}</span><span title={torError}>{$t("♜ Tor:")} {torRunning ? $t("ready") : torError ? $t("failed") : torStarting && torProgress > 0 ? `${torProgress}%` : $t("starting")}</span><span class="status-clock">{new Intl.DateTimeFormat($locale, { hour: '2-digit', minute: '2-digit' }).format(clockNow)}</span></footer>
   </section>
 
   {#if aboutOpen}
     <div class="modal-backdrop" role="presentation" onclick={() => (aboutOpen = false)}>
-      <dialog class="dialog" open aria-label="About Napstr" onclick={(e) => e.stopPropagation()} onkeydown={(e) => { if (e.key === 'Escape') aboutOpen = false; }}>
-        <header class="titlebar"><div class="title-left"><span class="app-icon"><img src="/napstr-logo.png" alt="" /></span><span>About Napstr</span></div><div class="window-controls"><button onclick={() => (aboutOpen = false)}>×</button></div></header>
+      <dialog class="dialog" open aria-label={$t("About Napstr")} onclick={(e) => e.stopPropagation()} onkeydown={(e) => { if (e.key === 'Escape') aboutOpen = false; }}>
+        <header class="titlebar"><div class="title-left"><span class="app-icon"><img src="/napstr-logo.png" alt="" /></span><span>{$t("About Napstr")}</span></div><div class="window-controls"><button onclick={() => (aboutOpen = false)}>×</button></div></header>
         <div class="dialog-body about-dialog-body">
-          <div class="about-summary"><div class="about-logo"><img src="/napstr-logo.png" alt="" /></div><div><h2>Napstr</h2><p>Version {appVersion}</p><p>Public discovery over Nostr.<br />Private verified transfers over Tor.</p></div></div>
-          <p class="about-donation">donations welcome!<br /><code>bc1qwgms685z3j69qtgalyjtrfuqg5f6pt302z0k60</code></p>
+          <div class="about-summary"><div class="about-logo"><img src="/napstr-logo.png" alt="" /></div><div><h2>Napstr</h2><p>{$t("Version")} {appVersion}</p><p>{$t("Public discovery over Nostr.")}<br />{$t("Private verified transfers over Tor.")}</p></div></div>
+          <p class="about-donation">{$t("donations welcome!")}<br /><code>bc1qwgms685z3j69qtgalyjtrfuqg5f6pt302z0k60</code></p>
         </div>
-        <div class="dialog-actions"><button class="classic-button primary" onclick={() => (aboutOpen = false)}>OK</button></div>
+        <div class="dialog-actions"><button class="classic-button primary" onclick={() => (aboutOpen = false)}>{$t("OK")}</button></div>
       </dialog>
     </div>
   {/if}
 
   {#if sourceProfile}
     <div class="modal-backdrop" role="presentation" onclick={() => (sourceProfile = null)}>
-      <dialog class="dialog" open aria-label="Napstr public profile" onclick={(e) => e.stopPropagation()}>
-        <header class="titlebar"><div class="title-left"><span class="app-icon"><img src="/napstr-logo.png" alt="" /></span><span>Public Napstr Profile</span></div><div class="window-controls"><button onclick={() => (sourceProfile = null)}>×</button></div></header>
-        <div class="dialog-body"><div class="about-logo">☺</div><div><h2><button class="user-name" onclick={() => browseUser(sourceProfile!)}>{sourceProfile.displayName}</button></h2><p>{sourceProfile.about || 'No profile description published.'}</p><code>{sourceProfile.npub}</code></div></div>
-        <div class="dialog-actions"><button class="classic-button primary" onclick={() => (sourceProfile = null)}>OK</button></div>
+      <dialog class="dialog" open aria-label={$t("Napstr public profile")} onclick={(e) => e.stopPropagation()}>
+        <header class="titlebar"><div class="title-left"><span class="app-icon"><img src="/napstr-logo.png" alt="" /></span><span>{$t("Public Napstr Profile")}</span></div><div class="window-controls"><button onclick={() => (sourceProfile = null)}>×</button></div></header>
+        <div class="dialog-body"><div class="about-logo">☺</div><div><h2><button class="user-name" onclick={() => browseUser(sourceProfile!)}>{sourceProfile.displayName}</button></h2><p>{sourceProfile.about || $t("No profile description published.")}</p><code>{sourceProfile.npub}</code></div></div>
+        <div class="dialog-actions"><button class="classic-button primary" onclick={() => (sourceProfile = null)}>{$t("OK")}</button></div>
       </dialog>
     </div>
   {/if}
 
   {#if audiobookEditorOpen}
     <div class="modal-backdrop" role="presentation" onclick={() => { if (!audiobookSaving) audiobookEditorOpen = false; }}>
-      <dialog class="dialog audiobook-dialog" open aria-label="Group folder as audiobook" onclick={(event) => event.stopPropagation()} onkeydown={(event) => { if (event.key === 'Escape' && !audiobookSaving) audiobookEditorOpen = false; }}>
-        <header class="titlebar"><div class="title-left"><span class="app-icon">▥</span><span>Publish Audiobook</span></div><div class="window-controls"><button disabled={audiobookSaving} onclick={() => (audiobookEditorOpen = false)}>×</button></div></header>
+      <dialog class="dialog audiobook-dialog" open aria-label={$t("Group folder as audiobook")} onclick={(event) => event.stopPropagation()} onkeydown={(event) => { if (event.key === 'Escape' && !audiobookSaving) audiobookEditorOpen = false; }}>
+        <header class="titlebar"><div class="title-left"><span class="app-icon">▥</span><span>{$t("Publish Audiobook")}</span></div><div class="window-controls"><button disabled={audiobookSaving} onclick={() => (audiobookEditorOpen = false)}>×</button></div></header>
         <div class="audiobook-dialog-body">
-          <p>Napstr will publish this folder as one ordered audiobook while retaining its normal chapter file events.</p>
-          <label>Title <input bind:value={audiobookTitle} maxlength="256" /></label>
-          <label>Author <input bind:value={audiobookAuthor} maxlength="256" /></label>
-          <label>Narrator <input bind:value={audiobookNarrator} maxlength="256" /></label>
-          <fieldset><legend>Chapter order</legend><div class="audiobook-preview">{#each audiobookFolderFiles() as file, index}<div><span>{String(index + 1).padStart(2, '0')}</span><b>{file.title || file.filename}</b><small>{file.readableSize}</small></div>{/each}</div></fieldset>
-          <p class="privacy-note"><span>i</span> The title, author, narrator, chapter names, and ordered file hashes will be public. Your folder name and filesystem path remain private.</p>
+          <p>{$t("Napstr will publish this folder as one ordered audiobook while retaining its normal chapter file events.")}</p>
+          <label>{$t("Title")} <input bind:value={audiobookTitle} maxlength="256" /></label>
+          <label>{$t("Author")} <input bind:value={audiobookAuthor} maxlength="256" /></label>
+          <label>{$t("Narrator")} <input bind:value={audiobookNarrator} maxlength="256" /></label>
+          <fieldset><legend>{$t("Chapter order")}</legend><div class="audiobook-preview">{#each audiobookFolderFiles() as file, index}<div><span>{String(index + 1).padStart(2, '0')}</span><b>{file.title || file.filename}</b><small>{file.readableSize}</small></div>{/each}</div></fieldset>
+          <p class="privacy-note"><span>i</span> {$t("The title, author, narrator, chapter names, and ordered file hashes will be public. Your folder name and filesystem path remain private.")}</p>
         </div>
-        <div class="dialog-actions audiobook-dialog-actions">{#if currentFolderAudiobook()}<button class="classic-button" disabled={audiobookSaving} onclick={ungroupAudiobook}>Publish separately</button>{/if}<span></span><button class="classic-button primary" disabled={audiobookSaving || !audiobookTitle.trim()} onclick={saveAudiobookGroup}>{audiobookSaving ? 'Publishing…' : 'Save & publish'}</button><button class="classic-button" disabled={audiobookSaving} onclick={() => (audiobookEditorOpen = false)}>Cancel</button></div>
+        <div class="dialog-actions audiobook-dialog-actions">{#if currentFolderAudiobook()}<button class="classic-button" disabled={audiobookSaving} onclick={ungroupAudiobook}>{$t("Publish separately")}</button>{/if}<span></span><button class="classic-button primary" disabled={audiobookSaving || !audiobookTitle.trim()} onclick={saveAudiobookGroup}>{audiobookSaving ? $t("Publishing…") : $t("Save & publish")}</button><button class="classic-button" disabled={audiobookSaving} onclick={() => (audiobookEditorOpen = false)}>{$t("Cancel")}</button></div>
       </dialog>
     </div>
   {/if}
 
   {#if blockConfirmation}
     <div class="modal-backdrop" role="presentation" onclick={() => { if (!blockInProgress) blockConfirmation = null; }}>
-      <dialog class="dialog confirm-dialog" open aria-label="Confirm block" onclick={(e) => e.stopPropagation()} onkeydown={(e) => { if (e.key === 'Escape' && !blockInProgress) blockConfirmation = null; }}>
-        <header class="titlebar"><div class="title-left"><span class="app-icon">!</span><span>Confirm block</span></div><div class="window-controls"><button disabled={blockInProgress} onclick={() => (blockConfirmation = null)}>×</button></div></header>
-        <div class="dialog-body"><div class="confirm-icon">!</div><div><h3>Are you sure?</h3>{#if blockConfirmation.kind === 'file'}<p>Block <strong>{blockConfirmation.label}</strong>?</p><p>Every seeder offering these exact file bytes will be hidden.</p>{:else}<p>Block <strong>{blockConfirmation.label}</strong>?</p><p>Their catalogue entries, public chat messages, and download requests will be ignored.</p>{/if}</div></div>
-        <div class="dialog-actions"><button class="classic-button primary" disabled={blockInProgress} onclick={confirmBlock}>{blockInProgress ? 'Blocking…' : 'Block'}</button><button class="classic-button" disabled={blockInProgress} onclick={() => (blockConfirmation = null)}>Cancel</button></div>
+      <dialog class="dialog confirm-dialog" open aria-label={$t("Confirm block")} onclick={(e) => e.stopPropagation()} onkeydown={(e) => { if (e.key === 'Escape' && !blockInProgress) blockConfirmation = null; }}>
+        <header class="titlebar"><div class="title-left"><span class="app-icon">!</span><span>{$t("Confirm block")}</span></div><div class="window-controls"><button disabled={blockInProgress} onclick={() => (blockConfirmation = null)}>×</button></div></header>
+        <div class="dialog-body"><div class="confirm-icon">!</div><div><h3>{$t("Are you sure?")}</h3>{#if blockConfirmation.kind === 'file'}<p>{$t("Block")} <strong>{blockConfirmation.label}</strong>?</p><p>{$t("Every seeder offering these exact file bytes will be hidden.")}</p>{:else}<p>{$t("Block")} <strong>{blockConfirmation.label}</strong>?</p><p>{$t("Their catalogue entries, public chat messages, and download requests will be ignored.")}</p>{/if}</div></div>
+        <div class="dialog-actions"><button class="classic-button primary" disabled={blockInProgress} onclick={confirmBlock}>{blockInProgress ? $t("Blocking…") : $t("Block")}</button><button class="classic-button" disabled={blockInProgress} onclick={() => (blockConfirmation = null)}>{$t("Cancel")}</button></div>
       </dialog>
     </div>
   {/if}

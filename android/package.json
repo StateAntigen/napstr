@@ -9,17 +9,25 @@
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "tauri": "tauri",
     "desktop": "tauri dev",
+    "bundle": "tauri build",
+    "bundle:linux": "tauri build --bundles appimage",
+    "appimage:build": "bash scripts/build-linux-container.sh",
+    "bundle:windows": "tauri build --bundles nsis",
+    "bundle:macos": "tauri build --bundles dmg",
     "android:init": "tauri icon ../src-tauri/icons/icon.png && tauri android init && node scripts/configure-android.mjs",
     "android:dev": "node scripts/configure-android.mjs && tauri android dev",
     "android:dev:usb": "node scripts/configure-android.mjs && adb reverse tcp:1421 tcp:1421 && tauri android dev --host 127.0.0.1",
     "android:build": "node scripts/configure-android.mjs && tauri android build",
     "ios:init": "tauri icon ../src-tauri/icons/icon.png && tauri ios init",
     "ios:dev": "tauri ios dev",
-    "ios:build": "tauri ios build"
+    "ios:build": "tauri ios build",
+    "test": "npm --prefix .. test"
   },
   "dependencies": {
+    "@napstr/i18n": "file:../shared/i18n",
     "@tauri-apps/api": "^2.3.0",
-    "@tauri-apps/plugin-barcode-scanner": "^2.4.5"
+    "@tauri-apps/plugin-barcode-scanner": "^2.4.5",
+    "@tauri-apps/plugin-os": "^2.3.2"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^5.0.0",

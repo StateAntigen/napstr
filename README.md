@@ -55,7 +55,7 @@ Privacy & Security → Open Anyway**. Apple Silicon and Intel builds both includ
 - Click a user name in seeder lists, profiles, or chat to browse that user's currently shared tracks in Search. Clear the name and search again to return to normal song searches. Exact names already discovered by Napstr and full public keys (`npub` or hex) can also be searched; duplicate names offer a choice of public keys.
 - A bundled Tor process carries transfers without a direct-IP fallback.
 - The optional Napstrfy companion pairs by one-use QR and reaches the running desktop over encrypted Iroh.
-- The Mobile page has separate full-access and read-only QR codes. Read-only phones can play and cache the local catalogue for offline listening, but cannot request downloads on the host; see [pairing details](android/README.md#build-and-install-a-debug-apk).
+- The Napstrfy page has separate full-access and read-only QR codes. Read-only phones can play and cache the local catalogue for offline listening, but cannot request downloads on the host; see [pairing details](android/README.md#build-and-install-a-debug-apk).
 - One recursively watched folder contains both downloads and shared audio.
 - Napstr uses or creates a non-destructive `Audiobooks` drop zone: each child folder becomes an ordered book and each loose audio file becomes a one-file book. Existing contents are never replaced.
 - Files are audio-validated and identified by SHA-256. Downloads use a responsive seeder, verify the complete hash, and are available in the built-in player.

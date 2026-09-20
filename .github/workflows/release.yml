@@ -155,11 +155,9 @@ jobs:
           # tauri-action has already uploaded the initial bundle. Replace that
           # asset with the repaired, verified AppImage under the same filename.
           gh release upload "$RELEASE_TAG" "$appimage" --clobber
-      - name: Verify and checksum macOS community DMG
+      - name: Verify macOS community DMG
         if: matrix.tor_platform == 'macos'
         shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           dmg="$(find src-tauri/target -type f -path '*/release/bundle/dmg/*.dmg' -print -quit)"
           if [[ -z "$dmg" ]]; then
@@ -192,12 +190,6 @@ jobs:
 
           cleanup_dmg
           trap - EXIT
-          checksum="$dmg.sha256"
-          (
-            cd "$(dirname "$dmg")"
-            shasum -a 256 "$(basename "$dmg")" > "$(basename "$checksum")"
-          )
-          gh release upload "$RELEASE_TAG" "$checksum" --clobber
 
   android:
     name: Build Napstrfy Android APK
@@ -311,11 +303,6 @@ jobs:
 
           asset="$RUNNER_TEMP/Napstrfy_${release_version}_android.apk"
           cp "$apk" "$asset"
-          checksum="$asset.sha256"
-          (
-            cd "$(dirname "$asset")"
-            sha256sum "$(basename "$asset")" > "$(basename "$checksum")"
-          )
 
           if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             create_args=(release create "$RELEASE_TAG" --draft --title "Napstr $RELEASE_TAG" --notes "Cross-platform Napstr desktop installers and the Napstrfy Android companion.")
@@ -325,4 +312,4 @@ jobs:
             gh "${create_args[@]}" || gh release view "$RELEASE_TAG" >/dev/null
           fi
 
-          gh release upload "$RELEASE_TAG" "$asset" "$checksum" --clobber
+          gh release upload "$RELEASE_TAG" "$asset" --clobber

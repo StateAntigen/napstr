@@ -49,6 +49,11 @@ const STORED_COVER_TTL_MS = 7 * 24 * 60 * 60 * 1000;
  * signal; this is what still works against a host too old to report one.
  */
 const NEGATIVE_TTL_MS = 60 * 1000;
+/**
+ * How long a tile waits before asking again after this album had nothing to
+ * draw, or the image the host named would not load.
+ */
+export const ARTWORK_RETRY_MS = 60 * 1000;
 /** A page composes in stages: gather its keys briefly before asking. */
 const BATCH_DELAY_MS = 40;
 
@@ -185,6 +190,19 @@ export function coverFor(track: RemoteTrack): Promise<AlbumCover | null> {
     return Promise.resolve(null);
   }
   return requestCover(key);
+}
+
+/**
+ * Forget one album's cover because the image itself would not load, so the
+ * next ask resolves a fresh URL instead of handing back the dead one. The
+ * stored copy goes too: it names the same URL.
+ */
+export function dropCover(track: RemoteTrack) {
+  const key = coverKey(track.artist ?? '', track.album ?? '');
+  if (!key) return;
+  sessionCovers.delete(key);
+  negativeAt.delete(key);
+  dropStoredCover(key);
 }
 
 function requestCover(key: string): Promise<AlbumCover | null> {

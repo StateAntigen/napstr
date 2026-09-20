@@ -472,7 +472,11 @@ impl TransferService {
         // Registration and removal share this lock so a late offer cannot
         // start another worker after its entry has been removed.
         let mut active_guard = self.active.lock().await;
-        let status: Option<String> = crate::open_connection(&self.db_path)?
+        let connection = crate::open_connection(&self.db_path)?;
+        let transaction = connection
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
+        let status: Option<String> = transaction
             .query_row(
                 "SELECT status FROM network_downloads WHERE request_id=?1",
                 [&offer.request_id],
@@ -480,12 +484,14 @@ impl TransferService {
             )
             .optional()
             .map_err(|error| error.to_string())?;
-        if matches!(
-            status.as_deref(),
-            None | Some("Verified · Complete") | Some("Cancelled")
-        ) {
+        if !status
+            .as_deref()
+            .is_some_and(crate::network::download_accepts_offers)
+        {
             return Ok(());
         }
+        transaction.execute("UPDATE download_sources SET status='Connected',updated_at=?1 WHERE request_id=?2 AND source_pubkey=?3", params![Utc::now().to_rfc3339(), offer.request_id, source_pubkey]).map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
         let db_path = self.db_path.clone();
         let tor = self.tor.clone();
         let active = self.active.clone();
@@ -513,32 +519,51 @@ impl TransferService {
                 ),
             )
             .await;
+            // Serialize the final worker's status/removal with new offers so a
+            // late fallback cannot revive a failed song outside the queue limit.
+            let mut active_guard = active.lock().await;
             let remaining = coordinator.workers.fetch_sub(1, Ordering::SeqCst) - 1;
             let source_status = match &result {
                 Ok(_) => "Complete".to_string(),
                 Err(error) => format!("Failed: {error}"),
             };
-            if let Ok(connection) = crate::open_connection(&db_path) {
-                let _ = connection.execute("UPDATE download_sources SET status=?1,updated_at=?2 WHERE request_id=?3 AND source_pubkey=?4", params![source_status, Utc::now().to_rfc3339(), offer.request_id, source_pubkey]);
-            }
-            if let Err(error) = result {
-                if remaining == 0 && !coordinator.complete.load(Ordering::SeqCst) {
-                    let status = if coordinator.cancel.is_cancelled() {
-                        "Cancelled".to_string()
-                    } else {
-                        format!("Failed: {error}")
-                    };
-                    let current = current_progress(&db_path, &offer.request_id).unwrap_or(0.0);
-                    let _ =
-                        update_download(&db_path, &offer.request_id, current, &status, "—", None);
+            let _ = (|| -> Result<(), String> {
+                let mut connection = crate::open_connection(&db_path)?;
+                let transaction = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(|error| error.to_string())?;
+                transaction.execute("UPDATE download_sources SET status=?1,updated_at=?2 WHERE request_id=?3 AND source_pubkey=?4", params![source_status, Utc::now().to_rfc3339(), offer.request_id, source_pubkey]).map_err(|error| error.to_string())?;
+                if let Err(error) = result {
+                    if remaining == 0 && !coordinator.complete.load(Ordering::SeqCst) {
+                        let awaiting_offer: bool = transaction.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM download_sources WHERE request_id=?1 AND status='Requested')",
+                            [&offer.request_id], |row| row.get(0),
+                        ).map_err(|error| error.to_string())?;
+                        let status = if coordinator.cancel.is_cancelled() {
+                            "Cancelled".to_string()
+                        } else if awaiting_offer {
+                            crate::network::DOWNLOAD_WAITING_FALLBACK.to_string()
+                        } else {
+                            format!("Failed: {error}")
+                        };
+                        transaction.execute(
+                            "UPDATE network_downloads SET status=?1,speed='—',updated_at=?2 WHERE request_id=?3",
+                            params![status, Utc::now().to_rfc3339(), offer.request_id],
+                        ).map_err(|error| error.to_string())?;
+                    }
                 }
-            }
+                transaction.commit().map_err(|error| error.to_string())
+            })();
             if remaining == 0 {
-                active.lock().await.remove(&request_id);
+                active_guard.remove(&request_id);
                 coordinator.stopped.notify_waiters();
             }
         });
         Ok(())
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.globally_paused.load(Ordering::SeqCst)
     }
 
     pub async fn set_paused(&self, paused: bool) {
@@ -1155,6 +1180,90 @@ mod tests {
             );
             std::fs::remove_dir_all(&directory).unwrap();
         });
+    }
+
+    #[tokio::test]
+    async fn queued_and_finished_downloads_ignore_late_offers_and_queued_cancel_is_immediate() {
+        let (directory, db_path, file_id, _) = shared_fixture();
+        let service = TransferService::new(
+            db_path.clone(),
+            Arc::new(TorManager::new(directory.clone(), directory.clone())),
+        );
+        let connection = crate::open_connection(&db_path).unwrap();
+        for status in [
+            "Queued",
+            "Waiting to restart after reconnect",
+            "Failed: no seeder responded",
+            "Cancelled",
+            "All seeders refused",
+            "Verified · Complete",
+        ] {
+            connection.execute(
+                "INSERT INTO network_downloads(request_id,file_id,source_pubkey,filename,size,progress,status,speed,destination,onion,updated_at) VALUES(?1,?2,'source','song.wav',100,0,?1,'Queued','','','now')",
+                params![status, file_id],
+            ).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO download_sources VALUES(?1,'source','Queued','now')",
+                    [status],
+                )
+                .unwrap();
+            service
+                .accept_offer(
+                    DownloadOffer {
+                        request_id: status.into(),
+                        file_id: file_id.clone(),
+                        onion: format!("{}.onion", "a".repeat(56)),
+                        port: 80,
+                        capability: "late-offer".into(),
+                        expires_at: Utc::now().timestamp() + 60,
+                    },
+                    "source".into(),
+                )
+                .await
+                .unwrap();
+        }
+        assert!(service.active.lock().await.is_empty());
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM download_sources WHERE status='Connected'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        service.set_paused(true).await;
+        assert!(service.is_paused());
+        let rowid = connection
+            .query_row(
+                "SELECT rowid FROM network_downloads WHERE request_id='Queued'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        timeout(
+            Duration::from_secs(1),
+            service.remove_downloads(Some(rowid)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM download_sources WHERE request_id='Queued'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        service.set_paused(false).await;
+        assert!(!service.is_paused());
+        drop(connection);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]

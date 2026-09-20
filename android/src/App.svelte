@@ -1,5 +1,9 @@
 <script lang="ts">
-  import { onMount, tick } from 'svelte';
+  import { t, locale, message as msg, initializeLocale, type Message } from '@napstr/i18n/svelte';
+  import LanguageSelect from '@napstr/i18n/LanguageSelect.svelte';
+  import { locale as osLocale } from '@tauri-apps/plugin-os';
+  import '@napstr/i18n/styles.css';
+  import { onMount, tick, untrack } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import {
     Format,
@@ -11,6 +15,9 @@
   import TrackArtwork from './lib/TrackArtwork.svelte';
   import TrackBadge from './lib/TrackBadge.svelte';
   import CoverDebug from './lib/CoverDebug.svelte';
+  import SeekIcon from './lib/SeekIcon.svelte';
+  import { rateLimitedTask, safePosition, validDuration } from './lib/playback';
+  import appIcon from '../src-tauri/icons/icon.png';
   import { artworkHue, coverFor, coverKey, invalidateCoverNegatives, type AlbumCover } from './lib/artwork';
   import { reportReasons } from './lib/types';
   import type { AudiobookLibraryPage, CachedAudio, CompanionStatus, CoverReport, LibraryPage, PlaybackCommand, PodcastDownload, PodcastEpisode, PodcastFeed, ReadOnlyTicketOffer, RemoteAudiobook, RemoteAudiobookSummary, RemotePlaybackState, RemoteRepeat, RemoteTrack, RemoteTransfer, ReportReason } from './lib/types';
@@ -80,6 +87,24 @@
     more: AlbumShelf[];
   };
   let activeTab = $state<AppTab>('music');
+  /** What Tauri reports this build is: a phone, or one of the desktop systems. */
+  let platform = $state('');
+  const mobile = $derived(platform === 'android' || platform === 'ios');
+  /**
+   * A desktop window wide enough for three columns pins the now-playing sheet as
+   * the third one, instead of leaving it as a drawer over the content. A phone
+   * never pins, whatever its width: the sheet there is the full-screen drawer.
+   */
+  let wideWindow = $state(false);
+  $effect(() => {
+    if (mobile || platform === '') return;
+    const query = window.matchMedia('(min-width: 800px)');
+    wideWindow = query.matches;
+    const listener = (event: MediaQueryListEvent) => { wideWindow = event.matches; };
+    query.addEventListener('change', listener);
+    return () => query.removeEventListener('change', listener);
+  });
+  const pinned = $derived(!mobile && platform !== '' && wideWindow);
   let status = $state<CompanionStatus>({ streamOnly: false, paired: false, connected: false, desktopName: '', endpointId: '', libraryRevision: 0, coverRevision: 0, error: '' });
   let statusLoading = $state(true);
   let statusPending = $state(false);
@@ -87,14 +112,21 @@
   let pairing = $state(false);
   let scanning = $state(false);
   let cameraPermissionDenied = $state(false);
-  let error = $state('');
-  let notice = $state('');
+  /** Open on a desktop, where there is no camera to scan with. */
+  let manualPairOpen = $state(true);
+  $effect(() => { manualPairOpen = !mobile; });
+  // Either a finished sentence, or a `msg(...)` still to be translated, so a
+  // notice already on screen follows a change of language.
+  let error = $state<string | Message>('');
+  let notice = $state<string | Message>('');
   let query = $state('');
   let tracks = $state<RemoteTrack[]>([]);
   let likedMusic = $state<RemoteTrack[]>([]);
   let showingLikedMusic = $state(false);
   let total = $state(0);
   let loading = $state(false);
+  /** The network half of a search is still running while the host's half is not. */
+  let searchingNetwork = $state(false);
   let loadingMore = $state(false);
   let musicViewVersion = 0;
   let loadedLibraryRevision = 0;
@@ -115,6 +147,12 @@
   let caching = $state(false);
   let currentTime = $state(0);
   let duration = $state(0);
+  /**
+   * True while `duration` is the podcast feed's own claim rather than a length
+   * the audio has reported. A feed can be wrong, so a hint may be shown with a
+   * "~" but must never enable seeking or be published to the system controls.
+   */
+  let durationEstimated = $state(false);
   let volume = $state(0.85);
   let pending = $state(new Map<string, string>());
   let pendingAudiobooks = $state(new Map<string, string>());
@@ -299,9 +337,25 @@
   let shownPlaying = $derived(playbackTarget === 'desktop' ? remoteState?.playing === true : playing);
   let shownPosition = $derived(playbackTarget === 'desktop' ? remotePositionMs() / 1000 : currentTime);
   let shownDuration = $derived(playbackTarget === 'desktop' ? (remoteState?.durationMs ?? 0) / 1000 : duration);
+  /** The length the audio itself reported: what can honestly be sought and published. */
+  let verifiedDuration = $derived(playbackTarget === 'desktop' ? shownDuration : durationEstimated ? 0 : duration);
+  /** An unknown length says so, and a feed's claim is marked as the estimate it is. */
+  let shownDurationLabel = $derived(
+    shownDuration > 0 ? `${playbackTarget === 'desktop' ? '' : durationEstimated ? '≈ ' : ''}${clock(shownDuration)}` : '—'
+  );
   /** Whether the player on screen has a neighbour to move to. */
   let shownCanSkip = $derived(
     playbackTarget === 'desktop' ? (remoteState?.queueLen ?? 0) > 1 : playerQueue.length > 1
+  );
+  /**
+   * Whether ±15 s can land anywhere: there has to be a live player on the
+   * chosen side and a known length to clamp against. The timeline uses the same
+   * rule, so the buttons and the bar never disagree about what is seekable.
+   */
+  let shownCanSeek = $derived(
+    playbackTarget === 'desktop'
+      ? !status.streamOnly && remoteState?.active === true
+      : !caching && verifiedDuration > 0
   );
   /** The playlist the drawer would open: this phone's, or the copy of theirs. */
   let shownQueue = $derived(playbackTarget === 'desktop' ? remoteQueue : playerQueue);
@@ -381,7 +435,38 @@
   let discoverSeed = '';
   let playedAlbums = $state<PlayedAlbum[]>(readPlayedAlbums());
   let audio: HTMLAudioElement;
-  let lastSystemMediaSync = 0;
+  /**
+   * The lock screen needs a position about once a second while the events that
+   * carry one arrive several times a second, so they are coalesced into one
+   * update rather than each calling into the native side.
+   */
+  const mediaUpdates = rateLimitedTask(() => publishSystemMedia());
+  /**
+   * A desktop window has no Android bridge, so the system's media controls read
+   * the web Media Session instead. These remember what it was last told, so a
+   * position that has not moved is not published again.
+   */
+  let lastSessionPosition = '';
+  let lastSessionMetadata = '';
+  let lastSessionState = '';
+
+  /** What the system's media controls need to know, whichever surface draws them. */
+  type SystemMediaState = {
+    title: string;
+    artist: string;
+    playing: boolean;
+    position: number;
+    duration: number;
+    artwork?: string;
+    canPrevious?: boolean;
+    canNext?: boolean;
+    canSeek?: boolean;
+    labels?: Record<string, string>;
+    liked?: boolean;
+    looping?: boolean;
+    volume?: number;
+    remote?: boolean;
+  };
   /** True while the system's media controls have been told to show nothing. */
   let systemMediaEmpty = false;
 
@@ -508,15 +593,13 @@
   }
 
   function showLikedTracks() {
-    musicViewVersion += 1;
+    abandonSearch();
     activeTab = 'music';
     showingLikedMusic = !showingLikedMusic;
     if (!showingLikedMusic) {
       void searchTracks(query);
       return;
     }
-    loading = false;
-    loadingMore = false;
     tracks = [...likedMusic];
     total = tracks.length;
     selected = tracks[0] ?? null;
@@ -758,6 +841,7 @@
     if (!status.paired || loading || loadingMore) return;
     const viewVersion = ++musicViewVersion;
     showingLikedMusic = false;
+    searchingNetwork = false;
     append ? (loadingMore = true) : (loading = true);
     error = '';
     try {
@@ -802,51 +886,70 @@
     }
   }
 
+  /**
+   * Give up on the search that is in flight. Its request still settles later,
+   * but every `viewVersion` check in `searchTracks` is guarded against the stale
+   * one, so nothing else would ever clear these flags — an abandoned search left
+   * the list spinning forever and refused the library reload that followed it.
+   */
+  function abandonSearch() {
+    musicViewVersion += 1;
+    loading = false;
+    loadingMore = false;
+    searchingNetwork = false;
+  }
+
   async function searchTracks(nextQuery = query) {
     query = nextQuery;
     showingLikedMusic = false;
-    if (!query.trim()) return loadLibrary();
-    if (loading) return;
-    const viewVersion = ++musicViewVersion;
-    loading = true;
-    error = '';
-    try {
-      // Two passes. The host answers for its own folder straight away, so those
-      // results appear before the relay round trip has finished; the network
-      // search then only adds what the local pass did not already have.
-      const local = await invoke<LibraryPage>('remote_library', {
-        query: query.trim(),
-        offset: 0,
-        limit: MAX_ALBUM_TRACKS
-      });
-      if (viewVersion !== musicViewVersion) return;
-      const known = new Set(local.tracks.map((track) => track.fileId));
-      tracks = local.tracks;
-      total = local.tracks.length;
-      selected = tracks[0] ?? null;
-      try {
-        const found = await invoke<RemoteTrack[]>('remote_search', { query: query.trim() });
-        if (viewVersion !== musicViewVersion) return;
-        const merged = [
-          ...local.tracks,
-          ...found.filter((track) => !known.has(track.fileId))
-        ];
-        tracks = merged;
-        total = merged.length;
-        if (!selected || !merged.some((track) => track.fileId === selected?.fileId)) {
-          selected = merged[0] ?? null;
-        }
-      } catch (networkError) {
-        // The host's own files are still worth showing when the network is out.
-        if (viewVersion === musicViewVersion) {
-          notice = `Showing results from Napstr only: ${String(networkError)}`;
-        }
-      }
-    } catch (nextError) {
-      if (viewVersion === musicViewVersion) error = String(nextError);
-    } finally {
-      if (viewVersion === musicViewVersion) loading = false;
+    // Clearing the box abandons the search in flight and goes back to the library.
+    if (!query.trim()) {
+      abandonSearch();
+      return loadLibrary();
     }
+    const viewVersion = ++musicViewVersion;
+    const searchQuery = query.trim();
+    loading = true;
+    loadingMore = false;
+    searchingNetwork = !status.streamOnly;
+    tracks = [];
+    total = 0;
+    selected = null;
+    error = '';
+    const mergeResults = (results: RemoteTrack[]) => {
+      if (viewVersion !== musicViewVersion) return;
+      const merged = new Map(tracks.map((track) => [track.fileId, track]));
+      for (const track of results) {
+        // A network answer must not downgrade a track already on the host.
+        if (!merged.get(track.fileId)?.local || track.local) merged.set(track.fileId, track);
+      }
+      tracks = [...merged.values()].sort((left, right) => Number(right.local) - Number(left.local));
+      total = tracks.length;
+      selected = tracks.find((track) => track.fileId === selected?.fileId) ?? tracks[0] ?? null;
+    };
+    // Both requests go out together: the host answers for its own folder, the
+    // network for everything else, and neither waits for the other. A query
+    // typed while they are in flight supersedes them rather than being ignored.
+    const localSearch = invoke<LibraryPage>('remote_library', {
+      query: searchQuery,
+      offset: 0,
+      limit: MAX_ALBUM_TRACKS
+    })
+      .then((page) => mergeResults(page.tracks))
+      .catch((nextError) => { if (viewVersion === musicViewVersion) error = String(nextError); })
+      .finally(() => { if (viewVersion === musicViewVersion) loading = false; });
+    const networkSearch = searchingNetwork
+      ? invoke<RemoteTrack[]>('remote_search', { query: searchQuery })
+        .then(mergeResults)
+        .catch((nextError) => {
+          if (viewVersion !== musicViewVersion) return;
+          // The host's own files are still worth showing when the network is out.
+          if (tracks.length > 0) notice = msg("Showing results from Napstr only: {p0}", { p0: String(nextError) });
+          else error = String(nextError);
+        })
+        .finally(() => { if (viewVersion === musicViewVersion) searchingNetwork = false; })
+      : Promise.resolve();
+    await Promise.all([localSearch, networkSearch]);
   }
 
   async function showAudiobooks() {
@@ -925,6 +1028,10 @@
       audio?.pause();
       const cached = await invoke<CachedAudio>('cache_remote_audio', { track, libraryVisible });
       current = cached.track;
+      // The new source has no length until it reports one: keeping the old one
+      // would show the previous track's length, and seek against it.
+      duration = 0;
+      durationEstimated = false;
       await tick();
       audio.src = cached.url;
       audio.volume = volume;
@@ -1060,16 +1167,30 @@
   }
 
   /**
+   * Ask the system's media controls to catch up with the player this phone is
+   * listening to.
+   *
+   * `force` skips the coalescing for the changes that would look wrong until
+   * it came round on its own: a new track, a pause, a duration that just
+   * arrived.
+   */
+  function syncSystemMedia(force = false) {
+    if (!force) return mediaUpdates.request();
+    mediaUpdates.cancel();
+    publishSystemMedia();
+  }
+
+  /**
    * Tell Android what its media controls should be showing.
    *
    * The lock screen, the notification, Android Auto and every Bluetooth button
    * speak this one session, so it has to describe the player the user is
    * actually listening to: the computer when it is the source, this phone
-   * otherwise. Position and duration go over in seconds.
+   * otherwise. Position and duration go over in seconds, and only when they are
+   * a length the native session can hold.
    */
-  function syncSystemMedia(force = false) {
-    const bridge = androidMediaBridge();
-    if (!bridge) return;
+  function publishSystemMedia() {
+    if (!androidMediaBridge() && !webMediaSession()) return;
 
     if (playbackTarget === 'desktop') {
       const state = remoteState;
@@ -1078,22 +1199,22 @@
         // its own playback when the computer took the source over.
         if (systemMediaEmpty) return;
         systemMediaEmpty = true;
-        bridge.clear();
+        stopSystemMedia();
         return;
       }
-      const now = performance.now();
-      if (!force && now - lastSystemMediaSync < 900) return;
-      lastSystemMediaSync = now;
       systemMediaEmpty = false;
-      bridge.update(JSON.stringify({
+      const seconds = validDuration((state.durationMs ?? 0) / 1000);
+      publishSystemMetadata({
         title: state.title || 'Unknown track',
         artist: state.artist || status.desktopName || 'The computer',
         artwork: sheetCoverUrl(),
         playing: state.playing,
-        position: remotePositionMs() / 1000,
-        duration: (state.durationMs ?? 0) / 1000,
+        position: safePosition(remotePositionMs() / 1000, seconds || undefined),
+        duration: seconds,
         canPrevious: state.queueLen > 1,
         canNext: state.queueLen > 1,
+        canSeek: seconds > 0,
+        labels: mediaLabels(),
         // The heart is still this phone's own list, exactly as it is for local
         // playback: liking something never reaches the computer.
         liked: shownTrack ? isTrackLiked(shownTrack) : false,
@@ -1102,7 +1223,7 @@
         // Not this phone's audio: the service must not hold the screen for it,
         // and its volume keys belong to the computer's player instead.
         remote: true
-      }));
+      });
       return;
     }
 
@@ -1113,29 +1234,183 @@
       // screen after the source has moved back here.
       if (systemMediaEmpty) return;
       systemMediaEmpty = true;
-      bridge.clear();
+      stopSystemMedia();
       return;
     }
-    const now = performance.now();
-    if (!force && now - lastSystemMediaSync < 900) return;
-    lastSystemMediaSync = now;
     systemMediaEmpty = false;
-    bridge.update(JSON.stringify({
-      title: activeMedia === 'podcast' ? currentPodcast?.title : current ? title(current) : '',
-      artist: activeMedia === 'podcast' ? currentPodcast?.feedTitle : current ? artist(current) : '',
+    const seconds = validDuration(verifiedDuration);
+    publishSystemMetadata({
+      title: activeMedia === 'podcast' ? currentPodcast?.title ?? '' : current ? title(current) : '',
+      artist: activeMedia === 'podcast' ? currentPodcast?.feedTitle ?? '' : current ? artist(current) : '',
       artwork: activeMedia === 'podcast'
         ? currentPodcast?.image ?? ''
         : nowCover && !nowArtFailed ? nowCover.art || nowCover.thumb : '',
       playing,
-      position: Number.isFinite(currentTime) ? currentTime : 0,
-      duration: Number.isFinite(duration) ? duration : 0,
+      position: safePosition(currentTime, seconds || undefined),
+      duration: seconds,
       canPrevious: activeMedia === 'music' && playerQueue.length > 1 && (!shuffle || randomHistoryIndex > 0),
       canNext: activeMedia === 'music' && playerQueue.length > 1,
+      canSeek: seconds > 0 && !caching,
+      labels: mediaLabels(),
       liked: activeMedia === 'music' && !!current && isTrackLiked(current),
       looping: activeMedia === 'music' && loopMode !== 'off',
       volume: Math.round(volume * 100),
       remote: false
-    }));
+    });
+  }
+
+  /** No Android bridge means a desktop window, which is driven through the web session. */
+  function webMediaSession(): MediaSession | undefined {
+    return 'mediaSession' in navigator ? navigator.mediaSession : undefined;
+  }
+
+  /**
+   * Publish what is playing to whichever system surface this build has. On a
+   * phone that is the app's own media service, which draws the notification and
+   * the lock screen; in a desktop window it is the web session, which the OS
+   * reads for its own player and its media keys.
+   */
+  function publishSystemMetadata(metadata: SystemMediaState) {
+    const bridge = androidMediaBridge();
+    if (bridge) {
+      bridge.update(JSON.stringify(metadata));
+      return;
+    }
+    const session = webMediaSession();
+    if (!session) return;
+    try {
+      // A progress bar needs a length. Without one, say nothing rather than
+      // publish a made-up duration at it.
+      if (!metadata.duration) {
+        if (lastSessionPosition) stopSystemMedia();
+        return;
+      }
+      const position = {
+        duration: metadata.duration,
+        playbackRate: 1,
+        position: Math.min(metadata.position, metadata.duration)
+      };
+      const positionKey = JSON.stringify(position);
+      if (positionKey !== lastSessionPosition) {
+        session.setPositionState(position);
+        lastSessionPosition = positionKey;
+      }
+      const metadataKey = JSON.stringify([metadata.title, metadata.artist, metadata.artwork ?? '']);
+      if (metadataKey !== lastSessionMetadata && 'MediaMetadata' in window) {
+        session.metadata = new MediaMetadata({ title: metadata.title, artist: metadata.artist });
+        lastSessionMetadata = metadataKey;
+      }
+      const state = metadata.playing ? 'playing' : 'paused';
+      if (state !== lastSessionState) {
+        session.playbackState = state;
+        lastSessionState = state;
+      }
+    } catch {
+      // Some webviews expose only part of Media Session.
+    }
+  }
+
+  /** Take the track down from the system's controls, on either surface. */
+  function stopSystemMedia() {
+    const bridge = androidMediaBridge();
+    if (bridge) {
+      bridge.clear();
+      return;
+    }
+    const session = webMediaSession();
+    lastSessionPosition = '';
+    lastSessionMetadata = '';
+    lastSessionState = '';
+    if (!session) return;
+    try {
+      session.metadata = null;
+      session.playbackState = 'none';
+      session.setPositionState();
+    } catch {
+      // Some webviews expose only part of Media Session.
+    }
+  }
+
+  /**
+   * A desktop window has no Android service to receive its player's buttons, so
+   * the media keys, the OS player and the keyboard arrive here instead.
+   */
+  function setupMediaSession() {
+    if (androidMediaBridge() || !('mediaSession' in navigator)) return () => {};
+    const handlers: Array<[MediaSessionAction, MediaSessionActionHandler]> = [
+      ['play', () => { if (audio?.paused) togglePlayer(); }],
+      ['pause', () => audio?.pause()],
+      ['previoustrack', () => { void moveTrackBy(-1); }],
+      ['nexttrack', () => { void moveTrackBy(1); }],
+      ['seekto', (event) => { if (event.seekTime !== undefined) void seekShown(event.seekTime); }],
+      ['seekbackward', (event) => void nudgeShown(-(event.seekOffset ?? 15))],
+      ['seekforward', (event) => void nudgeShown(event.seekOffset ?? 15)]
+    ];
+    const registered: MediaSessionAction[] = [];
+    for (const [action, handler] of handlers) {
+      try {
+        navigator.mediaSession.setActionHandler(action, handler);
+        registered.push(action);
+      } catch {
+        // An action this webview does not know must not cost the others.
+      }
+    }
+    return () => {
+      for (const action of registered) navigator.mediaSession.setActionHandler(action, null);
+    };
+  }
+
+  /**
+   * A desk has a keyboard, and a phone can have one attached. Space and the
+   * arrow keys do what the transport buttons do, as long as nothing else is
+   * listening - no field is being typed into and no drawer is open on top.
+   */
+  function handleKeyboard(event: KeyboardEvent) {
+    if (event.defaultPrevented || event.isComposing || showSettings) return;
+    if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === 'f') {
+      const search = document.querySelector<HTMLInputElement>('.search-area input');
+      if (search) {
+        event.preventDefault();
+        search.focus();
+        search.select();
+      }
+      return;
+    }
+    if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey || event.repeat) return;
+    if (event.target instanceof HTMLElement
+      && event.target.closest('input, textarea, select, button, a, summary, [contenteditable="true"]')) return;
+    if (!current && !currentPodcast) return;
+    if (event.code === 'Space') {
+      event.preventDefault();
+      togglePlayer();
+    } else if (event.key === 'ArrowLeft') {
+      event.preventDefault();
+      void nudgeShown(-15);
+    } else if (event.key === 'ArrowRight') {
+      event.preventDefault();
+      void nudgeShown(15);
+    }
+  }
+
+  /**
+   * The notification's own buttons are drawn by Android, so their words have to
+   * travel with the state: this phone is what knows which language the reader
+   * chose, and which of the two like and repeat labels applies right now.
+   */
+  function mediaLabels() {
+    return {
+      previous: $t('Previous track'),
+      rewind: $t('Back 15 seconds'),
+      play: $t('Play'),
+      pause: $t('Pause'),
+      forward: $t('Forward 15 seconds'),
+      next: $t('Next track'),
+      channel: $t('Media playback'),
+      like: $t('Add to Liked Songs'),
+      unlike: $t('Remove from Liked Songs'),
+      repeat: $t('Repeat'),
+      repeatOff: $t('Turn repeat off')
+    };
   }
 
   function handleSystemMediaAction(event: Event) {
@@ -1150,6 +1425,8 @@
       else if (action === 'next') void moveTrackBy(1);
       else if (action === 'like') toggleShownLike();
       else if (action === 'repeat') cycleShownRepeat();
+      else if (action === 'rewind') void nudgeShown(-15);
+      else if (action === 'forward') void nudgeShown(15);
       else if (action === 'volumeUp') adjustRemoteVolume(1);
       else if (action === 'volumeDown') adjustRemoteVolume(-1);
       else if (action.startsWith('seek:')) {
@@ -1178,6 +1455,10 @@
         savePlaySettings();
         syncSystemMedia(true);
       }
+    } else if (action === 'rewind') {
+      void nudgeShown(-15);
+    } else if (action === 'forward') {
+      void nudgeShown(15);
     } else if (action.startsWith('seek:')) {
       const milliseconds = Number(action.slice(5));
       if (Number.isFinite(milliseconds)) seek(milliseconds / 1000);
@@ -1342,7 +1623,8 @@
   }
 
   function startSheetDrag(event: PointerEvent) {
-    if (sheetClosing) return;
+    // A pinned column is not a drawer: there is nothing to pull down or dismiss.
+    if (pinned || sheetClosing) return;
     // Sliders own their own gestures.
     if ((event.target as HTMLElement | null)?.closest('input')) return;
     const target = (event.target as Node | null) ?? null;
@@ -1443,8 +1725,12 @@
 
   /** Seek by a relative amount on whichever player the drawer is showing. */
   async function nudgeShown(seconds: number) {
-    const limit = shownDuration > 0 ? shownDuration : Number.POSITIVE_INFINITY;
-    await seekShown(Math.min(Math.max(0, shownPosition + seconds), limit));
+    // Local playback is read from the element itself: the OS asks for a seek
+    // between two `timeupdate` events, and our copied position would still be
+    // the old one, so "back 15" could land somewhere the user did not ask for.
+    const position = playbackTarget === 'desktop' || !audio ? shownPosition : audio.currentTime;
+    const limit = verifiedDuration > 0 ? verifiedDuration : Number.POSITIVE_INFINITY;
+    await seekShown(Math.min(Math.max(0, position + seconds), limit));
   }
 
   /** Seek on whichever player the drawer is showing. */
@@ -2409,7 +2695,9 @@
       activeMedia = 'podcast';
       currentPodcast = episode;
       currentTime = 0;
+      // The feed's length is only a claim until the audio reports its own.
       duration = episode.duration || 0;
+      durationEstimated = true;
       audio.src = source.url;
       audio.volume = volume;
       await audio.play();
@@ -2445,7 +2733,15 @@
     return podcastDownloads.some((download) => !download.ready && /downloading/i.test(download.status));
   }
 
+  // The language is taken from the system the first time this phone runs; the
+  // native side learns it through the labels published with the media state.
+  onMount(() => initializeLocale(() => osLocale()));
+  $effect(() => { $locale; untrack(() => syncSystemMedia()); });
+  $effect(() => { duration; untrack(() => syncSystemMedia()); });
+
   onMount(() => {
+    void invoke<string>('client_platform').then((value) => { platform = value; }).catch(() => {});
+    const clearMediaSession = setupMediaSession();
     // Older builds stored one of four mode names; newer ones store both
     // settings together. Either shape restores cleanly.
     try {
@@ -2528,6 +2824,7 @@
     document.addEventListener('visibilitychange', foreground);
     window.addEventListener('napstrfy-media-action', handleSystemMediaAction);
     window.addEventListener('napstrfy-back', handleSystemBack);
+    window.addEventListener('keydown', handleKeyboard);
     return () => {
       window.clearInterval(statusTimer);
       window.clearInterval(remoteTimer);
@@ -2538,6 +2835,9 @@
       document.removeEventListener('visibilitychange', foreground);
       window.removeEventListener('napstrfy-media-action', handleSystemMediaAction);
       window.removeEventListener('napstrfy-back', handleSystemBack);
+      window.removeEventListener('keydown', handleKeyboard);
+      clearMediaSession();
+      mediaUpdates.cancel();
       androidBackBridge()?.setDrawerOpen(false);
       androidMediaBridge()?.clear();
     };
@@ -2547,8 +2847,8 @@
 <svelte:head><title>Napstrfy</title></svelte:head>
 
 {#snippet trackList(emptyTitle: string, emptyHint: string, showLoadMore: boolean)}
-  <section class="track-list" aria-busy={loading}>
-    {#if !loading && tracks.length === 0}
+  <section class="track-list" aria-busy={loading || searchingNetwork}>
+    {#if !loading && !searchingNetwork && tracks.length === 0}
       <div class="empty-library"><img src="/napstr-logo-small.png" alt="" /><h2>{emptyTitle}</h2><p>{emptyHint}</p></div>
     {/if}
     {#each tracks as track (track.fileId)}
@@ -2572,8 +2872,8 @@
 {#snippet playbackTargetRows()}
   <button class:active={playbackTarget === 'phone'} class="actions-row" onclick={() => choosePlaybackTarget('phone')}>
     <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="2.8" width="10" height="18.4" rx="2.2" /><path d="M11 18.4h2" /></svg>
-    <span>This phone</span>
-    {#if playbackTarget === 'phone'}<small>Playing here</small>{/if}
+    <span>{$t("This phone")}</span>
+    {#if playbackTarget === 'phone'}<small>{$t("Playing here")}</small>{/if}
   </button>
   <button
     class:active={playbackTarget === 'desktop'}
@@ -2600,36 +2900,40 @@
 {#if !status.paired && activeTab !== 'podcasts'}
   <main class="pair-screen">
     <div class="pair-glow"></div>
-    <div class="pair-logo" aria-label="Napstrfy"><img src="/favicon.png" alt="" /><span>napstrfy</span></div>
-    <p class="eyebrow">NAPSTR COMPANION</p>
-    <h1>Your music.<br />Wherever you are.</h1>
-    <p class="pair-copy">Pair securely with Napstr on your computer. Discovery and Tor downloads stay there; your music reaches this phone over encrypted Iroh.</p>
+    <div class="pair-logo" aria-label="Napstrfy"><img src={appIcon} alt="" /><span>napstrfy</span></div>
+    <p class="eyebrow">{$t("NAPSTR COMPANION")}</p>
+    <h1>{$t("Your music.")}<br />{$t("Wherever you are.")}</h1>
+    <p class="pair-copy">{$t("Pair securely with Napstr on your computer. Discovery and Tor downloads stay there; your music reaches this phone over encrypted Iroh.")}</p>
     {#if error}
       <div class="error-card">
-        <span>{error}</span>
-        {#if cameraPermissionDenied}<button onclick={showCameraSettings}>Open app settings</button>{/if}
+        <span>{$t(error)}</span>
+        {#if cameraPermissionDenied}<button onclick={showCameraSettings}>{$t("Open app settings")}</button>{/if}
       </div>
     {/if}
-    <button class="scan-button" onclick={scanCode} disabled={scanning || pairing || statusLoading}><span>▦</span>{scanning ? 'Opening camera…' : pairing ? 'Pairing…' : 'Scan Napstr QR'}</button>
-    <button class="browse-podcasts" onclick={showPodcasts}>Listen to podcasts without pairing</button>
-    <details class="manual-pair">
-      <summary>Enter a pairing code instead</summary>
-      <textarea bind:value={pairingCode} placeholder="napstrfy://pair/…"></textarea>
-      <button onclick={() => pair()} disabled={!pairingCode.trim() || pairing}>Connect</button>
+    {#if mobile}
+      <button class="scan-button" onclick={scanCode} disabled={scanning || pairing || statusLoading}><span>▦</span>{scanning ? $t("Opening camera…") : pairing ? $t("Pairing…") : $t("Scan Napstr QR")}</button>
+    {/if}
+    <button class="browse-podcasts" onclick={showPodcasts}>{$t("Listen to podcasts without pairing")}</button>
+    <details class="manual-pair" class:desktop-pair={!mobile} bind:open={manualPairOpen}>
+      <summary>{mobile ? $t("Enter a pairing code instead") : $t("Connect with a pairing code")}</summary>
+      <p>{$t("On the computer running Napstr, open")} <strong>{$t("Napstrfy → Pair without a camera")}</strong>{$t(". Copy the code and paste it here within five minutes.")}</p>
+      <textarea bind:value={pairingCode} aria-label={$t("Napstr pairing code")} placeholder="napstrfy://pair/…" spellcheck="false" autocapitalize="off" autocomplete="off"></textarea>
+      <button onclick={() => pair()} disabled={!pairingCode.trim() || pairing || statusLoading}>{pairing ? $t("Connecting…") : $t("Connect")}</button>
     </details>
-    <small class="pair-security">One-use pairing · no Nostr keys leave your computer</small>
+    <LanguageSelect />
+    <small class="pair-security">{$t("One-use pairing · no Nostr keys leave your computer")}</small>
   </main>
 {:else}
-  <main class="app-shell">
+  <main class="app-shell" class:desktop={!mobile && platform !== ''}>
     <header class="mobile-header">
       {#if status.paired}
         <button class="status-chip" class:offline={!status.connected} onclick={reconnect} title={status.connected ? `Connected to ${status.desktopName || 'Napstr'}` : 'Reconnect to Napstr'}>
-          <i></i><span>{statusPending ? 'Connecting…' : status.connected ? status.desktopName || 'Napstr' : 'Offline'}{status.streamOnly ? ' · Read only' : ''}</span>
+          <i></i><span>{statusPending ? $t("Connecting…") : status.connected ? status.desktopName || 'Napstr' : $t("Offline")}{status.streamOnly ? $t(" · Read only") : ''}</span>
         </button>
       {:else}
-        <button class="status-chip offline" onclick={showMusic}><i></i><span>Pair Napstr</span></button>
+        <button class="status-chip offline" onclick={showMusic}><i></i><span>{$t("Pair Napstr")}</span></button>
       {/if}
-      <button class="header-icon" onclick={() => (showSettings = true)} aria-label="Settings">
+      <button class="header-icon" onclick={() => (showSettings = true)} aria-label={$t("Settings")}>
         <svg viewBox="0 0 24 24" aria-hidden="true">
           <path d="M3.4 7.6h9.4" /><path d="M17.6 7.6h3" /><circle cx="15.2" cy="7.6" r="2.4" />
           <path d="M3.4 16.4h4.2" /><path d="M12.4 16.4h8.2" /><circle cx="10" cy="16.4" r="2.4" />
@@ -2637,444 +2941,443 @@
       </button>
     </header>
 
-    {#if error}<button class="error-banner" onclick={() => (error = '')}>{error}<span>×</span></button>{/if}
-    {#if notice}{#key notice}<div class="toast" role="status">{notice}</div>{/key}{/if}
+    <!-- On a desktop this is the middle column of the shell grid. -->
+    <div class="app-content">
+      {#if error}<button class="error-banner" onclick={() => (error = '')}>{$t(error)}<span>×</span></button>{/if}
+      {#if notice}{#key notice}<div class="toast" role="status">{$t(notice)}</div>{/key}{/if}
 
-    {#if activeTab === 'search'}
-      <section class="search-area">
-        <form onsubmit={(event) => { event.preventDefault(); event.currentTarget.querySelector('input')?.blur(); void searchTracks(); }}>
-          <span>⌕</span><input bind:value={query} placeholder={status.streamOnly ? "Search Napstr’s music" : "Search your music and Nostr"} aria-label="Search tracks" />
-          {#if loading}<i class="search-spinner" role="status" aria-label="Searching"></i>{/if}
-          {#if query}<button type="button" class="clear-search" onclick={() => searchTracks('')}>×</button>{/if}
-        </form>
-      </section>
-      <div class="chips-row"><div class="chips"><button class:active={showingLikedMusic} onclick={showLikedTracks}>♥ Liked</button>{#each musicChips as chip}<button class:active={!showingLikedMusic && query.toLocaleLowerCase() === chip.toLocaleLowerCase()} onclick={() => selectChip(chip)}>{chip}</button>{/each}</div></div>
-
-      {#if searching && (resultArtists.length > 0 || libraryAlbums.length > 0)}
-        <section class="album-shelves">
-          {#if resultArtists.length > 0}
-            <div class="album-shelf-block">
-              <div class="section-label"><b>Artists</b><span>{resultArtists.length} in these results</span></div>
-              <div class="album-shelf">
-                {#each resultArtists as entry (entry.name)}
-                  <div class="artist-card">
-                    <button class="artist-open" onclick={() => void searchTracks(entry.name)} aria-label={`Show tracks by ${entry.name}`}>
-                      <TrackArtwork track={entry.representative} lookup />
-                      <span class="album-play" aria-hidden="true">⌕</span>
-                    </button>
-                    <strong>{entry.name}</strong>
-                    <small>{entry.count} {entry.count === 1 ? 'track' : 'tracks'}</small>
-                  </div>
-                {/each}
-              </div>
-            </div>
-          {/if}
-          {#if libraryAlbums.length > 0}
-            <div class="album-shelf-block">
-              <div class="section-label"><b>Albums</b><span>{libraryAlbums.length} in these results</span></div>
-              <div class="album-shelf">
-                {#each libraryAlbums as album (album.key)}
-                  <div class="album-card">
-                    <button class="album-open" onclick={() => void openAlbum(album)} aria-label={`Open ${album.album} by ${album.artist || 'an unknown artist'}`}>
-                      <TrackArtwork track={album.representative} lookup />
-                      <span class="album-play" aria-hidden="true">▶</span>
-                    </button>
-                    <strong>{album.album}</strong>
-                    <small>{album.artist || 'Unknown artist'}</small>
-                  </div>
-                {/each}
-              </div>
-            </div>
-          {/if}
+      {#if activeTab === 'search'}
+        <section class="search-area">
+          <form onsubmit={(event) => { event.preventDefault(); event.currentTarget.querySelector('input')?.blur(); void searchTracks(); }}>
+            <span>⌕</span><input bind:value={query} placeholder={status.streamOnly ? "Search Napstr’s music" : "Search your music and Nostr"} aria-label={$t("Search tracks")} />
+            {#if loading || searchingNetwork}<i class="search-spinner" role="status" aria-label={$t("Searching")}></i>{/if}
+            {#if query}<button type="button" class="clear-search" onclick={() => searchTracks('')}>×</button>{/if}
+          </form>
         </section>
-        <div class="section-label tracks-label"><b>Tracks</b><span>{tracks.length} {tracks.length === 1 ? 'result' : 'results'}</span></div>
-      {:else if !query.trim()}
-        <section class="library-heading"><div><p>SEARCH</p><h1>Find something</h1></div><span>Your library and the network</span></section>
-      {/if}
-
-      {@render trackList(
-        'No tracks found',
-        query.trim() ? 'Try different words or clear the search.' : 'Search your Napstr library and the network.',
-        !showingLikedMusic && Boolean(query.trim())
-      )}
-    {:else if activeTab === 'music'}
-      <section class="library-heading">
-        <div><p>{showingLikedMusic ? 'FAVOURITES' : 'YOUR NAPSTR'}</p><h1>{showingLikedMusic ? 'Liked music' : 'Your music'}</h1></div>
-        <span>{total} {total === 1 ? 'track' : 'tracks'}</span>
-      </section>
-
-      {#if !showingLikedMusic && (discoverAlbums.length > 0 || lastPlayed.length > 0)}
-        <section class="album-shelves">
-          {#if lastPlayed.length > 0}
-            <div class="album-shelf-block">
-              <div class="section-label"><b>Last played</b><span>Recent albums</span></div>
-              <div class="album-shelf">
-                {#each lastPlayed as album (album.key)}
-                  <div class="album-card">
-                    <button class="album-open" onclick={() => void openAlbum(album)} aria-label={`Open ${album.album} by ${album.artist || 'an unknown artist'}`}>
-                      <TrackArtwork track={album.representative} lookup />
-                      <span class="album-play" aria-hidden="true">▶</span>
-                    </button>
-                    <strong>{album.album}</strong>
-                    <small>{album.artist || 'Unknown artist'}</small>
-                  </div>
-                {/each}
+        <div class="chips-row"><div class="chips"><button class:active={showingLikedMusic} onclick={showLikedTracks}>{$t("♥ Liked")}</button>{#each musicChips as chip}<button class:active={!showingLikedMusic && query.toLocaleLowerCase() === chip.toLocaleLowerCase()} onclick={() => selectChip(chip)}>{chip}</button>{/each}</div></div>
+  
+        {#if searching && (resultArtists.length > 0 || libraryAlbums.length > 0)}
+          <section class="album-shelves">
+            {#if resultArtists.length > 0}
+              <div class="album-shelf-block">
+                <div class="section-label"><b>{$t("Artists")}</b><span>{resultArtists.length} {$t("in these results")}</span></div>
+                <div class="album-shelf">
+                  {#each resultArtists as entry (entry.name)}
+                    <div class="artist-card">
+                      <button class="artist-open" onclick={() => void searchTracks(entry.name)} aria-label={`Show tracks by ${entry.name}`}>
+                        <TrackArtwork track={entry.representative} lookup />
+                        <span class="album-play" aria-hidden="true">⌕</span>
+                      </button>
+                      <strong>{entry.name}</strong>
+                      <small>{entry.count} {entry.count === 1 ? 'track' : 'tracks'}</small>
+                    </div>
+                  {/each}
+                </div>
               </div>
-            </div>
-          {/if}
-          {#if discoverAlbums.length > 0}
-            <div class="album-shelf-block">
-              <div class="section-label"><b>Discover albums</b><span>{libraryAlbums.length} in this library</span></div>
-              <div class="album-shelf">
-                {#each discoverAlbums as album (album.key)}
-                  <div class="album-card">
-                    <button class="album-open" onclick={() => void openAlbum(album)} aria-label={`Open ${album.album} by ${album.artist || 'an unknown artist'}`}>
-                      <TrackArtwork track={album.representative} lookup />
-                      <span class="album-play" aria-hidden="true">▶</span>
-                    </button>
-                    <strong>{album.album}</strong>
-                    <small>{album.artist || 'Unknown artist'}</small>
-                  </div>
-                {/each}
+            {/if}
+            {#if libraryAlbums.length > 0}
+              <div class="album-shelf-block">
+                <div class="section-label"><b>{$t("Albums")}</b><span>{libraryAlbums.length} {$t("in these results")}</span></div>
+                <div class="album-shelf">
+                  {#each libraryAlbums as album (album.key)}
+                    <div class="album-card">
+                      <button class="album-open" onclick={() => void openAlbum(album)} aria-label={`Open ${album.album} by ${album.artist || 'an unknown artist'}`}>
+                        <TrackArtwork track={album.representative} lookup />
+                        <span class="album-play" aria-hidden="true">▶</span>
+                      </button>
+                      <strong>{album.album}</strong>
+                      <small>{album.artist || 'Unknown artist'}</small>
+                    </div>
+                  {/each}
+                </div>
               </div>
-            </div>
-          {/if}
-        </section>
-      {/if}
-
-      {@render trackList(
-        showingLikedMusic ? 'No liked tracks yet' : 'No tracks found',
-        showingLikedMusic ? 'Tap the heart beside a song to keep it here.' : 'Add music to your Napstr folder on the computer.',
-        !showingLikedMusic
-      )}
-    {:else if activeTab === 'podcasts'}
-      <section class="search-area podcast-search">
-        <form onsubmit={(event) => { event.preventDefault(); event.currentTarget.querySelector('input')?.blur(); void searchPodcasts(); }}>
-          <span>⌕</span><input bind:value={podcastQuery} placeholder="Search podcasts" aria-label="Search podcasts" />
-          {#if podcastQuery}<button type="button" class="clear-search" onclick={() => { podcastQuery = ''; void loadTrendingPodcasts(); }}>×</button>{/if}
-        </form>
-      </section>
-      <div class="chips-row"><div class="chips podcast-genres"><button class:active={showingLikedPodcasts} onclick={showLikedPodcastList}>♥ Liked</button>{#each podcastGenres as genre}<button class:active={!showingLikedPodcasts && podcastGenre === genre} onclick={() => selectPodcastGenre(genre)}>{genre}</button>{/each}</div></div>
-
-      {#if selectedPodcast}
-        <section class="podcast-show-heading">
-          <button class="podcast-back" onclick={() => { selectedPodcast = null; podcastEpisodes = []; }}>‹</button>
-          {#if selectedPodcast.image}<img src={selectedPodcast.image} alt="" />{:else}<div class="podcast-art-fallback">◉</div>{/if}
-          <div><p>PODCAST</p><h1>{selectedPodcast.title}</h1><small>{selectedPodcast.author || 'Independent podcast'}</small></div>
-          <button class:liked={isPodcastLiked(selectedPodcast)} class="like-button podcast-heading-like" onclick={() => togglePodcastLike(selectedPodcast!)} aria-label={`${isPodcastLiked(selectedPodcast) ? 'Unlike' : 'Like'} ${selectedPodcast.title}`}>{isPodcastLiked(selectedPodcast) ? '♥' : '♡'}</button>
-        </section>
-        <section class="episode-list" aria-busy={podcastLoading}>
-          {#if podcastLoading}<div class="loading-list"><i></i><span>Loading episodes…</span></div>{/if}
-          {#each podcastEpisodes as episode (episode.id)}
-            {@const download = podcastDownloadFor(episode.id)}
-            {@const episodeImage = episode.image || selectedPodcast.image}
-            <article class="episode-row">
-              <button class="episode-art" onclick={() => playPodcast(episode)} aria-label={`Play ${episode.title}`}>
-                <span class="podcast-art-fallback">◉</span>
-                {#if episodeImage}<img src={episodeImage} alt="" onerror={(event) => usePodcastArtwork(event, selectedPodcast!.image)} />{/if}
-                <i aria-hidden="true">▶</i>
-              </button>
-              <button class="episode-copy" onclick={() => playPodcast(episode)}>
-                <strong>{episode.title}</strong>
-                {#if episode.description}<span>{episode.description}</span>{/if}
-                <small>{podcastDate(episode.datePublished)}{episode.duration ? ` · ${clock(episode.duration)}` : ''}</small>
-              </button>
-              <button class:ready={download?.ready} class="episode-download" onclick={() => downloadPodcast(episode)} disabled={download?.status === 'Downloading'} aria-label={`Download ${episode.title}`} title={download?.status || 'Download for offline listening'}>{download?.ready ? '✓' : download?.status === 'Downloading' ? `${Math.round(download.progress)}%` : '⇩'}</button>
-            </article>
-          {/each}
-          {#if !podcastLoading && podcastEpisodes.length === 0}<div class="empty-library"><h2>No playable episodes</h2><p>This feed may not currently expose supported HTTPS audio.</p></div>{/if}
-        </section>
-      {:else}
-        {#if podcastHistory.length > 0 && !podcastQuery && !podcastGenre && !showingLikedPodcasts}
-          <section class="podcast-history"><div class="section-label"><b>Recently played</b><span>Last 10</span></div><div class="history-scroller">{#each podcastHistory as episode (episode.id)}<button onclick={() => playPodcast(episode)}>{#if episode.image}<img src={episode.image} alt="" />{:else}<span>◉</span>{/if}<strong>{episode.title}</strong><small>{episode.feedTitle}</small></button>{/each}</div></section>
+            {/if}
+          </section>
+          <div class="section-label tracks-label"><b>{$t("Tracks")}</b><span>{tracks.length} {tracks.length === 1 ? 'result' : 'results'}</span></div>
+        {:else if !query.trim()}
+          <section class="library-heading"><div><p>{$t("SEARCH")}</p><h1>{$t("Find something")}</h1></div><span>{$t("Your library and the network")}</span></section>
         {/if}
+  
+        {@render trackList(
+          'No tracks found',
+          query.trim() ? 'Try different words or clear the search.' : 'Search your Napstr library and the network.',
+          !showingLikedMusic && Boolean(query.trim())
+        )}
+      {:else if activeTab === 'music'}
         <section class="library-heading">
-          <div><p>{showingLikedPodcasts ? 'FAVOURITES' : 'POWERED BY PODCAST INDEX'}</p><h1>{showingLikedPodcasts ? 'Liked podcasts' : podcastGenre ? podcastGenre : podcastQuery ? `Results for “${podcastQuery}”` : 'Discover podcasts'}</h1></div>
-          <span>{podcastFeeds.length} shows</span>
+          <div><p>{showingLikedMusic ? 'FAVOURITES' : 'YOUR NAPSTR'}</p><h1>{showingLikedMusic ? 'Liked music' : 'Your music'}</h1></div>
+          <span>{total} {total === 1 ? 'track' : 'tracks'}</span>
         </section>
-        <section class="podcast-grid" aria-busy={podcastLoading}>
-          {#if podcastLoading}<div class="loading-list"><i></i><span>Searching podcasts…</span></div>{/if}
-          {#each podcastFeeds as feed (feed.id)}
-            <article class="podcast-card">
-              <button class="podcast-open" onclick={() => openPodcast(feed)}>
-                {#if feed.image}<img src={feed.image} alt="" />{:else}<div class="podcast-art-fallback">◉</div>{/if}
-                <span><strong>{feed.title}</strong><small>{feed.author || 'Independent podcast'}</small></span>
-              </button>
-              <button class:liked={isPodcastLiked(feed)} class="like-button podcast-like" onclick={() => togglePodcastLike(feed)} aria-label={`${isPodcastLiked(feed) ? 'Unlike' : 'Like'} ${feed.title}`}>{isPodcastLiked(feed) ? '♥' : '♡'}</button>
-            </article>
-          {/each}
-          {#if !podcastLoading && podcastFeeds.length === 0}<div class="empty-library"><h2>{showingLikedPodcasts ? 'No liked podcasts yet' : 'Search podcasts'}</h2><p>{showingLikedPodcasts ? 'Tap the heart beside a podcast to keep it here.' : 'Napstrfy searches podcasts directly over this phone\'s internet connection.'}</p></div>{/if}
+  
+        {#if !showingLikedMusic && (discoverAlbums.length > 0 || lastPlayed.length > 0)}
+          <section class="album-shelves">
+            {#if lastPlayed.length > 0}
+              <div class="album-shelf-block">
+                <div class="section-label"><b>{$t("Last played")}</b><span>{$t("Recent albums")}</span></div>
+                <div class="album-shelf">
+                  {#each lastPlayed as album (album.key)}
+                    <div class="album-card">
+                      <button class="album-open" onclick={() => void openAlbum(album)} aria-label={`Open ${album.album} by ${album.artist || 'an unknown artist'}`}>
+                        <TrackArtwork track={album.representative} lookup />
+                        <span class="album-play" aria-hidden="true">▶</span>
+                      </button>
+                      <strong>{album.album}</strong>
+                      <small>{album.artist || 'Unknown artist'}</small>
+                    </div>
+                  {/each}
+                </div>
+              </div>
+            {/if}
+            {#if discoverAlbums.length > 0}
+              <div class="album-shelf-block">
+                <div class="section-label"><b>{$t("Discover albums")}</b><span>{libraryAlbums.length} {$t("in this library")}</span></div>
+                <div class="album-shelf">
+                  {#each discoverAlbums as album (album.key)}
+                    <div class="album-card">
+                      <button class="album-open" onclick={() => void openAlbum(album)} aria-label={`Open ${album.album} by ${album.artist || 'an unknown artist'}`}>
+                        <TrackArtwork track={album.representative} lookup />
+                        <span class="album-play" aria-hidden="true">▶</span>
+                      </button>
+                      <strong>{album.album}</strong>
+                      <small>{album.artist || 'Unknown artist'}</small>
+                    </div>
+                  {/each}
+                </div>
+              </div>
+            {/if}
+          </section>
+        {/if}
+  
+        {@render trackList(
+          showingLikedMusic ? 'No liked tracks yet' : 'No tracks found',
+          showingLikedMusic ? 'Tap the heart beside a song to keep it here.' : 'Add music to your Napstr folder on the computer.',
+          !showingLikedMusic
+        )}
+      {:else if activeTab === 'podcasts'}
+        <section class="search-area podcast-search">
+          <form onsubmit={(event) => { event.preventDefault(); event.currentTarget.querySelector('input')?.blur(); void searchPodcasts(); }}>
+            <span>⌕</span><input bind:value={podcastQuery} placeholder={$t("Search podcasts")} aria-label={$t("Search podcasts")} />
+            {#if podcastQuery}<button type="button" class="clear-search" onclick={() => { podcastQuery = ''; void loadTrendingPodcasts(); }}>×</button>{/if}
+          </form>
         </section>
-      {/if}
-    {:else}
-      <section class="search-area audiobook-search">
-        <form onsubmit={(event) => { event.preventDefault(); event.currentTarget.querySelector('input')?.blur(); void loadAudiobooks(); }}>
-          <span>⌕</span><input bind:value={audiobookQuery} placeholder="Search audiobooks" aria-label="Search audiobooks" />
-          {#if audiobookQuery}<button type="button" class="clear-search" onclick={() => { audiobookQuery = ''; void loadAudiobooks(); }}>×</button>{/if}
-        </form>
-      </section>
-
-      {#if selectedAudiobook}
-        <section class="audiobook-show-heading">
-          <button class="podcast-back" onclick={() => (selectedAudiobook = null)}>‹</button>
-          <div class="audiobook-cover">▥</div>
-          <div><p>AUDIOBOOK</p><h1>{selectedAudiobook.title}</h1><small>{selectedAudiobook.author || 'Unknown author'}{selectedAudiobook.narrator ? ` · Read by ${selectedAudiobook.narrator}` : ''}</small></div>
-        </section>
-        <section class="audiobook-chapter-list" aria-busy={audiobookLoading}>
-          {#each selectedAudiobook.chapters as chapter, index (chapter.fileId)}
-            <button class="audiobook-chapter" disabled={status.streamOnly && !chapter.local} onclick={() => activateAudiobookChapter(selectedAudiobook!, chapter)}>
-              <span>{chapter.local ? '▶' : status.streamOnly ? '—' : '⇩'}</span>
-              <span><strong>{chapter.title || chapter.filename}</strong><small>Chapter {index + 1} · {readableSize(chapter.size)}</small></span>
-            </button>
-          {/each}
-        </section>
+        <div class="chips-row"><div class="chips podcast-genres"><button class:active={showingLikedPodcasts} onclick={showLikedPodcastList}>{$t("♥ Liked")}</button>{#each podcastGenres as genre}<button class:active={!showingLikedPodcasts && podcastGenre === genre} onclick={() => selectPodcastGenre(genre)}>{genre}</button>{/each}</div></div>
+  
+        {#if selectedPodcast}
+          <section class="podcast-show-heading">
+            <button class="podcast-back" onclick={() => { selectedPodcast = null; podcastEpisodes = []; }}>‹</button>
+            {#if selectedPodcast.image}<img src={selectedPodcast.image} alt="" />{:else}<div class="podcast-art-fallback">◉</div>{/if}
+            <div><p>{$t("PODCAST")}</p><h1>{selectedPodcast.title}</h1><small>{selectedPodcast.author || 'Independent podcast'}</small></div>
+            <button class:liked={isPodcastLiked(selectedPodcast)} class="like-button podcast-heading-like" onclick={() => togglePodcastLike(selectedPodcast!)} aria-label={`${isPodcastLiked(selectedPodcast) ? 'Unlike' : 'Like'} ${selectedPodcast.title}`}>{isPodcastLiked(selectedPodcast) ? '♥' : '♡'}</button>
+          </section>
+          <section class="episode-list" aria-busy={podcastLoading}>
+            {#if podcastLoading}<div class="loading-list"><i></i><span>{$t("Loading episodes…")}</span></div>{/if}
+            {#each podcastEpisodes as episode (episode.id)}
+              {@const download = podcastDownloadFor(episode.id)}
+              {@const episodeImage = episode.image || selectedPodcast.image}
+              <article class="episode-row">
+                <button class="episode-art" onclick={() => playPodcast(episode)} aria-label={`Play ${episode.title}`}>
+                  <span class="podcast-art-fallback">◉</span>
+                  {#if episodeImage}<img src={episodeImage} alt="" onerror={(event) => usePodcastArtwork(event, selectedPodcast!.image)} />{/if}
+                  <i aria-hidden="true">▶</i>
+                </button>
+                <button class="episode-copy" onclick={() => playPodcast(episode)}>
+                  <strong>{episode.title}</strong>
+                  {#if episode.description}<span>{episode.description}</span>{/if}
+                  <small>{podcastDate(episode.datePublished)}{episode.duration ? ` · ${clock(episode.duration)}` : ''}</small>
+                </button>
+                <button class:ready={download?.ready} class="episode-download" onclick={() => downloadPodcast(episode)} disabled={download?.status === 'Downloading'} aria-label={`Download ${episode.title}`} title={download?.status || 'Download for offline listening'}>{download?.ready ? '✓' : download?.status === 'Downloading' ? `${Math.round(download.progress)}%` : '⇩'}</button>
+              </article>
+            {/each}
+            {#if !podcastLoading && podcastEpisodes.length === 0}<div class="empty-library"><h2>{$t("No playable episodes")}</h2><p>{$t("This feed may not currently expose supported HTTPS audio.")}</p></div>{/if}
+          </section>
+        {:else}
+          {#if podcastHistory.length > 0 && !podcastQuery && !podcastGenre && !showingLikedPodcasts}
+            <section class="podcast-history"><div class="section-label"><b>{$t("Recently played")}</b><span>{$t("Last 10")}</span></div><div class="history-scroller">{#each podcastHistory as episode (episode.id)}<button onclick={() => playPodcast(episode)}>{#if episode.image}<img src={episode.image} alt="" />{:else}<span>◉</span>{/if}<strong>{episode.title}</strong><small>{episode.feedTitle}</small></button>{/each}</div></section>
+          {/if}
+          <section class="library-heading">
+            <div><p>{showingLikedPodcasts ? 'FAVOURITES' : 'POWERED BY PODCAST INDEX'}</p><h1>{showingLikedPodcasts ? 'Liked podcasts' : podcastGenre ? podcastGenre : podcastQuery ? `Results for “${podcastQuery}”` : 'Discover podcasts'}</h1></div>
+            <span>{podcastFeeds.length} {$t("shows")}</span>
+          </section>
+          <section class="podcast-grid" aria-busy={podcastLoading}>
+            {#if podcastLoading}<div class="loading-list"><i></i><span>{$t("Searching podcasts…")}</span></div>{/if}
+            {#each podcastFeeds as feed (feed.id)}
+              <article class="podcast-card">
+                <button class="podcast-open" onclick={() => openPodcast(feed)}>
+                  {#if feed.image}<img src={feed.image} alt="" />{:else}<div class="podcast-art-fallback">◉</div>{/if}
+                  <span><strong>{feed.title}</strong><small>{feed.author || 'Independent podcast'}</small></span>
+                </button>
+                <button class:liked={isPodcastLiked(feed)} class="like-button podcast-like" onclick={() => togglePodcastLike(feed)} aria-label={`${isPodcastLiked(feed) ? 'Unlike' : 'Like'} ${feed.title}`}>{isPodcastLiked(feed) ? '♥' : '♡'}</button>
+              </article>
+            {/each}
+            {#if !podcastLoading && podcastFeeds.length === 0}<div class="empty-library"><h2>{showingLikedPodcasts ? 'No liked podcasts yet' : 'Search podcasts'}</h2><p>{showingLikedPodcasts ? 'Tap the heart beside a podcast to keep it here.' : 'Napstrfy searches podcasts directly over this phone\'s internet connection.'}</p></div>{/if}
+          </section>
+        {/if}
       {:else}
-        <section class="library-heading">
-          <div><p>YOUR NAPSTR</p><h1>Audiobooks</h1></div>
-          <span>{audiobookTotal} {audiobookTotal === 1 ? 'book' : 'books'}</span>
+        <section class="search-area audiobook-search">
+          <form onsubmit={(event) => { event.preventDefault(); event.currentTarget.querySelector('input')?.blur(); void loadAudiobooks(); }}>
+            <span>⌕</span><input bind:value={audiobookQuery} placeholder={$t("Search audiobooks")} aria-label={$t("Search audiobooks")} />
+            {#if audiobookQuery}<button type="button" class="clear-search" onclick={() => { audiobookQuery = ''; void loadAudiobooks(); }}>×</button>{/if}
+          </form>
         </section>
-        <section class="audiobook-list" aria-busy={audiobookLoading}>
-          {#if audiobookLoading}<div class="loading-list"><i></i><span>Asking Napstr…</span></div>{/if}
-          {#each audiobooks as book (book.audiobookId)}
-            <button class="audiobook-card" onclick={() => openAudiobook(book)}>
-              <span class="audiobook-cover">▥</span>
-              <span><strong>{book.title}</strong><small>{book.author || 'Unknown author'}</small><i>{book.chapterCount} {book.chapterCount === 1 ? 'file' : 'chapters'} · {readableSize(book.totalSize)}</i></span>
-              <b>›</b>
-            </button>
-          {/each}
-          {#if !audiobookLoading && audiobooks.length === 0}<div class="empty-library"><h2>No audiobooks found</h2><p>Group a chapter folder in Napstr, or add the tag “audiobook” to a complete one-file book.</p></div>{/if}
-        </section>
+  
+        {#if selectedAudiobook}
+          <section class="audiobook-show-heading">
+            <button class="podcast-back" onclick={() => (selectedAudiobook = null)}>‹</button>
+            <div class="audiobook-cover">▥</div>
+            <div><p>{$t("AUDIOBOOK")}</p><h1>{selectedAudiobook.title}</h1><small>{selectedAudiobook.author || 'Unknown author'}{selectedAudiobook.narrator ? ` · Read by ${selectedAudiobook.narrator}` : ''}</small></div>
+          </section>
+          <section class="audiobook-chapter-list" aria-busy={audiobookLoading}>
+            {#each selectedAudiobook.chapters as chapter, index (chapter.fileId)}
+              <button class="audiobook-chapter" disabled={status.streamOnly && !chapter.local} onclick={() => activateAudiobookChapter(selectedAudiobook!, chapter)}>
+                <span>{chapter.local ? '▶' : status.streamOnly ? '—' : '⇩'}</span>
+                <span><strong>{chapter.title || chapter.filename}</strong><small>{$t("Chapter")} {index + 1} · {readableSize(chapter.size)}</small></span>
+              </button>
+            {/each}
+          </section>
+        {:else}
+          <section class="library-heading">
+            <div><p>{$t("YOUR NAPSTR")}</p><h1>{$t("Audiobooks")}</h1></div>
+            <span>{audiobookTotal} {audiobookTotal === 1 ? 'book' : 'books'}</span>
+          </section>
+          <section class="audiobook-list" aria-busy={audiobookLoading}>
+            {#if audiobookLoading}<div class="loading-list"><i></i><span>{$t("Asking Napstr…")}</span></div>{/if}
+            {#each audiobooks as book (book.audiobookId)}
+              <button class="audiobook-card" onclick={() => openAudiobook(book)}>
+                <span class="audiobook-cover">▥</span>
+                <span><strong>{book.title}</strong><small>{book.author || 'Unknown author'}</small><i>{book.chapterCount} {book.chapterCount === 1 ? 'file' : 'chapters'} · {readableSize(book.totalSize)}</i></span>
+                <b>›</b>
+              </button>
+            {/each}
+            {#if !audiobookLoading && audiobooks.length === 0}<div class="empty-library"><h2>{$t("No audiobooks found")}</h2><p>{$t("Group a chapter folder in Napstr, or add the tag “audiobook” to a complete one-file book.")}</p></div>{/if}
+          </section>
+        {/if}
       {/if}
-    {/if}
+    </div>
 
-    <nav class:dragging={sheetDragging || barDragging} style={`--nav-shift:${navShift}`} class="bottom-nav" aria-label="Napstrfy navigation">
-      <button class:active={activeTab === 'music'} onclick={showMusic}><span>♫</span>Music</button>
-      <button class:active={activeTab === 'search'} onclick={showSearch}><span class="nav-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.4" /><path d="M15.9 15.9 20.6 20.6" /></svg></span>Search</button>
-      <button class:active={activeTab === 'podcasts'} onclick={showPodcasts}><span>◉</span>Podcasts</button>
-      <button class:active={activeTab === 'audiobooks'} onclick={showAudiobooks}><span>▥</span>Audiobooks</button>
+    <nav class:dragging={sheetDragging || barDragging} style={`--nav-shift:${navShift}`} class="bottom-nav" aria-label={$t("Napstrfy navigation")}>
+      <button class:active={activeTab === 'music'} onclick={showMusic}><span>♫</span>{$t("Music")}</button>
+      <button class:active={activeTab === 'search'} onclick={showSearch}><span class="nav-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.4" /><path d="M15.9 15.9 20.6 20.6" /></svg></span>{$t("Search")}</button>
+      <button class:active={activeTab === 'podcasts'} onclick={showPodcasts}><span>◉</span>{$t("Podcasts")}</button>
+      <button class:active={activeTab === 'audiobooks'} onclick={showAudiobooks}><span>▥</span>{$t("Audiobooks")}</button>
     </nav>
 
-    <section
-      class:dragging={barDragging}
-      style={`--bar-shift:${barShift}px; --bar-opacity:${barFade}; --bar-progress:${barProgress}; ${barArtStyle}`}
-      class:empty={barEmpty}
-      class="now-playing"
-    >
-      <span class="now-fill" aria-hidden="true"></span>
-      <button
-        class="now-open"
-        bind:this={barElement}
-        disabled={!nowPlayingAvailable()}
-        onclick={handleBarClick}
-        onpointerdown={startBarDrag}
-        onpointermove={moveBarDrag}
-        onpointerup={endBarDrag}
-        onpointercancel={endBarDrag}
-        aria-label={playbackTarget === 'desktop' ? `Open what ${playbackTargetLabel()} is playing` : 'Open the now playing screen'}
+    {#if !pinned}
+      <!-- The compact bar is the phone's player; a pinned desktop column replaces it. -->
+      <section
+        class:dragging={barDragging}
+        style={`--bar-shift:${barShift}px; --bar-opacity:${barFade}; --bar-progress:${barProgress}; ${barArtStyle}`}
+        class:empty={barEmpty}
+        class="now-playing"
       >
-        {#if playbackTarget === 'desktop'}
-          {#if barTrack}<TrackArtwork track={barTrack} large lookup />{:else}<div class="empty-art">♬</div>{/if}
-        {:else if activeMedia === 'podcast' && currentPodcast}
-          {#if currentPodcast.image}<img class="podcast-player-art" src={currentPodcast.image} alt="" />{:else}<div class="empty-art">◉</div>{/if}
-        {:else if current}<TrackArtwork track={current} large lookup />{:else}<div class="empty-art">♪</div>{/if}
-        <div class="now-copy">
-          <div class="now-title" bind:this={titleClipper}>
-            {#key nowTitle}
-              <div class:marquee={titleOverflows} class="now-title-row">
-                <span bind:this={titleText}>{nowTitle}</span>
-                {#if titleOverflows}<span aria-hidden="true">{nowTitle}</span>{/if}
-              </div>
-            {/key}
+        <span class="now-fill" aria-hidden="true"></span>
+        <button
+          class="now-open"
+          bind:this={barElement}
+          disabled={!nowPlayingAvailable()}
+          onclick={handleBarClick}
+          onpointerdown={startBarDrag}
+          onpointermove={moveBarDrag}
+          onpointerup={endBarDrag}
+          onpointercancel={endBarDrag}
+          aria-label={playbackTarget === 'desktop' ? `Open what ${playbackTargetLabel()} is playing` : 'Open the now playing screen'}
+        >
+          {#if playbackTarget === 'desktop'}
+            {#if barTrack}<TrackArtwork track={barTrack} large lookup />{:else}<div class="empty-art">♬</div>{/if}
+          {:else if activeMedia === 'podcast' && currentPodcast}
+            {#if currentPodcast.image}<img class="podcast-player-art" src={currentPodcast.image} alt="" />{:else}<div class="empty-art">◉</div>{/if}
+          {:else if current}<TrackArtwork track={current} large lookup />{:else}<div class="empty-art">♪</div>{/if}
+          <div class="now-copy">
+            <div class="now-title" bind:this={titleClipper}>
+              {#key nowTitle}
+                <div class:marquee={titleOverflows} class="now-title-row">
+                  <span bind:this={titleText}>{nowTitle}</span>
+                  {#if titleOverflows}<span aria-hidden="true">{nowTitle}</span>{/if}
+                </div>
+              {/key}
+            </div>
+            <small>{nowArtist}</small>
           </div>
-          <small>{nowArtist}</small>
+        </button>
+        <button class="now-play" onclick={togglePlayer} disabled={barEmpty || (playbackTarget !== 'desktop' && caching)} aria-label={barPlaying ? 'Pause' : 'Play'}>
+          {#if playbackTarget !== 'desktop' && caching}<span class="icon-busy"></span>{:else if barPlaying}<span class="icon-pause"></span>{:else}<span class="icon-play"></span>{/if}
+        </button>
+      </section>
+    {/if}
+
+    {#if showNowPlaying || pinned}
+      <div
+        class="now-sheet"
+        class:pinned
+        class:entering={sheetEntering}
+        class:closing={sheetClosing}
+        class:dragging={sheetDragging}
+        bind:this={sheetElement}
+        style={`--sheet-drag:${sheetDragY}px; --cover-hue:${artworkHue(shownTrack?.fileId ?? '')}`}
+        role={pinned ? 'complementary' : 'dialog'}
+        aria-modal={pinned ? undefined : 'true'}
+        tabindex="-1"
+        aria-label={$t("Now playing")}
+        onpointerdown={startSheetDrag}
+        onpointermove={moveSheetDrag}
+        onpointerup={endSheetDrag}
+        onpointercancel={endSheetDrag}
+      >
+        <div class="now-sheet-hero">
+          {#if sheetCoverUrl()}
+            <div class="now-sheet-backdrop" style={`background-image:url(${sheetCoverUrl()})`}></div>
+          {:else}
+            <div class="now-sheet-backdrop empty"></div>
+          {/if}
+          <div class="now-sheet-scrim"></div>
+          <div class="now-sheet-top">
+            <button class="now-sheet-icon now-sheet-close" onclick={closeNowPlaying} aria-label={$t("Close the now playing screen")}>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 9.5 12 16l7-6.5" /></svg>
+            </button>
+            <div class="now-sheet-top-buttons">
+              {#if status.paired}
+                <button class="now-sheet-icon" onclick={openSourcePicker} aria-label={`Play on: ${playbackTargetLabel()}`} title={$t("Play on")}>
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <rect x="3.4" y="5.2" width="17.2" height="12.6" rx="2" />
+                    <circle class="filled" cx="4.9" cy="16.9" r="1.1" />
+                    <path d="M7.4 16.9A2.5 2.5 0 0 0 4.9 14.4" /><path d="M9.6 16.9A4.7 4.7 0 0 0 4.9 12.2" />
+                  </svg>
+                </button>
+              {/if}
+              <button class="now-sheet-icon" onclick={() => openActions(null)} aria-label={$t("Track options")}>
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <circle class="filled" cx="12" cy="5.6" r="1.7" /><circle class="filled" cx="12" cy="12" r="1.7" /><circle class="filled" cx="12" cy="18.4" r="1.7" />
+                </svg>
+              </button>
+            </div>
+          </div>
+          <div class="now-sheet-art">
+            {#if sheetCoverUrl()}
+              <img src={sheetCoverUrl()} alt="" onerror={() => (nowArtFailed = true)} />
+            {:else}<div class="now-sheet-art-empty">♪</div>{/if}
+          </div>
         </div>
-      </button>
-      <button class="now-play" onclick={togglePlayer} disabled={barEmpty || (playbackTarget !== 'desktop' && caching)} aria-label={barPlaying ? 'Pause' : 'Play'}>
-        {#if playbackTarget !== 'desktop' && caching}<span class="icon-busy"></span>{:else if barPlaying}<span class="icon-pause"></span>{:else}<span class="icon-play"></span>{/if}
-      </button>
-    </section>
+
+        <div class="now-sheet-body" bind:this={sheetScroller}>
+          {#if playbackTarget === 'desktop' && (remoteError || remoteState?.error)}
+            <p class="sheet-error">{remoteState?.error || remoteError}</p>
+          {/if}
+
+          <div class="now-sheet-timeline">
+            <input
+              type="range"
+              min="0"
+              max={shownDuration || 0}
+              step="0.1"
+              value={shownPosition}
+              oninput={(event) => { if (playbackTarget !== 'desktop') void seekShown(Number(event.currentTarget.value)); }}
+              onchange={(event) => { if (playbackTarget === 'desktop') void seekShown(Number(event.currentTarget.value)); }}
+              disabled={!shownCanSeek}
+              aria-label={$t("Seek")}
+            />
+          </div>
+
+          <div class="now-sheet-meta">
+            <span>{clock(shownPosition)}</span>
+            <span class="now-sheet-speed">
+              {playbackTarget === 'desktop'
+                ? `${remoteState?.queueLen ?? 0} ${(remoteState?.queueLen ?? 0) === 1 ? 'track' : 'tracks'} there`
+                : 'Speed: 1x'}
+            </span>
+            <span>{shownDurationLabel}</span>
+          </div>
+
+          {#if playbackTarget === 'desktop' && !remoteState?.active}
+            <div class="now-sheet-copy">
+              <h1>{$t("Nothing is playing there")}</h1>
+              <p>
+                {status.streamOnly
+                  ? 'This pairing is read only, so it cannot start anything.'
+                  : 'Napstr will pick up from wherever the computer left off.'}
+              </p>
+            </div>
+          {:else if shownTrack}
+            <div class="now-sheet-copy">
+              <h1>{title(shownTrack)}</h1>
+              <p>{artist(shownTrack)}</p>
+              {#if shownTrack.album}<small>{shownTrack.album}</small>{/if}
+              {#if playbackTarget !== 'desktop' && fileSummary(shownTrack)}<em>{fileSummary(shownTrack)}</em>{/if}
+            </div>
+          {/if}
+
+          <div class="now-sheet-actions">
+            <button onclick={() => void moveTrackBy(-1)} disabled={!shownCanSkip || (playbackTarget === 'phone' && shuffle && randomHistoryIndex <= 0)} aria-label={$t("Previous track")}>|◀</button>
+            <button class="skip-button" onclick={() => void nudgeShown(-15)} disabled={!shownCanSeek} aria-label={$t("Back 15 seconds")} title={$t("Back 15 seconds")}>
+              <SeekIcon />
+            </button>
+            <button class="play-main" class:square={shownPlaying} onclick={togglePlayer} disabled={playbackTarget === 'desktop' ? remoteBusy || status.streamOnly : caching} aria-label={shownPlaying ? 'Pause' : 'Play'}>
+              {#if playbackTarget === 'desktop' ? remoteBusy : caching}<span class="icon-busy"></span>{:else if shownPlaying}<span class="icon-pause"></span>{:else}<span class="icon-play"></span>{/if}
+            </button>
+            <button class="skip-button" onclick={() => void nudgeShown(15)} disabled={!shownCanSeek} aria-label={$t("Forward 15 seconds")} title={$t("Forward 15 seconds")}>
+              <SeekIcon forward />
+            </button>
+            <button onclick={() => void moveTrackBy(1)} disabled={!shownCanSkip} aria-label={$t("Next track")}>▶|</button>
+          </div>
+
+          {#if playbackTarget === 'desktop' && remoteState?.active}
+            <label class="sheet-volume">
+              <span>{$t("Volume")}</span>
+              <input
+                type="range"
+                min="0"
+                max="100"
+                step="1"
+                value={remoteVolumePercent()}
+                oninput={(event) => setRemoteVolume(Number(event.currentTarget.value))}
+                disabled={status.streamOnly}
+                aria-label={$t("Volume on the computer")}
+              />
+            </label>
+          {/if}
+
+          <div class="now-sheet-modes">
+            <button class:active={shownLoopActive} onclick={cycleShownRepeat} aria-label={shownLoopLabel} title={shownLoopLabel}>
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M4.5 9.2A4.7 4.7 0 0 1 9.2 4.5H18" /><path d="M15.6 1.8 18.6 4.5 15.6 7.2" />
+                <path d="M19.5 14.8a4.7 4.7 0 0 1-4.7 4.7H6" /><path d="M8.4 22.2 5.4 19.5 8.4 16.8" />
+                {#if shownLoopOne}<path d="M11.7 11.4 12.9 10.3v5.2" /><path d="M11.2 15.5h3.4" />{/if}
+              </svg>
+            </button>
+            <button class:active={shownShuffle} onclick={toggleShownShuffle} aria-label={shownShuffle ? 'Shuffle on' : 'Shuffle off'} title={$t("Shuffle")}>
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M3.5 6.5h3.2l10.1 11h4" /><path d="M18.3 3.7 21 6.5l-2.7 2.8" />
+                <path d="M3.5 17.5h3.2l10.1-11h4" /><path d="M18.3 14.7 21 17.5l-2.7 2.8" />
+              </svg>
+            </button>
+            <button onclick={() => (showQueue = true)} disabled={playbackTarget === 'desktop' && remoteQueue.length === 0} aria-label={$t("Open the playlist")} title={$t("Playlist")}>
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M4 6.5h16" /><path d="M4 12h16" /><path d="M4 17.5h16" />
+              </svg>
+            </button>
+            <button disabled aria-label={$t("Smart playlists, coming soon")} title={$t("Smart playlists, coming soon")}>
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M12 12h.01" /><path d="M8.4 8.4a5.1 5.1 0 0 0 0 7.2" /><path d="M15.6 8.4a5.1 5.1 0 0 1 0 7.2" />
+              </svg>
+            </button>
+            <button class="now-mode-like" class:liked={shownLiked} aria-pressed={shownLiked} onclick={toggleShownLike} aria-label={$t("Like this track")} disabled={!shownTrack}>
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M12 20.3c-1.4-1-7.2-5.2-7.2-9.4A4.2 4.2 0 0 1 12 8.2a4.2 4.2 0 0 1 7.2 2.7c0 4.2-5.8 8.4-7.2 9.4z" />
+              </svg>
+            </button>
+          </div>
+        </div>
+      </div>
+    {/if}
   </main>
 {/if}
 
-{#if showNowPlaying && (playbackTarget === 'desktop' ? remoteAvailable() : !!current && activeMedia === 'music')}
-  <div
-    class="now-sheet"
-    class:entering={sheetEntering}
-    class:closing={sheetClosing}
-    class:dragging={sheetDragging}
-    bind:this={sheetElement}
-    style={`--sheet-drag:${sheetDragY}px; --cover-hue:${artworkHue(shownTrack?.fileId ?? '')}`}
-    role="dialog"
-    aria-modal="true"
-    tabindex="-1"
-    aria-label="Now playing"
-    onpointerdown={startSheetDrag}
-    onpointermove={moveSheetDrag}
-    onpointerup={endSheetDrag}
-    onpointercancel={endSheetDrag}
-  >
-    <div class="now-sheet-hero">
-      {#if sheetCoverUrl()}
-        <div class="now-sheet-backdrop" style={`background-image:url(${sheetCoverUrl()})`}></div>
-      {:else}
-        <div class="now-sheet-backdrop empty"></div>
-      {/if}
-      <div class="now-sheet-scrim"></div>
-      <div class="now-sheet-top">
-        <button class="now-sheet-icon" onclick={closeNowPlaying} aria-label="Close the now playing screen">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 9.5 12 16l7-6.5" /></svg>
-        </button>
-        <div class="now-sheet-top-buttons">
-          {#if status.paired}
-            <button class="now-sheet-icon" onclick={openSourcePicker} aria-label={`Play on: ${playbackTargetLabel()}`} title="Play on">
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <rect x="3.4" y="5.2" width="17.2" height="12.6" rx="2" />
-                <circle class="filled" cx="4.9" cy="16.9" r="1.1" />
-                <path d="M7.4 16.9A2.5 2.5 0 0 0 4.9 14.4" /><path d="M9.6 16.9A4.7 4.7 0 0 0 4.9 12.2" />
-              </svg>
-            </button>
-          {/if}
-          <button class="now-sheet-icon" onclick={() => openActions(null)} aria-label="Track options">
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <circle class="filled" cx="12" cy="5.6" r="1.7" /><circle class="filled" cx="12" cy="12" r="1.7" /><circle class="filled" cx="12" cy="18.4" r="1.7" />
-            </svg>
-          </button>
-        </div>
-      </div>
-      <div class="now-sheet-art">
-        {#if sheetCoverUrl()}
-          <img src={sheetCoverUrl()} alt="" onerror={() => (nowArtFailed = true)} />
-        {:else}<div class="now-sheet-art-empty">♪</div>{/if}
-      </div>
-    </div>
-
-    <div class="now-sheet-body" bind:this={sheetScroller}>
-      {#if playbackTarget === 'desktop' && (remoteError || remoteState?.error)}
-        <p class="sheet-error">{remoteState?.error || remoteError}</p>
-      {/if}
-
-      <div class="now-sheet-timeline">
-        <input
-          type="range"
-          min="0"
-          max={shownDuration || 0}
-          step="0.1"
-          value={shownPosition}
-          oninput={(event) => { if (playbackTarget !== 'desktop') void seekShown(Number(event.currentTarget.value)); }}
-          onchange={(event) => { if (playbackTarget === 'desktop') void seekShown(Number(event.currentTarget.value)); }}
-          disabled={playbackTarget === 'desktop' && (status.streamOnly || !remoteState?.active)}
-          aria-label="Seek"
-        />
-      </div>
-
-      <div class="now-sheet-meta">
-        <span>{clock(shownPosition)}</span>
-        <span class="now-sheet-speed">
-          {playbackTarget === 'desktop'
-            ? `${remoteState?.queueLen ?? 0} ${(remoteState?.queueLen ?? 0) === 1 ? 'track' : 'tracks'} there`
-            : 'Speed: 1x'}
-        </span>
-        <span>{clock(shownDuration)}</span>
-      </div>
-
-      {#if playbackTarget === 'desktop' && !remoteState?.active}
-        <div class="now-sheet-copy">
-          <h1>Nothing is playing there</h1>
-          <p>
-            {status.streamOnly
-              ? 'This pairing is read only, so it cannot start anything.'
-              : 'Napstr will pick up from wherever the computer left off.'}
-          </p>
-        </div>
-      {:else if shownTrack}
-        <div class="now-sheet-copy">
-          <h1>{title(shownTrack)}</h1>
-          <p>{artist(shownTrack)}</p>
-          {#if shownTrack.album}<small>{shownTrack.album}</small>{/if}
-          {#if playbackTarget !== 'desktop' && fileSummary(shownTrack)}<em>{fileSummary(shownTrack)}</em>{/if}
-        </div>
-      {/if}
-
-      <div class="now-sheet-actions">
-        <button onclick={() => void moveTrackBy(-1)} disabled={!shownCanSkip || (playbackTarget === 'phone' && shuffle && randomHistoryIndex <= 0)} aria-label="Previous track">|◀</button>
-        <button class="skip-button" onclick={() => void nudgeShown(-10)} aria-label="Back 10 seconds">
-          <svg viewBox="0 0 24 24" aria-hidden="true">
-            <circle cx="12" cy="12" r="7.4" />
-            <path class="filled" d="M12 1.9 8.4 5.2l3.6 3.3z" />
-            <text class="filled" x="12" y="15.1" text-anchor="middle" font-size="8.4" font-weight="700">10</text>
-          </svg>
-        </button>
-        <button class="play-main" class:square={shownPlaying} onclick={togglePlayer} disabled={playbackTarget === 'desktop' ? remoteBusy || status.streamOnly : caching} aria-label={shownPlaying ? 'Pause' : 'Play'}>
-          {#if playbackTarget === 'desktop' ? remoteBusy : caching}<span class="icon-busy"></span>{:else if shownPlaying}<span class="icon-pause"></span>{:else}<span class="icon-play"></span>{/if}
-        </button>
-        <button class="skip-button" onclick={() => void nudgeShown(10)} aria-label="Forward 10 seconds">
-          <svg viewBox="0 0 24 24" aria-hidden="true">
-            <circle cx="12" cy="12" r="7.4" />
-            <path class="filled" d="M12 1.9 15.6 5.2 12 8.5z" />
-            <text class="filled" x="12" y="15.1" text-anchor="middle" font-size="8.4" font-weight="700">10</text>
-          </svg>
-        </button>
-        <button onclick={() => void moveTrackBy(1)} disabled={!shownCanSkip} aria-label="Next track">▶|</button>
-      </div>
-
-      {#if playbackTarget === 'desktop' && remoteState?.active}
-        <label class="sheet-volume">
-          <span>Volume</span>
-          <input
-            type="range"
-            min="0"
-            max="100"
-            step="1"
-            value={remoteVolumePercent()}
-            oninput={(event) => setRemoteVolume(Number(event.currentTarget.value))}
-            disabled={status.streamOnly}
-            aria-label="Volume on the computer"
-          />
-        </label>
-      {/if}
-
-      <div class="now-sheet-modes">
-        <button class:active={shownLoopActive} onclick={cycleShownRepeat} aria-label={shownLoopLabel} title={shownLoopLabel}>
-          <svg viewBox="0 0 24 24" aria-hidden="true">
-            <path d="M4.5 9.2A4.7 4.7 0 0 1 9.2 4.5H18" /><path d="M15.6 1.8 18.6 4.5 15.6 7.2" />
-            <path d="M19.5 14.8a4.7 4.7 0 0 1-4.7 4.7H6" /><path d="M8.4 22.2 5.4 19.5 8.4 16.8" />
-            {#if shownLoopOne}<path d="M11.7 11.4 12.9 10.3v5.2" /><path d="M11.2 15.5h3.4" />{/if}
-          </svg>
-        </button>
-        <button class:active={shownShuffle} onclick={toggleShownShuffle} aria-label={shownShuffle ? 'Shuffle on' : 'Shuffle off'} title="Shuffle">
-          <svg viewBox="0 0 24 24" aria-hidden="true">
-            <path d="M3.5 6.5h3.2l10.1 11h4" /><path d="M18.3 3.7 21 6.5l-2.7 2.8" />
-            <path d="M3.5 17.5h3.2l10.1-11h4" /><path d="M18.3 14.7 21 17.5l-2.7 2.8" />
-          </svg>
-        </button>
-        <button onclick={() => (showQueue = true)} disabled={playbackTarget === 'desktop' && remoteQueue.length === 0} aria-label="Open the playlist" title="Playlist">
-          <svg viewBox="0 0 24 24" aria-hidden="true">
-            <path d="M4 6.5h16" /><path d="M4 12h16" /><path d="M4 17.5h16" />
-          </svg>
-        </button>
-        <button disabled aria-label="Smart playlists, coming soon" title="Smart playlists, coming soon">
-          <svg viewBox="0 0 24 24" aria-hidden="true">
-            <path d="M12 12h.01" /><path d="M8.4 8.4a5.1 5.1 0 0 0 0 7.2" /><path d="M15.6 8.4a5.1 5.1 0 0 1 0 7.2" />
-          </svg>
-        </button>
-        <button class="now-mode-like" class:liked={shownLiked} onclick={toggleShownLike} aria-label="Like this track" disabled={!shownTrack}>
-          <svg viewBox="0 0 24 24" aria-hidden="true">
-            <path d="M12 20.3c-1.4-1-7.2-5.2-7.2-9.4A4.2 4.2 0 0 1 12 8.2a4.2 4.2 0 0 1 7.2 2.7c0 4.2-5.8 8.4-7.2 9.4z" />
-          </svg>
-        </button>
-      </div>
-    </div>
-  </div>
-{/if}
-
 {#if showQueue && (playbackTarget === 'desktop' || activeMedia === 'music')}
-  <div class="queue-view" role="dialog" aria-modal="true" aria-label="Playlist">
+  <div class="queue-view" role="dialog" aria-modal="true" aria-label={$t("Playlist")}>
     <header class="queue-head">
       <div>
         <p>{playbackTarget === 'desktop' ? `ON ${(status.desktopName || 'the computer').toUpperCase()}` : shuffle ? 'SHUFFLED' : 'PLAYING NEXT'}</p>
         <h1>{shownQueue.length === 1 ? '1 track' : `${shownQueue.length} tracks`}</h1>
       </div>
-      <button class="queue-close" onclick={() => (showQueue = false)} aria-label="Close the playlist">×</button>
+      <button class="queue-close" onclick={() => (showQueue = false)} aria-label={$t("Close the playlist")}>×</button>
     </header>
     <div class="queue-list">
       {#each shownQueue as track, index (track.fileId)}
@@ -3084,19 +3387,19 @@
           <span class="queue-copy"><strong>{title(track)}</strong><small>{artist(track)}</small></span>
         </button>
       {/each}
-      {#if shownQueue.length === 0}<p class="queue-empty">Nothing is queued yet.</p>{/if}
+      {#if shownQueue.length === 0}<p class="queue-empty">{$t("Nothing is queued yet.")}</p>{/if}
       {#if playbackTarget === 'desktop' && shownQueue.length > 0 && shownQueueIndex < 0}
-        <p class="queue-note">This is the list this phone sent. The computer is playing something else now.</p>
+        <p class="queue-note">{$t("This is the list this phone sent. The computer is playing something else now.")}</p>
       {/if}
     </div>
   </div>
 {/if}
 
 {#if showSettings}
-  <div class="settings-view" role="dialog" aria-modal="true" aria-label="Settings">
+  <div class="settings-view" role="dialog" aria-modal="true" aria-label={$t("Settings")}>
     <header class="view-head">
-      <h1>Settings</h1>
-      <button class="view-icon" onclick={() => (showSettings = false)} aria-label="Close settings">
+      <h1>{$t("Settings")}</h1>
+      <button class="view-icon" onclick={() => (showSettings = false)} aria-label={$t("Close settings")}>
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6.5 6.5 17.5 17.5" /><path d="M17.5 6.5 6.5 17.5" /></svg>
       </button>
     </header>
@@ -3108,26 +3411,31 @@
           <small>{status.paired ? (status.connected ? 'Connected over Iroh' : 'Tap reconnect to try again') : 'Pair with Napstr on your computer'}</small>
         </div>
       </div>
-      {#if status.streamOnly}<p class="settings-note">This pairing is read only: it can browse and play, but cannot ask Napstr to download or publish.</p>{/if}
+      {#if status.streamOnly}<p class="settings-note">{$t("This pairing is read only: it can browse and play, but cannot ask Napstr to download or publish.")}</p>{/if}
+
+      <!-- Near the top, so the language can be changed without scrolling. -->
+      <div class="settings-section">
+        <LanguageSelect />
+      </div>
 
       {#if status.paired}
         <button class="settings-row" onclick={() => { showSettings = false; void reconnect(); }} disabled={statusPending}>
-          <span>Reconnect</span><small>{statusPending ? 'Trying…' : 'Refresh the connection now'}</small>
+          <span>{$t("Reconnect")}</span><small>{statusPending ? 'Trying…' : 'Refresh the connection now'}</small>
         </button>
         <button class="settings-row danger" onclick={() => { showSettings = false; void forgetDesktop(); }}>
-          <span>Disconnect this phone</span><small>You will need a new QR code</small>
+          <span>{$t("Disconnect this phone")}</span><small>{$t("You will need a new QR code")}</small>
         </button>
       {:else}
         <button class="settings-row" onclick={() => { showSettings = false; showMusic(); }}>
-          <span>Pair Napstr</span><small>Scan a QR code from the computer</small>
+          <span>{$t("Pair Napstr")}</span><small>{$t("Scan a QR code from the computer")}</small>
         </button>
       {/if}
 
       {#if status.paired}
         <div class="settings-section">
-          <p>Playback</p>
+          <p>{$t("Playback")}</p>
           <button class="settings-row" onclick={openSourcePickerAlone}>
-            <span>Play on</span>
+            <span>{$t("Play on")}</span>
             <small>{playbackTargetLabel()}</small>
           </button>
         </div>
@@ -3135,9 +3443,9 @@
 
       {#if status.paired && !status.streamOnly}
         <div class="settings-section">
-          <p>Lend access</p>
+          <p>{$t("Lend access")}</p>
           <button class="settings-row" onclick={() => void requestReadOnlyCode()} disabled={ticketBusy || !status.connected}>
-            <span>Create a read-only code</span>
+            <span>{$t("Create a read-only code")}</span>
             <small>{ticketBusy ? 'Asking Napstr…' : 'For a guest phone'}</small>
           </button>
           {#if ticketError}<p class="settings-note">{ticketError}</p>{/if}
@@ -3146,13 +3454,13 @@
               {#if readOnlyTicket.qrSvg}
                 <div class="ticket-qr">{@html readOnlyTicket.qrSvg}</div>
               {:else}
-                <p class="ticket-note">Your computer drew no QR image. Send the code below instead.</p>
+                <p class="ticket-note">{$t("Your computer drew no QR image. Send the code below instead.")}</p>
               {/if}
               <code>{readOnlyTicket.uri}</code>
-              <small>Expires in about {ticketMinutesLeft()} minutes. Whoever scans this can browse, listen and keep what they play, and nothing else.</small>
+              <small>{$t("Expires in about")} {ticketMinutesLeft()} {$t("minutes. Whoever scans this can browse, listen and keep what they play, and nothing else.")}</small>
               <div class="ticket-actions">
-                <button onclick={() => void copyReadOnlyCode()}>Copy code</button>
-                <button onclick={() => (readOnlyTicket = null)}>Done</button>
+                <button onclick={() => void copyReadOnlyCode()}>{$t("Copy code")}</button>
+                <button onclick={() => (readOnlyTicket = null)}>{$t("Done")}</button>
               </div>
             </div>
           {/if}
@@ -3161,7 +3469,7 @@
 
       {#if COVER_DEBUG}
         <div class="settings-section">
-          <p>Developer tools</p>
+          <p>{$t("Developer tools")}</p>
           <CoverDebug {tracks} {status} embedded />
         </div>
       {/if}
@@ -3174,10 +3482,10 @@
     <div class="album-glow" style={albumView.art ? `background-image:url(${albumView.art})` : ''}></div>
     <div class="album-glow-scrim"></div>
     <header class="view-head">
-      <button class="view-icon" onclick={closeAlbumView} aria-label="Close the album">
+      <button class="view-icon" onclick={closeAlbumView} aria-label={$t("Close the album")}>
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14.5 5 8 12l6.5 7" /></svg>
       </button>
-      <button class="view-icon" onclick={() => openActions(albumView?.tracks[0] ?? null)} aria-label="Album options" disabled={albumView.tracks.length === 0}>
+      <button class="view-icon" onclick={() => openActions(albumView?.tracks[0] ?? null)} aria-label={$t("Album options")} disabled={albumView.tracks.length === 0}>
         <svg viewBox="0 0 24 24" aria-hidden="true">
           <circle class="filled" cx="12" cy="5.6" r="1.7" /><circle class="filled" cx="12" cy="12" r="1.7" /><circle class="filled" cx="12" cy="18.4" r="1.7" />
         </svg>
@@ -3193,7 +3501,7 @@
         <div class="album-title-copy">
           <h1>{albumView.album}</h1>
           <p>{albumView.artist || 'Unknown artist'}</p>
-          <p class="album-meta">Album · {albumView.year || 'Year unknown'}</p>
+          <p class="album-meta">{$t("Album ·")} {albumView.year || 'Year unknown'}</p>
         </div>
         <button class="album-play-all" onclick={() => void playAlbumNow()} disabled={albumView.tracks.length === 0} aria-label={`Play ${albumView.album}`}>
           {#if caching}<span class="icon-busy"></span>{:else}<span class="icon-play"></span>{/if}
@@ -3215,11 +3523,11 @@
           </li>
         {/each}
       </ol>
-      {#if albumView.tracks.length === 0}<p class="queue-empty">No tracks for this album yet.</p>{/if}
+      {#if albumView.tracks.length === 0}<p class="queue-empty">{$t("No tracks for this album yet.")}</p>{/if}
 
       {#if albumView.more.length > 0}
         <div class="album-shelf-block">
-          <div class="section-label"><b>More by {albumView.artist}</b><span>{albumView.more.length} albums</span></div>
+          <div class="section-label"><b>{$t("More by")} {albumView.artist}</b><span>{albumView.more.length} {$t("albums")}</span></div>
           <div class="album-shelf">
             {#each albumView.more as album (album.key)}
               <div class="album-card">
@@ -3239,27 +3547,27 @@
 {/if}
 
 {#if showReport}
-  <div class="report-view" role="dialog" aria-modal="true" aria-label="Report a cover">
-    <button class="actions-scrim" onclick={() => (showReport = false)} aria-label="Close the report"></button>
+  <div class="report-view" role="dialog" aria-modal="true" aria-label={$t("Report a cover")}>
+    <button class="actions-scrim" onclick={() => (showReport = false)} aria-label={$t("Close the report")}></button>
     <div class="actions-panel report-panel">
       <div class="report-head">
-        <h1>Report this cover</h1>
+        <h1>{$t("Report this cover")}</h1>
         <p>{reportLabel}</p>
       </div>
       <div class="actions-divider"></div>
       {#each reportReasons as reason (reason.value)}
         <button class:active={reportReason === reason.value} class="actions-row" onclick={() => (reportReason = reason.value)}>
           <span>{reason.label}</span>
-          {#if reportReason === reason.value}<small>Chosen</small>{/if}
+          {#if reportReason === reason.value}<small>{$t("Chosen")}</small>{/if}
         </button>
       {/each}
       <label class="report-note">
-        <span>Anything to add? (optional)</span>
-        <textarea bind:value={reportNote} rows="3" maxlength="500" placeholder="Say what is wrong with this cover"></textarea>
+        <span>{$t("Anything to add? (optional)")}</span>
+        <textarea bind:value={reportNote} rows="3" maxlength="500" placeholder={$t("Say what is wrong with this cover")}></textarea>
       </label>
       {#if reportError}<p class="report-error">{reportError}</p>{/if}
       <p class="remote-note">
-        Signed by {status.desktopName || 'your computer'} as a NIP-56 report. It tells other clients which cover to distrust.
+        {$t("Signed by")} {status.desktopName || 'your computer'} {$t("as a NIP-56 report. It tells other clients which cover to distrust.")}
       </p>
       <button class="report-send" onclick={() => void submitCoverReport()} disabled={reportBusy || !status.connected}>
         {reportBusy ? 'Sending…' : 'Send report'}
@@ -3269,13 +3577,13 @@
 {/if}
 
 {#if showSourceOptions && !showActions}
-  <div class="actions-view" role="dialog" aria-modal="true" aria-label="Where to play">
-    <button class="actions-scrim" onclick={() => (showSourceOptions = false)} aria-label="Close the source picker"></button>
+  <div class="actions-view" role="dialog" aria-modal="true" aria-label={$t("Where to play")}>
+    <button class="actions-scrim" onclick={() => (showSourceOptions = false)} aria-label={$t("Close the source picker")}></button>
     <div class="actions-panel">
       <div class="actions-head">
         <div class="actions-head-copy">
-          <strong>Play on</strong>
-          <small>Where tapping a track sends it</small>
+          <strong>{$t("Play on")}</strong>
+          <small>{$t("Where tapping a track sends it")}</small>
         </div>
       </div>
       <div class="actions-divider"></div>
@@ -3285,8 +3593,8 @@
 {/if}
 
 {#if showActions && menuTrack}
-  <div class="actions-view" role="dialog" aria-modal="true" aria-label="Track options">
-    <button class="actions-scrim" onclick={closeActions} aria-label="Close the track options"></button>
+  <div class="actions-view" role="dialog" aria-modal="true" aria-label={$t("Track options")}>
+    <button class="actions-scrim" onclick={closeActions} aria-label={$t("Close the track options")}></button>
     <div class="actions-panel">
       <div class="actions-head">
         <TrackArtwork track={menuTrack} lookup />
@@ -3297,24 +3605,24 @@
       {#if showSleepOptions}
         <button class="actions-row back" onclick={() => (showSleepOptions = false)}>
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14.5 5 8 12l6.5 7" /></svg>
-          <span>Sleep timer</span><small>{sleepSummary()}</small>
+          <span>{$t("Sleep timer")}</span><small>{sleepSummary()}</small>
         </button>
         {#each SLEEP_OPTIONS as option (option.value)}
           <button class:active={sleepValue === option.value} class="actions-row" onclick={() => chooseSleep(option)}>
             <span>{option.label}</span>
-            {#if sleepValue === option.value}<small>On</small>{/if}
+            {#if sleepValue === option.value}<small>{$t("On")}</small>{/if}
           </button>
         {/each}
       {:else if showSourceOptions}
         <button class="actions-row back" onclick={() => (showSourceOptions = false)}>
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14.5 5 8 12l6.5 7" /></svg>
-          <span>Play on</span><small>{playbackTargetLabel()}</small>
+          <span>{$t("Play on")}</span><small>{playbackTargetLabel()}</small>
         </button>
         {@render playbackTargetRows()}
       {:else}
         <button class="actions-row" onclick={() => void shareTrack(menuTrack)}>
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4" /><path d="M8 7.5 12 3.5l4 4" /><path d="M5 14v6h14v-6" /></svg>
-          <span>Share</span><small>{trackUri(menuTrack)}</small>
+          <span>{$t("Share")}</span><small>{trackUri(menuTrack)}</small>
         </button>
         <button class="actions-row" onclick={() => toggleTrackLike(menuTrack)}>
           <svg class:filled={isTrackLiked(menuTrack)} viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20.3c-1.4-1-7.2-5.2-7.2-9.4A4.2 4.2 0 0 1 12 8.2a4.2 4.2 0 0 1 7.2 2.7c0 4.2-5.8 8.4-7.2 9.4z" /></svg>
@@ -3322,27 +3630,27 @@
         </button>
         <button class="actions-row" disabled>
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6.5h11" /><path d="M4 12h11" /><path d="M4 17.5h7" /><path d="M17 14v6" /><path d="M14 17h6" /></svg>
-          <span>Add to playlist</span><small>Coming soon</small>
+          <span>{$t("Add to playlist")}</span><small>{$t("Coming soon")}</small>
         </button>
         <button class="actions-row" onclick={() => void goToAlbum(menuTrack)}>
           <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8" /><circle class="filled" cx="12" cy="12" r="2.4" /></svg>
-          <span>Go to album</span>
+          <span>{$t("Go to album")}</span>
         </button>
         <button class="actions-row" disabled={!menuTrack.artist.trim()} onclick={() => goToArtist(menuTrack.artist)}>
           <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8.2" r="3.4" /><path d="M5.6 19.6a6.5 6.5 0 0 1 12.8 0" /></svg>
-          <span>Go to artist</span>
+          <span>{$t("Go to artist")}</span>
         </button>
         <button class="actions-row" disabled={!remoteAvailable()} onclick={() => openCoverReport(menuTrack)}>
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4.8 21 20H3z" /><path d="M12 10.6v4" /><circle class="filled" cx="12" cy="17.4" r="0.9" /></svg>
-          <span>Report this cover</span><small>{remoteAvailable() ? '' : 'Needs a connection'}</small>
+          <span>{$t("Report this cover")}</span><small>{remoteAvailable() ? '' : 'Needs a connection'}</small>
         </button>
         <button class="actions-row" onclick={openSourcePicker}>
           <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.4" y="5.2" width="17.2" height="12.6" rx="2" /><circle class="filled" cx="4.9" cy="16.9" r="1.1" /><path d="M7.4 16.9A2.5 2.5 0 0 0 4.9 14.4" /><path d="M9.6 16.9A4.7 4.7 0 0 0 4.9 12.2" /></svg>
-          <span>Play on</span><small>{playbackTargetLabel()}</small>
+          <span>{$t("Play on")}</span><small>{playbackTargetLabel()}</small>
         </button>
         <button class="actions-row" onclick={() => (showSleepOptions = true)}>
           <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8" /><path d="M12 7.4V12l3.1 2" /></svg>
-          <span>Sleep timer</span><small>{sleepSummary()}</small>
+          <span>{$t("Sleep timer")}</span><small>{sleepSummary()}</small>
         </button>
       {/if}
     </div>
@@ -3354,7 +3662,14 @@
   onplay={() => { playing = true; syncSystemMedia(true); }}
   onpause={() => { playing = false; syncSystemMedia(true); }}
   ontimeupdate={() => { currentTime = audio.currentTime; syncSystemMedia(); }}
-  ondurationchange={() => { duration = Number.isFinite(audio.duration) ? audio.duration : 0; syncSystemMedia(true); }}
+  ondurationchange={() => {
+    const reported = validDuration(audio.duration);
+    // A length beyond any real track is a broken reading, not a very long one,
+    // and a zero means nothing is known yet: neither should displace the feed's
+    // own estimate. A usable reading is the audio's answer and replaces it.
+    if (reported > 0) { duration = reported; durationEstimated = false; }
+    syncSystemMedia(true);
+  }}
   onended={handleTrackEnded}
   onerror={() => {
     if (activeMedia === 'podcast' && currentPodcast) error = `This phone could not play ${currentPodcast.title}.`;
