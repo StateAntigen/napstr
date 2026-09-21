@@ -3,7 +3,7 @@ use ::rand::seq::SliceRandom;
 use chrono::Utc;
 use futures_util::{stream, StreamExt};
 use keyring::Entry;
-use napstr_remote_protocol::{MAX_REPORT_NOTE_CHARS, REPORT_REASONS};
+use napstr_remote_protocol::{RemotePlaylist, MAX_REPORT_NOTE_CHARS, REPORT_REASONS};
 use nostr_sdk::prelude::*;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -23,6 +23,7 @@ use tokio::sync::{Mutex, Notify, RwLock};
 use uuid::Uuid;
 
 use crate::cover;
+use crate::playlist;
 pub use crate::cover::AlbumCover;
 
 pub const CATALOGUE_KIND: u16 = 30421;
@@ -498,7 +499,12 @@ fn apply_cover_seeders(
     Ok(covers)
 }
 
-fn catalogue_search_tokens(fields: &[&str]) -> Vec<String> {
+/// The words a catalogue entry, or a playlist, can be found by.
+///
+/// Shared deliberately: a title should search the same way whichever kind
+/// carries it, and the literal `napstr` is dropped because a `t` tag holding it
+/// would put this event in the catalogue's own marker space.
+pub(crate) fn catalogue_search_tokens(fields: &[&str]) -> Vec<String> {
     let mut seen = HashSet::new();
     let field_tokens = fields
         .iter()
@@ -3092,6 +3098,68 @@ impl NetworkService {
         let connection = super::open_connection(&self.db_path)?;
         cover::store_cover_events(&connection, &[(fields.key, event)])?;
         Ok(event_id)
+    }
+
+    /// Sign and publish a public playlist, and keep it in this computer's own
+    /// store so it does not have to appear from a relay to be offered.
+    ///
+    /// What is stored is the playlist as it reads back from the signed event,
+    /// not as it was handed in: a playlist that will not read back is refused
+    /// rather than published, which keeps the publishing and reading halves of
+    /// the codec in step without anyone having to remember to.
+    ///
+    /// `suggest_tags` is the author's answer to "suggest search words from the
+    /// title?". Their own words always win: it applies only while they have
+    /// written none, so an author who wants no suggested words gets none.
+    pub async fn publish_playlist(
+        &self,
+        playlist: &RemotePlaylist,
+        suggest_tags: bool,
+    ) -> Result<RemotePlaylist, String> {
+        let event = playlist::playlist_event_builder(
+            playlist,
+            suggest_tags,
+            &load_or_create_identity()?,
+        )?;
+        let Some(playlist::PlaylistEvent::Playlist(read_back)) = playlist::playlist_event(&event)
+        else {
+            return Err("this playlist would not read back, so it was not published".into());
+        };
+        let stored = RemotePlaylist {
+            total: read_back.tracks.len(),
+            ..*read_back
+        };
+        self.client
+            .read()
+            .await
+            .clone()
+            .ok_or("Nostr is not connected")?
+            .send_event(&event)
+            .await
+            .map_err(|error| format!("playlist publication failed: {error}"))?;
+        playlist::save(&super::open_connection(&self.db_path)?, &stored)?;
+        Ok(stored)
+    }
+
+    /// Withdraw a playlist this identity published, and forget it locally.
+    ///
+    /// The coordinate is replaced by the withdrawal body rather than deleted, so
+    /// a client that already has an older revision cannot be offered it again.
+    pub async fn withdraw_playlist(&self, playlist_id: &str) -> Result<(), String> {
+        let keys = load_or_create_identity()?;
+        let author = keys.public_key().to_hex();
+        let event = playlist::playlist_withdrawal_builder(playlist_id, &keys)?;
+        self.client
+            .read()
+            .await
+            .clone()
+            .ok_or("Nostr is not connected")?
+            .send_event(&event)
+            .await
+            .map_err(|error| format!("playlist withdrawal failed: {error}"))?;
+        // Forgotten by coordinate: this identity's playlist under that id, not
+        // anybody else's that happens to share the id.
+        playlist::remove(&super::open_connection(&self.db_path)?, &author, playlist_id)
     }
 
     /// NIP-56: report the winning cover published for one album key.

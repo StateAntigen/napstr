@@ -23,6 +23,7 @@ mod cover_publish;
 mod mobile;
 mod network;
 mod playback_bridge;
+mod playlist;
 mod player;
 mod protocol;
 mod tor;
@@ -268,6 +269,7 @@ fn initialise_database(path: &Path, app_data: &Path) -> Result<(), String> {
         )
         .map_err(|error| error.to_string())?;
     network::initialise_network_schema(&connection)?;
+    playlist::initialise_schema(&connection)?;
     connection
         .execute_batch(
             "DELETE FROM download_sources WHERE request_id IN (
@@ -2169,6 +2171,42 @@ fn publish_playback_state(snapshot: playback_bridge::QueueSnapshot, state: State
     state.playback.publish_queue(snapshot);
 }
 
+/// Sign and publish a public playlist, and keep it here so this computer offers
+/// it without waiting for a relay to echo it back.
+///
+/// A private playlist is refused rather than published: it stays on this
+/// computer and the phones paired with it, because a relay would see a
+/// coordinate, a size and an edit timestamp even with the body encrypted.
+///
+/// `suggest_tags` asks for search words derived from the title, and only matters
+/// while the playlist has none of its own: the author's words are the whole
+/// answer whenever there are any.
+#[tauri::command]
+async fn publish_playlist(
+    playlist: napstr_remote_protocol::RemotePlaylist,
+    suggest_tags: bool,
+    state: State<'_, AppState>,
+) -> Result<napstr_remote_protocol::RemotePlaylist, String> {
+    state.network.publish_playlist(&playlist, suggest_tags).await
+}
+
+/// Withdraw a playlist this computer published, on the relays and here.
+#[tauri::command]
+async fn withdraw_playlist(playlist_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    state.network.withdraw_playlist(&playlist_id).await
+}
+
+/// An id for a playlist that has not been published yet.
+///
+/// A playlist's identity is its name and role for its author, not its contents,
+/// so it cannot be derived from anything: it is minted here and then persisted
+/// by whoever asked, which is what lets a later edit replace the same playlist
+/// rather than making a second one.
+#[tauri::command]
+fn new_playlist_id() -> String {
+    playlist::new_playlist_id()
+}
+
 /// The albums the cover worker would act on next, for the Covers tab.
 #[tauri::command]
 fn cover_candidates(
@@ -2430,6 +2468,9 @@ pub fn run() {
             player::set_audio_volume,
             player::audio_status,
             publish_playback_state,
+            publish_playlist,
+            withdraw_playlist,
+            new_playlist_id,
             cover_candidates,
             cover_status,
             set_cover_preferences,
