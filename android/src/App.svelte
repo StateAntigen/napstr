@@ -191,6 +191,9 @@
   let showNowPlaying = $state(false);
   let nowCover = $state<AlbumCover | null>(null);
   let nowArtFailed = $state(false);
+  /** The sheet's full-cover URL once that image has landed, so the small
+   *  rendition under it stays on screen until something better is drawn. */
+  let sheetArtLoaded = $state('');
   /** The track the resolved cover belongs to, so a new object for the same one
    *  does not throw the artwork away and fetch it again. */
   let nowCoverKey = '';
@@ -1382,7 +1385,10 @@
       artist: activeMedia === 'podcast' ? currentPodcast?.feedTitle ?? '' : current ? artist(current) : '',
       artwork: activeMedia === 'podcast'
         ? currentPodcast?.image ?? ''
-        : nowCover && !nowArtFailed ? nowCover.art || nowCover.thumb : '',
+        // The full cover is what the lock screen shows, but a large rendition
+        // that will not load should not leave it bare: the thumbnail is the
+        // one rendition already proven to exist on this phone.
+        : nowCover ? (nowArtFailed ? nowCover.thumb : nowCover.art || nowCover.thumb) : '',
       playing,
       position: safePosition(currentTime, seconds || undefined),
       duration: seconds,
@@ -1621,6 +1627,7 @@
     nowCoverKey = key;
     nowArtFailed = false;
     nowCover = null;
+    sheetArtLoaded = '';
     if (!track) return;
     let alive = true;
     void coverFor(track).then((cover) => {
@@ -1750,6 +1757,17 @@
   function sheetCoverUrl() {
     if (!nowCover || nowArtFailed) return '';
     return nowCover.art || nowCover.thumb;
+  }
+
+  /**
+   * The small rendition, drawn from the moment the drawer opens.
+   *
+   * The list that was tapped has already fetched this one, so it is in the
+   * image cache; the full front cover is a fresh download and would otherwise
+   * leave the sheet black for as long as it takes to arrive.
+   */
+  function sheetThumbUrl() {
+    return nowCover?.thumb ?? '';
   }
 
   async function playFromQueue(index: number) {
@@ -3492,11 +3510,11 @@
         onpointercancel={endSheetDrag}
       >
         <div class="now-sheet-hero">
-          {#if sheetCoverUrl()}
-            <div class="now-sheet-backdrop" style={`background-image:url(${sheetCoverUrl()})`}></div>
-          {:else}
-            <div class="now-sheet-backdrop empty"></div>
-          {/if}
+          <div
+            class="now-sheet-backdrop"
+            class:empty={!sheetThumbUrl() && !sheetCoverUrl()}
+            style={sheetThumbUrl() || sheetCoverUrl() ? `background-image:url(${sheetThumbUrl() || sheetCoverUrl()})` : ''}
+          ></div>
           <div class="now-sheet-scrim"></div>
           <div class="now-sheet-top">
             <button class="now-sheet-icon now-sheet-close" onclick={closeNowPlaying} aria-label={$t("Close the now playing screen")}>
@@ -3520,9 +3538,27 @@
             </div>
           </div>
           <div class="now-sheet-art">
-            {#if sheetCoverUrl()}
-              <img src={sheetCoverUrl()} alt="" onerror={() => (nowArtFailed = true)} />
-            {:else}<div class="now-sheet-art-empty">♪</div>{/if}
+            {#if sheetThumbUrl()}
+              <!-- The tile that was tapped has this one already, so the square is
+                   a cover the moment the drawer opens. -->
+              <img class="now-sheet-art-thumb" src={sheetThumbUrl()} alt="" aria-hidden="true" />
+            {/if}
+            <!-- A publisher who gave one rendition gave nothing to fade to, and
+                 the thumbnail is that same image, so it is the only layer. -->
+            {#if sheetCoverUrl() && sheetCoverUrl() !== sheetThumbUrl()}
+              {@const art = sheetCoverUrl()}
+              <img
+                class="now-sheet-art-full"
+                class:ready={sheetArtLoaded === art}
+                src={art}
+                alt=""
+                decoding="async"
+                onload={() => (sheetArtLoaded = art)}
+                onerror={() => (nowArtFailed = true)}
+              />
+            {:else if !sheetThumbUrl()}
+              <div class="now-sheet-art-empty">♪</div>
+            {/if}
           </div>
         </div>
 
@@ -3779,7 +3815,6 @@
                at once and the full cover fades in over it. -->
           <img
             class="album-art-backdrop"
-            class:blurred={albumView.art !== '' && albumView.art !== albumView.thumb}
             src={albumView.thumb}
             alt=""
             aria-hidden="true"

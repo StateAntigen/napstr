@@ -37,8 +37,8 @@ const albumCover = {
   author: '', eventId: '', createdAt: 0, seeder: false
 };
 
-async function openApp(page, { library = [], album = null, cached = null, likes = null } = {}) {
-  await mockNative(page);
+async function openApp(page, { library = [], album = null, cached = null, likes = null, platform = 'linux' } = {}) {
+  await mockNative(page, { platform });
   await page.route('**/fixture.wav', serveAudio);
   // Registered after the blanket https route, so it wins for the covers. The
   // full rendition is held back to leave the thumbnail on screen on its own.
@@ -150,7 +150,6 @@ test('Napstrfy opens an album on its thumbnail and fades the full cover in over 
   // before the full cover has finished, and it is what the blurred glow uses.
   const backdrop = page.locator('.album-art-backdrop');
   await expect(backdrop).toHaveAttribute('src', coverThumb);
-  await expect(backdrop).toHaveClass(/blurred/);
   // The glow is blurred past the point where a full cover would show, so it must
   // be the small rendition rather than a second fetch of the big one.
   const glowStyle = await page.locator('.album-glow').getAttribute('style');
@@ -159,4 +158,24 @@ test('Napstrfy opens an album on its thumbnail and fades the full cover in over 
   const full = page.locator('.album-art-full');
   await expect(full).not.toHaveClass(/ready/);
   await expect(full).toHaveClass(/ready/);
+});
+
+test('Napstrfy opens the now-playing drawer on the thumbnail rather than a blank square', async ({ page }) => {
+  // A phone, because a wide desktop window pins this sheet as a column and has
+  // no drawer to open.
+  await openApp(page, { library: [zzTop[0]], album: zzTop, platform: 'android' });
+  await page.locator('.track-open').click();
+  await page.locator('.now-open').click();
+  const thumb = page.locator('.now-sheet-art img.now-sheet-art-thumb');
+  const full = page.locator('.now-sheet-art img.now-sheet-art-full');
+  // The tile that was tapped fetched the small rendition, so the drawer is a
+  // cover from its first frame; the full one is a fresh download behind it.
+  await expect(thumb).toHaveAttribute('src', coverThumb);
+  await expect(full).not.toHaveClass(/ready/);
+  await expect(full).toHaveClass(/ready/);
+  // The backdrop is blurred too far to show a bigger image, so it takes the
+  // small rendition rather than making a second request for the large one.
+  const backdrop = await page.locator('.now-sheet-backdrop').getAttribute('style');
+  expect(backdrop).toContain(coverThumb);
+  expect(backdrop).not.toContain(coverFull);
 });
