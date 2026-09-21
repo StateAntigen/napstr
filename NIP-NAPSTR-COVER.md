@@ -146,6 +146,29 @@ replaced URLs by falling back to their own external lookup or placeholder.
 Consumers SHOULD bound per-host image concurrency and MUST NOT treat a broken
 `art` URL as a reason to penalize the author — URLs rot.
 
+### Sizes
+
+`art` SHOULD be a bounded rendition rather than whatever the source API hands
+back. Around 1200 pixels on the long edge is the working rule: that covers a
+phone's album header, which draws at roughly 750 device pixels, and a desktop
+window's largest art surface, without shipping a scan. Cover sources return the
+file that was uploaded — commonly 1500 pixels and up, sometimes several
+megabytes — so a link to the original makes every consumer on the network pay for
+detail no screen will draw. Where the source offers renditions, ask for one: the
+Cover Art Archive serves 250, 500 and 1200 pixel versions of every image, and the
+1200 is what `art` wants. Note that its `large` alias means 500, so ask by number.
+
+`thumb` is the counterpart for dense grids: 250 pixels on the long edge fills a
+shelf tile, a list row, or a blurred backdrop, and it is the rendition a client
+can paint while the larger one is still arriving. Publishers SHOULD supply both
+when they can, because a client that has only `art` has nothing to show until the
+larger image lands.
+
+Neither bound can be checked before the image is fetched, so these are publisher
+obligations rather than validation rules: a consumer MUST NOT reject a cover for
+an `art` URL it cannot measure, and SHOULD prefer `thumb` wherever the display is
+small enough that the difference cannot be seen.
+
 ## Embedded covers
 
 Publishers whose local audio files contain embedded artwork MAY share the
