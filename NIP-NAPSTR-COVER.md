@@ -6,11 +6,16 @@
 > Normative keywords follow the
 > main document: **MUST**, **MUST NOT**, **SHOULD**, **MAY**.
 >
-> **Kind selection (surveyed 2026-09-10):** `30427` is the first free kind in
-> the Napstr addressable block. `30424` and `30426` carry events from an
-> unrelated game protocol (`story:*` markers, April–May 2026), and `30425` is
-> `napstr-playlist`. Marker tags (`#t=napstr-cover`) would namespace either way,
-> but a free kind avoids all cross-protocol event mixing.
+> **Kind selection (surveyed 2026-09-10, occupancy re-probed 2026-09-21):**
+> `30427` was the first kind in this range with no occupant when it was chosen.
+> The range is a shared commons rather than a Napstr reservation: every
+> coordinate from `30420` upward is claimed by at least one unrelated
+> application, and `30425` was quiet only temporarily — an unrelated protocol
+> resumed publishing there on 2026-09-15. `30427` itself has since acquired three
+> foreign events as well. Marker tags (`#t=napstr-cover`) are therefore not
+> decorative: they are the only thing distinguishing Napstr events from neighbours
+> at the same coordinate, so publishers and consumers MUST filter on the marker
+> and never on the kind alone. See "Neighbourhood occupancy" below.
 
 Album artwork is cosmetic metadata that every browsing client otherwise resolves
 independently from rate-limited third-party APIs (MusicBrainz, Cover Art
@@ -281,6 +286,76 @@ transfer capabilities anywhere in the event.
 A publisher SHOULD refuse to publish covers for tracks whose embedded tags are
 obviously junk: URL or watermark prefixes, bare filenames as album names, or
 leading track numbers. A bad cover on the network is worse than no cover.
+
+## Neighbourhood occupancy (non-normative)
+
+A probe of kinds `30415`–`30435` on 2026-09-21 found no empty coordinate from
+`30420` upward. Sampled events and their occupants:
+
+| kind | occupants | notes |
+| --- | --- | --- |
+| `30420` | text-adventure game, encrypted session app, lobby app | game went quiet 2026-05-18; others active to 2026-09-18 |
+| `30421` | Napstr catalogue (961), game shop listings, LLM oracle app | Napstr's own kind, shared |
+| `30422` | art marketplace (≈350), Napstr availability (47), game state | far more foreign than Napstr |
+| `30423` | Napstr audiobooks (59), art gallery (85), game loot (9) | three unrelated apps at one coordinate |
+| `30424` | encrypted session app, text-adventure game | game stopped 2026-05-05, app resumed 2026-09-18 |
+| `30425` | encrypted session app (42), text-adventure game (28), `napstr-playlist` (1) | quiet 2026-05-12 → 2026-09-15, then resumed |
+| `30426` | text-adventure game, encrypted session app | game stopped 2026-05-01 |
+| `30427` | Napstr covers (712), encrypted session app (3) | **this kind** |
+| `30428`, `30429` | text-adventure game trades | `30429` untouched since 2026-04-29 |
+| `30430` | `voidstrike` / `macsand` lobby codes (514) | one event per author |
+
+`30418` and `30419` are the only probed coordinates with zero events. Kind
+selection is therefore best-effort and time-bound: a coordinate that is empty
+today may be occupied next month, which is why the marker tag carries the
+disambiguation rather than the kind number.
+
+The most consequential occupant in the table is the unidentified "encrypted
+session app". It is a peer-addressed protocol: exactly two tags, `p` and `d`,
+where `d` is either `<8-char base36>-<8-char base36>:<peer pubkey>` or a bare
+`<peer pubkey>`, and `p` repeats that same key. Every payload is NIP-44 version 2
+ciphertext, so no string in it is searchable and no identity is recoverable. It
+used 80 freshly generated keys across 76 sessions, entirely between 2026-09-12
+and 2026-09-18, and its events exist on only two of eighteen relays probed
+(`relay.damus.io` and `nos.lol`). Those keys publish nothing else at all — no
+kind `0`, no kind `1`, no relay list.
+
+Its two busiest channels are `30422` (84 sampled events) and `30423` (53) — the
+Napstr availability and audiobook kinds — so a client that read either kind
+without checking the marker would ingest encrypted blobs as heartbeats or
+manifests. `merge_availability_events` requires the `napstr-availability` tag and
+`valid_audiobook_event` requires `napstr-audiobook`, and that requirement is the
+only reason this is harmless.
+
+## Kind coexistence (non-normative)
+
+NIP-01 defines the kind ranges as conventions — "just conventions and relay
+implementations may differ" — and states that "each NIP may define the meaning of
+a set of kinds that weren't defined elsewhere". It provides no allocation
+authority, no reservation mechanism, and no exclusivity: any keypair may publish
+any kind at any time, and collisions are expected rather than exceptional.
+Occupying this range is therefore ordinary practice, as is the fact that others
+already occupy it.
+
+What follows from that is not a permission question but three obligations:
+
+- **Clients MUST filter by marker tag and MUST NOT rely on kind exclusivity.**
+  `{"kinds":[30427]}` alone ingests foreign events.
+- **Publishers MUST NOT assume a coordinate is theirs alone, and SHOULD choose
+  `d` values whose *shape* is distinct from neighbours' patterns.** A cover key
+  (`artist|album`) and a playlist ID (a UUID) are both distinct in shape from the
+  neighbours' `d` patterns observed here, which is what keeps shape collisions
+  from becoming bugs. Napstr's catalogue and audiobook `d` values are 64-character
+  hex, which is **shape-identical to a public key** — the same shape the session
+  app uses for its peer-addressed slots. On `30421` and `30423` the marker tag is
+  the *only* thing separating a Napstr file ID from a peer key, so a `#d` query
+  against those kinds is ambiguous by construction and MUST be accompanied by the
+  marker.
+- **Napstr events MUST stay ignorable by any foreign client.** The markers and the
+  `d` shapes achieve this. Note that the unidentified protocol publishes bare `p`
+  and `d` with no marker whatsoever, which makes it the fragile participant in
+  this neighbourhood rather than Napstr: it has no way to exclude our events from
+  its own queries, whereas we have a marker on every event.
 
 ## Rationale notes (non-normative)
 
