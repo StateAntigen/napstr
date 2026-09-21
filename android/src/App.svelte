@@ -43,6 +43,8 @@
   const COVER_DEBUG = true;
   /** The host caps a library page at 200, so one album always fits. */
   const MAX_ALBUM_TRACKS = 200;
+  /** Fraction of the screen a right swipe on the liked page must cover to leave it. */
+  const LIKED_SWIPE_DISMISS_RATIO = 0.25;
   /** Albums grouped out of the tracks this phone has loaded. */
   type AlbumShelf = {
     key: string;
@@ -85,6 +87,7 @@
     album: string;
     year: string;
     art: string;
+    thumb: string;
     tracks: RemoteTrack[];
     more: AlbumShelf[];
   };
@@ -215,6 +218,12 @@
   /** Album preview, split into distinct sections. */
   let showAlbumView = $state(false);
   let albumView = $state<AlbumView | null>(null);
+  /** The header `art` URL whose full image has landed, so the small rendition
+   *  it is standing on can stay there until something better is on screen. */
+  let albumArtLoaded = $state('');
+  /** The header backdrop: the small rendition, which is all a blurred glow can
+   *  show and the one the shelf tile has already fetched. */
+  let albumGlow = $derived(albumView ? albumView.thumb || albumView.art : '');
   /** File ids held in this phone's audio cache, for the storage badge. */
   let cachedFileIds = $state<Set<string>>(new Set());
   let showSettings = $state(false);
@@ -492,11 +501,28 @@
   }
 
   type AndroidBackBridge = {
-    setDrawerOpen(open: boolean): void;
+    /** True while the page has something for a back press to close. */
+    setBackAvailable?(available: boolean): void;
+    /** The older name for the same flag, for a page paired with an older app. */
+    setDrawerOpen?(open: boolean): void;
   };
 
   function androidBackBridge(): AndroidBackBridge | undefined {
     return (window as Window & { NapstrfyBack?: AndroidBackBridge }).NapstrfyBack;
+  }
+
+  /**
+   * Tell the native side whether back has anywhere to go.
+   *
+   * Kotlin cannot ask the page synchronously, so the flag is pushed on every
+   * transition: while it is set the press is handed to the page, and while it is
+   * clear the system takes it, so back leaves the app when nothing is open.
+   */
+  function pushBackAvailability(available: boolean) {
+    const bridge = androidBackBridge();
+    if (!bridge) return;
+    if (bridge.setBackAvailable) bridge.setBackAvailable(available);
+    else bridge.setDrawerOpen?.(available);
   }
 
   /** The hardware back button arrives as an event, not a callback. */
@@ -526,7 +552,18 @@
       showQueue = false;
       return;
     }
-    if (showNowPlaying) closeNowPlaying();
+    if (showNowPlaying) {
+      closeNowPlaying();
+      return;
+    }
+    // The liked page is a page of its own, so back leaves it exactly as its own
+    // close button does: for the search page it was opened from.
+    if (showingLikedMusic) {
+      closeLikedMusic();
+      return;
+    }
+    // Back from any other tab is the way home.
+    if (activeTab !== 'music') activeTab = 'music';
   }
 
   function title(track: RemoteTrack) {
@@ -615,6 +652,80 @@
     tracks = [...likedMusic];
     total = tracks.length;
     selected = tracks[0] ?? null;
+  }
+
+  /**
+   * Leaves the liked page, back where it was opened from.
+   *
+   * The only control that opens it is the "Liked" chip on the search page, so
+   * that is where it returns to: the search that was running, or the search
+   * page itself. Before this the chip moved the app to the music tab and the
+   * page had no way out of its own.
+   */
+  function closeLikedMusic() {
+    if (!showingLikedMusic) return;
+    showingLikedMusic = false;
+    activeTab = 'search';
+    if (query.trim()) void searchTracks(query);
+    else void loadLibrary();
+  }
+
+  /** A right swipe on the liked page, so the page can be thrown away by hand. */
+  let likedSwipeTracking = false;
+  let likedSwipeActive = $state(false);
+  let likedSwipeX = $state(0);
+  let likedSwipeStartX = 0;
+  let likedSwipeStartY = 0;
+  let likedSwipeSwallowClick = false;
+
+  function startLikedSwipe(event: PointerEvent) {
+    if (!showingLikedMusic || event.button !== 0) return;
+    likedSwipeTracking = true;
+    likedSwipeActive = false;
+    likedSwipeSwallowClick = false;
+    likedSwipeStartX = event.clientX;
+    likedSwipeStartY = event.clientY;
+    likedSwipeX = 0;
+  }
+
+  function moveLikedSwipe(event: PointerEvent) {
+    if (!likedSwipeTracking) return;
+    const travelX = event.clientX - likedSwipeStartX;
+    const travelY = event.clientY - likedSwipeStartY;
+    if (!likedSwipeActive) {
+      // The list scrolls vertically, so only a clearly sideways pull takes the
+      // gesture, and only to the right. Everything else stays the list's.
+      if (Math.abs(travelX) < 12 || Math.abs(travelX) < Math.abs(travelY) * 1.5) return;
+      if (travelX <= 0) {
+        likedSwipeTracking = false;
+        return;
+      }
+      likedSwipeActive = true;
+    }
+    likedSwipeX = Math.max(0, travelX);
+  }
+
+  function endLikedSwipe() {
+    if (!likedSwipeTracking) return;
+    likedSwipeTracking = false;
+    if (!likedSwipeActive) return;
+    likedSwipeActive = false;
+    // A pull must not also press whatever was under the finger.
+    likedSwipeSwallowClick = likedSwipeX > 8;
+    const threshold = Math.min(window.innerWidth * LIKED_SWIPE_DISMISS_RATIO, 140);
+    if (likedSwipeX > threshold) closeLikedMusic();
+    likedSwipeX = 0;
+  }
+
+  /**
+   * Swallows the click a swipe would otherwise become. A pressed track row
+   * starts playing, so a pull that ends on one must not play anything.
+   */
+  function swallowLikedSwipeClick(event: MouseEvent) {
+    if (!likedSwipeSwallowClick) return;
+    likedSwipeSwallowClick = false;
+    event.preventDefault();
+    event.stopPropagation();
   }
 
   function randomIndexExcept(currentIndex: number) {
@@ -752,6 +863,19 @@
     } catch {
       // Offline or a damaged cache: the badge falls back to host and network.
     }
+  }
+
+  /**
+   * Records a file the host has just cached on this phone.
+   *
+   * Playing a track is how most music reaches the phone, because the host caches
+   * it for offline playback. The badge only moved when a *download* finished, so
+   * a song that arrived by being played went on claiming it was stored on the
+   * computer until the next launch read the cache again.
+   */
+  function noteCachedOnPhone(fileId: string) {
+    if (cachedFileIds.has(fileId)) return;
+    cachedFileIds = new Set(cachedFileIds).add(fileId);
   }
 
   async function reconcileAudioCache() {
@@ -1040,6 +1164,8 @@
       audio?.pause();
       const cached = await invoke<CachedAudio>('cache_remote_audio', { track, libraryVisible });
       current = cached.track;
+      // The file is on this phone now, so the badge has to stop saying otherwise.
+      noteCachedOnPhone(cached.track.fileId);
       // The new source has no length until it reports one: keeping the old one
       // would show the previous track's length, and seek against it.
       duration = 0;
@@ -1565,17 +1691,27 @@
     return () => window.clearTimeout(timer);
   });
 
-  // The drawer, and every view above it, own the hardware back button.
-  $effect(() => {
-    androidBackBridge()?.setDrawerOpen(
+  /**
+   * Everything a back press could close, in the order `handleSystemBack` walks
+   * it: the overlays over the drawer, then the drawer, then the pages below it.
+   * The liked page and the tabs count too, because they are pages the user can
+   * be left standing on.
+   */
+  let backHasDestination = $derived(
+    showReport ||
+      (showSourceOptions && !showActions) ||
       showSettings ||
-        showReport ||
-        showActions ||
-        showAlbumView ||
-        showQueue ||
-        showSourceOptions ||
-        (showNowPlaying && !sheetClosing)
-    );
+      showActions ||
+      showAlbumView ||
+      showQueue ||
+      (showNowPlaying && !sheetClosing) ||
+      showingLikedMusic ||
+      activeTab !== 'music'
+  );
+
+  // The page, and every view above it, own the hardware back button.
+  $effect(() => {
+    pushBackAvailability(backHasDestination);
   });
 
   function nowPlayingAvailable() {
@@ -1830,12 +1966,14 @@
     if (showNowPlaying) closeNowPlaying();
     closeActions();
     showAlbumView = true;
+    albumArtLoaded = '';
     albumView = {
       key: album.key,
       artist: album.artist,
       album: album.album,
       year: '',
       art: '',
+      thumb: '',
       tracks: prepared ?? album.tracks,
       more: []
     };
@@ -1852,6 +1990,7 @@
       album: album.album,
       year: cover?.year ?? '',
       art: cover ? cover.art || cover.thumb : '',
+      thumb: cover?.thumb ?? '',
       tracks,
       more
     };
@@ -1860,6 +1999,7 @@
   function closeAlbumView() {
     showAlbumView = false;
     albumView = null;
+    albumArtLoaded = '';
   }
 
   /** Opens the same album preview from a track, wherever the menu was opened. */
@@ -2381,6 +2521,23 @@
   }
 
   /**
+   * Whether a track's artist string can belong to this album's artist.
+   *
+   * Neither the catalogue nor the companion protocol carries an album-level
+   * artist or any guest-credit structure, so the only widening an album fetch
+   * may take beyond an exact `artist|album` match is a literal extension of the
+   * album's own name: "ZZ Top feat. X" belongs to ZZ Top's album, "Will Smith"
+   * does not.
+   */
+  function artistBelongsToAlbum(trackArtist: string, albumArtist: string) {
+    const artist = (trackArtist ?? '').trim().toLocaleLowerCase();
+    const owner = (albumArtist ?? '').trim().toLocaleLowerCase();
+    if (!owner) return artist.length === 0;
+    if (artist === owner) return true;
+    return artist.startsWith(owner) && /^[^a-z0-9]/.test(artist.slice(owner.length));
+  }
+
+  /**
    * The shelves are grouped out of the tracks this phone has loaded, which is
    * one page of the library. An album's other tracks are usually not in it, so
    * ask the host for the album before queueing anything.
@@ -2394,12 +2551,20 @@
       });
       const sameAlbum = (track: RemoteTrack) =>
         (track.album ?? '').trim().toLocaleLowerCase() === name.toLocaleLowerCase();
-      // Prefer the exact artist|album key, but fall back to the album name so a
-      // guest credit on one track does not silently drop it from the playlist.
       const byKey = page.tracks.filter(
         (track) => coverKey(track.artist ?? '', track.album ?? '') === album.key
       );
-      const found = byKey.length > album.tracks.length ? byKey : page.tracks.filter(sameAlbum);
+      // The album name is not an identity: "Greatest Hits" is a title almost
+      // every artist has used, and matching on it alone drew ZZ Top, Linkin Park
+      // and Will Smith into one album. Widening far enough for a guest credit
+      // only needs to reach the album's own artist.
+      const credited = page.tracks.filter(
+        (track) =>
+          !byKey.includes(track)
+          && sameAlbum(track)
+          && artistBelongsToAlbum(track.artist ?? '', album.artist)
+      );
+      const found = [...byKey, ...credited];
       return found.length > album.tracks.length ? found : album.tracks;
     } catch {
       // Offline, or a host that cannot answer: play what the shelf already had.
@@ -2890,6 +3055,9 @@
       void refreshStatus();
       void refreshTransfers();
       void refreshPodcastDownloads();
+      // The cache can have grown or been pruned while the app was away, and a
+      // prefetched track never announces that it has arrived.
+      void refreshCachedIds();
       // Unlocking after a while away should show what is playing now, not what
       // was playing when the screen went off.
       if (playbackTarget === 'desktop') void refreshRemote();
@@ -2912,7 +3080,7 @@
       window.removeEventListener('keydown', handleKeyboard);
       clearMediaSession();
       mediaUpdates.cancel();
-      androidBackBridge()?.setDrawerOpen(false);
+      pushBackAvailability(false);
       androidMediaBridge()?.clear();
     };
   });
@@ -2921,12 +3089,23 @@
 <svelte:head><title>Napstrfy</title></svelte:head>
 
 {#snippet trackList(emptyTitle: string, emptyHint: string, showLoadMore: boolean)}
-  <section class="track-list" aria-busy={loading || searchingNetwork}>
+  <section
+    class="track-list"
+    class:sliding={likedSwipeActive}
+    role="list"
+    aria-busy={loading || searchingNetwork}
+    style:transform={showingLikedMusic && likedSwipeX ? `translateX(${likedSwipeX}px)` : null}
+    onpointerdown={startLikedSwipe}
+    onpointermove={moveLikedSwipe}
+    onpointerup={endLikedSwipe}
+    onpointercancel={endLikedSwipe}
+    onclickcapture={swallowLikedSwipeClick}
+  >
     {#if !loading && !searchingNetwork && tracks.length === 0}
       <div class="empty-library"><img src="/napstr-logo-small.png" alt="" /><h2>{emptyTitle}</h2><p>{emptyHint}</p></div>
     {/if}
     {#each tracks as track (track.fileId)}
-      <div class:selected={selected?.fileId === track.fileId} class:remote={!track.local} class:liked={isTrackLiked(track)} class="track-row">
+      <div class:selected={selected?.fileId === track.fileId} class:remote={!track.local} class:liked={isTrackLiked(track)} class="track-row" role="listitem">
         <button class="track-open" disabled={status.streamOnly && !track.local} onclick={() => activateTrack(track)}>
           <TrackArtwork {track} lookup />
           <span class="track-copy">
@@ -3087,7 +3266,16 @@
       {:else if activeTab === 'music'}
         <section class="library-heading">
           <div><p>{showingLikedMusic ? 'FAVOURITES' : 'YOUR NAPSTR'}</p><h1>{showingLikedMusic ? 'Liked music' : 'Your music'}</h1></div>
-          <span>{total} {total === 1 ? 'track' : 'tracks'}</span>
+          {#if showingLikedMusic}
+            <div class="heading-end">
+              <span>{total} {total === 1 ? 'track' : 'tracks'}</span>
+              <button class="liked-close" onclick={closeLikedMusic} aria-label={$t("Close liked music")}>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6.5 6.5l11 11" /><path d="M17.5 6.5l-11 11" /></svg>
+              </button>
+            </div>
+          {:else}
+            <span>{total} {total === 1 ? 'track' : 'tracks'}</span>
+          {/if}
         </section>
   
         {#if !showingLikedMusic && (discoverAlbums.length > 0 || lastPlayed.length > 0)}
@@ -3571,7 +3759,7 @@
 
 {#if showAlbumView && albumView}
   <div class="album-view" class:desktop={desktopShell} style={`--cover-hue:${artworkHue(albumView.tracks[0]?.fileId ?? albumView.key)}`} role="dialog" aria-modal="true" aria-label={`${albumView.album} by ${albumView.artist}`}>
-    <div class="album-glow" style={albumView.art ? `background-image:url(${albumView.art})` : ''}></div>
+    <div class="album-glow" style={albumGlow ? `background-image:url(${albumGlow})` : ''}></div>
     <div class="album-glow-scrim"></div>
     <header class="view-head">
       <button class="view-icon" onclick={closeAlbumView} aria-label={$t("Close the album")}>
@@ -3586,7 +3774,30 @@
 
     <div class="album-scroll">
       <div class="album-art">
-        {#if albumView.art}<img src={albumView.art} alt="" />{:else}<div class="album-art-empty">♪</div>{/if}
+        {#if albumView.thumb}
+          <!-- The shelf tile has already fetched this one, so the header paints
+               at once and the full cover fades in over it. -->
+          <img
+            class="album-art-backdrop"
+            class:blurred={albumView.art !== '' && albumView.art !== albumView.thumb}
+            src={albumView.thumb}
+            alt=""
+            aria-hidden="true"
+          />
+        {/if}
+        {#if albumView.art && albumView.art !== albumView.thumb}
+          {@const art = albumView.art}
+          <img
+            class="album-art-full"
+            class:ready={albumArtLoaded === art}
+            src={art}
+            alt=""
+            decoding="async"
+            onload={() => (albumArtLoaded = art)}
+          />
+        {:else if !albumView.thumb}
+          <div class="album-art-empty">♪</div>
+        {/if}
       </div>
 
       <div class="album-title-row">

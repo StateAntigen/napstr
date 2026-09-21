@@ -159,6 +159,14 @@ audio { display: none; }
 .now-sheet-icon, .view-icon { width: 42px; height: 42px; padding: 0; display: grid; place-items: center; color: #fff; background: rgba(12,12,16,.52); border: 0; border-radius: 50%; backdrop-filter: blur(10px); }
 .now-sheet-icon:disabled, .view-icon:disabled { opacity: .45; }
 .now-sheet-icon svg, .view-icon svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width: 1.9; stroke-linecap: round; stroke-linejoin: round; }
+/* The liked page is thrown away with a right swipe, so its list follows the finger. */
+.track-list { transition: transform .18s ease-out; }
+.track-list.sliding { transition: none; }
+.library-heading .heading-end { flex: 0 0 auto; display: flex; align-items: center; gap: 10px; }
+.library-heading .heading-end > span { padding-bottom: 4px; color: #85858d; font-size: 12px; }
+.liked-close { width: 36px; height: 36px; padding: 0; flex: 0 0 auto; display: grid; place-items: center; color: #eee; background: #28282b; border: 1px solid #313136; border-radius: 50%; }
+.liked-close:active { background: #333338; }
+.liked-close svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; }
 .now-sheet-backdrop { position: absolute; inset: -22%; background-position: center; background-size: cover; filter: blur(44px) saturate(1.75) brightness(.72); }
 .now-sheet-backdrop.empty { background: linear-gradient(160deg, hsl(var(--cover-hue) 55% 42%), hsl(calc(var(--cover-hue) + 70) 45% 14%)); }
 .now-sheet-scrim { position: absolute; inset: 0; background: linear-gradient(180deg, rgba(0,0,0,.24) 0, rgba(0,0,0,.5) 46%, #000 100%); }
@@ -243,6 +251,13 @@ svg .filled { fill: currentColor; stroke: none; }
 .album-art { width: min(70%, 31vh); margin: 0 auto; aspect-ratio: 1; overflow: hidden; background: #17171d; border-radius: 16px; box-shadow: 0 18px 44px rgba(0,0,0,.6); }
 .album-art img { width: 100%; height: 100%; object-fit: cover; }
 .album-art-empty { width: 100%; height: 100%; display: grid; place-items: center; color: #cdc8ff; background: linear-gradient(145deg, hsl(var(--cover-hue) 55% 42%), hsl(calc(var(--cover-hue) + 70) 45% 14%)); font-size: 52px; }
+/* The header paints the small rendition it already holds and fades the full
+   cover in over it, so an album never opens on an empty square. */
+.album-art { position: relative; }
+.album-art-backdrop, .album-art-full { position: absolute; inset: 0; }
+.album-art-backdrop.blurred { filter: blur(12px); transform: scale(1.08); }
+.album-art-full { opacity: 0; transition: opacity .22s ease-out; }
+.album-art-full.ready { opacity: 1; }
 .album-title-row { padding: 20px 20px 6px; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .album-title-copy { min-width: 0; }
 .album-title-copy h1 { margin: 0; font-size: 23px; line-height: 1.14; letter-spacing: -.03em; overflow-wrap: anywhere; }

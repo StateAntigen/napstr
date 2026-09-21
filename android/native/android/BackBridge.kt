@@ -5,23 +5,29 @@ import android.webkit.WebView
 import java.lang.ref.WeakReference
 
 /**
- * Lets the now-playing drawer own the hardware back button.
+ * Lets the page own the hardware back button.
  *
- * Kotlin cannot ask the page whether the drawer is open synchronously, so the
- * webview pushes that flag on every drawer transition. When the drawer is open,
- * a back press closes it and is consumed; otherwise the press is handed back to
- * the system so back still leaves the app.
+ * Kotlin cannot ask the page whether it has anything for back to close, so the
+ * webview pushes that flag on every transition. While it is set, a back press is
+ * handed to the page and consumed; otherwise the press goes back to the system,
+ * so back still leaves the app when the page has nothing open.
  */
 class BackBridge {
   @JavascriptInterface
+  fun setBackAvailable(available: Boolean) {
+    backAvailable = available
+  }
+
+  /** The older name for the same flag, for a page that predates this one. */
+  @JavascriptInterface
   fun setDrawerOpen(open: Boolean) {
-    drawerOpen = open
+    backAvailable = open
   }
 
   companion object {
     private const val BACK_EVENT = "napstrfy-back"
     // Written from the webview's JS bridge thread and read from the UI thread.
-    @Volatile private var drawerOpen = false
+    @Volatile private var backAvailable = false
     private var webView = WeakReference<WebView>(null)
 
     fun attach(next: WebView) {
@@ -29,14 +35,16 @@ class BackBridge {
     }
 
     fun detach() {
-      drawerOpen = false
+      backAvailable = false
       webView.clear()
     }
 
-    /** True when the press was consumed by the drawer. */
+    /** True when the press was handed to the page rather than the system. */
     fun consumeBack(): Boolean {
-      if (!drawerOpen) return false
-      drawerOpen = false
+      if (!backAvailable) return false
+      // Clearing it decides this one press only: the page publishes the flag
+      // again as soon as it has closed whatever it had.
+      backAvailable = false
       webView.get()?.post {
         webView.get()?.evaluateJavascript(
           "window.dispatchEvent(new CustomEvent('$BACK_EVENT'))",
