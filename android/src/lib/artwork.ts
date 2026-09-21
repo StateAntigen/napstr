@@ -192,6 +192,39 @@ export function coverFor(track: RemoteTrack): Promise<AlbumCover | null> {
   return requestCover(key);
 }
 
+/** Thumbnails already fetched on the chance they would be wanted. */
+const warmedThumbs = new Set<string>();
+
+/**
+ * Resolve a track's cover and fetch its small rendition now, rather than when the
+ * screen that shows it appears.
+ *
+ * This is for the track coming next: by the time it plays, its cover has been
+ * asked about and its thumbnail is in the image cache, so the player is not the
+ * first place either happens. It costs one batched ask - free when the album is
+ * already known, as it is when the track was picked from a list - and a few
+ * kilobytes of thumbnail.
+ *
+ * The full rendition is deliberately not fetched: it is the publisher's own
+ * upload, worth hundreds of kilobytes, and it is left to the view that displays
+ * it, fading in over the thumbnail that is already there.
+ */
+export function preloadArtwork(track: RemoteTrack) {
+  void coverFor(track).then(preloadThumbnail);
+}
+
+/** Fetch a small rendition into the image cache, once per URL. */
+function preloadThumbnail(cover: AlbumCover | null) {
+  const url = cover?.thumb;
+  if (!url || warmedThumbs.has(url)) return;
+  warmedThumbs.add(url);
+  // Nothing holds this element: the fetch it starts is the point, and whether
+  // the cover is still wanted when it lands is decided by the screen itself.
+  const image = new Image();
+  image.decoding = 'async';
+  image.src = url;
+}
+
 /**
  * Forget one album's cover because the image itself would not load, so the
  * next ask resolves a fresh URL instead of handing back the dead one. The

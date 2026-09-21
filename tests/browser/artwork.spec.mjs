@@ -73,6 +73,29 @@ test('Napstrfy asks the host about the artwork it can show, in batches by album,
   expect(await askCount(page)).toBe(asksBeforePlay);
 });
 
+test('Napstrfy asks about the artwork of the track next in the queue while the one before it plays', async ({ page }) => {
+  await mockNative(page);
+  await seedLibrary(page, 40);
+  await page.route('**/cover-*.png', (route) => route.fulfill({ contentType: 'image/png', body: PNG }));
+  await page.route('**/fixture.wav', serveAudio);
+  await page.goto('http://127.0.0.1:15174');
+  const rows = page.locator('.track-row');
+  await expect(rows).toHaveCount(40);
+  await rows.first().locator('.track-open').click();
+  // The playlist looks its own artwork up for the first twelve rows only, and the
+  // library rows that far down have never been scrolled into view, so the album
+  // twenty-one tracks along has never been asked about by anything on screen.
+  await page.getByRole('button', { name: 'Open the playlist' }).click();
+  const asked = async () => (await asks(page)).flat().join('\n');
+  // The rows on screen have asked for their own albums by now, and the ones below
+  // the fold have not, so this is a real absence rather than a race not yet lost.
+  await expect.poll(asked).toContain('album 5');
+  expect(await asked()).not.toContain('album 21');
+  await page.locator('.queue-row').nth(20).locator('.queue-open').click();
+  // Playing it is what asks on behalf of the track that will follow it.
+  await expect.poll(asked).toContain('album 21');
+});
+
 test('Napstrfy artwork recovers from a transient host failure while the screen stays open', async ({ page }) => {
   await mockNative(page);
   await seedLibrary(page, 1);

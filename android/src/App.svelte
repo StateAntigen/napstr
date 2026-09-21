@@ -20,7 +20,7 @@
   import SeekIcon from './lib/SeekIcon.svelte';
   import { rateLimitedTask, safePosition, validDuration } from './lib/playback';
   import appIcon from '../src-tauri/icons/icon.png';
-  import { artworkHue, coverFor, coverKey, invalidateCoverNegatives, type AlbumCover } from './lib/artwork';
+  import { artworkHue, coverFor, coverKey, invalidateCoverNegatives, preloadArtwork, type AlbumCover } from './lib/artwork';
   import { reportReasons } from './lib/types';
   import type { AudiobookLibraryPage, CachedAudio, CompanionStatus, CoverReport, LibraryPage, PlaybackCommand, PodcastDownload, PodcastEpisode, PodcastFeed, ReadOnlyTicketOffer, RemoteAudiobook, RemoteAudiobookSummary, RemotePlaybackState, RemoteRepeat, RemoteTrack, RemoteTransfer, ReportReason } from './lib/types';
 
@@ -1196,6 +1196,9 @@
           libraryVisible
         });
       }
+      // The same track's artwork is asked about and fetched now, so the player
+      // has a cover the moment it starts instead of after a round trip.
+      if (next) preloadArtwork(next);
     } catch (nextError) {
       playing = false;
       error = `Could not play ${title(track)}: ${String(nextError)}`;
