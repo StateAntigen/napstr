@@ -28,17 +28,23 @@
   type RemoteRepeat = 'off' | 'all' | 'one';
   /**
    * A transport instruction a phone sent, forwarded by the playback bridge.
-   * Commands the native player carries out on its own - pause, stop, seek and
-   * volume - never reach the window, so only these arrive here.
+   * Commands the native player carries out on its own - pause, seek and volume -
+   * never reach the window, so only these arrive here. `stop` does arrive, even
+   * though the player stops on its own: the window has to know that the track it
+   * was showing is no longer loaded, or its own play button would ask a player
+   * that holds nothing.
    */
   type RemotePlaybackCommand =
     | { type: 'play' }
     | { type: 'toggle' }
     | { type: 'next' }
     | { type: 'previous' }
+    | { type: 'volume'; percent: number }
     | { type: 'repeat'; mode: RemoteRepeat }
     | { type: 'shuffle'; enabled: boolean }
-    | { type: 'playTrack'; fileId: string; queue: string[] };
+    | { type: 'stop' }
+    | { type: 'handoff' }
+    | { type: 'playTrack'; fileId: string; queue: string[]; positionMs: number };
   type WindowResizeDirection = 'East' | 'North' | 'NorthEast' | 'NorthWest' | 'South' | 'SouthEast' | 'SouthWest' | 'West';
   type Result = {
     id: number;
@@ -93,7 +99,7 @@
   type CatalogueBrowseCursor = { sessionId: string };
   type CatalogueBrowsePage = { results: NetworkResult[]; cursor: CatalogueBrowseCursor | null; totalAvailable: number };
   type PlayerTrack = { fileId: string; name: string; folder: string; artist: string; mime: string };
-  type PlaybackStatus = { fileId: string; currentTime: number; duration: number; playing: boolean; ended: boolean; error: string };
+  type PlaybackStatus = { fileId: string; currentTime: number; duration: number; playing: boolean; ended: boolean; error: string; volume: number };
   type ReleaseStatus = { version: string; url: string };
   type GitHubRelease = { tag_name?: unknown; html_url?: unknown };
   type TrollboxMessage = { eventId: string; pubkey: string; npub: string; displayName: string; content: string; createdAt: number };
@@ -221,9 +227,16 @@
   let playerShuffle = false;
   /** What the bridge was last told, so a change is the only thing that is sent. */
   let publishedQueueFacts = '';
-  let queueFacts: { len: number; index: number; repeat: RemoteRepeat; shuffle: boolean } = {
+  let queueFacts: {
+    len: number;
+    index: number;
+    fileIds: string[];
+    repeat: RemoteRepeat;
+    shuffle: boolean;
+  } = {
     len: 0,
     index: -1,
+    fileIds: [],
     repeat: 'off',
     shuffle: false
   };
@@ -233,6 +246,9 @@
   let playerCurrentTime = 0;
   let playerDuration = 0;
   let playerVolume = 0.85;
+  /** When this window last told the player what volume to use. */
+  let volumeSentAt = 0;
+  let pushedPlayerVolume = false;
   let playerEnded = false;
   let lastPlayerError = '';
   let transferPaneHeight = 119;
@@ -739,7 +755,7 @@
     playerDuration = 0;
     playerEnded = false;
     try {
-      applyPlaybackStatus(await invoke<PlaybackStatus>('play_audio', { fileId: track.fileId, volume: playerVolume }));
+      applyPlaybackStatus(await invoke<PlaybackStatus>('play_audio', { fileId: track.fileId }));
       if (!lastPlayerError) activityMessage = msg("Playing {p0}{p1}", { p0: track.name, p1: track.folder ? ` · ${track.folder}` : '' });
     } catch (error) {
       playerPlaying = false;
@@ -853,9 +869,11 @@
    * The list arrives as file ids in the phone's order and is used in that order.
    * Tracks this computer does not hold are dropped, exactly as they are from its
    * own search results: it can only play what it has, and a queue that stops on
-   * something unplayable is worse than a shorter one.
+   * something unplayable is worse than a shorter one. `positionMs` is where the
+   * phone had got to, so handing playback over resumes there instead of starting
+   * the track again from the beginning.
    */
-  async function playRemoteQueue(fileId: string, fileIds: string[]) {
+  async function playRemoteQueue(fileId: string, fileIds: string[], positionMs: number) {
     const order: PlayerTrack[] = [];
     for (const id of fileIds) {
       const file = sharedFiles.find((candidate) => candidate.fileId === id);
@@ -879,13 +897,29 @@
     playerQueueOrder = order;
     playerQueue = playerShuffle ? shuffledQueue(order, fileId) : order;
     await loadPlayerTrack(Math.max(0, playerQueue.findIndex((item) => item.fileId === fileId)));
+    if (positionMs > 0) await seekToPosition(positionMs / 1000);
+  }
+
+  /** Resume where a phone had got to, clamped to the length of what is loaded. */
+  async function seekToPosition(seconds: number) {
+    if (!currentTrack || !Number.isFinite(seconds) || seconds <= 0) return;
+    const target = playerDuration > 0 ? Math.min(seconds, playerDuration) : seconds;
+    try {
+      applyPlaybackStatus(await invoke<PlaybackStatus>('seek_audio', { seconds: target }));
+      playerCurrentTime = target;
+      playerEnded = false;
+    } catch (error) {
+      activityMessage = msg("Could not seek in this track: {p0}", { p0: String(error) });
+    }
   }
 
   /**
    * Carry out a transport command a phone sent.
    *
    * Only what the native player cannot manage alone arrives here, which is why
-   * there is nothing to do for pause, stop, seek or volume.
+   * there is nothing to do for pause and seek. Volume does arrive, and is only
+   * shown: the player has already been told, and this window follows it rather
+   * than telling it again.
    */
   async function handleRemoteCommand(command: RemotePlaybackCommand) {
     switch (command.type) {
@@ -901,6 +935,9 @@
       case 'previous':
         await previousPlayerTrack();
         break;
+      case 'volume':
+        adoptPlayerVolume(command.percent / 100);
+        break;
       case 'repeat':
         playerRepeat = command.mode;
         break;
@@ -908,8 +945,20 @@
         playerShuffle = command.enabled;
         applyPlayerQueueOrder();
         break;
+      // The audio has already stopped at the native player's end, so the only
+      // thing left is for this window to agree: a track that is no longer
+      // loaded has to be reloadable rather than playable.
+      case 'stop':
+        playerPlaying = false;
+        playerEnded = true;
+        break;
+      case 'handoff':
+        playerPlaying = false;
+        playerEnded = true;
+        activityMessage = msg("Napstrfy took playback over");
+        break;
       case 'playTrack':
-        await playRemoteQueue(command.fileId, command.queue);
+        await playRemoteQueue(command.fileId, command.queue, command.positionMs ?? 0);
         break;
     }
   }
@@ -917,14 +966,19 @@
   /**
    * Tell the bridge what the queue looks like. It cannot see any of this, and a
    * phone shows a queue length and enables "next" from it.
+   *
+   * The file ids go too, because they are what a handoff answers with: a phone
+   * taking playback over adopts this list, and the length alone would leave it
+   * unable to say what comes next.
    */
   async function publishPlayerQueueFacts(facts: {
     len: number;
     index: number;
+    fileIds: string[];
     repeat: RemoteRepeat;
     shuffle: boolean;
   }) {
-    const key = `${facts.len}:${facts.index}:${facts.repeat}:${facts.shuffle}`;
+    const key = `${facts.len}:${facts.index}:${facts.repeat}:${facts.shuffle}:${facts.fileIds.join(',')}`;
     if (key === publishedQueueFacts) return;
     publishedQueueFacts = key;
     try {
@@ -940,10 +994,19 @@
   $: queueFacts = {
     len: playerQueue.length,
     index: playerQueueIndex,
+    fileIds: playerQueue.map((track) => track.fileId),
     repeat: playerRepeat,
     shuffle: playerShuffle
   };
   $: if (nativeReady) void publishPlayerQueueFacts(queueFacts);
+
+  // The player starts at whatever volume it had, and remembers nothing between
+  // runs, so the stored preference is pushed once when it becomes available.
+  $: if (nativeReady && !pushedPlayerVolume) {
+    pushedPlayerVolume = true;
+    volumeSentAt = Date.now();
+    invoke<PlaybackStatus>('set_audio_volume', { volume: playerVolume }).catch(() => {});
+  }
 
   async function seekPlayer(event: Event) {
     try {
@@ -954,11 +1017,35 @@
 
   function changePlayerVolume(event: Event) {
     playerVolume = Number((event.currentTarget as HTMLInputElement).value);
-    if (currentTrack) invoke<PlaybackStatus>('set_audio_volume', { volume: playerVolume }).catch(() => {});
+    volumeSentAt = Date.now();
+    // Always told, even with nothing loaded: the player is the one that owns the
+    // volume, so a change made while it is idle is the volume the next track
+    // starts at.
+    invoke<PlaybackStatus>('set_audio_volume', { volume: playerVolume }).catch(() => {});
     window.localStorage.setItem('napstr-player-volume', String(playerVolume));
   }
 
+  /**
+   * Follow the player's volume, which is the only place one is kept.
+   *
+   * A phone changing the volume is the reason this exists: the slider has to
+   * move with it rather than disagreeing until the next poll. A change this
+   * window just sent is skipped, so that a drag cannot be yanked backwards by an
+   * answer to its own request.
+   */
+  function adoptPlayerVolume(volume: number) {
+    if (!Number.isFinite(volume)) return;
+    const value = Math.min(1, Math.max(0, volume));
+    if (Math.abs(value - playerVolume) < 0.005) return;
+    if (Date.now() - volumeSentAt < 500) return;
+    playerVolume = value;
+    window.localStorage.setItem('napstr-player-volume', String(value));
+  }
+
   function applyPlaybackStatus(status: PlaybackStatus) {
+    // Read before the track check below: a volume can change while nothing is
+    // loaded, and the slider still has to be right when something loads.
+    adoptPlayerVolume(status.volume);
     if (!currentTrack || status.fileId !== currentTrack.fileId) return;
     if (status.error) {
       playerPlaying = false;

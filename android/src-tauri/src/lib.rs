@@ -5,10 +5,9 @@ use futures_util::StreamExt;
 use iroh::{endpoint::presets, Endpoint, EndpointAddr, EndpointId, SecretKey};
 use napstr_remote_protocol::{
     ClientRequest, PairingTicket, PlaybackCommand, RemoteAlbumCover, RemoteAudiobook,
-    RemoteAudiobookSummary, RemotePlaybackState, RemoteTrack, RemoteTransfer, ServerResponse,
-    ALPN, MAX_CONTROL_FRAME_BYTES, MAX_COVER_KEYS, MAX_PLAY_QUEUE, MAX_QR_SVG_BYTES,
-    MAX_REPORT_NOTE_CHARS,
-    REPORT_REASONS,
+    RemoteAudiobookSummary, RemotePlaybackState, RemotePlaylist, RemotePlaylistSummary, RemoteTrack,
+    RemoteTransfer, ServerResponse, ALPN, MAX_CONTROL_FRAME_BYTES, MAX_COVER_KEYS, MAX_PLAYLIST_PAGE,
+    MAX_PLAY_QUEUE, MAX_QR_SVG_BYTES, MAX_REPORT_NOTE_CHARS, MAX_TRACKS_BY_ID, REPORT_REASONS,
 };
 use quick_xml::{events::Event, Reader};
 use qrcode::{render::svg, QrCode};
@@ -60,6 +59,13 @@ struct CompanionStatus {
 #[serde(rename_all = "camelCase")]
 struct LibraryPage {
     tracks: Vec<RemoteTrack>,
+    total: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlaylistPage {
+    playlists: Vec<RemotePlaylistSummary>,
     total: usize,
 }
 
@@ -1836,6 +1842,82 @@ async fn remote_library(
     }
 }
 
+/// The catalogue records for particular file ids, in the order asked for.
+///
+/// A queue handed over from the computer, and a playlist, both arrive as file
+/// ids: this is how the phone turns them into tracks it can show and play, and
+/// how it learns that a member is one the computer no longer holds. Requests are
+/// chunked so each one, and each answer, fits inside a single control frame.
+#[tauri::command]
+async fn remote_library_by_ids(
+    file_ids: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<RemoteTrack>, String> {
+    if file_ids.len() > MAX_PLAY_QUEUE {
+        return Err("That is more tracks than one queue can hold".into());
+    }
+    let mut tracks = Vec::with_capacity(file_ids.len());
+    for batch in file_ids.chunks(MAX_TRACKS_BY_ID) {
+        let response = state
+            .remote
+            .request(ClientRequest::LibraryByIds {
+                file_ids: batch.to_vec(),
+            })
+            .await?;
+        match response {
+            ServerResponse::LibraryByIds { tracks: batch } => tracks.extend(batch),
+            response => return Err(unexpected_response(&response)),
+        }
+    }
+    Ok(tracks)
+}
+
+/// Playlists this computer can see, newest first and without their members.
+#[tauri::command]
+async fn remote_playlists(
+    offset: usize,
+    limit: usize,
+    state: State<'_, AppState>,
+) -> Result<PlaylistPage, String> {
+    match state
+        .remote
+        .request(ClientRequest::Playlists { offset, limit })
+        .await?
+    {
+        ServerResponse::Playlists { playlists, total } => Ok(PlaylistPage { playlists, total }),
+        response => Err(unexpected_response(&response)),
+    }
+}
+
+/// One playlist, a page of its members at a time in the order it puts them in.
+///
+/// Named by its coordinate - its author and its id together - because the id is
+/// chosen by the author and two authors may choose the same one. Both come from
+/// the summary this phone was shown.
+#[tauri::command]
+async fn remote_playlist(
+    author: String,
+    playlist_id: String,
+    offset: usize,
+    limit: usize,
+    state: State<'_, AppState>,
+) -> Result<RemotePlaylist, String> {
+    let limit = limit.clamp(1, MAX_PLAYLIST_PAGE);
+    match state
+        .remote
+        .request(ClientRequest::Playlist {
+            author,
+            playlist_id,
+            offset,
+            limit,
+        })
+        .await?
+    {
+        ServerResponse::Playlist { playlist } => Ok(playlist),
+        response => Err(unexpected_response(&response)),
+    }
+}
+
 #[tauri::command]
 async fn cached_library(state: State<'_, AppState>) -> Result<OfflineLibrary, String> {
     state.remote.offline_library().await
@@ -2648,6 +2730,9 @@ pub fn run() {
             pair_desktop,
             forget_desktop,
             remote_library,
+            remote_library_by_ids,
+            remote_playlists,
+            remote_playlist,
             cached_library,
             remote_covers,
             remote_playback_state,

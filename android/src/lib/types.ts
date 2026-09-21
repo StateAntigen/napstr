@@ -99,8 +99,17 @@ export type PlaybackCommand =
   | { type: 'volume'; percent: number }
   | { type: 'repeat'; mode: RemoteRepeat }
   | { type: 'shuffle'; enabled: boolean }
-  /** Play one track, with the list the phone was showing as the queue. */
-  | { type: 'playTrack'; fileId: string; queue: string[] };
+  /**
+   * Take playback over from the computer: it stops, and answers with exactly
+   * what it was doing, queue and all, so this phone can carry on from there.
+   */
+  | { type: 'handoff' }
+  /**
+   * Play one track, with the list the phone was showing as the queue.
+   * `positionMs` is where to start inside the track, which is how a handover
+   * resumes rather than restarting.
+   */
+  | { type: 'playTrack'; fileId: string; queue: string[]; positionMs?: number };
 
 export type RemotePlaybackState = {
   active: boolean;
@@ -114,12 +123,63 @@ export type RemotePlaybackState = {
   volume: number;
   queueLen: number;
   queueIndex: number;
+  /**
+   * The computer's own record of the file it is playing, when it holds it.
+   * Fetching the audio needs the real record's size, format and MIME, so a
+   * track named by title alone could be shown here but never played.
+   */
+  track?: RemoteTrack | null;
+  /**
+   * File ids of the computer's queue, in its order. Only the answer to a
+   * handoff carries them: a queue is far too big to repeat on every poll.
+   */
+  queue?: string[];
   repeat: RemoteRepeat;
   shuffle: boolean;
   /** True while a phone has driven the host recently. */
   remoteControl: boolean;
   error: string;
   updatedAt: number;
+};
+
+/** What a playlist is called and who published it, without its members. */
+export type RemotePlaylistSummary = {
+  playlistId: string;
+  title: string;
+  /** Author of a public playlist; empty for one only this computer holds. */
+  author: string;
+  displayName: string;
+  trackCount: number;
+  /** True when it is private, so it only ever arrives from its own computer. */
+  private: boolean;
+  updatedAt: number;
+};
+
+/** One member of a playlist, in the order the playlist puts it in. */
+export type RemotePlaylistTrack = {
+  /** Where it sits in the playlist. The first member is 1. */
+  position: number;
+  fileId: string;
+  /** Display hints, which a catalogue entry always wins over. */
+  title: string;
+  artist: string;
+  album: string;
+};
+
+/** A playlist and one page of its members. */
+export type RemotePlaylist = {
+  playlistId: string;
+  title: string;
+  author: string;
+  displayName: string;
+  /** Album artist and release-group MBID, when it describes one release. */
+  artist: string;
+  mbid: string;
+  private: boolean;
+  updatedAt: number;
+  tracks: RemotePlaylistTrack[];
+  /** Members the whole playlist names, so a page says how many are still to come. */
+  total: number;
 };
 
 /** A read-only pairing code, minted by the computer, for another device. */

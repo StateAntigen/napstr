@@ -278,6 +278,15 @@
    * choosing the source again costs one tap.
    */
   let playbackTarget = $state<PlaybackTarget>('phone');
+  /**
+   * A handover to the computer, waiting on it to fetch a track it does not have
+   * yet. This phone keeps playing until the file lands, because a handover that
+   * arrives late is still worth making and a silence in the meantime is not.
+   */
+  let pendingHandoff = $state<{ track: RemoteTrack; queue: RemoteTrack[]; positionMs: number } | null>(null);
+  let pendingHandoffTimer = 0;
+  /** How many times a waiting handover has checked, so it can give up. */
+  let pendingHandoffAttempts = 0;
   let showSourceOptions = $state(false);
   /** The track's own code, drawn when that row of the track menu is chosen. */
   let showTrackCode = $state(false);
@@ -2208,17 +2217,214 @@
   }
 
   function choosePlaybackTarget(target: PlaybackTarget) {
+    if (target === playbackTarget) {
+      showSourceOptions = false;
+      return;
+    }
     playbackTarget = target;
     showSourceOptions = false;
     remoteVolume = -1;
-    // One player at a time: handing over stops this phone. The drawer stays
-    // open, because from here on it is showing the computer's player instead.
-    if (target === 'desktop') {
-      audio?.pause();
-      playing = false;
-      void refreshRemote();
-    }
+    cancelPendingHandoff();
+    // One player at a time, and each direction stops the device that is giving
+    // playback up - but only once the other one has agreed to take it, because a
+    // handover that fails has to leave the music playing where it already was.
+    if (target === 'desktop') void handOverToDesktop();
+    else void takeOverFromDesktop();
     syncSystemMedia(true);
+  }
+
+  /**
+   * Turn a list of file ids into tracks this phone can show and play.
+   *
+   * The computer answers for the files it still holds, in the order asked, so a
+   * queue it has lost a member from arrives shorter rather than broken. A
+   * computer too old to answer at all says so, and the caller falls back to the
+   * one track it was told about.
+   */
+  async function tracksByIds(fileIds: string[]): Promise<RemoteTrack[]> {
+    const wanted = fileIds.filter((fileId) => fileId);
+    if (wanted.length === 0 || !remoteAvailable()) return [];
+    try {
+      return await invoke<RemoteTrack[]>('remote_library_by_ids', { fileIds: wanted });
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Hand what this phone is playing to the computer.
+   *
+   * The track, the list around it and the second it had reached go over
+   * together, so the computer resumes rather than starts again. A computer can
+   * only play what it holds, so a track it does not have is asked for first: the
+   * phone keeps playing while it is fetched and the handover happens when it
+   * arrives.
+   */
+  async function handOverToDesktop() {
+    if (!desktopTargetAvailable()) return;
+    // A podcast episode is streamed from its feed and is not a file the computer
+    // can hold, so there is nothing here for it to take over.
+    if (activeMedia === 'podcast' && currentPodcast) {
+      notice = 'Napstr cannot play a podcast · it keeps playing here';
+      syncSystemMedia(true);
+      return;
+    }
+    const track = current;
+    if (!track || !playing) {
+      // Nothing is playing here, so what the drawer should show is the
+      // computer's own player.
+      void refreshRemote();
+      return;
+    }
+    const queue = playerQueue.length > 0 ? playerQueue : [track];
+    const positionMs = Math.round((audio?.currentTime ?? currentTime) * 1000);
+    if ((await tracksByIds([track.fileId])).length > 0) {
+      await sendHandoff(track, queue, positionMs, false);
+      return;
+    }
+    // The computer does not have this track. Asking it to fetch the file is the
+    // only way it can ever play it, and this phone is the side that knows who
+    // seeds it.
+    await requestDownload(track);
+    if (!pending.has(track.fileId)) {
+      // The request did not start, so that track is never going to arrive and
+      // waiting for it would only keep the source pointed at a silent computer.
+      playbackTarget = 'phone';
+      syncSystemMedia(true);
+      return;
+    }
+    watchPendingHandoff({ track, queue, positionMs });
+    notice = `Napstr is fetching ${title(track)} · it takes over when it arrives`;
+  }
+
+  /** Ask the computer to take over, and stop this phone only once it has. */
+  async function sendHandoff(
+    track: RemoteTrack,
+    queue: RemoteTrack[],
+    positionMs: number,
+    fetched: boolean
+  ) {
+    const order = queue.slice(0, MAX_DESKTOP_QUEUE);
+    const sent = await sendPlaybackState({
+      type: 'playTrack',
+      fileId: track.fileId,
+      queue: order.map((item) => item.fileId),
+      positionMs
+    });
+    if (!sent) {
+      // The computer refused, so this phone is still the one playing: keeping it
+      // as the source says that honestly.
+      playbackTarget = 'phone';
+      notice = remoteError || 'Napstr could not take playback over';
+      syncSystemMedia(true);
+      return;
+    }
+    remoteQueue = order;
+    audio?.pause();
+    playing = false;
+    selected = track;
+    notice = fetched ? `Napstr took over ${title(track)}` : '';
+    syncSystemMedia(true);
+  }
+
+  /** Wait for a track the computer is fetching, then hand playback over. */
+  function watchPendingHandoff(pending: {
+    track: RemoteTrack;
+    queue: RemoteTrack[];
+    positionMs: number;
+  }) {
+    pendingHandoff = pending;
+    pendingHandoffAttempts = 0;
+    window.clearInterval(pendingHandoffTimer);
+    pendingHandoffTimer = window.setInterval(() => void advancePendingHandoff(), 5000);
+  }
+
+  async function advancePendingHandoff() {
+    const pending = pendingHandoff;
+    if (!pending) return;
+    if (!desktopTargetAvailable()) {
+      cancelPendingHandoff();
+      return;
+    }
+    if ((await tracksByIds([pending.track.fileId])).length > 0) {
+      cancelPendingHandoff();
+      await sendHandoff(pending.track, pending.queue, pending.positionMs, true);
+      return;
+    }
+    pendingHandoffAttempts += 1;
+    // Five minutes is longer than a track of this size takes to arrive, and
+    // giving up says so rather than waiting forever on a download that stalled.
+    if (pendingHandoffAttempts >= 60) {
+      cancelPendingHandoff();
+      notice = `Napstr never finished fetching ${title(pending.track)}`;
+    }
+  }
+
+  function cancelPendingHandoff() {
+    pendingHandoff = null;
+    pendingHandoffAttempts = 0;
+    window.clearInterval(pendingHandoffTimer);
+    pendingHandoffTimer = 0;
+  }
+
+  /**
+   * Take playback over from the computer.
+   *
+   * One request, because the computer is asked to stop and to say what it was
+   * doing in the same breath: asked twice, it could move on to the next track in
+   * between and hand over the wrong one. The answer carries the track itself -
+   * which is what this phone needs to fetch the audio - along with the queue it
+   * was playing and the second it had reached.
+   */
+  async function takeOverFromDesktop() {
+    if (!desktopTargetAvailable()) return;
+    if (!remoteState?.active) {
+      // Nothing to take over, so the drawer shows the computer's own player.
+      void refreshRemote();
+      return;
+    }
+    const handed = await sendPlaybackState({ type: 'handoff' });
+    if (!handed) {
+      notice = remoteError || 'Napstr would not hand playback over';
+      return;
+    }
+    const track = handed.track;
+    if (!track || !track.local) {
+      notice = 'Napstr was not playing anything this phone can hold';
+      return;
+    }
+    // The queue comes as ids because a queue is too big to repeat on every
+    // poll; it is resolved here, and the one playing is always in it even when
+    // the computer no longer holds a member or two.
+    const queue = await tracksByIds(handed.queue ?? []);
+    const order = queue.some((item) => item.fileId === track.fileId) ? queue : [track];
+    playerQueue = order;
+    playerQueueLibraryVisible = false;
+    playerIndex = Math.max(0, order.findIndex((item) => item.fileId === track.fileId));
+    resetRandomOrder();
+    await playTrack(track);
+    if (!playing) return;
+    await seekLocalTo(handed.positionMs / 1000);
+    notice = `Took over from ${status.desktopName || 'the computer'}`;
+    syncSystemMedia(true);
+  }
+
+  /**
+   * Pick up where the computer left off.
+   *
+   * The audio element has no length until it has read the file's header, and a
+   * position cannot be set before that, so this waits for a length and gives up
+   * rather than holding the handover open.
+   */
+  async function seekLocalTo(seconds: number) {
+    if (!Number.isFinite(seconds) || seconds <= 0) return;
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      if (audio && Number.isFinite(audio.duration) && audio.duration > 0) {
+        seek(Math.min(seconds, audio.duration));
+        return;
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, 50));
+    }
   }
 
   /**
@@ -2270,13 +2476,26 @@
 
   /** Every transport button lands here, so the view never has to guess. */
   async function sendPlayback(command: PlaybackCommand) {
-    if (remoteBusy) return;
+    await sendPlaybackState(command);
+  }
+
+  /**
+   * The same, for callers that have to know whether it landed and what the
+   * computer said afterwards.
+   */
+  async function sendPlaybackState(
+    command: PlaybackCommand
+  ): Promise<RemotePlaybackState | null> {
+    if (remoteBusy) return null;
     remoteBusy = true;
     try {
-      applyRemoteState(await invoke<RemotePlaybackState>('remote_playback', { command }));
+      const state = await invoke<RemotePlaybackState>('remote_playback', { command });
+      applyRemoteState(state);
       remoteError = '';
+      return state;
     } catch (nextError) {
       remoteError = String(nextError);
+      return null;
     } finally {
       remoteBusy = false;
     }
@@ -3147,6 +3366,7 @@
       window.clearInterval(transferTimer);
       window.clearInterval(podcastTimer);
       window.clearInterval(sleepTimer);
+      window.clearInterval(pendingHandoffTimer);
       document.removeEventListener('visibilitychange', foreground);
       window.removeEventListener('napstrfy-media-action', handleSystemMediaAction);
       window.removeEventListener('napstrfy-back', handleSystemBack);
@@ -3223,9 +3443,11 @@
           ? 'Not reachable'
           : status.streamOnly
             ? 'Read-only pairing'
-            : playbackTarget === 'desktop'
-              ? 'Playing there'
-              : 'Play its library here'}
+            : pendingHandoff
+              ? 'Fetching a track…'
+              : playbackTarget === 'desktop'
+                ? 'Playing there'
+                : 'Play its library here'}
     </small>
   </button>
 {/snippet}

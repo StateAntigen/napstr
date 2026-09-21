@@ -20,7 +20,9 @@
 
 use crate::player::NativePlayer;
 use chrono::Utc;
-use napstr_remote_protocol::{PlaybackCommand, RemotePlaybackState, RemoteRepeat};
+use napstr_remote_protocol::{
+    PlaybackCommand, RemotePlaybackState, RemoteRepeat, MAX_PLAY_QUEUE,
+};
 use std::{
     path::Path,
     sync::{Arc, Mutex},
@@ -44,6 +46,11 @@ pub struct QueueSnapshot {
     pub len: usize,
     /// Index of the playing entry, or -1 when nothing is playing.
     pub index: i64,
+    /// File ids in playing order, which is what lets a phone take the whole
+    /// queue over rather than only the track that happens to be playing. They
+    /// are far too big to travel with every state poll, so only a handoff
+    /// answer carries them.
+    pub file_ids: Vec<String>,
     pub repeat: RemoteRepeat,
     pub shuffle: bool,
 }
@@ -94,8 +101,19 @@ impl PlaybackBridge {
                 }
             }
         };
-        let (title, artist, album) =
-            track_metadata(db_path, &status.file_id).unwrap_or_default();
+        // The catalogue's own record of the file, which is both how the phone
+        // names the track and what it needs to fetch it.
+        let track = crate::mobile::local_track_for(db_path, &status.file_id);
+        let (title, artist, album) = track
+            .as_ref()
+            .map(|track| {
+                (
+                    track.title.clone(),
+                    track.artist.clone(),
+                    track.album.clone(),
+                )
+            })
+            .unwrap_or_default();
         RemotePlaybackState {
             active: !status.file_id.is_empty(),
             playing: status.playing,
@@ -108,12 +126,36 @@ impl PlaybackBridge {
             volume: f64::from(status.volume.clamp(0.0, 1.0)),
             queue_len: queue.len,
             queue_index: queue.index,
+            // The record itself, not only its name: fetching the audio needs the
+            // size, format and MIME the catalogue entry carries, so a phone that
+            // was told only a title could show the track but never play it here.
+            track,
+            queue: Vec::new(),
             repeat: queue.repeat,
             shuffle: queue.shuffle,
             remote_control: self.remote_control_active(),
             error: status.error,
             updated_at: Utc::now().timestamp(),
         }
+    }
+
+    /// Everything a phone needs to take this player's place, read before it is
+    /// stopped.
+    ///
+    /// The queue comes from the window, because the window owns it, and it is
+    /// only ever sent here: a state poll carries the queue's length and nothing
+    /// more.
+    fn handoff_state(&self, db_path: &Path) -> RemotePlaybackState {
+        let mut state = self.state(db_path);
+        if let Ok(queue) = self.queue.lock() {
+            state.queue = queue
+                .file_ids
+                .iter()
+                .take(MAX_PLAY_QUEUE)
+                .cloned()
+                .collect();
+        }
+        state
     }
 
     /// Carry out one command from a phone, and report the result.
@@ -148,12 +190,29 @@ impl PlaybackBridge {
             }
             PlaybackCommand::Stop => {
                 self.player.stop_playback()?;
+                // The window is told as well, because the native player keeps
+                // the file id it stopped: without this the window still thinks a
+                // track is loaded and its own play button would ask a player
+                // that holds nothing.
+                self.notify(&PlaybackCommand::Stop);
+            }
+            PlaybackCommand::Handoff => {
+                // Read and stop in one request: with two, this computer could
+                // move on to the next track in between and the phone would take
+                // over something other than what it was told about.
+                let state = self.handoff_state(db_path);
+                self.player.stop_playback()?;
+                self.notify(&PlaybackCommand::Handoff);
+                return Ok(state);
             }
             PlaybackCommand::Seek { position_ms } => {
                 self.player.seek(position_ms as f64 / 1000.0)?;
             }
             PlaybackCommand::Volume { percent } => {
                 self.player.set_volume(f32::from(percent.min(100)) / 100.0)?;
+                // The player has it; the window is told so its own slider follows
+                // rather than showing the volume it had a moment ago.
+                self.notify(&PlaybackCommand::Volume { percent });
             }
             // The queue is the frontend's to move through, and it reports the
             // new position back through `publish_queue`.
@@ -175,6 +234,17 @@ impl PlaybackBridge {
             .map_err(|error| format!("could not reach the Napstr window: {error}"))
     }
 
+    /// Tell the window about a change the audio player has already made.
+    ///
+    /// Best effort, unlike [`Self::forward`]: the sound has already stopped, so
+    /// failing the phone's request because a window could not be reached would
+    /// describe something that did not happen.
+    fn notify(&self, command: &PlaybackCommand) {
+        if let Err(error) = self.forward(command) {
+            eprintln!("the Napstr window could not be told what a phone asked for: {error}");
+        }
+    }
+
     fn note_remote_activity(&self) {
         let now = Utc::now().timestamp();
         if let Ok(mut until) = self.remote_until.lock() {
@@ -191,24 +261,10 @@ impl PlaybackBridge {
     }
 }
 
+/// Seconds as whole milliseconds, which is the unit the wire uses everywhere.
 fn seconds_to_ms(seconds: f64) -> u64 {
     if !seconds.is_finite() || seconds < 0.0 {
         return 0;
     }
     (seconds * 1000.0).round() as u64
-}
-
-/// Title, artist and album of a loaded track. Covers the desktop's own library
-/// only: a track the desktop is playing from a relay is not in `files`, and the
-/// phone then shows the file id on its own.
-fn track_metadata(db_path: &Path, file_id: &str) -> Option<(String, String, String)> {
-    if file_id.is_empty() {
-        return None;
-    }
-    let connection = crate::open_connection(db_path).ok()?;
-    crate::load_files_by_id(&connection, &[file_id.to_string()])
-        .ok()?
-        .into_iter()
-        .next()
-        .map(|file| (file.title, file.artist, file.album))
 }

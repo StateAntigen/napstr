@@ -1,15 +1,15 @@
 use crate::{
     build_local_audiobooks, build_local_audiobooks_from_files, cover_publish::CoverAlbumNote,
     cover_publish::CoverPublisher, load_files, load_files_by_id, load_transfers, open_connection,
-    search_matches,
+    search_matches, SharedFile,
 };
 use chrono::Utc;
 use iroh::{endpoint::presets, Endpoint, SecretKey};
 use napstr_remote_protocol::{
     ClientRequest, CoverReportResult, PairingTicket, PlaybackCommand, RemoteAlbumCover,
     RemoteAudiobook, RemoteAudiobookSummary, RemoteSource, RemoteTrack, RemoteTransfer,
-    ServerResponse, ALPN, MAX_CONTROL_FRAME_BYTES, MAX_COVER_KEYS, MAX_PAGE_SIZE, MAX_PLAY_QUEUE,
-    PROTOCOL_VERSION,
+    ServerResponse, ALPN, MAX_CONTROL_FRAME_BYTES, MAX_COVER_KEYS, MAX_PAGE_SIZE, MAX_PLAYLIST_PAGE,
+    MAX_PLAY_QUEUE, MAX_POSITION_MS, MAX_TRACKS_BY_ID, PROTOCOL_VERSION,
 };
 use qrcode::{render::svg, QrCode};
 use rusqlite::{params, OptionalExtension};
@@ -670,22 +670,8 @@ impl MobileService {
                     load_files_by_id(&open_connection(&self.db_path)?, &chapter_ids)?
                         .into_iter()
                         .map(|file| {
-                            (
-                                file.file_id.clone(),
-                                RemoteTrack {
-                                    file_id: file.file_id,
-                                    filename: file.filename,
-                                    title: file.title,
-                                    artist: file.artist,
-                                    album: file.album,
-                                    format: file.format,
-                                    mime: file.mime,
-                                    size: file.size,
-                                    tags: file.tags,
-                                    local: true,
-                                    sources: Vec::new(),
-                                },
-                            )
+                            let file_id = file.file_id.clone();
+                            (file_id, remote_track(file))
                         })
                         .collect::<std::collections::HashMap<_, _>>();
                 for chapter in &mut audiobook.chapters {
@@ -756,6 +742,52 @@ impl MobileService {
                     },
                 )
                 .await
+            }
+            ClientRequest::LibraryByIds { file_ids } => {
+                if file_ids.len() > MAX_TRACKS_BY_ID
+                    || file_ids.iter().any(|file_id| !is_sha256_file_id(file_id))
+                {
+                    return Err("Invalid track lookup request".into());
+                }
+                // In the order asked for, and only the files this computer still
+                // holds: a queue or playlist that names a file it no longer has
+                // is answered with the rest of itself rather than with nothing.
+                let tracks = load_files_by_id(&open_connection(&self.db_path)?, &file_ids)?
+                    .into_iter()
+                    .map(remote_track)
+                    .collect();
+                write_response(send, &ServerResponse::LibraryByIds { tracks }).await
+            }
+            ClientRequest::Playlists { offset, limit } => {
+                let (playlists, total) = crate::playlist::list(
+                    &open_connection(&self.db_path)?,
+                    offset,
+                    limit.clamp(1, MAX_PAGE_SIZE),
+                )?;
+                write_response(send, &ServerResponse::Playlists { playlists, total }).await
+            }
+            ClientRequest::Playlist {
+                author,
+                playlist_id,
+                offset,
+                limit,
+            } => {
+                let page = crate::playlist::page(
+                    &open_connection(&self.db_path)?,
+                    &author,
+                    &playlist_id,
+                    offset,
+                    limit.clamp(1, MAX_PLAYLIST_PAGE),
+                )?;
+                match page {
+                    Some(playlist) => {
+                        write_response(send, &ServerResponse::Playlist { playlist }).await
+                    }
+                    // A playlist this computer does not have is not an empty
+                    // one: saying so is what lets a phone drop it from a list
+                    // it is holding.
+                    None => Err("That playlist is not on this computer".into()),
+                }
             }
             ClientRequest::AlbumCovers { keys } => {
                 if keys.len() > MAX_COVER_KEYS {
@@ -949,6 +981,10 @@ fn check_request_permission(stream_only: bool, request: &ClientRequest) -> Resul
         | ClientRequest::Audiobook { .. }
         | ClientRequest::FetchAudio { .. }
         | ClientRequest::Available { .. }
+        | ClientRequest::LibraryByIds { .. }
+        // A playlist is a list of names, and reading it is reading the library.
+        | ClientRequest::Playlists { .. }
+        | ClientRequest::Playlist { .. }
         | ClientRequest::AlbumCovers { .. }
         // Seeing what the computer is playing is not a way of changing it.
         | ClientRequest::PlaybackState
@@ -980,7 +1016,11 @@ fn is_sha256_file_id(value: &str) -> bool {
 /// dropped, because a request that cannot play its own track is a broken one.
 fn bounded_playback(command: PlaybackCommand) -> Result<PlaybackCommand, String> {
     match command {
-        PlaybackCommand::PlayTrack { file_id, queue } => {
+        PlaybackCommand::PlayTrack {
+            file_id,
+            queue,
+            position_ms,
+        } => {
             if !is_sha256_file_id(&file_id) {
                 return Err("That is not a track this computer can look up".into());
             }
@@ -995,6 +1035,10 @@ fn bounded_playback(command: PlaybackCommand) -> Result<PlaybackCommand, String>
                     .into_iter()
                     .filter(|candidate| is_sha256_file_id(candidate))
                     .collect(),
+                // Clamped rather than refused: a position past any track is a
+                // broken sender, but playing the track from the beginning of it
+                // is a better answer than an error the phone cannot act on.
+                position_ms: position_ms.min(MAX_POSITION_MS),
             })
         }
         other => Ok(other),
@@ -1077,20 +1121,8 @@ fn load_local_remote_audiobooks(
     let local_tracks = load_files(&connection, None)?
         .into_iter()
         .map(|file| {
-            let track = RemoteTrack {
-                file_id: file.file_id.clone(),
-                filename: file.filename,
-                title: file.title,
-                artist: file.artist,
-                album: file.album,
-                format: file.format,
-                mime: file.mime,
-                size: file.size,
-                tags: file.tags,
-                local: true,
-                sources: Vec::new(),
-            };
-            (file.file_id, track)
+            let file_id = file.file_id.clone();
+            (file_id, remote_track(file))
         })
         .collect::<std::collections::HashMap<_, _>>();
     let audiobooks = build_local_audiobooks(&connection)?
@@ -1170,19 +1202,7 @@ fn build_music_library(
     let tracks = files
         .into_iter()
         .filter(|file| !audiobook_chapter_ids.contains(&file.file_id))
-        .map(|file| RemoteTrack {
-            file_id: file.file_id,
-            filename: file.filename,
-            title: file.title,
-            artist: file.artist,
-            album: file.album,
-            format: file.format,
-            mime: file.mime,
-            size: file.size,
-            tags: file.tags,
-            local: true,
-            sources: Vec::new(),
-        })
+        .map(remote_track)
         .collect::<Vec<_>>();
     Ok((tracks, audiobook_chapter_ids))
 }
@@ -1235,24 +1255,45 @@ fn cover_revision(db_path: &Path) -> Result<u64, String> {
     crate::cover::cover_revision(&connection)
 }
 
+/// One catalogue row as the wire describes it.
+///
+/// Every file this produces is one this computer holds, so `local` is always
+/// true and no seeders are named: a track this computer does not hold is
+/// described by the catalogue's own copy of it instead.
+fn remote_track(file: SharedFile) -> RemoteTrack {
+    RemoteTrack {
+        file_id: file.file_id,
+        filename: file.filename,
+        title: file.title,
+        artist: file.artist,
+        album: file.album,
+        format: file.format,
+        mime: file.mime,
+        size: file.size,
+        tags: file.tags,
+        local: true,
+        sources: Vec::new(),
+    }
+}
+
 fn local_track(db_path: &Path, file_id: &str) -> Result<RemoteTrack, String> {
     load_files_by_id(&open_connection(db_path)?, &[file_id.to_string()])?
         .into_iter()
-        .map(|file| RemoteTrack {
-            file_id: file.file_id,
-            filename: file.filename,
-            title: file.title,
-            artist: file.artist,
-            album: file.album,
-            format: file.format,
-            mime: file.mime,
-            size: file.size,
-            tags: file.tags,
-            local: true,
-            sources: Vec::new(),
-        })
         .next()
-        .ok_or("This track is no longer in the Napstr folder".into())
+        .map(remote_track)
+        .ok_or_else(|| "This track is no longer in the Napstr folder".into())
+}
+
+/// The same record, for callers that only want to describe what they are
+/// playing.
+///
+/// The playback bridge needs it in both directions of a handoff: a phone can
+/// only take playback over if it is told the size, format and MIME of what the
+/// computer is playing, because fetching the audio is what needs them.
+/// A computer that no longer holds the track answers `None`, and the phone shows
+/// what the state already says about it.
+pub(crate) fn local_track_for(db_path: &Path, file_id: &str) -> Option<RemoteTrack> {
+    local_track(db_path, file_id).ok()
 }
 
 fn secure_audio_path(db_path: &Path, file_id: &str) -> Result<PathBuf, String> {
@@ -1494,28 +1535,51 @@ mod tests {
     fn a_play_queue_is_bounded_and_filtered_to_file_ids() {
         let track = "a".repeat(64);
         let queued = "b".repeat(64);
-        let PlaybackCommand::PlayTrack { file_id, queue } = bounded_playback(
-            PlaybackCommand::PlayTrack {
-                file_id: track.clone(),
-                queue: vec![queued.clone(), "not-a-file".into(), String::new()],
-            },
-        )
+        let PlaybackCommand::PlayTrack {
+            file_id,
+            queue,
+            position_ms,
+        } = bounded_playback(PlaybackCommand::PlayTrack {
+            file_id: track.clone(),
+            queue: vec![queued.clone(), "not-a-file".into(), String::new()],
+            position_ms: 12_000,
+        })
         .unwrap()
         else {
             panic!("a play command must stay a play command")
         };
         assert_eq!(file_id, track);
         assert_eq!(queue, vec![queued]);
+        // Where a handover resumes is carried through untouched.
+        assert_eq!(position_ms, 12_000);
+
+        // A position past anything this computer could be playing is clamped
+        // rather than refused, because there is nothing a phone could do about
+        // an error but the track itself is still playable.
+        let PlaybackCommand::PlayTrack { position_ms, .. } = bounded_playback(
+            PlaybackCommand::PlayTrack {
+                file_id: "a".repeat(64),
+                queue: Vec::new(),
+                position_ms: MAX_POSITION_MS + 1,
+            },
+        )
+        .unwrap()
+        else {
+            panic!("a play command must stay a play command")
+        };
+        assert_eq!(position_ms, MAX_POSITION_MS);
 
         // The track being asked for is never quietly swapped for another.
         assert!(bounded_playback(PlaybackCommand::PlayTrack {
             file_id: "nope".into(),
             queue: Vec::new(),
+            position_ms: 0,
         })
         .is_err());
         assert!(bounded_playback(PlaybackCommand::PlayTrack {
             file_id: track,
             queue: vec!["c".repeat(64); MAX_PLAY_QUEUE + 1],
+            position_ms: 0,
         })
         .is_err());
 

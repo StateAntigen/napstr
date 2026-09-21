@@ -8,10 +8,22 @@ pub const MAX_PAGE_SIZE: usize = 200;
 /// Album covers per request. Bounded so a full answer always fits in one
 /// control frame even when every URL is at its maximum length.
 pub const MAX_COVER_KEYS: usize = 40;
-/// Longest queue a phone may hand to the host when it asks the host to play
-/// something. 200 file ids of the 64 characters a SHA-256 takes is about 13 KB,
-/// so a full queue always fits in one control frame.
+/// Longest queue either side may hand to the other. 200 file ids of the 64
+/// characters a SHA-256 takes is about 13 KB, so a full queue always fits in one
+/// control frame, in a request or in the answer a handoff gets back.
 pub const MAX_PLAY_QUEUE: usize = 200;
+/// Longest track a handoff can be asked to start inside. Nothing either side
+/// plays is a day long, and a position past this is a bug in the caller rather
+/// than a preference.
+pub const MAX_POSITION_MS: u64 = 24 * 60 * 60 * 1000;
+/// Catalogue records per by-id request. Smaller than a library page because every
+/// field of every track may be at its maximum length and a full answer still has
+/// to fit in one control frame - which a page of 200 such tracks would not.
+pub const MAX_TRACKS_BY_ID: usize = 100;
+/// Members per playlist page, for the same reason as `MAX_TRACKS_BY_ID`: a
+/// playlist may name 500 members, so a page of them is what keeps an answer
+/// inside one control frame.
+pub const MAX_PLAYLIST_PAGE: usize = 100;
 /// NIP-56 report types a cover report may use. `other` exists so a phone is
 /// never forced to mislabelled something to be able to report it at all.
 pub const REPORT_REASONS: [&str; 7] = [
@@ -168,6 +180,13 @@ pub enum PlaybackCommand {
     /// Pause when playing, resume when paused: what a single button wants.
     Toggle,
     Stop,
+    /// Hand playback over to the phone that asked: stop, and answer with what
+    /// this computer was doing as it was at the moment it stopped.
+    ///
+    /// One request rather than "read the state, then stop", because between two
+    /// requests this host may have moved on to the next track by itself and the
+    /// phone would take over the wrong one.
+    Handoff,
     Next,
     Previous,
     Seek {
@@ -192,6 +211,11 @@ pub enum PlaybackCommand {
         file_id: String,
         #[serde(default)]
         queue: Vec<String>,
+        /// Where inside the track to start, so handing playback over resumes at
+        /// the second the other device was at rather than starting again. Older
+        /// senders omit it, which reads as the beginning of the track.
+        #[serde(default)]
+        position_ms: u64,
     },
 }
 
@@ -214,6 +238,17 @@ pub struct RemotePlaybackState {
     pub queue_len: usize,
     /// Index of the playing track in the host's queue, or -1.
     pub queue_index: i64,
+    /// The host's own record of the file it is playing, when this computer holds
+    /// it. A phone needs the real record - format, mime, size - to fetch the
+    /// audio and take playback over; one built from the title alone cannot be
+    /// played. Absent when the host is playing something it does not index.
+    #[serde(default)]
+    pub track: Option<RemoteTrack>,
+    /// File ids of the host's queue, in the order it would play them. Only the
+    /// answer to a handoff fills this: a queue is far too big to repeat on every
+    /// poll, and a phone that needs it is taking the whole queue over.
+    #[serde(default)]
+    pub queue: Vec<String>,
     pub repeat: RemoteRepeat,
     pub shuffle: bool,
     /// True while a phone has driven the host recently, so the desktop can say
@@ -248,6 +283,91 @@ pub struct RemoteTransfer {
     pub speed: String,
 }
 
+/// What a playlist is called and who published it, without its members. A phone
+/// lists these first and asks for the members of the one it is about to play, so
+/// that browsing never carries the members of playlists nobody opened.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct RemotePlaylistSummary {
+    /// The stable id from the `d` tag: a canonical lowercase UUID, which stays
+    /// the same across edits. Every playlist kind uses it, so it is also what a
+    /// phone sends back to ask for one.
+    pub playlist_id: String,
+    pub title: String,
+    /// Author of a public playlist. Empty for a playlist only this computer
+    /// holds.
+    pub author: String,
+    pub display_name: String,
+    /// Members the playlist names, which is also how many rows the members of it
+    /// can be paged through.
+    pub track_count: usize,
+    /// True when the playlist is private. A private playlist is never published
+    /// to a relay at all: its owner's computer stores it and serves it to a
+    /// paired companion over the companion channel, and nowhere else. A relay
+    /// would see the coordinate, the size and the edit time even with the body
+    /// encrypted, which is exactly what a private playlist is for avoiding.
+    pub private: bool,
+    pub updated_at: i64,
+}
+
+/// One member of a playlist, in the order the playlist puts it in.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct RemotePlaylistTrack {
+    /// Where the member sits in the playlist. The first member is 1.
+    pub position: u32,
+    pub file_id: String,
+    /// Display hints, which exist so a member whose catalogue entry cannot be
+    /// found still renders as something a person recognises. A catalogue entry
+    /// always wins over them, and they are never authoritative.
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+}
+
+/// A playlist and one page of its members.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct RemotePlaylist {
+    pub playlist_id: String,
+    pub title: String,
+    pub author: String,
+    pub display_name: String,
+    /// Album artist and release-group MBID, when the playlist describes one
+    /// release group rather than a mix. Untrusted display metadata.
+    pub artist: String,
+    pub mbid: String,
+    /// The author's own search words, comma-separated in the format a catalogue
+    /// entry uses for its `tags`: what this playlist is meant to be found by.
+    ///
+    /// These are the author's choice and outrank anything a client would
+    /// suggest, including the choice of having none. A publisher MUST NOT add
+    /// words of its own on top of them.
+    pub tags: String,
+    pub private: bool,
+    pub updated_at: i64,
+    /// Members in `position` order, this page of them.
+    pub tracks: Vec<RemotePlaylistTrack>,
+    /// Members the whole playlist names, so a paged answer says how many are
+    /// still to come.
+    pub total: usize,
+}
+
+impl RemotePlaylist {
+    /// The same playlist without its members, for a list that only needs names.
+    pub fn summary(&self) -> RemotePlaylistSummary {
+        RemotePlaylistSummary {
+            playlist_id: self.playlist_id.clone(),
+            title: self.title.clone(),
+            author: self.author.clone(),
+            display_name: self.display_name.clone(),
+            track_count: self.total,
+            private: self.private,
+            updated_at: self.updated_at,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(
     tag = "type",
@@ -264,6 +384,12 @@ pub enum ClientRequest {
         offset: usize,
         limit: usize,
     },
+    /// The catalogue records for particular file ids, in the order asked for.
+    /// A handoff answer carries the host's queue as ids, so this is how a phone
+    /// turns that queue into tracks it can actually play.
+    LibraryByIds {
+        file_ids: Vec<String>,
+    },
     Search {
         query: String,
     },
@@ -277,6 +403,28 @@ pub enum ClientRequest {
     },
     Audiobook {
         audiobook_id: String,
+    },
+    /// Playlists this computer can see: the ones it published, the ones it found
+    /// on relays, and its own private ones. Discovery is by name here rather
+    /// than by member, because "which playlists contain any of my N files" does
+    /// not survive library scale.
+    Playlists {
+        offset: usize,
+        limit: usize,
+    },
+    /// One playlist, a page of its members at a time in `position` order.
+    ///
+    /// A playlist is named by its coordinate: its author and its id together.
+    /// The id is chosen by the author, so two authors may choose the same one,
+    /// and a playlist must never be answerable with a stranger's under that id.
+    /// An empty `author` means "whichever playlist this computer holds under that
+    /// id", which is only unambiguous while there is one.
+    Playlist {
+        #[serde(default)]
+        author: String,
+        playlist_id: String,
+        offset: usize,
+        limit: usize,
     },
     RequestDownload {
         file_id: String,
@@ -336,6 +484,9 @@ pub enum ServerResponse {
         tracks: Vec<RemoteTrack>,
         total: usize,
     },
+    LibraryByIds {
+        tracks: Vec<RemoteTrack>,
+    },
     Search {
         tracks: Vec<RemoteTrack>,
     },
@@ -348,6 +499,13 @@ pub enum ServerResponse {
     },
     Audiobook {
         audiobook: RemoteAudiobook,
+    },
+    Playlists {
+        playlists: Vec<RemotePlaylistSummary>,
+        total: usize,
+    },
+    Playlist {
+        playlist: RemotePlaylist,
     },
     DownloadRequested {
         request_id: String,
@@ -566,6 +724,50 @@ mod tests {
             serde_json::to_string(&ClientRequest::PlaybackState).unwrap(),
             r#"{"type":"playbackState"}"#
         );
+        assert_eq!(
+            serde_json::to_string(&ClientRequest::Playback {
+                command: PlaybackCommand::Handoff
+            })
+            .unwrap(),
+            r#"{"type":"playback","command":{"type":"handoff"}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&ClientRequest::LibraryByIds {
+                file_ids: vec!["a".repeat(64)]
+            })
+            .unwrap(),
+            format!(
+                r#"{{"type":"libraryByIds","fileIds":["{}"]}}"#,
+                "a".repeat(64)
+            )
+        );
+        assert_eq!(
+            serde_json::to_string(&ClientRequest::Playlists {
+                offset: 0,
+                limit: 100
+            })
+            .unwrap(),
+            r#"{"type":"playlists","offset":0,"limit":100}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&ClientRequest::Playlist {
+                author: "a".repeat(64),
+                playlist_id: "id".into(),
+                offset: 0,
+                limit: 100
+            })
+            .unwrap(),
+            format!(
+                r#"{{"type":"playlist","author":"{}","playlistId":"id","offset":0,"limit":100}}"#,
+                "a".repeat(64)
+            )
+        );
+        // A companion that predates the coordinate still asks by id, which the
+        // host reads as "the playlist you hold under this id".
+        let by_id: ClientRequest =
+            serde_json::from_str(r#"{"type":"playlist","playlistId":"id","offset":0,"limit":100}"#)
+                .unwrap();
+        assert!(matches!(by_id, ClientRequest::Playlist { author, .. } if author.is_empty()));
         assert_eq!(serde_json::to_string(&RemoteRepeat::One).unwrap(), r#""one""#);
         assert_eq!(
             serde_json::to_string(&ClientRequest::ReadOnlyTicket).unwrap(),
@@ -580,6 +782,7 @@ mod tests {
             PlaybackCommand::Pause,
             PlaybackCommand::Toggle,
             PlaybackCommand::Stop,
+            PlaybackCommand::Handoff,
             PlaybackCommand::Next,
             PlaybackCommand::Previous,
             PlaybackCommand::Seek {
@@ -593,6 +796,7 @@ mod tests {
             PlaybackCommand::PlayTrack {
                 file_id: "a".repeat(64),
                 queue: vec!["b".repeat(64), "c".repeat(64)],
+                position_ms: 12_000,
             },
         ] {
             let request = ClientRequest::Playback {
@@ -615,6 +819,10 @@ mod tests {
         assert!(!state.active);
         assert_eq!(state.repeat, RemoteRepeat::Off);
         assert_eq!(state.queue_index, 0);
+        // A host that predates the handoff fields sends neither, and a phone
+        // must read that as "no record, no queue" rather than as a failure.
+        assert!(state.track.is_none());
+        assert!(state.queue.is_empty());
         let response: ServerResponse =
             serde_json::from_str(r#"{"type":"playback","state":{"title":"Song"}}"#).unwrap();
         assert_eq!(
@@ -692,6 +900,124 @@ mod tests {
         );
     }
 
+    #[test]
+    fn playlists_round_trip() {
+        let playlist = RemotePlaylist {
+            playlist_id: "77abf082-7075-4d36-afe2-e9710ac6b33c".into(),
+            title: "rock".into(),
+            author: "a".repeat(64),
+            display_name: "Sean Parker".into(),
+            artist: "Metallica".into(),
+            mbid: "60691bed-fdd7-32f9-92dc-b151aac9e271".into(),
+            tags: "driving, late night".into(),
+            private: false,
+            updated_at: 1_787_680_200,
+            tracks: vec![RemotePlaylistTrack {
+                position: 1,
+                file_id: "b".repeat(64),
+                title: "Enter Sandman".into(),
+                artist: "Metallica".into(),
+                album: "Metallica".into(),
+            }],
+            total: 1,
+        };
+        let response = ServerResponse::Playlist {
+            playlist: playlist.clone(),
+        };
+        assert_eq!(
+            serde_json::from_str::<ServerResponse>(&serde_json::to_string(&response).unwrap())
+                .unwrap(),
+            response
+        );
+        // The list view is the same object with the members left out.
+        let summary = playlist.summary();
+        assert_eq!(summary.playlist_id, playlist.playlist_id);
+        assert_eq!(summary.track_count, 1);
+        let request = ClientRequest::Playlist {
+            author: playlist.author.clone(),
+            playlist_id: playlist.playlist_id.clone(),
+            offset: 0,
+            limit: MAX_PLAYLIST_PAGE,
+        };
+        assert_eq!(
+            serde_json::from_str::<ClientRequest>(&serde_json::to_string(&request).unwrap())
+                .unwrap(),
+            request
+        );
+        // A private playlist never leaves its owner's own devices, so the flag
+        // has to survive the wire rather than being assumed false.
+        let response: ServerResponse = serde_json::from_str(
+            r#"{"type":"playlists","playlists":[{"playlistId":"id","private":true}],"total":1}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            response,
+            ServerResponse::Playlists { playlists, .. } if playlists[0].private
+        ));
+    }
+
+    /// A playlist may name 500 members and every hint may be at its maximum
+    /// length, so a page of them still has to fit in one control frame.
+    #[test]
+    fn a_full_playlist_page_fits_in_one_control_frame() {
+        let members = (0..MAX_PLAYLIST_PAGE)
+            .map(|index| RemotePlaylistTrack {
+                position: index as u32 + 1,
+                file_id: "a".repeat(64),
+                title: "t".repeat(256),
+                artist: "a".repeat(256),
+                album: "l".repeat(256),
+            })
+            .collect::<Vec<_>>();
+        let payload = serde_json::to_vec(&ServerResponse::Playlist {
+            playlist: RemotePlaylist {
+                playlist_id: "77abf082-7075-4d36-afe2-e9710ac6b33c".into(),
+                title: "t".repeat(256),
+                author: "a".repeat(64),
+                display_name: "d".repeat(256),
+                artist: "a".repeat(256),
+                mbid: "60691bed-fdd7-32f9-92dc-b151aac9e271".into(),
+                // The author's own words, at the catalogue's maximum of 12.
+                tags: (1..=12)
+                    .map(|index| format!("w{index}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                private: false,
+                updated_at: 1_787_680_200,
+                tracks: members,
+                total: 500,
+            },
+        })
+        .unwrap();
+        assert!(
+            payload.len() <= MAX_CONTROL_FRAME_BYTES,
+            "a full playlist page is {} bytes, over the {MAX_CONTROL_FRAME_BYTES} byte frame limit",
+            payload.len()
+        );
+        let summaries = (0..MAX_PAGE_SIZE)
+            .map(|_| RemotePlaylistSummary {
+                playlist_id: "77abf082-7075-4d36-afe2-e9710ac6b33c".into(),
+                title: "t".repeat(256),
+                author: "a".repeat(64),
+                display_name: "d".repeat(256),
+                track_count: 500,
+                private: false,
+                updated_at: 1_787_680_200,
+            })
+            .collect::<Vec<_>>();
+        let payload =
+            serde_json::to_vec(&ServerResponse::Playlists {
+                playlists: summaries,
+                total: 500,
+            })
+            .unwrap();
+        assert!(
+            payload.len() <= MAX_CONTROL_FRAME_BYTES,
+            "a full playlist list is {} bytes, over the {MAX_CONTROL_FRAME_BYTES} byte frame limit",
+            payload.len()
+        );
+    }
+
     /// A phone may hand the desktop the whole list it was showing, and that
     /// request still has to fit in one control frame.
     #[test]
@@ -702,12 +1028,78 @@ mod tests {
                 queue: (0..MAX_PLAY_QUEUE)
                     .map(|index| format!("{index:064x}"))
                     .collect(),
+                position_ms: 3_600_000,
             },
         };
         let payload = serde_json::to_vec(&request).unwrap();
         assert!(
             payload.len() <= MAX_CONTROL_FRAME_BYTES,
             "a full play queue is {} bytes, over the {MAX_CONTROL_FRAME_BYTES} byte frame limit",
+            payload.len()
+        );
+    }
+
+    /// A handoff answers with the track the host was playing and its whole
+    /// queue, and that answer has to fit in one control frame too.
+    #[test]
+    fn a_full_handoff_answer_fits_in_one_control_frame() {
+        let state = RemotePlaybackState {
+            active: true,
+            playing: true,
+            file_id: "a".repeat(64),
+            title: "t".repeat(256),
+            artist: "a".repeat(256),
+            album: "l".repeat(256),
+            position_ms: 3_600_000,
+            duration_ms: 3_600_000,
+            volume: 1.0,
+            queue_len: MAX_PLAY_QUEUE,
+            queue_index: 0,
+            track: Some(RemoteTrack {
+                file_id: "a".repeat(64),
+                filename: "f".repeat(256),
+                title: "t".repeat(256),
+                artist: "a".repeat(256),
+                album: "l".repeat(256),
+                format: "FLAC".into(),
+                mime: "audio/flac".into(),
+                size: u64::MAX,
+                tags: "g".repeat(256),
+                local: true,
+                sources: Vec::new(),
+            }),
+            queue: (0..MAX_PLAY_QUEUE)
+                .map(|index| format!("{index:064x}"))
+                .collect(),
+            remote_control: true,
+            error: String::new(),
+            updated_at: 1_787_680_200,
+            ..RemotePlaybackState::default()
+        };
+        let payload =
+            serde_json::to_vec(&ServerResponse::Playback { state: state.clone() }).unwrap();
+        assert!(
+            payload.len() <= MAX_CONTROL_FRAME_BYTES,
+            "a full handoff answer is {} bytes, over the {MAX_CONTROL_FRAME_BYTES} byte frame limit",
+            payload.len()
+        );
+        // And the largest queue a phone may hand over can be looked up again,
+        // which is how it becomes playable tracks on the phone.
+        let request = ClientRequest::LibraryByIds {
+            file_ids: (0..MAX_TRACKS_BY_ID)
+                .map(|index| format!("{index:064x}"))
+                .collect(),
+        };
+        assert!(serde_json::to_vec(&request).unwrap().len() <= MAX_CONTROL_FRAME_BYTES);
+        let answer = ServerResponse::LibraryByIds {
+            tracks: (0..MAX_TRACKS_BY_ID)
+                .map(|_| state.track.clone().unwrap())
+                .collect(),
+        };
+        let payload = serde_json::to_vec(&answer).unwrap();
+        assert!(
+            payload.len() <= MAX_CONTROL_FRAME_BYTES,
+            "a full page of tracks by id is {} bytes, over the {MAX_CONTROL_FRAME_BYTES} byte frame limit",
             payload.len()
         );
     }

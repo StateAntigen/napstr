@@ -12,6 +12,27 @@ export async function mockNative(page, { app = 'napstrfy', nativeLocale = 'en-GB
     const episode = { id: 'episode', title: 'Original episode', feedTitle: 'Original podcast', audioUrl: 'https://example.com/episode.mp3', datePublished: 1700000000, duration: 100, description: '', image: '', mime: 'audio/mpeg' };
     const status = () => ({ paired, connected: paired, desktopName: 'Music computer', streamOnly: false, endpointId: 'endpoint', libraryRevision: 1, error: '' });
     const transfers = [{ id: 1, fileId: track.fileId, filename: track.filename, size: track.size, progress: 100, status: 'Verified · Complete', speed: '', destination: '/music/Search.wav' }, { id: 2, fileId: 'b'.repeat(64), filename: 'Downloading.wav', size: 100, progress: 12, status: 'Downloading', speed: '', destination: '' }];
+    // The computer's player, idle until a test says otherwise.
+    const idleRemote = () => ({
+      active: false, playing: false, fileId: '', title: '', artist: '', album: '',
+      positionMs: 0, durationMs: 0, volume: 0.85, queueLen: 0, queueIndex: -1,
+      track: null, queue: [], repeat: 'off', shuffle: false, remoteControl: false,
+      error: '', updatedAt: 0
+    });
+    const remoteNow = () => window.remotePlaying ?? idleRemote();
+    const startRemote = (fileId, queue) => {
+      const known = window.remoteLibrary ?? [track];
+      const found = known.find((item) => item.fileId === fileId) ?? { ...track, fileId };
+      window.remotePlaying = {
+        ...remoteNow(),
+        active: true, playing: true, fileId,
+        title: found.title, artist: found.artist, album: found.album,
+        track: found, queue,
+        queueLen: queue.length,
+        queueIndex: Math.max(0, queue.indexOf(fileId))
+      };
+      return window.remotePlaying;
+    };
     window.__TAURI_INTERNALS__ = {
       metadata: { currentWindow: { label: 'main' }, currentWebview: { label: 'main' } },
       transformCallback: () => 1,
@@ -39,7 +60,7 @@ export async function mockNative(page, { app = 'napstrfy', nativeLocale = 'en-GB
           case 'client_platform': return platform;
           case 'companion_status': return status();
           case 'cached_library': return { ...status(), tracks: paired ? [track] : [], total: paired ? 1 : 0 };
-          case 'remote_library': return { tracks: [track], total: 1 };
+          case 'remote_library': return { tracks: window.remoteLibrary ?? [track], total: (window.remoteLibrary ?? [track]).length };
           case 'remote_search': if (window.searchError) throw window.searchError; return [track];
           case 'remote_transfers': return [{ ...transfers[1], fileId: track.fileId }];
           case 'reconcile_audio_cache': return true;
@@ -49,6 +70,35 @@ export async function mockNative(page, { app = 'napstrfy', nativeLocale = 'en-GB
           case 'podcast_playback_url': return { url: location.origin + '/fixture.wav', downloaded: false };
           case 'prefetch_remote_audio': return;
           case 'remote_audiobook_library': return { audiobooks: [], total: 0 };
+          // The computer's own player. A test seeds `window.remotePlaying` to
+          // describe what it is doing; a handoff stops it, and a play command
+          // starts it on the track it was asked for, so a test can watch both
+          // sides of a handover rather than only the request that was sent.
+          case 'remote_playback_state': return remoteNow();
+          case 'remote_playback': {
+            const command = args.command ?? {};
+            if (command.type === 'handoff') {
+              const state = remoteNow();
+              // It stops as it answers: asking again must not find it still
+              // playing, or a phone could take the same track over twice.
+              window.remotePlaying = { ...state, playing: false };
+              return state;
+            }
+            if (command.type === 'playTrack') return startRemote(command.fileId, command.queue ?? []);
+            if (command.type === 'volume') return (window.remotePlaying = { ...remoteNow(), volume: command.percent / 100 });
+            if (command.type === 'stop' || command.type === 'pause') return (window.remotePlaying = { ...remoteNow(), playing: false });
+            if (command.type === 'play' || command.type === 'toggle') return (window.remotePlaying = { ...remoteNow(), playing: true });
+            return remoteNow();
+          }
+          case 'remote_library_by_ids': {
+            const known = window.remoteLibrary ?? [track];
+            return args.fileIds
+              .map((fileId) => known.find((item) => item.fileId === fileId))
+              .filter(Boolean);
+          }
+          case 'remote_download': return 'request-1';
+          case 'remote_playlists': return { playlists: window.remotePlaylists ?? [], total: (window.remotePlaylists ?? []).length };
+          case 'remote_playlist': return { playlist: null, ...(window.remotePlaylist ?? { playlistId: args.playlistId, tracks: [], total: 0 }) };
           case 'podcast_downloads': return [{ episode, ready: false, status: 'Downloading', progress: 20 }];
           case 'podcast_parse_search': return [{ id: 1, title: 'Original podcast', author: 'Original author', feedUrl: 'https://example.com/feed', image: '', description: '', language: 'en', episodeCount: 1, genres: ['Music'] }];
           case 'podcast_episodes': return [episode];
