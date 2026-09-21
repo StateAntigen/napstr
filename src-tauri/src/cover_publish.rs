@@ -800,6 +800,10 @@ struct CoverArtImage {
 struct CoverArtThumbnails {
     #[serde(default)]
     small: String,
+    /// The archive's 1200-pixel rendition. Asked for by number because the
+    /// archive's `large` alias means 500, which is too soft for an album header.
+    #[serde(default, rename = "1200")]
+    full: String,
 }
 
 /// Ask MusicBrainz for the release group, then the Cover Art Archive for its
@@ -932,7 +936,12 @@ fn front_image(archive: &CoverArtArchive) -> Option<(String, String, bool)> {
         .iter()
         .find(|image| image.front && !image.image.is_empty());
     let chosen = front.or_else(|| archive.images.iter().find(|image| !image.image.is_empty()))?;
-    let art = secure_image_url(&chosen.image)?;
+    // The archive serves back the file that was uploaded, which is routinely far
+    // bigger than anything draws it: a phone album header is around 750 device
+    // pixels, so the 1200-pixel rendition is the whole picture at a fraction of
+    // the bytes. An upload smaller than that has no 1200 rendition, and the
+    // original is then already the smaller file.
+    let art = secure_image_url(&chosen.thumbnails.full).or_else(|| secure_image_url(&chosen.image))?;
     // A thumbnail is a convenience: one that is missing or unusable must not
     // cost the cover itself.
     let thumb = secure_image_url(&chosen.thumbnails.small).unwrap_or_default();
@@ -1626,6 +1635,56 @@ mod tests {
         // A group with no images at all is still a considered "no art".
         let empty: CoverArtArchive = serde_json::from_str(r#"{"images":[]}"#).unwrap();
         assert_eq!(front_image(&empty), None);
+    }
+
+    #[test]
+    fn a_large_upload_is_published_as_the_archives_own_rendition() {
+        // The archive answers with the file that was uploaded, and offers its own
+        // smaller renditions beside it. Publishing the upload makes every client
+        // carry a scan-sized download for a picture no screen can use all of, so
+        // the 1200 rendition is what travels and the upload is the fallback.
+        let archive: CoverArtArchive = serde_json::from_str(
+            r#"{"images":[{"image":"https://coverartarchive.org/release/aa/bb.jpg","front":true,"thumbnails":{"250":"https://coverartarchive.org/release/aa/bb-250.jpg","500":"https://coverartarchive.org/release/aa/bb-500.jpg","1200":"https://coverartarchive.org/release/aa/bb-1200.jpg","small":"https://coverartarchive.org/release/aa/bb-250.jpg","large":"https://coverartarchive.org/release/aa/bb-500.jpg"}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            front_image(&archive),
+            Some((
+                "https://coverartarchive.org/release/aa/bb-1200.jpg".to_string(),
+                "https://coverartarchive.org/release/aa/bb-250.jpg".to_string(),
+                true
+            )),
+            "the 1200 rendition is the picture, and the archive's `large` alias is 500, which is not"
+        );
+
+        // An upload smaller than 1200 has no such rendition, and the original is
+        // then already the smaller file.
+        let smaller_upload: CoverArtArchive = serde_json::from_str(
+            r#"{"images":[{"image":"https://coverartarchive.org/release/cc/dd.jpg","front":true,"thumbnails":{"250":"https://coverartarchive.org/release/cc/dd-250.jpg","small":"https://coverartarchive.org/release/cc/dd-250.jpg"}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            front_image(&smaller_upload),
+            Some((
+                "https://coverartarchive.org/release/cc/dd.jpg".to_string(),
+                "https://coverartarchive.org/release/cc/dd-250.jpg".to_string(),
+                true
+            ))
+        );
+
+        // A rendition is subject to the same scheme rule as the original.
+        let insecure: CoverArtArchive = serde_json::from_str(
+            r#"{"images":[{"image":"https://coverartarchive.org/release/ee/ff.jpg","front":true,"thumbnails":{"1200":"http://coverartarchive.org/release/ee/ff-1200.jpg","250":"http://coverartarchive.org/release/ee/ff-250.jpg","small":"http://coverartarchive.org/release/ee/ff-250.jpg"}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            front_image(&insecure),
+            Some((
+                "https://coverartarchive.org/release/ee/ff-1200.jpg".to_string(),
+                "https://coverartarchive.org/release/ee/ff-250.jpg".to_string(),
+                true
+            ))
+        );
     }
 
     #[test]
