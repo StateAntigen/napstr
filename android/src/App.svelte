@@ -530,6 +530,10 @@
 
   /** The hardware back button arrives as an event, not a callback. */
   function handleSystemBack() {
+    // Android took the flag to hand us this press, so the answer below has to be
+    // published again: the states that follow this one are not always a change
+    // of answer, and a derived value that stays true would publish nothing.
+    backPresses += 1;
     if (showReport) {
       showReport = false;
       return;
@@ -1716,8 +1720,20 @@
       activeTab !== 'music'
   );
 
+  /**
+   * Counted by every press the page handles.
+   *
+   * Android clears the flag when it gives the page a press, because one press is
+   * one answer. A press that closes the liked page lands on the search page,
+   * which is also somewhere back can go, so the answer does not change and
+   * nothing derived from it will fire on its own: without this counter the flag
+   * would stay cleared and the app would be left by the press after that.
+   */
+  let backPresses = $state(0);
+
   // The page, and every view above it, own the hardware back button.
   $effect(() => {
+    void backPresses;
     pushBackAvailability(backHasDestination);
   });
 

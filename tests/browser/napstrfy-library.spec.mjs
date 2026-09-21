@@ -37,21 +37,29 @@ const albumCover = {
   author: '', eventId: '', createdAt: 0, seeder: false
 };
 
-async function openApp(page, { library = [], album = null, cached = null, likes = null, platform = 'linux' } = {}) {
+async function openApp(page, { library = [], album = null, cached = null, likes = null, platform = 'linux', holdFullCover = false } = {}) {
+  // A test that needs the full rendition still in flight holds it there, rather
+  // than racing the clock: the player bar fetches that same image, so a delay
+  // can expire before the drawer that is being tested is even open.
+  let releaseFullCover = () => {};
+  const fullCoverGate = holdFullCover ? new Promise((resolve) => { releaseFullCover = resolve; }) : null;
   await mockNative(page, { platform });
   await page.route('**/fixture.wav', serveAudio);
   // Registered after the blanket https route, so it wins for the covers. The
   // full rendition is held back to leave the thumbnail on screen on its own.
   await page.route(coverThumb, (route) => route.fulfill({ contentType: 'image/png', body: tinyPng }));
   await page.route(coverFull, async (route) => {
-    await new Promise((resolve) => setTimeout(resolve, 400));
+    if (fullCoverGate) await fullCoverGate;
+    else await new Promise((resolve) => setTimeout(resolve, 400));
     await route.fulfill({ contentType: 'image/png', body: tinyPng });
   });
   await page.addInitScript(({ library, album, cover, cached, likes }) => {
     if (likes) window.localStorage.setItem('napstrfy-liked-music', JSON.stringify(likes));
     // The page talks to Kotlin through this object. The native side is not in the
-    // browser, so record the flag it is given instead of pressing a real button.
+    // browser, so record the flag it is given instead of pressing a real button,
+    // and count what Android would have done with a press it was not given.
     window.backAvailable = null;
+    window.appExits = 0;
     window.NapstrfyBack = {
       setBackAvailable: (available) => { window.backAvailable = available; },
       setDrawerOpen: (open) => { window.backAvailable = open; }
@@ -69,6 +77,7 @@ async function openApp(page, { library = [], album = null, cached = null, likes 
     };
   }, { library, album, cover: albumCover, cached, likes });
   await page.goto('http://127.0.0.1:15174');
+  return { releaseFullCover };
 }
 
 /** The liked page is only reachable from the chip on the search tab. */
@@ -85,6 +94,26 @@ const searchPageIsBack = (page) => Promise.all([
   expect(page.locator('.liked-close')).toHaveCount(0)
 ]);
 
+const backFlag = (page) => page.evaluate(() => window.backAvailable);
+
+/**
+ * Presses the hardware back button the way Android does. The page is given the
+ * press only while it advertises a destination, and the flag is taken when the
+ * press is consumed - which is the page's cue to publish its answer again. A
+ * press with nothing behind it leaves the app.
+ */
+async function pressBack(page) {
+  return page.evaluate(() => {
+    if (!window.backAvailable) {
+      window.appExits += 1;
+      return 'exit';
+    }
+    window.backAvailable = false;
+    window.dispatchEvent(new CustomEvent('napstrfy-back'));
+    return 'handled';
+  });
+}
+
 test('Napstrfy leaves the liked page from its close button', async ({ page }) => {
   await openApp(page, { likes: [likedSong] });
   await openLikedPage(page);
@@ -92,19 +121,44 @@ test('Napstrfy leaves the liked page from its close button', async ({ page }) =>
   await searchPageIsBack(page);
 });
 
-test('Napstrfy walks back from the liked page to the search page and home, rather than out of the app', async ({ page }) => {
-  await openApp(page, { likes: [likedSong] });
-  await openLikedPage(page);
-  // Back has somewhere to go, so the press must reach the page rather than the app.
-  await expect.poll(() => page.evaluate(() => window.backAvailable)).toBe(true);
-  await page.evaluate(() => window.dispatchEvent(new CustomEvent('napstrfy-back')));
-  await searchPageIsBack(page);
-  // The search page has the home tab behind it, so back is still the page's.
-  await expect.poll(() => page.evaluate(() => window.backAvailable)).toBe(true);
-  await page.evaluate(() => window.dispatchEvent(new CustomEvent('napstrfy-back')));
+test('Napstrfy walks back out of every page it advertises, and is only left from home', async ({ page }) => {
+  // A phone, because a wide desktop window pins the player as a column that is
+  // never a drawer to close.
+  await openApp(page, { library: zzTop, album: zzTop, likes: [likedSong], platform: 'android' });
+  // Home has nothing behind it, so this is the one press that leaves the app.
+  await expect.poll(() => backFlag(page)).toBe(false);
+  expect(await pressBack(page)).toBe('exit');
+
+  // The search tab has home behind it.
+  await page.locator('.bottom-nav button').nth(1).click();
+  await expect.poll(() => backFlag(page)).toBe(true);
+  expect(await pressBack(page)).toBe('handled');
   await expect(page.locator('.library-heading h1')).toHaveText('Your music');
-  // Home is the end of the road: only from here does back leave the app.
-  await expect.poll(() => page.evaluate(() => window.backAvailable)).toBe(false);
+
+  // The liked page has the search page behind it, and the press after this one is
+  // the one that used to leave the app: the flag is taken when a press is
+  // consumed, and the liked page closing onto another page that back can leave
+  // does not change the answer, so the page has to publish it again regardless.
+  await openLikedPage(page);
+  expect(await pressBack(page)).toBe('handled');
+  await searchPageIsBack(page);
+  expect(await pressBack(page)).toBe('handled');
+  await expect(page.locator('.library-heading h1')).toHaveText('Your music');
+
+  // An album preview, and the player drawer, each have the library behind them.
+  await page.locator('.album-open').click();
+  await expect.poll(() => backFlag(page)).toBe(true);
+  expect(await pressBack(page)).toBe('handled');
+  await expect(page.locator('.album-view')).toHaveCount(0);
+
+  await page.locator('.track-open').first().click();
+  await page.locator('.now-open').click();
+  await expect.poll(() => backFlag(page)).toBe(true);
+  expect(await pressBack(page)).toBe('handled');
+  await expect(page.locator('.now-sheet')).toHaveCount(0);
+
+  // One press in the whole walk was not the page's to handle.
+  expect(await page.evaluate(() => window.appExits)).toBe(1);
 });
 
 test('Napstrfy leaves the liked page with a right swipe, without playing what was under the finger', async ({ page }) => {
@@ -163,15 +217,16 @@ test('Napstrfy opens an album on its thumbnail and fades the full cover in over 
 test('Napstrfy opens the now-playing drawer on the thumbnail rather than a blank square', async ({ page }) => {
   // A phone, because a wide desktop window pins this sheet as a column and has
   // no drawer to open.
-  await openApp(page, { library: [zzTop[0]], album: zzTop, platform: 'android' });
-  await page.locator('.track-open').click();
+  const { releaseFullCover } = await openApp(page, { library: zzTop, album: zzTop, platform: 'android', holdFullCover: true });
+  await page.locator('.track-open').first().click();
   await page.locator('.now-open').click();
   const thumb = page.locator('.now-sheet-art img.now-sheet-art-thumb');
   const full = page.locator('.now-sheet-art img.now-sheet-art-full');
   // The tile that was tapped fetched the small rendition, so the drawer is a
-  // cover from its first frame; the full one is a fresh download behind it.
+  // cover from its first frame while the full one is still on its way.
   await expect(thumb).toHaveAttribute('src', coverThumb);
   await expect(full).not.toHaveClass(/ready/);
+  releaseFullCover();
   await expect(full).toHaveClass(/ready/);
   // The backdrop is blurred too far to show a bigger image, so it takes the
   // small rendition rather than making a second request for the large one.
