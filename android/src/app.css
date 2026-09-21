@@ -375,8 +375,10 @@ svg .filled { fill: currentColor; stroke: none; }
    pinned as the third one. Below 800px, and on every phone, the drawer keeps
    working exactly as it does on Android, so this block is the only difference. */
 @media (min-width: 800px) {
+  /* The album preview is a sibling of `.app-shell`, not a descendant, so the
+     column widths have to be declared somewhere both of them inherit from. */
+  :root { --sidebar-width: 190px; }
   .app-shell.desktop {
-    --sidebar-width: 190px;
     min-height: 100dvh;
     max-width: none;
     margin: 0;
@@ -389,12 +391,16 @@ svg .filled { fill: currentColor; stroke: none; }
   }
   .app-shell.desktop > .mobile-header { grid-area: 1 / 2; position: static; height: auto; max-width: none; margin: 0; padding: 20px 28px 8px; background: none; backdrop-filter: none; }
   .app-shell.desktop > .app-content { grid-area: 2 / 2; min-width: 0; padding: 0 28px 44px; }
-  /* The album preview is a full-window overlay on a phone, where there is no
-     column beside it to run under. In a three-column window that leaves it
-     sliding beneath the sidebar and the now-playing column, so it is pinned to
-     the middle column instead. It stays fixed rather than joining the grid so
-     that it keeps the window as its containing block while it scrolls. */
-  .app-shell.desktop .album-view { left: var(--sidebar-width); right: calc(var(--sidebar-width) * 1.5); }
+  /* Full-window overlays on a phone, where there is no column beside them to
+     run under. In a three-column window that leaves them sliding beneath the
+     sidebar and the now-playing column, so they are held to the middle column
+     instead. They stay fixed rather than joining the grid so that they keep the
+     window as their containing block while they scroll, which is also why they
+     are siblings of `.app-shell` and cannot be reached through it: the flag has
+     to be on the overlay itself. Logical properties, because the sidebar swaps
+     sides in RTL while the grid columns follow the inline axis. */
+  .album-view.desktop,
+  .queue-view.desktop { inset-inline-start: var(--sidebar-width); inset-inline-end: calc(var(--sidebar-width) * 1.5); }
   /* The sidebar keeps the bar's markup, so it only changes direction and shape. */
   .app-shell.desktop > .bottom-nav { top: 0; bottom: 0; inset-inline-start: 0; width: var(--sidebar-width); height: auto; max-width: none; margin: 0; padding: 20px 12px; flex-direction: column; align-items: stretch; justify-content: flex-start; gap: 8px; border-top: 0; border-inline-end: 1px solid #26252f; background: #0c0c0f; transform: none; }
   .app-shell.desktop > .bottom-nav button { min-width: 0; height: 48px; padding: 0 14px; flex-direction: row; justify-content: flex-start; gap: 12px; border-radius: 10px; font-size: 14px; font-weight: 650; }

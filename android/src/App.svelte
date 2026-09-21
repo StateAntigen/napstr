@@ -93,6 +93,12 @@
   let platform = $state('');
   const mobile = $derived(platform === 'android' || platform === 'ios');
   /**
+   * The three-column window. The album preview is a sibling of the shell rather
+   * than a child of it, so both elements need this flag, and it is derived once
+   * so the two can never disagree about when the columns exist.
+   */
+  const desktopShell = $derived(!mobile && platform !== '');
+  /**
    * A desktop window wide enough for three columns pins the now-playing sheet as
    * the third one, instead of leaving it as a drawer over the content. A phone
    * never pins, whatever its width: the sheet there is the full-screen drawer.
@@ -2999,7 +3005,7 @@
     <small class="pair-security">{$t("One-use pairing · no Nostr keys leave your computer")}</small>
   </main>
 {:else}
-  <main class="app-shell" class:desktop={!mobile && platform !== ''}>
+  <main class="app-shell" class:desktop={desktopShell}>
     <header class="mobile-header">
       {#if status.paired}
         <button class="status-chip" class:offline={!status.connected} onclick={reconnect} title={status.connected ? `Connected to ${status.desktopName || 'Napstr'}` : 'Reconnect to Napstr'}>
@@ -3446,7 +3452,7 @@
 {/if}
 
 {#if showQueue && (playbackTarget === 'desktop' || activeMedia === 'music')}
-  <div class="queue-view" role="dialog" aria-modal="true" aria-label={$t("Playlist")}>
+  <div class="queue-view" class:desktop={desktopShell} role="dialog" aria-modal="true" aria-label={$t("Playlist")}>
     <header class="queue-head">
       <div>
         <p>{playbackTarget === 'desktop' ? `ON ${(status.desktopName || 'the computer').toUpperCase()}` : shuffle ? 'SHUFFLED' : 'PLAYING NEXT'}</p>
@@ -3564,7 +3570,7 @@
 {/if}
 
 {#if showAlbumView && albumView}
-  <div class="album-view" style={`--cover-hue:${artworkHue(albumView.tracks[0]?.fileId ?? albumView.key)}`} role="dialog" aria-modal="true" aria-label={`${albumView.album} by ${albumView.artist}`}>
+  <div class="album-view" class:desktop={desktopShell} style={`--cover-hue:${artworkHue(albumView.tracks[0]?.fileId ?? albumView.key)}`} role="dialog" aria-modal="true" aria-label={`${albumView.album} by ${albumView.artist}`}>
     <div class="album-glow" style={albumView.art ? `background-image:url(${albumView.art})` : ''}></div>
     <div class="album-glow-scrim"></div>
     <header class="view-head">
