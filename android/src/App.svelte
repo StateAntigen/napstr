@@ -331,13 +331,15 @@
   );
   /** The track the bar draws, which is the computer's when it is the source. */
   let barTrack = $derived(playbackTarget === 'desktop' ? desktopTrackFromState() : null);
-  /** The cover the bar stretches behind itself, or '' when there is none. */
+  /** The cover the bar stretches behind itself, or '' when there is none. It is
+   *  blurred far past what a large image could show, so it takes the small
+   *  rendition: the one the tile that started this track has already fetched. */
   let barArtwork = $derived(
     playbackTarget === 'desktop'
-      ? sheetCoverUrl()
+      ? sheetThumbUrl() || sheetCoverUrl()
       : activeMedia === 'podcast'
         ? currentPodcast?.image ?? ''
-        : sheetCoverUrl()
+        : sheetThumbUrl() || sheetCoverUrl()
   );
   /** The custom properties its stretched cover needs, inert when there is none. */
   let barArtStyle = $derived(

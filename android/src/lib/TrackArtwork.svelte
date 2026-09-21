@@ -2,6 +2,14 @@
   import { ARTWORK_RETRY_MS, artworkHue, coverFor, coverRevision, dropCover } from './artwork';
   import type { RemoteTrack } from './types';
 
+  /**
+   * Every tile draws the small rendition. The full cover is the publisher's own
+   * upload, so the views that show it big - the album header, the drawer - draw
+   * it themselves, over a thumbnail rather than instead of one.
+   *
+   * `large` is the player bar's tile: the biggest one here, at the height of the
+   * bar, and it loads at once instead of when it is scrolled into view.
+   */
   let { track, lookup = true, large = false, onartworkchange }: { track: RemoteTrack; lookup?: boolean; large?: boolean; onartworkchange?: (url: string) => void } = $props();
   let image = $state('');
   let failed = $state(false);
@@ -52,9 +60,11 @@
           retryLater();
           return;
         }
-        // Dense grids prefer the published thumbnail; a large tile wants the
-        // full front cover, falling back to whichever the publisher gave us.
-        image = large ? cover.art || cover.thumb : cover.thumb || cover.art;
+        // The small rendition is what a tile wants, dense or not: the largest
+        // one here is the player bar's, at the height of the bar itself. The
+        // views that show a cover big - the album header, the drawer - draw the
+        // full one themselves, over the small one they start from.
+        image = cover.thumb || cover.art;
       });
     }
     return () => { alive = false; clearTimeout(retryTimer); };

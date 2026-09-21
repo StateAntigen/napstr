@@ -161,6 +161,18 @@ test('Napstrfy walks back out of every page it advertises, and is only left from
   expect(await page.evaluate(() => window.appExits)).toBe(1);
 });
 
+test('Napstrfy draws the player bar and the cover stretched behind it from the thumbnail', async ({ page }) => {
+  // The full rendition is never delivered in this test, so whatever is drawn on
+  // the bar is drawn from the small one the tile that was tapped already had.
+  const { releaseFullCover } = await openApp(page, { library: zzTop, album: zzTop, platform: 'android', holdFullCover: true });
+  await page.locator('.track-open').first().click();
+  await expect(page.locator('.now-playing .artwork img')).toHaveAttribute('src', coverThumb);
+  const bar = await page.locator('.now-playing').getAttribute('style');
+  expect(bar).toContain(coverThumb);
+  expect(bar).not.toContain(coverFull);
+  releaseFullCover();
+});
+
 test('Napstrfy leaves the liked page with a right swipe, without playing what was under the finger', async ({ page }) => {
   await openApp(page, { likes: [likedSong] });
   await openLikedPage(page);
