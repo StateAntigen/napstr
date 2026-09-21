@@ -37,7 +37,7 @@ const albumCover = {
   author: '', eventId: '', createdAt: 0, seeder: false
 };
 
-async function openApp(page, { library = [], album = null, cached = null, likes = null, platform = 'linux', holdFullCover = false } = {}) {
+async function openApp(page, { library = [], album = null, cached = null, likes = null, platform = 'linux', holdFullCover = false, recordMedia = false } = {}) {
   // A test that needs the full rendition still in flight holds it there, rather
   // than racing the clock: the player bar fetches that same image, so a delay
   // can expire before the drawer that is being tested is even open.
@@ -53,8 +53,14 @@ async function openApp(page, { library = [], album = null, cached = null, likes 
     else await new Promise((resolve) => setTimeout(resolve, 400));
     await route.fulfill({ contentType: 'image/png', body: tinyPng });
   });
-  await page.addInitScript(({ library, album, cover, cached, likes }) => {
+  await page.addInitScript(({ library, album, cover, cached, likes, recordMedia }) => {
     if (likes) window.localStorage.setItem('napstrfy-liked-music', JSON.stringify(likes));
+    if (recordMedia) {
+      // The media service is not in the browser either: keep what it is told, so a
+      // test can watch the lock screen's artwork arrive and then be replaced.
+      window.mediaUpdates = [];
+      window.NapstrfyMedia = { update: (payload) => window.mediaUpdates.push(JSON.parse(payload)), clear: () => {} };
+    }
     // The page talks to Kotlin through this object. The native side is not in the
     // browser, so record the flag it is given instead of pressing a real button,
     // and count what Android would have done with a press it was not given.
@@ -75,7 +81,7 @@ async function openApp(page, { library = [], album = null, cached = null, likes 
       if (cmd === 'remote_library' && !args.query) return { tracks: library, total: library.length };
       return invoke(cmd, args);
     };
-  }, { library, album, cover: albumCover, cached, likes });
+  }, { library, album, cover: albumCover, cached, likes, recordMedia });
   await page.goto('http://127.0.0.1:15174');
   return { releaseFullCover };
 }
@@ -171,6 +177,21 @@ test('Napstrfy draws the player bar and the cover stretched behind it from the t
   expect(bar).toContain(coverThumb);
   expect(bar).not.toContain(coverFull);
   releaseFullCover();
+});
+
+test('Napstrfy gives the lock screen the thumbnail, then the full cover once it has landed', async ({ page }) => {
+  // The full rendition is held open, so the order the two are published in is the
+  // assertion rather than a race between them.
+  const { releaseFullCover } = await openApp(page, { library: zzTop, album: zzTop, platform: 'android', recordMedia: true, holdFullCover: true });
+  await page.locator('.track-open').first().click();
+  const artwork = () => page.evaluate(() => window.mediaUpdates.at(-1)?.artwork ?? '');
+  // What the lock screen is given while the bigger rendition is on its way is the
+  // one already on this phone.
+  await expect.poll(artwork).toBe(coverThumb);
+  releaseFullCover();
+  // The full cover takes its place as soon as it has loaded, which the media
+  // service takes as a new URL for the same art.
+  await expect.poll(artwork).toBe(coverFull);
 });
 
 test('Napstrfy leaves the liked page with a right swipe, without playing what was under the finger', async ({ page }) => {

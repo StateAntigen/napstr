@@ -20,7 +20,7 @@
   import SeekIcon from './lib/SeekIcon.svelte';
   import { rateLimitedTask, safePosition, validDuration } from './lib/playback';
   import appIcon from '../src-tauri/icons/icon.png';
-  import { artworkHue, coverFor, coverKey, invalidateCoverNegatives, preloadArtwork, type AlbumCover } from './lib/artwork';
+  import { artworkHue, coverFor, coverKey, invalidateCoverNegatives, loadFullCover, preloadArtwork, type AlbumCover } from './lib/artwork';
   import { reportReasons } from './lib/types';
   import type { AudiobookLibraryPage, CachedAudio, CompanionStatus, CoverReport, LibraryPage, PlaybackCommand, PodcastDownload, PodcastEpisode, PodcastFeed, ReadOnlyTicketOffer, RemoteAudiobook, RemoteAudiobookSummary, RemotePlaybackState, RemoteRepeat, RemoteTrack, RemoteTransfer, ReportReason } from './lib/types';
 
@@ -194,6 +194,11 @@
   /** The sheet's full-cover URL once that image has landed, so the small
    *  rendition under it stays on screen until something better is drawn. */
   let sheetArtLoaded = $state('');
+  /**
+   * The best cover the system has been given for what is playing: the thumbnail
+   * to begin with, then the full cover once that one has landed.
+   */
+  let lockScreenCover = $state('');
   /** The track the resolved cover belongs to, so a new object for the same one
    *  does not throw the artwork away and fetch it again. */
   let nowCoverKey = '';
@@ -1357,7 +1362,7 @@
       publishSystemMetadata({
         title: state.title || 'Unknown track',
         artist: state.artist || status.desktopName || 'The computer',
-        artwork: sheetCoverUrl(),
+        artwork: lockScreenArtwork(),
         playing: state.playing,
         position: safePosition(remotePositionMs() / 1000, seconds || undefined),
         duration: seconds,
@@ -1394,10 +1399,7 @@
       artist: activeMedia === 'podcast' ? currentPodcast?.feedTitle ?? '' : current ? artist(current) : '',
       artwork: activeMedia === 'podcast'
         ? currentPodcast?.image ?? ''
-        // The full cover is what the lock screen shows, but a large rendition
-        // that will not load should not leave it bare: the thumbnail is the
-        // one rendition already proven to exist on this phone.
-        : nowCover ? (nowArtFailed ? nowCover.thumb : nowCover.art || nowCover.thumb) : '',
+        : lockScreenArtwork(),
       playing,
       position: safePosition(currentTime, seconds || undefined),
       duration: seconds,
@@ -1654,6 +1656,25 @@
     }
   });
 
+  // The lock screen starts on the thumbnail, which is already here, and moves to
+  // the full cover once that has landed. For a track that was reached by playing
+  // the one before it, the preload means this is a cache hit and the upgrade
+  // follows within a frame or two of the notification appearing.
+  $effect(() => {
+    const cover = nowCover;
+    lockScreenCover = cover?.thumb ?? '';
+    const full = cover?.art ?? '';
+    if (!full || full === cover?.thumb) return;
+    let alive = true;
+    void loadFullCover(cover).then((landed) => {
+      if (!alive || !landed) return;
+      lockScreenCover = landed;
+      // Not forced: nothing here is wrong-looking until the coalescer comes round.
+      syncSystemMedia();
+    });
+    return () => { alive = false; };
+  });
+
   // While a drag is in flight the browser must not claim the gesture as a
   // scroll: these listeners are deliberately non-passive so they can stop that.
   $effect(() => {
@@ -1789,6 +1810,19 @@
    */
   function sheetThumbUrl() {
     return nowCover?.thumb ?? '';
+  }
+
+  /**
+   * The artwork the system is given for what is playing.
+   *
+   * The thumbnail goes first, because it is the rendition already on this phone,
+   * and the full cover replaces it as soon as that one has landed: the media
+   * service takes a new URL for the same art and re-posts without alerting again.
+   * A full cover that will not load leaves the thumbnail in place.
+   */
+  function lockScreenArtwork(): string {
+    if (!nowCover) return '';
+    return lockScreenCover || nowCover.thumb || nowCover.art;
   }
 
   async function playFromQueue(index: number) {

@@ -192,37 +192,65 @@ export function coverFor(track: RemoteTrack): Promise<AlbumCover | null> {
   return requestCover(key);
 }
 
-/** Thumbnails already fetched on the chance they would be wanted. */
-const warmedThumbs = new Set<string>();
+/** Renditions already asked for, by URL, with the load that was started. */
+const renditionLoads = new Map<string, Promise<string>>();
 
 /**
- * Resolve a track's cover and fetch its small rendition now, rather than when the
- * screen that shows it appears.
+ * Fetch a rendition now and hand back what landed: its URL, or '' when the image
+ * would not load.
  *
- * This is for the track coming next: by the time it plays, its cover has been
- * asked about and its thumbnail is in the image cache, so the player is not the
- * first place either happens. It costs one batched ask - free when the album is
- * already known, as it is when the track was picked from a list - and a few
- * kilobytes of thumbnail.
- *
- * The full rendition is deliberately not fetched: it is the publisher's own
- * upload, worth hundreds of kilobytes, and it is left to the view that displays
- * it, fading in over the thumbnail that is already there.
+ * One fetch per URL however many callers ask, so a view that draws the same
+ * cover, and a preload that has already fetched it, cost one download between
+ * them. A failure is remembered for the session, which is what keeps an album
+ * whose image 404s from being retried on every track.
  */
-export function preloadArtwork(track: RemoteTrack) {
-  void coverFor(track).then(preloadThumbnail);
+function loadRendition(url: string): Promise<string> {
+  if (!url) return Promise.resolve('');
+  const asked = renditionLoads.get(url);
+  if (asked) return asked;
+  const landed = new Promise<string>((resolve) => {
+    // Nothing holds this element: the fetch it starts is the point, and whether
+    // the cover is still wanted when it lands is decided by the screen itself.
+    const image = new Image();
+    image.decoding = 'async';
+    image.onload = () => resolve(url);
+    image.onerror = () => resolve('');
+    image.src = url;
+  });
+  renditionLoads.set(url, landed);
+  return landed;
 }
 
-/** Fetch a small rendition into the image cache, once per URL. */
-function preloadThumbnail(cover: AlbumCover | null) {
-  const url = cover?.thumb;
-  if (!url || warmedThumbs.has(url)) return;
-  warmedThumbs.add(url);
-  // Nothing holds this element: the fetch it starts is the point, and whether
-  // the cover is still wanted when it lands is decided by the screen itself.
-  const image = new Image();
-  image.decoding = 'async';
-  image.src = url;
+/**
+ * Fetch both renditions of a track's cover now, rather than when the screens that
+ * show them appear. This is for the track coming next.
+ *
+ * By the time it plays, its cover has been asked about, its thumbnail is in the
+ * image cache - so the player is a cover from its first frame - and its full
+ * cover has landed, so the drawer fades it in without waiting and the lock screen
+ * is able to move on to it at once.
+ *
+ * Fetching the full rendition is a deliberate cost, and one worth revisiting on a
+ * metered connection: every track that becomes the next one has its full cover
+ * downloaded whether or not anything gets to draw it. Dropping the second call
+ * below would leave everything else as it is, with the lock screen upgrading when
+ * its own fetch lands rather than before the track is even played.
+ */
+export function preloadArtwork(track: RemoteTrack) {
+  void coverFor(track).then((cover) => {
+    if (!cover) return;
+    void loadRendition(cover.thumb);
+    void loadRendition(cover.art);
+  });
+}
+
+/**
+ * The full cover of an album, fetched now and resolved when it has landed. The
+ * URL is handed back rather than a flag so a caller can publish the very image it
+ * waited for, and '' means the publisher's rendition would not load at all.
+ */
+export function loadFullCover(cover: AlbumCover | null): Promise<string> {
+  return loadRendition(cover?.art ?? '');
 }
 
 /**
