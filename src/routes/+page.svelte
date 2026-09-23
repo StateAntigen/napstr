@@ -21,7 +21,7 @@
   const CHAT_PAGE_SIZE = 100;
   const VISIBLE_SEEDER_LIMIT = 100;
 
-  type View = 'Search' | 'Downloads' | 'Shared' | 'Profile' | 'Settings' | 'Trollbox' | 'Napstrfy' | 'Covers';
+  type View = 'Search' | 'Downloads' | 'Shared' | 'Playlists' | 'Profile' | 'Settings' | 'Trollbox' | 'Napstrfy' | 'Covers';
   type PlayerMode = 'single' | 'folder' | 'all';
   type PlayerOrigin = 'search' | 'downloads' | 'shared' | 'audiobook' | 'direct';
   /** Repeat, as the phone offers it and this window now plays it. */
@@ -81,6 +81,7 @@
     { label: 'Search', icon: '⌕' },
     { label: 'Downloads', icon: '⇩' },
     { label: 'Shared', icon: '▤' },
+    { label: 'Playlists', icon: '♫' },
     { label: 'Profile', icon: '☺' },
     { label: 'Settings', icon: '⚙' },
     { label: 'Trollbox', icon: '▣' },
@@ -111,6 +112,60 @@
   type BlockConfirmation =
     | { kind: 'file'; fileId: string; label: string }
     | { kind: 'user'; pubkey: string; label: string };
+  /** A playlist as the Playlists page lists it: no members, which is what makes
+   *  browsing cheap. `author` is half the coordinate, so it travels with every
+   *  row. */
+  type PlaylistSummary = {
+    playlistId: string;
+    title: string;
+    author: string;
+    displayName: string;
+    image: string;
+    trackCount: number;
+    private: boolean;
+    published: boolean;
+    updatedAt: number;
+  };
+  /** One member, in the order the playlist puts it in. */
+  type PlaylistMember = {
+    position: number;
+    fileId: string;
+    title: string;
+    artist: string;
+    album: string;
+  };
+  /** A playlist and all of its members, which is what the editor edits. */
+  type PlaylistDetail = {
+    playlistId: string;
+    title: string;
+    author: string;
+    displayName: string;
+    artist: string;
+    mbid: string;
+    image: string;
+    tags: string;
+    private: boolean;
+    published: boolean;
+    updatedAt: number;
+    tracks: PlaylistMember[];
+    total: number;
+  };
+  /**
+   * A track the editor may add as a member.
+   *
+   * `source` says where the row was found, not what the file is. A playlist may
+   * name files its author does not hold — that is curation, and the common case
+   * is building a list of things you have not listened to yet — so the picker
+   * searches this computer and the network, and marks what is not here yet.
+   */
+  type PlaylistCandidate = {
+    fileId: string;
+    title: string;
+    artist: string;
+    album: string;
+    filename: string;
+    source: 'local' | 'network';
+  };
 
   let activeView: View = 'Search';
   let results: Result[] = [];
@@ -1456,11 +1511,282 @@
     };
   }
 
+  let playlists: PlaylistSummary[] = [];
+  let playlistsLoading = false;
+  let playlistsError: string | Message = '';
+  /**
+   * This computer's own public key: the author half of every playlist it writes
+   * down. Read from the host rather than from the network status, because a
+   * playlist is edited offline too, and "is this row mine?" has to be answerable
+   * while the relays are down.
+   */
+  let playlistAuthor = '';
+  /** The playlist open in the editor, or null while the list is showing. */
+  let playlistDraft: PlaylistDetail | null = null;
+  /** The draft's members in the order the list shows them, which is the order
+   *  that gets saved: positions are written from this, never typed. */
+  let playlistMembers: PlaylistMember[] = [];
+  /** The author's answer to "suggest words from the title?". It only applies
+   *  while they have written no words of their own, and it is remembered here
+   *  because the event cannot carry the difference between "no" and "not asked". */
+  let playlistSuggestTags = true;
+  let playlistSaving = false;
+  let playlistError: string | Message = '';
+  let playlistNotice: string | Message = '';
+  let playlistCandidateQuery = '';
+  let playlistCandidates: PlaylistCandidate[] = [];
+  let playlistSearching = false;
+
+  async function refreshPlaylists() {
+    playlistsLoading = true;
+    playlistsError = '';
+    try {
+      if (!playlistAuthor) playlistAuthor = await invoke<string>('own_playlist_author');
+      playlists = await invoke<PlaylistSummary[]>('playlists');
+    } catch (error) {
+      playlistsError = String(error);
+    } finally {
+      playlistsLoading = false;
+    }
+  }
+
+  /**
+   * Whether a row is this computer's own playlist.
+   *
+   * Every row in the store was written by this computer, so an author it cannot
+   * match is still its own: only a key it does not hold would make a row
+   * somebody else's, and nothing stores one of those yet. Refusing to edit a
+   * playlist because the identity could not be read would be worse than the
+   * mistake it guards against.
+   */
+  function playlistIsMine(author: string) {
+    return !author || !playlistAuthor || author === playlistAuthor;
+  }
+
+  /** A playlist that has not been written down yet, with an id to write it under. */
+  async function newPlaylist() {
+    playlistsError = '';
+    try {
+      playlistDraft = {
+        playlistId: await invoke<string>('new_playlist_id'),
+        title: '',
+        author: playlistAuthor,
+        displayName,
+        artist: '',
+        mbid: '',
+        image: '',
+        tags: '',
+        private: false,
+        published: false,
+        updatedAt: 0,
+        tracks: [],
+        total: 0
+      };
+      playlistMembers = [];
+      playlistCandidates = [];
+      playlistCandidateQuery = '';
+      playlistSuggestTags = true;
+      playlistError = '';
+      playlistNotice = '';
+    } catch (error) {
+      playlistsError = String(error);
+    }
+  }
+
+  async function openPlaylist(summary: PlaylistSummary) {
+    playlistsError = '';
+    try {
+      const loaded = await invoke<PlaylistDetail | null>('playlist', {
+        author: summary.author,
+        playlistId: summary.playlistId
+      });
+      if (!loaded) {
+        playlistsError = msg("That playlist is not on this computer");
+        return;
+      }
+      playlistDraft = loaded;
+      playlistMembers = [...loaded.tracks];
+      playlistCandidates = [];
+      playlistCandidateQuery = '';
+      // A playlist that already carries words of its own has already answered
+      // the suggestion question, and re-asking would put our words back.
+      playlistSuggestTags = loaded.tags.trim() === '';
+      playlistError = '';
+      playlistNotice = '';
+    } catch (error) {
+      playlistsError = String(error);
+    }
+  }
+
+  function closePlaylistEditor() {
+    playlistDraft = null;
+    playlistMembers = [];
+    playlistCandidates = [];
+    playlistCandidateQuery = '';
+    playlistError = '';
+    playlistNotice = '';
+  }
+
+  function addPlaylistMember(candidate: PlaylistCandidate) {
+    if (playlistMembers.some((member) => member.fileId === candidate.fileId)) return;
+    playlistMembers = [
+      ...playlistMembers,
+      {
+        position: playlistMembers.length + 1,
+        fileId: candidate.fileId,
+        // The playlist's own description of the track, which is all there is to
+        // go on when the file is not here: a hint, always, and one a catalogue
+        // entry overrides the moment there is one.
+        title: candidate.title || candidate.filename,
+        artist: candidate.artist,
+        album: candidate.album
+      }
+    ];
+  }
+
+  /** Forget the picture a playlist names. The file itself is not touched. */
+  function clearPlaylistImage() {
+    if (playlistDraft) playlistDraft = { ...playlistDraft, image: '' };
+  }
+
+  function removePlaylistMember(index: number) {
+    playlistMembers = playlistMembers.filter((_, position) => position !== index);
+  }
+
+  function movePlaylistMember(index: number, delta: number) {
+    const target = index + delta;
+    if (target < 0 || target >= playlistMembers.length) return;
+    const moved = [...playlistMembers];
+    const [member] = moved.splice(index, 1);
+    moved.splice(target, 0, member);
+    playlistMembers = moved;
+  }
+
+  /** The draft as the host stores it: positions are the order on screen. */
+  function playlistForHost(): PlaylistDetail {
+    const tracks = playlistMembers.map((member, index) => ({ ...member, position: index + 1 }));
+    return { ...(playlistDraft as PlaylistDetail), tracks, total: tracks.length };
+  }
+
+  /**
+   * Find tracks to add: here first, then on the network.
+   *
+   * Searching only this computer would make the ordinary case impossible — a
+   * person listing music they have not listened to here yet — so a network row
+   * is offered the same way a local one is, and marked, because adding it means
+   * the playlist names a file before this computer holds it. That is allowed,
+   * and the member reads from the playlist's own description until it arrives.
+   */
+  async function searchPlaylistTracks() {
+    playlistSearching = true;
+    playlistError = '';
+    const query = playlistCandidateQuery.trim();
+    try {
+      const here = await invoke<NativeFile[]>('search_catalog', { query });
+      const found: PlaylistCandidate[] = here.map((file) => ({
+        fileId: file.fileId,
+        title: file.title,
+        artist: file.artist,
+        album: file.album,
+        filename: file.filename,
+        source: 'local' as const
+      }));
+      if (networkConnected) {
+        try {
+          const remote = await invoke<NetworkResult[]>('network_search', { query });
+          for (const result of remote) {
+            if (found.some((candidate) => candidate.fileId === result.fileId)) continue;
+            found.push({
+              fileId: result.fileId,
+              title: result.title,
+              artist: result.artist,
+              album: result.album,
+              filename: result.filename,
+              source: 'network' as const
+            });
+          }
+        } catch {
+          // A playlist is edited offline as often as not. A network that cannot
+          // answer is not a failure of the search: it leaves the local rows.
+        }
+      }
+      playlistCandidates = found;
+    } catch (error) {
+      playlistError = String(error);
+    } finally {
+      playlistSearching = false;
+    }
+  }
+
+  /** Write the draft down here. Editing is local until the author publishes. */
+  async function savePlaylist() {
+    if (!playlistDraft) return false;
+    playlistSaving = true;
+    playlistError = '';
+    playlistNotice = '';
+    try {
+      playlistDraft = await invoke<PlaylistDetail>('save_playlist', { playlist: playlistForHost() });
+      playlistMembers = [...playlistDraft.tracks];
+      playlistNotice = msg("Saved on this computer");
+      await refreshPlaylists();
+      return true;
+    } catch (error) {
+      playlistError = String(error);
+      return false;
+    } finally {
+      playlistSaving = false;
+    }
+  }
+
+  async function publishPlaylist() {
+    if (!playlistDraft) return;
+    if (!(await savePlaylist())) return;
+    playlistSaving = true;
+    playlistError = '';
+    try {
+      playlistDraft = await invoke<PlaylistDetail>('publish_playlist', {
+        playlist: playlistForHost(),
+        suggestTags: playlistSuggestTags
+      });
+      playlistMembers = [...playlistDraft.tracks];
+      playlistNotice = msg("Published to the relays");
+      await refreshPlaylists();
+    } catch (error) {
+      playlistError = String(error);
+    } finally {
+      playlistSaving = false;
+    }
+  }
+
+  /**
+   * Get rid of a playlist.
+   *
+   * A playlist the relays have seen is withdrawn rather than forgotten: deleting
+   * it here alone would leave the published revision standing, and the next
+   * client to look would find a playlist its author believes they threw away.
+   */
+  async function deletePlaylist(playlist: PlaylistDetail | PlaylistSummary | null) {
+    if (!playlist) return;
+    playlistSaving = true;
+    playlistError = '';
+    try {
+      if (playlist.published) await invoke('withdraw_playlist', { playlistId: playlist.playlistId });
+      else await invoke('delete_playlist', { author: playlist.author, playlistId: playlist.playlistId });
+      if (playlistDraft && playlistDraft.playlistId === playlist.playlistId) closePlaylistEditor();
+      await refreshPlaylists();
+    } catch (error) {
+      playlistError = String(error);
+    } finally {
+      playlistSaving = false;
+    }
+  }
+
   function activateView(view: View) {
     activeView = view;
     if (view === 'Trollbox') void refreshTrollbox();
     if (view === 'Napstrfy') void openMobileConnect();
     if (view === 'Covers') void refreshCovers();
+    if (view === 'Playlists') void refreshPlaylists();
   }
 
   async function openMobileConnect() {
@@ -3100,6 +3426,124 @@
             <input bind:value={trollboxDraft} maxlength="500" autocomplete="off" placeholder={networkConnected ? $t("Type a public message…") : $t("Connect to Nostr to chat")} disabled={!networkConnected || trollboxSending} aria-label={$t("Trollbox message")} onkeydown={(event) => { if (event.key === 'Enter') { event.preventDefault(); void sendTrollboxMessage(); } }} />
             <button class="classic-button primary" type="button" disabled={!networkConnected || trollboxSending || !trollboxDraft.trim()} onclick={() => void sendTrollboxMessage()}>{trollboxSending ? $t("Sending…") : $t("Send")}</button>
           </div>
+        </section>
+      {:else if activeView === 'Playlists'}
+        <section class="full-panel playlist-view">
+          <div class="panel-title playlist-title">
+            <span></span><b>{playlistDraft ? $t("Playlist") : $t("Playlists")}</b><span></span>
+            <button class="classic-button" title={$t("Refresh")} onclick={() => void refreshPlaylists()}>⟳</button>
+            {#if playlistDraft}
+              <button class="classic-button" title={$t("Back to playlists")} onclick={closePlaylistEditor}>← {$t("Playlists")}</button>
+            {:else}
+              <button class="classic-button primary" title={$t("New playlist")} onclick={() => void newPlaylist()}>+ {$t("New playlist")}</button>
+            {/if}
+          </div>
+
+          {#if playlistsError}<div class="trollbox-error">{$t(playlistsError)}</div>{/if}
+
+          {#if playlistDraft}
+            <div class="playlist-editor">
+              <div class="playlist-fields">
+                <label>{$t("Title")}
+                  <input bind:value={playlistDraft.title} maxlength="256" disabled={!playlistIsMine(playlistDraft.author)} />
+                </label>
+                <label>{$t("Album artist")}
+                  <input bind:value={playlistDraft.artist} maxlength="256" disabled={!playlistIsMine(playlistDraft.author)} />
+                </label>
+                <label>{$t("Release group MBID")}
+                  <input bind:value={playlistDraft.mbid} maxlength="36" disabled={!playlistIsMine(playlistDraft.author)} />
+                </label>
+                <label>{$t("Search words")}
+                  <input bind:value={playlistDraft.tags} maxlength="500" placeholder={$t("Tags")} disabled={!playlistIsMine(playlistDraft.author)} />
+                </label>
+                <p class="playlist-id">{$t("Playlist id")} <code>{playlistDraft.playlistId}</code></p>
+                {#if playlistDraft.image}
+                  <p class="playlist-id">{$t("Artwork")} <code>{playlistDraft.image}</code>
+                    <button class="classic-button" title={$t("Remove")} onclick={clearPlaylistImage}>×</button>
+                  </p>
+                {/if}
+                <label class="playlist-toggle">
+                  <input type="checkbox" bind:checked={playlistSuggestTags} disabled={!playlistIsMine(playlistDraft.author) || playlistDraft.tags.trim() !== ''} />
+                  <span>{$t("Suggest words from the title")}</span>
+                </label>
+                {#if playlistDraft.tags.trim() === ''}
+                  <p class="privacy-note wide"><span>i</span> {$t("With no words of your own, this playlist is found by its name and its members alone.")}</p>
+                {/if}
+              </div>
+
+              <div class="playlist-members">
+                <div class="playlist-members-head"><b>{$t("Tracks")}</b><span>{playlistMembers.length}</span></div>
+                {#each playlistMembers as member, index (member.fileId)}
+                  <div class="playlist-member">
+                    <span class="playlist-member-position">{index + 1}</span>
+                    <div class="playlist-member-copy">
+                      <b>{member.title || member.fileId.slice(0, 12)}</b>
+                      <small>{member.artist}{member.album ? ` · ${member.album}` : ''}</small>
+                    </div>
+                    {#if !localFileIds.has(member.fileId)}
+                      <i class="playlist-badge" title={$t("From the playlist")}>{$t("From the playlist")}</i>
+                    {/if}
+                    <button class="classic-button" title={$t("Move up")} disabled={index === 0} onclick={() => movePlaylistMember(index, -1)}>↑</button>
+                    <button class="classic-button" title={$t("Move down")} disabled={index === playlistMembers.length - 1} onclick={() => movePlaylistMember(index, 1)}>↓</button>
+                    <button class="classic-button" title={$t("Remove")} onclick={() => removePlaylistMember(index)}>×</button>
+                  </div>
+                {/each}
+                {#if playlistMembers.length === 0}
+                  <p class="empty-state compact">{$t("No tracks yet")}</p>
+                {/if}
+              </div>
+
+              <div class="playlist-add">
+                <div class="playlist-members-head"><b>{$t("Add a track")}</b><span></span></div>
+                <form class="playlist-track-search" onsubmit={(event) => { event.preventDefault(); void searchPlaylistTracks(); }}>
+                  <input bind:value={playlistCandidateQuery} placeholder={$t("Search")} aria-label={$t("Search")} />
+                  <button class="classic-button" type="submit" disabled={playlistSearching}>{$t("Search")}</button>
+                </form>
+                <div class="playlist-candidates">
+                  {#each playlistCandidates as candidate (candidate.fileId)}
+                    <div class="playlist-candidate">
+                      <div class="playlist-member-copy">
+                        <b>{candidate.title || candidate.filename}</b>
+                        <small>{candidate.artist}{candidate.album ? ` · ${candidate.album}` : ''}</small>
+                      </div>
+                      {#if candidate.source === 'network'}
+                        <i class="playlist-badge" title={$t("Not on this computer")}>{$t("Not on this computer")}</i>
+                      {/if}
+                      <button class="classic-button" disabled={playlistMembers.some((member) => member.fileId === candidate.fileId)} onclick={() => addPlaylistMember(candidate)}>{$t("Add")}</button>
+                    </div>
+                  {/each}
+                </div>
+              </div>
+
+              <div class="playlist-actions">
+                <button class="classic-button primary" disabled={playlistSaving || !playlistDraft.title.trim() || !playlistIsMine(playlistDraft.author)} onclick={() => void savePlaylist()}>{playlistSaving ? $t("Saving…") : $t("Save")}</button>
+                <button class="classic-button" title={$t("Publish")} disabled={playlistSaving || !playlistDraft.title.trim() || !playlistIsMine(playlistDraft.author)} onclick={() => void publishPlaylist()}>{$t("Publish")}</button>
+                <button class="classic-button" title={$t("Delete")} disabled={playlistSaving} onclick={() => void deletePlaylist(playlistDraft)}>× {$t("Delete")}</button>
+                {#if playlistNotice}<span class="playlist-notice">{$t(playlistNotice)}</span>{/if}
+                {#if playlistError}<span class="playlist-error">{$t(playlistError)}</span>{/if}
+              </div>
+            </div>
+          {:else}
+            <div class="playlist-list">
+              {#each playlists as playlist (playlist.author + " " + playlist.playlistId)}
+                <div class="playlist-row">
+                  <button class="playlist-open" title={$t("Open")} onclick={() => void openPlaylist(playlist)}>
+                    <b>{playlist.title}</b>
+                    <small>{playlist.trackCount} {$t("Tracks")} · {playlist.displayName || playlist.author.slice(0, 12)}</small>
+                  </button>
+                  <span class="playlist-badges">
+                    <i class="playlist-badge">{playlist.published ? $t("Published") : $t("Draft")}</i>
+                  </span>
+                  <button class="classic-button" title={$t("Delete")} onclick={() => void deletePlaylist(playlist)}>×</button>
+                </div>
+              {/each}
+              {#if playlistsLoading}
+                <p class="empty-state compact">···</p>
+              {:else if playlists.length === 0}
+                <p class="empty-state compact">{$t("No playlists yet")}</p>
+              {/if}
+            </div>
+          {/if}
         </section>
       {:else if activeView === 'Covers'}
         <section class="full-panel cover-scan-view">

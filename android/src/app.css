@@ -130,6 +130,86 @@ audio { display: none; }
 .bottom-nav.dragging { transition: none; }.bottom-nav button { min-width: 58px; height: 55px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; color: #72727b; background: transparent; border: 0; font-size: 10px; }.bottom-nav button span { font-size: 29px; line-height: 1; }.bottom-nav button.active { color: white; }
 /* Translated tab names are longer than "Music" and "Podcasts", so they wrap. */
 .bottom-nav button { overflow-wrap: anywhere; }
+
+/* Playlists: a list the Napstr computer keeps, and the editor that writes back
+   to it. Nothing here is stored on the phone, so every screen is drawn from
+   what the computer answered. */
+.playlist-view, .playlist-editor { padding: 0 14px 108px; }
+.playlist-new { width: 44px; height: 44px; flex: 0 0 auto; display: grid; place-items: center; color: #fff; background: #4c46a8; border: 0; border-radius: 50%; font-size: 26px; line-height: 1; }
+.playlist-new:active { background: #3a3585; }
+.playlist-row { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; padding: 6px 8px 6px 13px; background: #16161a; border: 1px solid #24242b; border-radius: 14px; }
+.playlist-open { flex: 1 1 auto; min-width: 0; display: flex; align-items: center; gap: 11px; padding: 4px 0; text-align: start; color: inherit; background: transparent; border: 0; font: inherit; }
+.playlist-row-art, .playlist-member-art { width: 44px; height: 44px; flex: 0 0 auto; display: block; overflow: hidden; background: #1d1d24; border-radius: 8px; }
+.playlist-row-art .artwork, .playlist-member-art .artwork { width: 100%; height: 100%; border-radius: 0; }
+.playlist-row-art-empty, .playlist-member-art-empty { width: 100%; height: 100%; display: grid; place-items: center; color: #6f6f78; font-size: 19px; }
+.playlist-row-copy { min-width: 0; display: grid; gap: 3px; }
+.playlist-row-copy strong { overflow: hidden; font-size: 15px; text-overflow: ellipsis; white-space: nowrap; }
+.playlist-row-copy small { color: #85858d; font-size: 12px; }
+.playlist-editor-head { display: flex; align-items: center; gap: 10px; padding: 16px 4px 14px; }
+.playlist-back { display: flex; align-items: center; gap: 5px; padding: 8px 10px 8px 0; color: #b9b9c1; background: transparent; border: 0; font: inherit; font-size: 13px; }
+.playlist-back svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.playlist-editor-head strong { overflow: hidden; font-size: 15px; text-overflow: ellipsis; white-space: nowrap; }
+.playlist-field { display: grid; gap: 5px; margin-bottom: 12px; color: #9a9aa3; font-size: 12px; }
+.playlist-field input { padding: 11px 12px; color: #f7f7f8; background: #16161a; border: 1px solid #2c2c34; border-radius: 12px; font-size: 15px; }
+.playlist-hint { margin: 0 0 10px; color: #85858d; font-size: 12px; line-height: 1.45; }
+.playlist-toggle { display: flex; align-items: center; gap: 10px; margin-bottom: 13px; color: #c9c9d1; font-size: 13px; }
+.playlist-toggle input { width: 20px; height: 20px; flex: 0 0 auto; }
+.playlist-members { margin: 0 0 14px; padding: 2px 9px 8px; background: #131317; border: 1px solid #24242b; border-radius: 14px; list-style: none; }
+.playlist-member { display: flex; align-items: center; gap: 9px; padding: 7px 2px; border-bottom: 1px solid #1f1f25; }
+.playlist-member:last-child { border-bottom: 0; }
+/* The row being dragged is lifted off the list while the finger is on it. */
+.playlist-member.dragging { position: relative; z-index: 2; background: #1d1d26; border-radius: 12px; box-shadow: 0 10px 24px rgba(0,0,0,.55); }
+.playlist-remove { width: 30px; height: 30px; flex: 0 0 auto; display: grid; place-items: center; padding: 0; color: #b3b3bb; background: transparent; border: 0; }
+.playlist-remove svg { width: 24px; height: 24px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; }
+.playlist-remove:active { color: #ff8a95; }
+.playlist-grip { width: 26px; height: 34px; flex: 0 0 auto; display: grid; place-items: center; /* The grip owns the gesture: without this the list would scroll instead. */ touch-action: none; color: #6f6f78; cursor: grab; }
+.playlist-grip svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; }
+.playlist-position { width: 18px; flex: 0 0 auto; color: #6f6f78; font-size: 12px; text-align: end; }
+.playlist-member-copy { flex: 1 1 auto; min-width: 0; display: grid; gap: 2px; }
+.playlist-member-copy strong, .playlist-member-copy small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.playlist-member-copy strong { font-size: 14px; font-weight: 600; }
+.playlist-member-copy small { color: #85858d; font-size: 11px; }
+.playlist-badge { flex: 0 0 auto; padding: 2px 7px; color: #b9b9c1; background: #202027; border-radius: 9px; font-size: 10px; font-style: normal; }
+.playlist-actions { display: flex; gap: 8px; padding: 2px 0 12px; }
+.playlist-actions button { flex: 1 1 0; min-height: 46px; color: #d8d8e0; background: #1d1d24; border: 1px solid #2c2c34; border-radius: 13px; font-size: 14px; }
+.playlist-actions button.primary { color: #fff; background: #4c46a8; border-color: #4c46a8; font-weight: 700; }
+.playlist-actions button:disabled { color: #55555d; background: #16161a; }
+.playlist-notice { margin: 0 0 10px; color: #79d18b; font-size: 13px; }
+.playlist-head-glyph { width: 46px; height: 46px; flex: 0 0 auto; display: grid; place-items: center; color: #b3b3bb; background: #1d1d24; border-radius: 10px; }
+.playlist-head-glyph svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; }
+/* A playlist, laid out the way an album is: the artwork and the title row are
+   the album's own rules, so the two screens read as the same kind of thing. */
+.playlist-page { position: relative; padding: 0 0 108px; }
+/* The first member's cover, stretched and blurred behind the page, with the same
+   scrim the album sheet and the player drawer put over theirs. */
+.playlist-glow { position: absolute; top: 0; right: 0; left: 0; height: min(60vh, 400px); background-color: hsl(var(--cover-hue) 45% 20%); background-position: center top; background-size: cover; filter: blur(46px) saturate(1.7) brightness(.72); }
+.playlist-glow-scrim { position: absolute; top: 0; right: 0; left: 0; height: min(60vh, 400px); background: linear-gradient(180deg, rgba(11,11,14,.28) 0, rgba(11,11,14,.74) 34%, #0b0b0e 100%); }
+.playlist-page > *:not(.playlist-glow, .playlist-glow-scrim) { position: relative; z-index: 1; }
+.playlist-page .playlist-editor-head { padding: 16px 16px 6px; }
+.playlist-page .album-art { width: min(78%, 38vh); }
+.playlist-page .album-title-row { padding: 18px 16px 4px; }
+.playlist-edit .playlist-editor-head { gap: 8px; }
+.playlist-edit .playlist-editor-head strong { flex: 1 1 auto; }
+.playlist-save { flex: 0 0 auto; min-height: 38px; padding: 0 16px; color: #fff; background: #4c46a8; border: 0; border-radius: 19px; font: inherit; font-size: 13px; font-weight: 700; }
+.playlist-save:disabled { color: #55555d; background: #1d1d24; }
+.playlist-tools { display: flex; flex-wrap: wrap; gap: 7px; padding: 8px 16px 6px; }
+.playlist-tools button { display: flex; align-items: center; gap: 6px; min-height: 34px; padding: 0 12px; color: #d8d8e0; background: #1d1d24; border: 1px solid #2c2c34; border-radius: 11px; font: inherit; font-size: 12px; }
+.playlist-tools button:active { background: #26262e; }
+.playlist-tools button span { color: #9a9aa3; font-size: 12px; font-weight: 600; }
+.playlist-add-form { display: flex; gap: 7px; padding: 10px 14px 8px; }
+.playlist-add-form input { flex: 1 1 auto; min-width: 0; padding: 10px 12px; color: #f7f7f8; background: #16161a; border: 1px solid #2c2c34; border-radius: 12px; font-size: 15px; }
+.playlist-add-form button { flex: 0 0 auto; padding: 0 15px; color: #d8d8e0; background: #1d1d24; border: 1px solid #2c2c34; border-radius: 12px; font-size: 13px; }
+.picker-row { gap: 10px; }
+.picker-copy { display: grid; gap: 3px; }
+.picker-copy strong { font-size: 15px; font-weight: 600; }
+.picker-copy small { color: #85858d; font-size: 11px; }
+.picker-toggle { width: 26px; height: 26px; flex: 0 0 auto; display: block; color: #b3b3bb; }
+.picker-toggle svg { width: 26px; height: 26px; }
+.picker-toggle .tick { opacity: 0; }
+.picker-toggle.on { color: #79d18b; }
+.picker-toggle.on .ring { fill: rgba(121,209,139,.16); }
+.picker-toggle.on .plus { opacity: 0; }
+.picker-toggle.on .tick { opacity: 1; }
 /* Right-to-left languages: the words read the other way, but a transport row
    and a progress bar do not - swapping them would put "next" where "previous"
    was and start the bar's fill from the wrong end. */

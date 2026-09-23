@@ -19,7 +19,7 @@
 > without a `#t` filter receives roughly seventy foreign events per playlist.
 > `30427` carries album covers.
 >
-> **Provisional:** the optional `artist` and `mbid` album-enrichment fields are
+> **Provisional:** the optional `artist`, `mbid` and `image` display fields are
 > newly added and untested in the wild. They are additive — a client that ignores
 > them is unaffected — and may be withdrawn without breaking the kind.
 
@@ -161,6 +161,8 @@ budget as a kind `30423` manifest:
   author's list — see "Author tags and suggested words".
 - `artist`, `mbid`: optional album enrichment, see "Album enrichment and cover
   resolution" below.
+- `image`: optional, the file ID of a picture to use as this playlist's
+  artwork, see "Playlist artwork" below. It is a file ID and never a URL.
 - `tracks`: between 1 and 500 members. `position` values MUST be contiguous and
   MUST start at 1. `fileId` values MUST be valid lowercase 64-character SHA-256
   IDs and MUST be **unique within the playlist**; a playlist MUST NOT repeat a
@@ -188,6 +190,7 @@ added:
   "title": "Blood on the Dance Floor: HIStory in the Mix",
   "artist": "Michael Jackson",
   "mbid": "60691bed-fdd7-32f9-92dc-b151aac9e271",
+  "image": "9f2c4b7e6a1d8c30547b1e2f8a9d6c430b7e5a1f8d2c6b9e4a7f1d3c8b5e2a60",
   "tracks": [
     {
       "position": 1,
@@ -220,7 +223,69 @@ derivable from fields a playlist already carries:
    successful key match, and its absence MUST NOT prevent one.
 
 A client that ignores `artist` and `mbid` remains fully interoperable: they change
-nothing about membership, ordering, or availability.
+nothing about membership, ordering, or availability. Which of these fields
+produces the picture a client draws, and what wins when several could, is set out
+in "Playlist artwork" below.
+
+## Playlist artwork
+
+A playlist's own picture is optional, and it is a **file**, not a link:
+
+```json
+{
+  "protocol": "napstr/1",
+  "playlistId": "77abf082-7075-4d36-afe2-e9710ac6b33c",
+  "title": "Driving",
+  "image": "9f2c4b7e6a1d8c30547b1e2f8a9d6c430b7e5a1f8d2c6b9e4a7f1d3c8b5e2a60",
+  "tracks": [
+    {
+      "position": 1,
+      "fileId": "48e5979efa6a56dc3cab293b954ae84e36f464b936bd8c534838189abcc93c68",
+      "title": "Enter Sandman"
+    }
+  ]
+}
+```
+
+- `image`, when present, MUST be a lowercase 64-character SHA-256 file ID with
+  the same meaning it has everywhere else in this protocol: the content hash of
+  a file, here a picture. A consumer that cannot read it as one MUST ignore the
+  field rather than refuse the playlist.
+- The picture is an ordinary file. It is claimed by a kind `30421` catalogue
+  entry, released by kind `30422` heartbeats, downloaded through the ordinary
+  transfer protocol, and MAY be seeded by anyone. Nothing about artwork needs a
+  mechanism this protocol does not already use.
+- The picture is **not a member**. It MUST NOT appear in an `x` tag, it MUST NOT
+  be counted in the member list or its ordering, and a consumer MUST NOT treat
+  its absence as a missing member.
+- `image` is self-asserted display metadata. It MUST NOT be used for identity,
+  availability, membership, or trust, and it MUST NOT be used to reject a
+  playlist.
+
+A client MUST NOT fetch a playlist's artwork from a remote URL, and a publisher
+MUST NOT put one in `image`. An `https://` value is not a file ID: refusing it is
+the point, because fetching it would hand a third party the fact that this
+listener, on this machine, at this moment, is looking at this playlist — a leak
+that no amount of later care can undo. The picture travels as bytes through the
+same protocol as everything else, which also means it keeps working when the
+site that hosted it does not.
+
+Artwork resolves in this order, and a client MUST stop at the first answer it
+has:
+
+1. `image`, when present and resolvable here.
+2. The release-group cover keyed by `artist` and `title`, when the playlist names
+   one, per "Album enrichment and cover resolution".
+3. A composition of its members' covers, which a client MAY build from art it
+   already has.
+4. Nothing. A client SHOULD render a neutral placeholder derived from the
+   playlist's own identity, so that a playlist without a picture looks
+   deliberate rather than broken.
+
+A publisher SHOULD keep the picture small — a few tens of kilobytes is plenty at
+any size a playlist is drawn at — because every reader of a playlist list that
+shows artwork fetches it, and a playlist that costs a megabyte to browse is worse
+than one with no picture at all.
 
 ## Member hints and precedence
 
@@ -235,7 +300,14 @@ Clients MUST apply this precedence:
    override the hint.
 2. When no catalogue entry is available — the file was never shared, was
    withdrawn, or the entry is missing from the author's current relay set —
-   clients MAY render the hint, and SHOULD mark it unverified.
+   clients MAY render the hint, and SHOULD say where the row's name came from:
+   from the playlist, not from the file. The distinction is **provenance, not
+   reliability**, and the wording a client uses has to carry that. "Unverified"
+   is the wrong word: it makes a curator's own description sound like a claim
+   about the network's health, and it reads as a warning about the track, when
+   all that has happened is that this client has not seen the file yet. A
+   playlist naming things its author does not hold is the normal case, not a
+   degraded one; see "Curation and availability".
 3. When neither is available, clients MUST render the file ID, truncated if
    space requires, rather than omitting the row.
 
@@ -471,9 +543,14 @@ An interoperable consumer MUST:
 - require 1 to 500 members with contiguous positions starting at 1, valid
   lowercase 64-character hexadecimal file IDs, and no duplicate file IDs;
 - require content at most 128 KiB;
-- treat `title`, member `artist`/`album` hints, top-level `artist`, and `mbid` as
-  untrusted display and organisation text, bounded by the catalogue metadata
+- treat `title`, member `artist`/`album` hints, top-level `artist`, `mbid` and
+  `image` as untrusted display metadata, bounded by the catalogue metadata
   rules, and never as authoritative;
+- ignore an `image` that is not a lowercase 64-character hexadecimal file ID,
+  and never fetch its value as a URL;
+- render a member whose catalogue entry is unavailable from the playlist's own
+  description, saying that is where the name came from rather than presenting it
+  as a claim about the file;
 - require `mbid`, when present, to be a canonical lowercase UUID, and ignore it
   when it is not;
 - ignore `x` tags that do not correspond to a member, and ignore any `x` tag
@@ -484,10 +561,12 @@ An interoperable consumer MUST:
 A publisher MUST NOT include local filesystem paths, private keys, or transfer
 capabilities anywhere in the event.
 
-A publisher SHOULD refuse to publish a playlist that names file IDs it cannot
-resolve to any known catalogue entry or availability record, unless the user is
-explicitly curating from memory. A playlist of unresolvable IDs renders as a list
-of unverified hints, which is worse than no playlist.
+A publisher SHOULD tell the user when a playlist names file IDs it cannot
+resolve to any known catalogue entry or availability record, so that publishing
+is never a surprise, but it MUST NOT refuse to publish on that ground. Naming
+files the author does not hold is an ordinary way to curate — see "Curation and
+availability" — and a member may be seeded by anyone, at any time, including the
+person reading the playlist.
 
 ## Privacy
 

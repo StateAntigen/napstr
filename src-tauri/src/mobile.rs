@@ -487,6 +487,25 @@ impl MobileService {
         Ok((page, total, audiobook_chapter_ids))
     }
 
+    /// Write a playlist down on this computer, on behalf of a phone.
+    ///
+    /// The author and the edit time are stamped here rather than taken from the
+    /// phone, for the same reason the desktop's own command does it: the
+    /// coordinate has to be the one a later publication will use, and a phone
+    /// must not be able to file a playlist under somebody else's key. What comes
+    /// back is what was stored, so a phone that keeps the returned copy and the
+    /// list the host will answer with cannot disagree about a title or a member.
+    fn save_playlist(
+        &self,
+        mut playlist: napstr_remote_protocol::RemotePlaylist,
+    ) -> Result<napstr_remote_protocol::RemotePlaylist, String> {
+        playlist.author = crate::network::own_pubkey()?;
+        playlist.updated_at = Utc::now().timestamp();
+        let connection = open_connection(&self.db_path)?;
+        crate::playlist::save(&connection, &playlist)?;
+        Ok(playlist)
+    }
+
     async fn serve_request(
         &self,
         remote_id: &str,
@@ -789,6 +808,68 @@ impl MobileService {
                     None => Err("That playlist is not on this computer".into()),
                 }
             }
+            ClientRequest::PlaylistsContaining { file_id } => {
+                // The picker's ticks, answered in one go: one indexed lookup
+                // here rather than a page of members for every playlist in the
+                // list the phone is already showing.
+                let playlists =
+                    crate::playlist::containing(&open_connection(&self.db_path)?, &file_id)?;
+                write_response(send, &ServerResponse::PlaylistsContaining { playlists }).await
+            }
+            ClientRequest::NewPlaylistId => {
+                write_response(
+                    send,
+                    &ServerResponse::PlaylistId {
+                        playlist_id: crate::playlist::new_playlist_id(),
+                    },
+                )
+                .await
+            }
+            ClientRequest::SavePlaylist { playlist } => {
+                let stored = self.save_playlist(playlist)?;
+                write_response(send, &ServerResponse::Playlist { playlist: stored }).await
+            }
+            ClientRequest::PublishPlaylist {
+                playlist,
+                suggest_tags,
+            } => {
+                // Written down first, so a publication that fails at the relay
+                // leaves the edit here rather than throwing it away: the phone
+                // would otherwise lose whatever the author had just typed.
+                let stored = self.save_playlist(playlist)?;
+                let published = self.network.publish_playlist(&stored, suggest_tags).await?;
+                write_response(
+                    send,
+                    &ServerResponse::Playlist {
+                        playlist: published,
+                    },
+                )
+                .await
+            }
+            ClientRequest::DeletePlaylist {
+                author,
+                playlist_id,
+            } => {
+                let connection = open_connection(&self.db_path)?;
+                // An empty author means "the one this computer holds under this
+                // id", which is the coordinate a phone was shown in the first
+                // place. A withdrawal is a different act and is asked for
+                // separately, because a relay has to be told about it.
+                let author = if author.is_empty() {
+                    match crate::playlist::page(&connection, "", &playlist_id, 0, 1)? {
+                        Some(playlist) => playlist.author,
+                        None => return Err("That playlist is not on this computer".into()),
+                    }
+                } else {
+                    author
+                };
+                crate::playlist::remove(&connection, &author, &playlist_id)?;
+                write_response(send, &ServerResponse::PlaylistRemoved).await
+            }
+            ClientRequest::WithdrawPlaylist { playlist_id } => {
+                self.network.withdraw_playlist(&playlist_id).await?;
+                write_response(send, &ServerResponse::PlaylistRemoved).await
+            }
             ClientRequest::AlbumCovers { keys } => {
                 if keys.len() > MAX_COVER_KEYS {
                     return Err("Too many album covers were requested at once".into());
@@ -985,11 +1066,24 @@ fn check_request_permission(stream_only: bool, request: &ClientRequest) -> Resul
         // A playlist is a list of names, and reading it is reading the library.
         | ClientRequest::Playlists { .. }
         | ClientRequest::Playlist { .. }
+        // Which playlists hold a file is one more way of reading a playlist.
+        | ClientRequest::PlaylistsContaining { .. }
         | ClientRequest::AlbumCovers { .. }
         // Seeing what the computer is playing is not a way of changing it.
         | ClientRequest::PlaybackState
         | ClientRequest::Status
         | ClientRequest::Ping => Ok(()),
+        // A playlist a phone edits is the same playlist the author could edit on
+        // the computer, so read-only access cannot reach any of these: an id for
+        // a playlist that does not exist yet included, because a listing minted
+        // there would only be a promise this phone could not keep.
+        ClientRequest::NewPlaylistId
+        | ClientRequest::SavePlaylist { .. }
+        | ClientRequest::DeletePlaylist { .. }
+        | ClientRequest::PublishPlaylist { .. }
+        | ClientRequest::WithdrawPlaylist { .. } => Err(
+            "This phone has read-only access, so it cannot create or edit playlists.".into(),
+        ),
         ClientRequest::Playback { .. } => Err(
             "This phone has read-only access, so it cannot control Napstr on the computer.".into(),
         ),

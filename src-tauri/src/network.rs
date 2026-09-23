@@ -3125,6 +3125,8 @@ impl NetworkService {
         else {
             return Err("this playlist would not read back, so it was not published".into());
         };
+        // The read-back is where `published` comes from: reading an event is the
+        // one thing that knows for certain that a coordinate has been sent.
         let stored = RemotePlaylist {
             total: read_back.tracks.len(),
             ..*read_back
@@ -4027,6 +4029,17 @@ fn load_or_create_identity() -> Result<Keys, String> {
         format!("could not store Nostr identity in the operating-system keyring: {error}")
     })?;
     Ok(keys)
+}
+
+/// This identity's public key, which is the author half of a playlist's
+/// coordinate.
+///
+/// A playlist written down here and a playlist published from here have to share
+/// one coordinate, or publishing a draft would file a second row beside it,
+/// under the same id and a different owner, and the author would be looking at
+/// two of their own playlists.
+pub(crate) fn own_pubkey() -> Result<String, String> {
+    Ok(load_or_create_identity()?.public_key().to_hex())
 }
 
 fn profile_keyring_account(profile: Option<&str>) -> Result<String, String> {

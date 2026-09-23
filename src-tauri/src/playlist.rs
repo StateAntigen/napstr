@@ -20,7 +20,9 @@
 //! can be read without loading the whole playlist, and so "which playlists name
 //! this file" is an index lookup rather than a scan of every playlist body.
 
-use napstr_remote_protocol::{RemotePlaylist, RemotePlaylistSummary, RemotePlaylistTrack};
+use napstr_remote_protocol::{
+    RemotePlaylist, RemotePlaylistCoordinate, RemotePlaylistSummary, RemotePlaylistTrack,
+};
 use nostr_sdk::prelude::*;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -35,6 +37,9 @@ pub const PLAYLIST_MARKER: &str = "napstr-playlist";
 pub const PLAYLIST_CONTENT_BYTE_LIMIT: usize = 128 * 1024;
 /// Members one playlist may name, also matching the audiobook manifest.
 pub const PLAYLIST_MEMBER_LIMIT: usize = 500;
+/// Playlists one list answer carries. This computer's Playlists page reads one
+/// page of them, and a companion pages through the same rows.
+pub const PLAYLIST_LIST_LIMIT: usize = 200;
 /// The `alt` string a public playlist carries, which is what a client that does
 /// not implement this kind shows to a person.
 const PLAYLIST_ALT: &str = "Napstr public playlist";
@@ -73,6 +78,14 @@ struct PlaylistContent {
     /// key that already matched.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     mbid: String,
+    /// The playlist's own artwork, as the file id of a picture.
+    ///
+    /// A file id and never a URL: the picture travels as bytes over the same
+    /// transfer path as everything else, so no reader has to tell a third party
+    /// that it is looking at this playlist. A value that is not a file id is
+    /// ignored on the way in and refused on the way out.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    image: String,
     /// The author's own search words, comma-separated, in the same shape as a
     /// catalogue entry's `tags`.
     ///
@@ -134,8 +147,10 @@ pub fn initialise_schema(connection: &Connection) -> Result<(), String> {
                display_name TEXT NOT NULL DEFAULT '',
                artist TEXT NOT NULL DEFAULT '',
                mbid TEXT NOT NULL DEFAULT '',
+               image TEXT NOT NULL DEFAULT '',
                tags TEXT NOT NULL DEFAULT '',
                private INTEGER NOT NULL DEFAULT 0,
+               published INTEGER NOT NULL DEFAULT 0,
                updated_at INTEGER NOT NULL DEFAULT 0,
                PRIMARY KEY (playlist_id, author)
              );
@@ -173,7 +188,10 @@ fn previous_shape_present(connection: &Connection) -> Result<bool, String> {
         .optional()
         .map_err(|error| error.to_string())?;
     Ok(schema.is_some_and(|sql| {
-        !sql.contains("PRIMARY KEY (playlist_id, author)") || !sql.contains("tags TEXT")
+        !sql.contains("PRIMARY KEY (playlist_id, author)")
+            || !sql.contains("tags TEXT")
+            || !sql.contains("published INTEGER")
+            || !sql.contains("image TEXT")
     }))
 }
 
@@ -188,15 +206,17 @@ pub fn save(connection: &Connection, playlist: &RemotePlaylist) -> Result<(), St
         .map_err(|error| error.to_string())?;
     transaction
         .execute(
-            "INSERT INTO playlists(playlist_id,author,title,display_name,artist,mbid,tags,private,updated_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
+            "INSERT INTO playlists(playlist_id,author,title,display_name,artist,mbid,image,tags,private,published,updated_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
              ON CONFLICT(playlist_id,author) DO UPDATE SET
                title=excluded.title,
                display_name=excluded.display_name,
                artist=excluded.artist,
                mbid=excluded.mbid,
+               image=excluded.image,
                tags=excluded.tags,
                private=excluded.private,
+               published=excluded.published,
                updated_at=excluded.updated_at",
             params![
                 playlist.playlist_id,
@@ -205,8 +225,10 @@ pub fn save(connection: &Connection, playlist: &RemotePlaylist) -> Result<(), St
                 playlist.display_name,
                 playlist.artist,
                 playlist.mbid,
+                playlist.image,
                 tags,
                 i64::from(playlist.private),
+                i64::from(playlist.published),
                 playlist.updated_at,
             ],
         )
@@ -276,9 +298,13 @@ pub fn list(
         .max(0) as usize;
     let mut statement = connection
         .prepare(
-            "SELECT p.playlist_id, p.title, p.author, p.display_name, p.private, p.updated_at,
+            "SELECT p.playlist_id, p.title, p.author, p.display_name, p.private, p.published,
+                    p.image, p.updated_at,
                     (SELECT COUNT(*) FROM playlist_tracks t
-                      WHERE t.playlist_id=p.playlist_id AND t.author=p.author)
+                      WHERE t.playlist_id=p.playlist_id AND t.author=p.author),
+                    (SELECT t.file_id FROM playlist_tracks t
+                      WHERE t.playlist_id=p.playlist_id AND t.author=p.author
+                      ORDER BY t.position LIMIT 1)
                FROM playlists p
               ORDER BY p.updated_at DESC, p.playlist_id, p.author
               LIMIT ?1 OFFSET ?2",
@@ -292,8 +318,15 @@ pub fn list(
                 author: row.get(2)?,
                 display_name: row.get(3)?,
                 private: row.get::<_, i64>(4)? != 0,
-                updated_at: row.get(5)?,
-                track_count: row.get::<_, i64>(6)?.max(0) as usize,
+                published: row.get::<_, i64>(5)? != 0,
+                image: row.get(6)?,
+                updated_at: row.get(7)?,
+                track_count: row.get::<_, i64>(8)?.max(0) as usize,
+                // A list row draws the album the playlist opens with, so the
+                // file it starts with travels with the name. `get` answers
+                // `None` for a playlist that names nothing yet, which is an
+                // empty string rather than an error.
+                first_file_id: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
             })
         })
         .map_err(|error| error.to_string())?
@@ -323,7 +356,7 @@ pub fn page(
     };
     let head = connection
         .query_row(
-            "SELECT title, display_name, artist, mbid, tags, private, updated_at,
+            "SELECT title, display_name, artist, mbid, image, tags, private, published, updated_at,
                     (SELECT COUNT(*) FROM playlist_tracks t
                       WHERE t.playlist_id=p.playlist_id AND t.author=p.author)
                FROM playlists p WHERE playlist_id=?1 AND author=?2",
@@ -335,15 +368,18 @@ pub fn page(
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
-                    row.get::<_, i64>(5)? != 0,
-                    row.get::<_, i64>(6)?,
-                    row.get::<_, i64>(7)?.max(0) as usize,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)? != 0,
+                    row.get::<_, i64>(7)? != 0,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?.max(0) as usize,
                 ))
             },
         )
         .optional()
         .map_err(|error| error.to_string())?;
-    let Some((title, display_name, artist, mbid, tags, private, updated_at, total)) = head else {
+    let Some((title, display_name, artist, mbid, image, tags, private, published, updated_at, total)) = head
+    else {
         return Ok(None);
     };
     let mut statement = connection
@@ -376,12 +412,47 @@ pub fn page(
         display_name,
         artist,
         mbid,
+        image,
         tags,
         private,
+        published,
         updated_at,
         tracks,
         total,
     }))
+}
+
+/// Which playlists name a file, as coordinates.
+///
+/// A track's menu draws a tick beside every playlist that already holds it, and
+/// this answers all of them at once: members are one row each, so the question is
+/// an index lookup on `file_id` rather than a page of members per playlist.
+///
+/// Coordinates rather than ids, because the id is chosen by the author and two
+/// authors may choose the same one. A playlist the caller may not edit is still
+/// an honest answer here; deciding what may be done about it is the caller's
+/// business.
+pub fn containing(
+    connection: &Connection,
+    file_id: &str,
+) -> Result<Vec<RemotePlaylistCoordinate>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT DISTINCT author, playlist_id FROM playlist_tracks
+              WHERE file_id=?1 ORDER BY playlist_id, author",
+        )
+        .map_err(|error| error.to_string())?;
+    let playlists = statement
+        .query_map([file_id], |row| {
+            Ok(RemotePlaylistCoordinate {
+                author: row.get(0)?,
+                playlist_id: row.get(1)?,
+            })
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    Ok(playlists)
 }
 
 /// The author of the only playlist this computer holds under an id.
@@ -477,10 +548,21 @@ pub fn playlist_event(event: &Event) -> Option<PlaylistEvent> {
         } else {
             String::new()
         },
+        // Likewise for artwork: an `https://` value is not a file id, and a
+        // reader that fetched it would hand a stranger the fact that this
+        // listener is looking at this playlist. Ignored, not fetched.
+        image: if is_file_id(&content.image) {
+            content.image
+        } else {
+            String::new()
+        },
         // The author's words, not the `t` tags: those also carry whatever a
         // client suggested, and a suggestion is not something they chose.
         tags: playlist_tags(&content.tags),
         private: false,
+        // A playlist that arrived as an event has a revision on the relays, which
+        // is what this records. Nothing this host reads is a draft.
+        published: true,
         updated_at: event.created_at.as_secs() as i64,
         tracks,
         total: 0,
@@ -532,6 +614,12 @@ pub fn playlist_event_builder(
     if !valid_members(&playlist.tracks) {
         return Err("a playlist needs 1 to 500 unique members in position order".into());
     }
+    // Artwork is a file id or nothing. A URL is refused rather than ignored,
+    // because a publisher that meant to attach a picture should hear about it
+    // rather than ship a playlist that silently has none.
+    if !playlist.image.is_empty() && !is_file_id(&playlist.image) {
+        return Err("a playlist's artwork is the file id of a picture, never a URL".into());
+    }
     let content = PlaylistContent {
         protocol: "napstr/1".into(),
         playlist_id: playlist.playlist_id.clone(),
@@ -542,6 +630,7 @@ pub fn playlist_event_builder(
         } else {
             String::new()
         },
+        image: playlist.image.clone(),
         tags: crate::normalise_tags(&playlist.tags)
             .map_err(|error| format!("this playlist's tags cannot be published: {error}"))?,
         deleted: false,
@@ -628,8 +717,15 @@ fn validate_stored(playlist: &RemotePlaylist) -> Result<String, String> {
     if playlist.title.trim().is_empty() {
         return Err("a playlist needs a title".into());
     }
-    if !valid_members(&playlist.tracks) {
-        return Err("a playlist needs 1 to 500 unique members in position order".into());
+    // A playlist on this computer may be empty. An empty one is a draft nobody
+    // has published, and "1 to 500 members" is a rule an event is held to, which
+    // is where it stays: `playlist_event_builder` refuses to sign an empty
+    // playlist, so nothing that reaches a relay can be one.
+    if !playlist.tracks.is_empty() && !valid_members(&playlist.tracks) {
+        return Err("a playlist needs up to 500 unique members in position order".into());
+    }
+    if !playlist.image.is_empty() && !is_file_id(&playlist.image) {
+        return Err("a playlist's artwork is the file id of a picture, never a URL".into());
     }
     // The same rules a catalogue entry's tags are held to, so a word that can be
     // stored here is one that could be published.
@@ -641,7 +737,9 @@ fn validate_stored(playlist: &RemotePlaylist) -> Result<String, String> {
 ///
 /// The position check is what makes `tracks` order meaningful on its own: the
 /// members of a playlist arrive in that order, and a playlist that skipped a
-/// position would play in an order nobody chose.
+/// position would play in an order nobody chose. The lower bound is the event's:
+/// the store also holds empty drafts, so a caller holding one checks for it
+/// first rather than being told its draft is malformed.
 fn valid_members(members: &[RemotePlaylistTrack]) -> bool {
     if members.is_empty() || members.len() > PLAYLIST_MEMBER_LIMIT {
         return false;
@@ -751,8 +849,10 @@ mod tests {
             display_name: "Sean Parker".into(),
             artist: String::new(),
             mbid: String::new(),
+            image: String::new(),
             tags: String::new(),
             private: false,
+            published: false,
             updated_at: 1_787_680_200,
             tracks: vec![
                 RemotePlaylistTrack {
@@ -820,6 +920,7 @@ mod tests {
         let mut published = playlist();
         published.artist = "Metallica".into();
         published.mbid = "60691bed-fdd7-32f9-92dc-b151aac9e271".into();
+        published.image = "9".repeat(64);
         let event = playlist_event_builder(&published, true, &keys).unwrap();
         let PlaylistEvent::Playlist(read) = playlist_event(&event).unwrap() else {
             panic!("a published playlist is not a withdrawal")
@@ -827,12 +928,23 @@ mod tests {
         assert_eq!(read.title, published.title);
         assert_eq!(read.artist, published.artist);
         assert_eq!(read.mbid, published.mbid);
+        assert_eq!(read.image, published.image, "the picture survives as a file id");
         assert_eq!(read.author, keys.public_key().to_hex());
         assert_eq!(read.updated_at, event.created_at.as_secs() as i64);
         assert_eq!(
             read.tracks,
             published.tracks,
             "the members and their order must come back unchanged"
+        );
+        // The picture is not a member: it gets no `x` tag, so a relay answering
+        // "which playlists name this file" is not told about artwork.
+        assert!(
+            !event
+                .tags
+                .iter()
+                .filter_map(|tag| tag.content())
+                .any(|value| value == published.image),
+            "artwork must not travel as a member"
         );
         // Every member gets its own `x` tag, in order, for relay-side lookups.
         let members = event
@@ -1136,6 +1248,9 @@ mod tests {
         assert_eq!(listed[0].title, "rock and roll");
         assert_eq!(listed[0].track_count, 1);
         assert_eq!(listed[0].display_name, "Sean Parker");
+        // A list row draws the album the playlist opens with, and it is told
+        // which file that is without being handed the members.
+        assert_eq!(listed[0].first_file_id, ENTER_SANDMAN);
         // The summary carries the author, because it is half the coordinate a
         // companion has to send back to ask for this playlist again.
         assert_eq!(listed[0].author, stored.author);
@@ -1186,6 +1301,187 @@ mod tests {
         let mut broken = playlist();
         broken.tracks[1].position = 3;
         assert!(save(&connection, &broken).is_err());
+        drop(connection);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A track's "add to playlist" picker needs to know which playlists already
+    /// hold it, and it has to be able to say "none of them" as readily as it says
+    /// "these three".
+    #[test]
+    fn which_playlists_hold_a_file_is_answered_by_coordinate() {
+        let directory =
+            std::env::temp_dir().join(format!("napstr-playlist-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let db_path = directory.join("napstr.sqlite3");
+        crate::initialise_database(&db_path, &directory).unwrap();
+        let connection = crate::open_connection(&db_path).unwrap();
+
+        let mine = playlist();
+        save(&connection, &mine).unwrap();
+        // A second author under the same id: whoever asks has to be told which
+        // coordinate holds the file, not just that some playlist with that id
+        // does.
+        let mut theirs = playlist();
+        theirs.author = "b".repeat(64);
+        let mut other = playlist();
+        other.playlist_id = "0f9de6a1-5c2e-47a8-9a3c-2f6f8f1b7d40".into();
+        other.tracks = vec![RemotePlaylistTrack {
+            position: 1,
+            file_id: ENTER_SANDMAN.into(),
+            ..Default::default()
+        }];
+        other.total = 1;
+        save(&connection, &other).unwrap();
+        save(&connection, &theirs).unwrap();
+
+        let holding = containing(&connection, ENTER_SANDMAN).unwrap();
+        assert_eq!(
+            holding,
+            vec![
+                RemotePlaylistCoordinate {
+                    author: "a".repeat(64),
+                    playlist_id: other.playlist_id.clone(),
+                },
+                RemotePlaylistCoordinate {
+                    author: "a".repeat(64),
+                    playlist_id: PLAYLIST_ID.into(),
+                },
+                RemotePlaylistCoordinate {
+                    author: "b".repeat(64),
+                    playlist_id: PLAYLIST_ID.into(),
+                },
+            ],
+            "one coordinate per playlist that names the file, whichever author holds it"
+        );
+
+        // A file nothing names is an empty answer rather than an error: that is
+        // the state every track starts in.
+        assert!(containing(&connection, &"e".repeat(64)).unwrap().is_empty());
+
+        // Dropping the member is what takes the playlist back out of the answer,
+        // which is what makes the picker's toggle tell the truth on the next ask.
+        // Positions are the order on screen, so a removal renumbers the rest -
+        // the store refuses a gap rather than quietly keeping one.
+        let mut emptied = mine.clone();
+        emptied.tracks = emptied
+            .tracks
+            .into_iter()
+            .skip(1)
+            .enumerate()
+            .map(|(index, member)| RemotePlaylistTrack {
+                position: index as u32 + 1,
+                ..member
+            })
+            .collect();
+        emptied.total = emptied.tracks.len();
+        save(&connection, &emptied).unwrap();
+        assert_eq!(
+            containing(&connection, ENTER_SANDMAN).unwrap().len(),
+            2,
+            "the member that was dropped is not still counted"
+        );
+
+        drop(connection);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A playlist this computer is still building has no members yet, and that is
+    /// a draft rather than a broken playlist: the "1 to 500 members" rule belongs
+    /// to the published event, so the store keeps the draft and the publisher is
+    /// the thing that refuses it.
+    #[test]
+    fn a_playlist_may_be_an_empty_draft_but_never_an_empty_event() {
+        let directory =
+            std::env::temp_dir().join(format!("napstr-playlist-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let db_path = directory.join("napstr.sqlite3");
+        crate::initialise_database(&db_path, &directory).unwrap();
+        let connection = crate::open_connection(&db_path).unwrap();
+
+        let mut draft = playlist();
+        draft.tracks.clear();
+        draft.total = 0;
+        save(&connection, &draft).unwrap();
+        let read_back = page(&connection, &draft.author, PLAYLIST_ID, 0, 10)
+            .unwrap()
+            .unwrap();
+        assert!(read_back.tracks.is_empty());
+        assert_eq!(read_back.total, 0);
+        assert!(
+            !read_back.published,
+            "nothing has been signed, so nothing of it is out there"
+        );
+        assert_eq!(list(&connection, 0, 10).unwrap().0[0].track_count, 0);
+        assert!(playlist_event_builder(&draft, false, &Keys::generate()).is_err());
+
+        // `published` is a stored fact about the coordinate, not about this
+        // revision: editing a playlist that is already on the relays leaves it
+        // true, or the next save would have the author believe their published
+        // playlist had never been sent anywhere.
+        draft.published = true;
+        save(&connection, &draft).unwrap();
+        let stored = page(&connection, &draft.author, PLAYLIST_ID, 0, 10)
+            .unwrap()
+            .unwrap();
+        assert!(stored.published);
+        assert!(list(&connection, 0, 10).unwrap().0[0].published);
+
+        drop(connection);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Artwork is the file id of a picture, and a URL is not a file id.
+    ///
+    /// A reader ignores a URL rather than fetching it, because fetching it would
+    /// tell a stranger that this listener, on this machine, is looking at this
+    /// playlist. A publisher is refused instead of ignored, so that a client that
+    /// meant to attach a picture hears about it rather than shipping a playlist
+    /// that silently has none.
+    #[test]
+    fn artwork_is_the_file_id_of_a_picture_and_never_a_url() {
+        let directory =
+            std::env::temp_dir().join(format!("napstr-playlist-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let db_path = directory.join("napstr.sqlite3");
+        crate::initialise_database(&db_path, &directory).unwrap();
+        let connection = crate::open_connection(&db_path).unwrap();
+
+        let picture = "9".repeat(64);
+        let mut stored = playlist();
+        stored.image = picture.clone();
+        save(&connection, &stored).unwrap();
+        let read_back = page(&connection, &stored.author, PLAYLIST_ID, 0, 10)
+            .unwrap()
+            .unwrap();
+        assert_eq!(read_back.image, picture);
+        assert_eq!(list(&connection, 0, 10).unwrap().0[0].image, picture);
+
+        let mut linked = playlist();
+        linked.image = "https://example.com/art.png".into();
+        assert!(save(&connection, &linked).is_err());
+        assert!(playlist_event_builder(&linked, false, &Keys::generate()).is_err());
+
+        // The reader's side of the same rule: an event carrying a link still
+        // parses as a playlist, and the field is simply not there.
+        let tags = vec![
+            Tag::parse(["d", PLAYLIST_ID]).unwrap(),
+            Tag::parse(["t", PLAYLIST_MARKER]).unwrap(),
+            Tag::parse(["title", "rock"]).unwrap(),
+        ];
+        let content = format!(
+            r#"{{"protocol":"napstr/1","playlistId":"{PLAYLIST_ID}","title":"rock","image":"https://example.com/art.png","tracks":[{{"position":1,"fileId":"{ENTER_SANDMAN}"}}]}}"#
+        );
+        let event = EventBuilder::new(Kind::from(PLAYLIST_KIND), content)
+            .tags(tags)
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let Some(PlaylistEvent::Playlist(read)) = playlist_event(&event) else {
+            panic!("a playlist that names a link is still a playlist")
+        };
+        assert_eq!(read.image, "");
+        assert_eq!(read.tracks.len(), 1);
+
         drop(connection);
         std::fs::remove_dir_all(directory).unwrap();
     }

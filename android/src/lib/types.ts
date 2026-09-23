@@ -149,10 +149,33 @@ export type RemotePlaylistSummary = {
   /** Author of a public playlist; empty for one only this computer holds. */
   author: string;
   displayName: string;
+  /** The picture the playlist names, as a file id, or empty when it has none. */
+  image: string;
+  /**
+   * The file the playlist opens with, so the row can draw that album's cover.
+   * Only the id travels: the artist and album it is drawn from come off the
+   * library, which answers for many file ids at once. Empty while the playlist
+   * names nothing.
+   */
+  firstFileId: string;
   trackCount: number;
   /** True when it is private, so it only ever arrives from its own computer. */
   private: boolean;
+  /** True once the coordinate has a revision the relays can answer with. */
+  published: boolean;
   updatedAt: number;
+};
+
+/** A playlist named by its coordinate: the author and the id together. */
+export type RemotePlaylistCoordinate = {
+  author: string;
+  playlistId: string;
+};
+
+/** A page of playlist names, which is what a browse costs. */
+export type PlaylistPage = {
+  playlists: RemotePlaylistSummary[];
+  total: number;
 };
 
 /** One member of a playlist, in the order the playlist puts it in. */
@@ -175,7 +198,16 @@ export type RemotePlaylist = {
   /** Album artist and release-group MBID, when it describes one release. */
   artist: string;
   mbid: string;
+  /** The picture it names, as a file id, or empty when it has none. */
+  image: string;
+  /**
+   * The author's own search words, comma-separated in the shape a catalogue
+   * entry uses. These are the author's choice and outrank anything a client
+   * would suggest, including the choice of having none.
+   */
+  tags: string;
   private: boolean;
+  published: boolean;
   updatedAt: number;
   tracks: RemotePlaylistTrack[];
   /** Members the whole playlist names, so a page says how many are still to come. */

@@ -33,6 +33,39 @@ export async function mockNative(page, { app = 'napstrfy', nativeLocale = 'en-GB
       };
       return window.remotePlaying;
     };
+    // The desktop's playlists, as the host stores them: rows a test seeds, which
+    // the page then lists, edits and deletes through the same commands the real
+    // host implements.
+    const playlistRows = () => window.playlistStore ?? [];
+    const ownPlaylistAuthor = () => window.playlistAuthor ?? 'c'.repeat(64);
+    const findPlaylist = (author, playlistId) =>
+      playlistRows().find((row) => row.playlistId === playlistId && (!author || row.author === author)) ?? null;
+    const savePlaylistRow = (row) => {
+      window.playlistStore = [
+        ...playlistRows().filter((existing) => !(existing.playlistId === row.playlistId && existing.author === row.author)),
+        row
+      ];
+      return row;
+    };
+    const dropPlaylistRow = (author, playlistId) => {
+      window.playlistStore = playlistRows().filter(
+        (row) => !(row.playlistId === playlistId && (!author || row.author === author))
+      );
+    };
+    const playlistSummaries = () =>
+      playlistRows().map((row) => ({
+        playlistId: row.playlistId,
+        title: row.title,
+        author: row.author,
+        displayName: row.displayName ?? '',
+        image: row.image ?? '',
+        // The row's artwork comes from the member the playlist opens with.
+        firstFileId: (row.tracks ?? [])[0]?.fileId ?? '',
+        trackCount: row.tracks?.length ?? 0,
+        private: Boolean(row.private),
+        published: Boolean(row.published),
+        updatedAt: row.updatedAt ?? 0
+      }));
     window.__TAURI_INTERNALS__ = {
       metadata: { currentWindow: { label: 'main' }, currentWebview: { label: 'main' } },
       transformCallback: () => 1,
@@ -50,8 +83,11 @@ export async function mockNative(page, { app = 'napstrfy', nativeLocale = 'en-GB
           case 'start_network':
           case 'network_status': return { connected: true, pubkey: 'c'.repeat(64), npub: 'npub1test', relayCount: 1, torRunning: true, torStarting: false, torProgress: 100, torError: '', error: '' };
           case 'network_browse': return { results: [track], cursor: null, totalAvailable: 1 };
-          case 'network_search':
-          case 'search_catalog': return [track];
+          // Both searches answer with the same one local track unless a test
+          // seeds its own rows, which is how a spec tells "here" from "the
+          // network" without inventing a second fixture track everywhere.
+          case 'network_search': return window.networkSearchResults ?? [track];
+          case 'search_catalog': return window.localSearchResults ?? [track];
           case 'network_search_audiobooks': return [];
           case 'get_track_discussion_messages':
           case 'get_trollbox_messages': return [{ eventId: 'event', content: 'Search', displayName: 'Settings', npub: 'npubother', pubkey: 'd'.repeat(64), createdAt: 1700000000 }];
@@ -61,7 +97,7 @@ export async function mockNative(page, { app = 'napstrfy', nativeLocale = 'en-GB
           case 'companion_status': return status();
           case 'cached_library': return { ...status(), tracks: paired ? [track] : [], total: paired ? 1 : 0 };
           case 'remote_library': return { tracks: window.remoteLibrary ?? [track], total: (window.remoteLibrary ?? [track]).length };
-          case 'remote_search': if (window.searchError) throw window.searchError; return [track];
+          case 'remote_search': if (window.searchError) throw window.searchError; return window.networkSearchResults ?? [track];
           case 'remote_transfers': return [{ ...transfers[1], fileId: track.fileId }];
           case 'reconcile_audio_cache': return true;
           // The native side draws the track code, so answer the way it does.
@@ -97,8 +133,59 @@ export async function mockNative(page, { app = 'napstrfy', nativeLocale = 'en-GB
               .filter(Boolean);
           }
           case 'remote_download': return 'request-1';
-          case 'remote_playlists': return { playlists: window.remotePlaylists ?? [], total: (window.remotePlaylists ?? []).length };
-          case 'remote_playlist': return { playlist: null, ...(window.remotePlaylist ?? { playlistId: args.playlistId, tracks: [], total: 0 }) };
+          case 'own_playlist_author': return ownPlaylistAuthor();
+          case 'new_playlist_id': return window.nextPlaylistId ?? '11111111-1111-4111-8111-111111111111';
+          // The phone reads and writes the same store the desktop page does, one
+          // command at a time; only the shapes differ.
+          case 'remote_new_playlist_id': return window.nextPlaylistId ?? '11111111-1111-4111-8111-111111111111';
+          case 'remote_playlists': {
+            const rows = playlistSummaries();
+            return { playlists: rows, total: rows.length };
+          }
+          case 'remote_playlist': {
+            const row = window.remotePlaylist ?? findPlaylist(args.author, args.playlistId);
+            if (!row) throw 'That playlist is not on this computer';
+            const tracks = row.tracks ?? [];
+            const offset = Number(args.offset ?? 0);
+            const limit = Number(args.limit ?? 100);
+            return { ...row, tracks: tracks.slice(offset, offset + limit), total: tracks.length };
+          }
+          // Which playlists name a file, answered from the same rows: one lookup
+          // rather than a page of members per playlist, the way the host does it.
+          case 'remote_playlists_containing':
+            return playlistRows()
+              .filter((row) => (row.tracks ?? []).some((member) => member.fileId === args.fileId))
+              .map((row) => ({ author: row.author ?? ownPlaylistAuthor(), playlistId: row.playlistId }));
+          case 'remote_save_playlist':
+            return savePlaylistRow({
+              ...args.playlist,
+              author: ownPlaylistAuthor(),
+              updatedAt: 1787000000
+            });
+          case 'remote_publish_playlist':
+            return savePlaylistRow({
+              ...args.playlist,
+              author: ownPlaylistAuthor(),
+              published: true,
+              updatedAt: 1787000000
+            });
+          case 'remote_delete_playlist': dropPlaylistRow(args.author, args.playlistId); return null;
+          case 'remote_withdraw_playlist': dropPlaylistRow('', args.playlistId); return null;
+          case 'playlists': return playlistSummaries();
+          case 'playlist': return findPlaylist(args.author, args.playlistId);
+          // Both desktop writes stamp the author the way the host does, so a page
+          // under test sees the coordinate it will really get back.
+          case 'save_playlist':
+            return savePlaylistRow({ ...args.playlist, author: ownPlaylistAuthor(), updatedAt: 1787000000 });
+          case 'publish_playlist':
+            return savePlaylistRow({
+              ...args.playlist,
+              author: ownPlaylistAuthor(),
+              published: true,
+              updatedAt: 1787000000
+            });
+          case 'withdraw_playlist': dropPlaylistRow('', args.playlistId); return null;
+          case 'delete_playlist': dropPlaylistRow(args.author, args.playlistId); return null;
           case 'podcast_downloads': return [{ episode, ready: false, status: 'Downloading', progress: 20 }];
           case 'podcast_parse_search': return [{ id: 1, title: 'Original podcast', author: 'Original author', feedUrl: 'https://example.com/feed', image: '', description: '', language: 'en', episodeCount: 1, genres: ['Music'] }];
           case 'podcast_episodes': return [episode];

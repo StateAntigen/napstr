@@ -24,6 +24,10 @@ pub const MAX_TRACKS_BY_ID: usize = 100;
 /// playlist may name 500 members, so a page of them is what keeps an answer
 /// inside one control frame.
 pub const MAX_PLAYLIST_PAGE: usize = 100;
+/// Members one playlist may name, which is the spec's own limit. A phone edits a
+/// playlist by sending the whole of it, so this is also the most a save can
+/// carry - see `a_full_playlist_save_fits_in_one_control_frame`.
+pub const MAX_PLAYLIST_MEMBERS: usize = 500;
 /// NIP-56 report types a cover report may use. `other` exists so a phone is
 /// never forced to mislabelled something to be able to report it at all.
 pub const REPORT_REASONS: [&str; 7] = [
@@ -283,6 +287,18 @@ pub struct RemoteTransfer {
     pub speed: String,
 }
 
+/// A playlist named by its coordinate: its author and its id together.
+///
+/// The id is chosen by the author, so two authors may choose the same one, which
+/// is why the author travels with it wherever a playlist is named rather than
+/// being assumed from whoever is asking.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct RemotePlaylistCoordinate {
+    pub author: String,
+    pub playlist_id: String,
+}
+
 /// What a playlist is called and who published it, without its members. A phone
 /// lists these first and asks for the members of the one it is about to play, so
 /// that browsing never carries the members of playlists nobody opened.
@@ -298,6 +314,18 @@ pub struct RemotePlaylistSummary {
     /// holds.
     pub author: String,
     pub display_name: String,
+    /// The playlist's own artwork, when it has any, so a list can draw a picture
+    /// without fetching every playlist's members.
+    pub image: String,
+    /// The first member's file id.
+    ///
+    /// A list row draws the album the playlist opens with, and asking each
+    /// playlist for its members to find that out would be a page of them per row.
+    /// Only the file id travels: a full page of names has to fit in one control
+    /// frame, and the artist and album it is drawn from come off the library,
+    /// which already answers for a hundred file ids at a time. Empty for a
+    /// playlist that names nothing yet.
+    pub first_file_id: String,
     /// Members the playlist names, which is also how many rows the members of it
     /// can be paged through.
     pub track_count: usize,
@@ -307,6 +335,14 @@ pub struct RemotePlaylistSummary {
     /// would see the coordinate, the size and the edit time even with the body
     /// encrypted, which is exactly what a private playlist is for avoiding.
     pub private: bool,
+    /// True once this coordinate has a revision the relays can answer with.
+    ///
+    /// It is not "this is the newest thing I hold": editing a playlist that was
+    /// published keeps the flag, because the edit lives on this computer until
+    /// the author publishes it again. It answers one question - has this
+    /// coordinate ever been signed and sent - which is also the question that
+    /// decides whether getting rid of the playlist means withdrawing it.
+    pub published: bool,
     pub updated_at: i64,
 }
 
@@ -337,6 +373,11 @@ pub struct RemotePlaylist {
     /// release group rather than a mix. Untrusted display metadata.
     pub artist: String,
     pub mbid: String,
+    /// The playlist's own artwork, as the file id of a picture, or empty when it
+    /// has none. A file id and never a URL: the picture travels as bytes over the
+    /// ordinary transfer path, so no reader has to tell a third party that it is
+    /// looking at this playlist.
+    pub image: String,
     /// The author's own search words, comma-separated in the format a catalogue
     /// entry uses for its `tags`: what this playlist is meant to be found by.
     ///
@@ -345,6 +386,9 @@ pub struct RemotePlaylist {
     /// words of its own on top of them.
     pub tags: String,
     pub private: bool,
+    /// True once this coordinate has a revision on the relays, so a reader can
+    /// tell a playlist it published from one it has only written down.
+    pub published: bool,
     pub updated_at: i64,
     /// Members in `position` order, this page of them.
     pub tracks: Vec<RemotePlaylistTrack>,
@@ -355,14 +399,22 @@ pub struct RemotePlaylist {
 
 impl RemotePlaylist {
     /// The same playlist without its members, for a list that only needs names.
+    ///
+    /// The artwork hints come from the first member of the page this playlist is
+    /// holding, so a summary is built from a page that starts at the top: a page
+    /// taken from the middle would name the member it starts at.
     pub fn summary(&self) -> RemotePlaylistSummary {
+        let first = self.tracks.first();
         RemotePlaylistSummary {
             playlist_id: self.playlist_id.clone(),
             title: self.title.clone(),
             author: self.author.clone(),
             display_name: self.display_name.clone(),
+            image: self.image.clone(),
+            first_file_id: first.map(|track| track.file_id.clone()).unwrap_or_default(),
             track_count: self.total,
             private: self.private,
+            published: self.published,
             updated_at: self.updated_at,
         }
     }
@@ -425,6 +477,59 @@ pub enum ClientRequest {
         playlist_id: String,
         offset: usize,
         limit: usize,
+    },
+    /// Which playlists name a file, as coordinates.
+    ///
+    /// A track's menu has to draw the playlists that already hold it, and that is
+    /// one indexed lookup in the store rather than a page of members for every
+    /// playlist in the list. Only the coordinates travel: the names, the counts
+    /// and the artwork come from the playlist list the picker is already
+    /// showing. This is a read, so it is also the one thing a read-only pairing
+    /// can ask of a playlist.
+    PlaylistsContaining {
+        file_id: String,
+    },
+    /// An id for a playlist that has not been written down yet.
+    ///
+    /// The host mints it, because a playlist's identity is its name and role for
+    /// its author rather than its contents, so it cannot be derived from
+    /// anything: whoever creates a playlist has to be handed an id, and the host
+    /// is the side that files it. An id on its own changes nothing anywhere, so
+    /// this is the one write in this group that is safe to ask for idly.
+    NewPlaylistId,
+    /// Write a playlist down on the host without publishing it.
+    ///
+    /// The whole playlist travels, because a revision **is** the whole list: an
+    /// edit that drops a member has to say so, and an incremental "remove the
+    /// third one" would be a second way of describing a playlist that could
+    /// disagree with the first. The host stamps the author and the edit time,
+    /// exactly as it does for its own window, so a phone never gets to claim a
+    /// coordinate that is not its owner's.
+    SavePlaylist {
+        playlist: RemotePlaylist,
+    },
+    /// Forget a playlist the host holds and has never published.
+    ///
+    /// An empty `author` means "whichever playlist this computer holds under
+    /// that id". A published playlist is withdrawn instead, because forgetting it
+    /// here alone would leave the revision on the relays standing.
+    DeletePlaylist {
+        #[serde(default)]
+        author: String,
+        playlist_id: String,
+    },
+    /// Sign a playlist and send it to the host's relays, keeping what comes
+    /// back rather than what was sent.
+    PublishPlaylist {
+        playlist: RemotePlaylist,
+        /// The author's answer to "suggest search words from the title?". It
+        /// only applies while they have written no words of their own.
+        #[serde(default)]
+        suggest_tags: bool,
+    },
+    /// Take a published playlist back off the relays.
+    WithdrawPlaylist {
+        playlist_id: String,
     },
     RequestDownload {
         file_id: String,
@@ -507,6 +612,17 @@ pub enum ServerResponse {
     Playlist {
         playlist: RemotePlaylist,
     },
+    /// The playlists that name a file, by coordinate.
+    PlaylistsContaining {
+        playlists: Vec<RemotePlaylistCoordinate>,
+    },
+    /// An id for a playlist that does not exist yet.
+    PlaylistId {
+        playlist_id: String,
+    },
+    /// A playlist is gone: forgotten here, and withdrawn from the relays when it
+    /// had ever been published.
+    PlaylistRemoved,
     DownloadRequested {
         request_id: String,
     },
@@ -909,8 +1025,10 @@ mod tests {
             display_name: "Sean Parker".into(),
             artist: "Metallica".into(),
             mbid: "60691bed-fdd7-32f9-92dc-b151aac9e271".into(),
+            image: "c".repeat(64),
             tags: "driving, late night".into(),
             private: false,
+            published: true,
             updated_at: 1_787_680_200,
             tracks: vec![RemotePlaylistTrack {
                 position: 1,
@@ -933,6 +1051,12 @@ mod tests {
         let summary = playlist.summary();
         assert_eq!(summary.playlist_id, playlist.playlist_id);
         assert_eq!(summary.track_count, 1);
+        assert_eq!(summary.image, playlist.image, "a list can draw the picture it is told about");
+        // The artwork a list row draws comes from the member the playlist opens
+        // with, so the summary carries that one file id and not the members.
+        assert_eq!(summary.first_file_id, playlist.tracks[0].file_id);
+        let empty = RemotePlaylist::default().summary();
+        assert!(empty.first_file_id.is_empty(), "a playlist that names nothing has no artwork");
         let request = ClientRequest::Playlist {
             author: playlist.author.clone(),
             playlist_id: playlist.playlist_id.clone(),
@@ -944,6 +1068,36 @@ mod tests {
                 .unwrap(),
             request
         );
+        // The membership question a track's "add to playlist" picker asks, and
+        // the coordinates it is answered with: the author is half the identity,
+        // so it has to survive the wire with the id rather than being guessed
+        // from whoever happens to be asking.
+        let request = ClientRequest::PlaylistsContaining {
+            file_id: "b".repeat(64),
+        };
+        assert_eq!(
+            serde_json::from_str::<ClientRequest>(&serde_json::to_string(&request).unwrap())
+                .unwrap(),
+            request
+        );
+        let response = ServerResponse::PlaylistsContaining {
+            playlists: vec![RemotePlaylistCoordinate {
+                author: "a".repeat(64),
+                playlist_id: "77abf082-7075-4d36-afe2-e9710ac6b33c".into(),
+            }],
+        };
+        let wire = serde_json::to_string(&response).unwrap();
+        assert_eq!(
+            wire,
+            format!(
+                r#"{{"type":"playlistsContaining","playlists":[{{"author":"{}","playlistId":"77abf082-7075-4d36-afe2-e9710ac6b33c"}}]}}"#,
+                "a".repeat(64)
+            )
+        );
+        assert_eq!(
+            serde_json::from_str::<ServerResponse>(&wire).unwrap(),
+            response
+        );
         // A private playlist never leaves its owner's own devices, so the flag
         // has to survive the wire rather than being assumed false.
         let response: ServerResponse = serde_json::from_str(
@@ -954,6 +1108,97 @@ mod tests {
             response,
             ServerResponse::Playlists { playlists, .. } if playlists[0].private
         ));
+        // "This coordinate is on the relays" is the difference between a
+        // withdrawal and simply forgetting a playlist, so it travels too.
+        let response: ServerResponse = serde_json::from_str(
+            r#"{"type":"playlist","playlist":{"playlistId":"id","published":true}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            response,
+            ServerResponse::Playlist { playlist } if playlist.published
+        ));
+    }
+
+    /// The write half of the playlist contract: a phone with write access can
+    /// say all of this, and every one of them has to survive the wire.
+    #[test]
+    fn playlist_writes_round_trip() {
+        let playlist = RemotePlaylist {
+            playlist_id: "77abf082-7075-4d36-afe2-e9710ac6b33c".into(),
+            title: "rock".into(),
+            author: "a".repeat(64),
+            display_name: "Sean Parker".into(),
+            artist: String::new(),
+            mbid: String::new(),
+            image: String::new(),
+            tags: "driving".into(),
+            private: false,
+            published: false,
+            updated_at: 1_787_680_200,
+            tracks: vec![RemotePlaylistTrack {
+                position: 1,
+                file_id: "b".repeat(64),
+                title: "Enter Sandman".into(),
+                artist: "Metallica".into(),
+                album: "Metallica".into(),
+            }],
+            total: 1,
+        };
+        let requests = vec![
+            ClientRequest::NewPlaylistId,
+            ClientRequest::SavePlaylist {
+                playlist: playlist.clone(),
+            },
+            ClientRequest::DeletePlaylist {
+                author: playlist.author.clone(),
+                playlist_id: playlist.playlist_id.clone(),
+            },
+            ClientRequest::PublishPlaylist {
+                playlist: playlist.clone(),
+                suggest_tags: true,
+            },
+            ClientRequest::WithdrawPlaylist {
+                playlist_id: playlist.playlist_id.clone(),
+            },
+        ];
+        for request in requests {
+            assert_eq!(
+                serde_json::from_str::<ClientRequest>(&serde_json::to_string(&request).unwrap())
+                    .unwrap(),
+                request
+            );
+        }
+        // A phone that says nothing about suggested words is asking for none,
+        // which is the direction that cannot put our words in someone's mouth.
+        let quiet: ClientRequest = serde_json::from_str(
+            r#"{"type":"publishPlaylist","playlist":{"playlistId":"id"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            quiet,
+            ClientRequest::PublishPlaylist { suggest_tags, .. } if !suggest_tags
+        ));
+        // And a phone that names no author is asking about the one this computer
+        // holds under that id, rather than about nobody's.
+        let unowned: ClientRequest =
+            serde_json::from_str(r#"{"type":"deletePlaylist","playlistId":"id"}"#).unwrap();
+        assert!(matches!(
+            unowned,
+            ClientRequest::DeletePlaylist { author, .. } if author.is_empty()
+        ));
+        for response in [
+            ServerResponse::PlaylistId {
+                playlist_id: playlist.playlist_id,
+            },
+            ServerResponse::PlaylistRemoved,
+        ] {
+            assert_eq!(
+                serde_json::from_str::<ServerResponse>(&serde_json::to_string(&response).unwrap())
+                    .unwrap(),
+                response
+            );
+        }
     }
 
     /// A playlist may name 500 members and every hint may be at its maximum
@@ -977,12 +1222,16 @@ mod tests {
                 display_name: "d".repeat(256),
                 artist: "a".repeat(256),
                 mbid: "60691bed-fdd7-32f9-92dc-b151aac9e271".into(),
+                // The picture is a member's worth of bytes on the wire, and the
+                // list answer carries it too, so both are sized here.
+                image: "c".repeat(64),
                 // The author's own words, at the catalogue's maximum of 12.
                 tags: (1..=12)
                     .map(|index| format!("w{index}"))
                     .collect::<Vec<_>>()
                     .join(", "),
                 private: false,
+                published: true,
                 updated_at: 1_787_680_200,
                 tracks: members,
                 total: 500,
@@ -1000,8 +1249,12 @@ mod tests {
                 title: "t".repeat(256),
                 author: "a".repeat(64),
                 display_name: "d".repeat(256),
+                image: "c".repeat(64),
+                // The one artwork hint a list row is given is a member's file id.
+                first_file_id: "b".repeat(64),
                 track_count: 500,
                 private: false,
+                published: true,
                 updated_at: 1_787_680_200,
             })
             .collect::<Vec<_>>();

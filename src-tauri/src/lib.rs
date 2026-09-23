@@ -2207,6 +2207,82 @@ fn new_playlist_id() -> String {
     playlist::new_playlist_id()
 }
 
+/// This computer's own public key, which is the author half of every playlist it
+/// writes down.
+///
+/// Reading it never touches a relay, which matters because playlists are edited
+/// offline: the page has to be able to say "this row is mine, I may edit it"
+/// while the network is down, and it can only do that if the answer is available
+/// then.
+#[tauri::command]
+fn own_playlist_author() -> Result<String, String> {
+    network::own_pubkey()
+}
+
+/// Every playlist this computer holds, newest first, without their members.
+///
+/// Two kinds of row sit in the one list and are told apart by what they carry:
+/// what this identity published, and what it has only written down. A member
+/// list is what makes a row expensive, so browsing never carries the members of
+/// playlists nobody opened.
+#[tauri::command]
+fn playlists(state: State<'_, AppState>) -> Result<Vec<napstr_remote_protocol::RemotePlaylistSummary>, String> {
+    playlist::list(&open_db(&state)?, 0, playlist::PLAYLIST_LIST_LIMIT)
+        .map(|(playlists, _)| playlists)
+}
+
+/// One playlist with its members, or nothing when this computer holds no
+/// playlist at that coordinate.
+///
+/// An empty `author` asks about the id alone, which is answered only while
+/// exactly one author's row answers to it.
+#[tauri::command]
+fn playlist(
+    author: String,
+    playlist_id: String,
+    state: State<'_, AppState>,
+) -> Result<Option<napstr_remote_protocol::RemotePlaylist>, String> {
+    playlist::page(
+        &open_db(&state)?,
+        &author,
+        &playlist_id,
+        0,
+        playlist::PLAYLIST_MEMBER_LIMIT,
+    )
+}
+
+/// Write a playlist down on this computer without publishing it.
+///
+/// Editing is local until the author says publish, so a half-written playlist
+/// survives a restart without a relay ever having seen it, and a private one is
+/// never anything but local. The author and the edit time are stamped here
+/// rather than taken from the caller: the coordinate has to be the one a later
+/// publication will use, or publishing a draft would leave two rows behind under
+/// one id, only one of which is the author's.
+#[tauri::command]
+fn save_playlist(
+    mut playlist: napstr_remote_protocol::RemotePlaylist,
+    state: State<'_, AppState>,
+) -> Result<napstr_remote_protocol::RemotePlaylist, String> {
+    playlist.author = network::own_pubkey()?;
+    playlist.updated_at = Utc::now().timestamp();
+    let connection = open_db(&state)?;
+    playlist::save(&connection, &playlist)?;
+    Ok(playlist)
+}
+
+/// Forget a playlist this computer holds and has never published.
+///
+/// A published one is withdrawn instead, which is what a relay has to be told.
+#[tauri::command]
+fn delete_playlist(
+    author: String,
+    playlist_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    playlist::remove(&open_db(&state)?, &author, &playlist_id)
+}
+
 /// The albums the cover worker would act on next, for the Covers tab.
 #[tauri::command]
 fn cover_candidates(
@@ -2471,6 +2547,11 @@ pub fn run() {
             publish_playlist,
             withdraw_playlist,
             new_playlist_id,
+            own_playlist_author,
+            playlists,
+            playlist,
+            save_playlist,
+            delete_playlist,
             cover_candidates,
             cover_status,
             set_cover_preferences,
