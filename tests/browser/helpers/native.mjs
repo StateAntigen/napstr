@@ -96,7 +96,14 @@ export async function mockNative(page, { app = 'napstrfy', nativeLocale = 'en-GB
           case 'client_platform': return platform;
           case 'companion_status': return status();
           case 'cached_library': return { ...status(), tracks: paired ? [track] : [], total: paired ? 1 : 0 };
-          case 'remote_library': return { tracks: window.remoteLibrary ?? [track], total: (window.remoteLibrary ?? [track]).length };
+          case 'remote_library': {
+            // The whole library unless a page is asked for, which is what the
+            // add sheet's list does as it is scrolled.
+            const rows = window.remoteLibrary ?? [track];
+            const offset = Number(args.offset ?? 0);
+            const limit = Number(args.limit ?? rows.length);
+            return { tracks: rows.slice(offset, offset + limit), total: rows.length };
+          }
           case 'remote_search': if (window.searchError) throw window.searchError; return window.networkSearchResults ?? [track];
           case 'remote_transfers': return [{ ...transfers[1], fileId: track.fileId }];
           case 'reconcile_audio_cache': return true;

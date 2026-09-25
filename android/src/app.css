@@ -1,5 +1,9 @@
 :root { font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #f7f7f8; background: #0c0c0e; font-synthesis: none; --bar-height: 62px; }
-* { box-sizing: border-box; }
+/* Android's WebView flashes a translucent BLUE over whatever it is tapped, which
+   turns a neutral row into a link for a moment. The app draws its own :active
+   states, so the flash is a neutral wash here instead: every control still
+   answers a press, and none of them turn the system's accent colour. */
+* { box-sizing: border-box; -webkit-tap-highlight-color: rgba(255, 255, 255, .1); }
 html, body, #app { min-width: 320px; min-height: 100%; margin: 0; background: #0c0c0e; }
 /* `clip` rather than `hidden`: `hidden` makes the body the nearest scroll
    container for the sticky header and search field, which stops them sticking
@@ -41,6 +45,22 @@ audio { display: none; }
 .error-card { width: min(380px, 100%); margin: 0 0 14px; padding: 10px 13px; color: #ffd9db; background: #3d1419; border: 1px solid #7d2831; border-radius: 10px; overflow-wrap: anywhere; }.error-card span { display: block; }.error-card button { min-height: 38px; margin-top: 9px; padding: 7px 14px; color: #fff; background: #72252e; border: 1px solid #a84450; border-radius: 19px; font-weight: 700; }
 
 .app-shell { min-height: 100vh; min-height: 100dvh; padding-bottom: calc(168px + env(safe-area-inset-bottom)); background: linear-gradient(#12121a 0, #0d0d10 190px, #0b0b0d 100%); }
+/* The page dissolves into the player instead of being cut off by it: one wash
+   that reaches well above the bar, and the nav's own background fading rather
+   than starting with a border. The wash sits behind the player bar and the nav
+   (both paint their own colour over it), and above the page, so what is left
+   visible is the fade above the bar. */
+.app-shell::after {
+  content: '';
+  position: fixed;
+  z-index: 1;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: calc(69px + env(safe-area-inset-bottom) + 190px);
+  background: linear-gradient(180deg, rgba(8,8,10,0) 0, rgba(8,8,10,.34) 34%, rgba(8,8,10,.72) 60%, rgba(8,8,10,.95) 82%, #08080a 100%);
+  pointer-events: none;
+}
 /* The chrome rides along with the page: the connection chip and the settings
    button stay reachable however far down the library, search results or a
    podcast's episodes you have scrolled. The frosted background is what keeps
@@ -74,7 +94,7 @@ audio { display: none; }
 @keyframes toast-out { to { opacity: 0; transform: translateY(-8px); } }
 
 .library-heading { padding: 20px 20px 9px; display: flex; align-items: end; justify-content: space-between; gap: 15px; }.library-heading p { margin: 0 0 4px; color: #8b84e9; font-size: 10px; font-weight: 800; letter-spacing: .18em; }.library-heading h1 { max-width: 70vw; margin: 0; overflow: hidden; font-size: 28px; letter-spacing: -.035em; text-overflow: ellipsis; white-space: nowrap; }.library-heading > span { flex: 0 0 auto; padding-bottom: 4px; color: #85858d; font-size: 12px; }
-.track-list { min-height: 250px; padding: 0 10px 22px; }.track-row { width: 100%; min-height: 72px; padding: 6px 5px 6px 7px; display: flex; align-items: center; color: white; background: transparent; border-radius: 10px; text-align: left; }.track-row.selected { background: #202027; }.track-row.remote { color: #e8e8ed; }.track-open { min-width: 0; padding: 0; flex: 1; display: grid; grid-template-columns: 58px minmax(0, 1fr) 46px; gap: 10px; align-items: center; color: inherit; background: transparent; border: 0; text-align: left; }.track-copy { min-width: 0; }.track-copy strong, .track-copy small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.track-copy strong { font-size: 16px; font-weight: 620; letter-spacing: -.018em; }.track-copy small { margin-top: 5px; color: #a2a2aa; font-size: 13px; }.track-meta { display: block; margin-top: 4px; color: #777780; font-size: 10px; white-space: nowrap; }
+.track-list { min-height: 250px; padding: 0 10px 22px; }.track-row { width: 100%; min-height: 72px; padding: 6px 5px 6px 7px; display: flex; align-items: center; color: white; background: transparent; border-radius: 10px; text-align: left; }.track-row.selected { background: #202027; }.track-row.remote { color: #e8e8ed; }.track-open { min-width: 0; padding: 0; flex: 1; display: grid; grid-template-columns: 58px minmax(0, 1fr) 46px; gap: 10px; align-items: center; color: inherit; background: transparent; border: 0; text-align: left; }.track-copy { min-width: 0; }.track-copy strong, .track-copy small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.track-copy strong { font-size: 16px; font-weight: 620; letter-spacing: -.018em; }.track-copy small { margin-top: 5px; color: #a2a2aa; font-size: 13px; }.track-meta { display: block; margin-top: 4px; overflow: hidden; color: #777780; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .track-badge { width: 46px; display: flex; align-items: center; justify-content: center; gap: 3px; }
 .track-badge svg { width: 22px; height: 22px; flex: 0 0 auto; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
 .track-badge b { font-size: 11px; font-weight: 700; font-variant-numeric: tabular-nums; }
@@ -126,7 +146,10 @@ audio { display: none; }
 .icon-play { display: block; width: 0; height: 0; border-left: 0.6em solid currentColor; border-top: 0.35em solid transparent; border-bottom: 0.35em solid transparent; }
 .icon-pause { display: block; width: 0.6em; height: 0.72em; border-right: 0.19em solid currentColor; border-left: 0.19em solid currentColor; }
 .icon-busy { display: block; width: 0.6em; height: 0.6em; border: 0.08em solid rgba(255,255,255,.25); border-top-color: currentColor; border-radius: 50%; animation: spin .8s linear infinite; }
-.bottom-nav { position: fixed; z-index: 35; right: 0; bottom: 0; left: 0; height: calc(69px + env(safe-area-inset-bottom)); padding: 6px 10px env(safe-area-inset-bottom); display: flex; align-items: center; justify-content: space-around; background: rgba(8,8,10,.96); border-top: 1px solid #29292f; transform: translateY(calc(var(--nav-shift, 0) * 100%)); transition: transform .28s cubic-bezier(.22,.61,.36,1); }
+/* No edge and no separate panel: the bar's own colour fades in from nothing, so
+   the page slides under it instead of being cut off by a line. The fade above it
+   is `.app-shell::after`, which is behind the player bar. */
+.bottom-nav { position: fixed; z-index: 35; right: 0; bottom: 0; left: 0; height: calc(69px + env(safe-area-inset-bottom)); padding: 6px 10px env(safe-area-inset-bottom); display: flex; align-items: center; justify-content: space-around; background: linear-gradient(180deg, rgba(8,8,10,0) 0, rgba(8,8,10,.5) 20%, rgba(8,8,10,.93) 52%, #08080a 100%); transform: translateY(calc(var(--nav-shift, 0) * 100%)); transition: transform .28s cubic-bezier(.22,.61,.36,1); }
 .bottom-nav.dragging { transition: none; }.bottom-nav button { min-width: 58px; height: 55px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; color: #72727b; background: transparent; border: 0; font-size: 10px; }.bottom-nav button span { font-size: 29px; line-height: 1; }.bottom-nav button.active { color: white; }
 /* Translated tab names are longer than "Music" and "Podcasts", so they wrap. */
 .bottom-nav button { overflow-wrap: anywhere; }
@@ -134,7 +157,7 @@ audio { display: none; }
 /* Playlists: a list the Napstr computer keeps, and the editor that writes back
    to it. Nothing here is stored on the phone, so every screen is drawn from
    what the computer answered. */
-.playlist-view, .playlist-editor { padding: 0 14px 108px; }
+.playlist-view { padding: 0 14px 108px; }
 .playlist-new { width: 44px; height: 44px; flex: 0 0 auto; display: grid; place-items: center; color: #fff; background: #4c46a8; border: 0; border-radius: 50%; font-size: 26px; line-height: 1; }
 .playlist-new:active { background: #3a3585; }
 .playlist-row { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; padding: 6px 8px 6px 13px; background: #16161a; border: 1px solid #24242b; border-radius: 14px; }
@@ -145,10 +168,6 @@ audio { display: none; }
 .playlist-row-copy { min-width: 0; display: grid; gap: 3px; }
 .playlist-row-copy strong { overflow: hidden; font-size: 15px; text-overflow: ellipsis; white-space: nowrap; }
 .playlist-row-copy small { color: #85858d; font-size: 12px; }
-.playlist-editor-head { display: flex; align-items: center; gap: 10px; padding: 16px 4px 14px; }
-.playlist-back { display: flex; align-items: center; gap: 5px; padding: 8px 10px 8px 0; color: #b9b9c1; background: transparent; border: 0; font: inherit; font-size: 13px; }
-.playlist-back svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
-.playlist-editor-head strong { overflow: hidden; font-size: 15px; text-overflow: ellipsis; white-space: nowrap; }
 .playlist-field { display: grid; gap: 5px; margin-bottom: 12px; color: #9a9aa3; font-size: 12px; }
 .playlist-field input { padding: 11px 12px; color: #f7f7f8; background: #16161a; border: 1px solid #2c2c34; border-radius: 12px; font-size: 15px; }
 .playlist-hint { margin: 0 0 10px; color: #85858d; font-size: 12px; line-height: 1.45; }
@@ -177,34 +196,96 @@ audio { display: none; }
 .playlist-notice { margin: 0 0 10px; color: #79d18b; font-size: 13px; }
 .playlist-head-glyph { width: 46px; height: 46px; flex: 0 0 auto; display: grid; place-items: center; color: #b3b3bb; background: #1d1d24; border-radius: 10px; }
 .playlist-head-glyph svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; }
-/* A playlist, laid out the way an album is: the artwork and the title row are
-   the album's own rules, so the two screens read as the same kind of thing. */
-.playlist-page { position: relative; padding: 0 0 108px; }
-/* The first member's cover, stretched and blurred behind the page, with the same
-   scrim the album sheet and the player drawer put over theirs. */
-.playlist-glow { position: absolute; top: 0; right: 0; left: 0; height: min(60vh, 400px); background-color: hsl(var(--cover-hue) 45% 20%); background-position: center top; background-size: cover; filter: blur(46px) saturate(1.7) brightness(.72); }
-.playlist-glow-scrim { position: absolute; top: 0; right: 0; left: 0; height: min(60vh, 400px); background: linear-gradient(180deg, rgba(11,11,14,.28) 0, rgba(11,11,14,.74) 34%, #0b0b0e 100%); }
-.playlist-page > *:not(.playlist-glow, .playlist-glow-scrim) { position: relative; z-index: 1; }
-.playlist-page .playlist-editor-head { padding: 16px 16px 6px; }
-.playlist-page .album-art { width: min(78%, 38vh); }
-.playlist-page .album-title-row { padding: 18px 16px 4px; }
-.playlist-edit .playlist-editor-head { gap: 8px; }
-.playlist-edit .playlist-editor-head strong { flex: 1 1 auto; }
+/* A playlist is the album sheet with a playlist in it: the artwork, the glow and
+   the scrolling body are the album's own rules, and only the tool row is ours. */
+.playlist-sheet .album-art { width: min(78%, 38vh); }
+/* The one thing that is not the album's: its tool row pins, and the bar it pins
+   to fades in above it. The bar is out of the flow, so it stays out of the way -
+   and out of the way of the artwork's play button - until it is pinned.
+
+   A sticky row is clamped by the box it scrolls in, so this scroller's own top
+   padding would stop the tool row 58px below the top it was given, with the page
+   showing through the gap. The padding moves onto the artwork, which is what it
+   was holding clear of the floating arrow in the first place. */
+.playlist-sheet .album-scroll.playlist-view { padding-top: 0; }
+.playlist-sheet .playlist-view .album-art { margin-top: calc(env(safe-area-inset-top) + 58px); }
+.playlist-sheet .playlist-pin { position: sticky; z-index: 2; top: calc(env(safe-area-inset-top) + 52px); }
+.playlist-sheet .playlist-tools { background: #0b0b0e; }
+/* The bar reaches the very top of the screen, because the sheet is edge to edge:
+   stopping it at the inset leaves a band of scrolling rows under the status bar.
+   Only its background does that - the title stays level with the round arrow. */
+.playlist-titlebar {
+  position: absolute;
+  right: 0;
+  bottom: 100%;
+  left: 0;
+  height: calc(env(safe-area-inset-top) + 52px);
+  padding: env(safe-area-inset-top) 76px 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  color: #f7f7f8;
+  background: #0b0b0e;
+  opacity: 0;
+  transform: translateY(-6px);
+  transition: opacity .18s ease-out, transform .18s ease-out;
+  pointer-events: none;
+}
+.playlist-pin.pinned .playlist-titlebar { opacity: 1; transform: none; pointer-events: auto; }
+.playlist-titlebar strong { overflow: hidden; font-size: 16px; font-weight: 700; letter-spacing: -.01em; text-align: center; text-overflow: ellipsis; white-space: nowrap; }
+/* The disc the title row carries, held at the foot of the bar once that row has
+   gone: on top of the bar and of the tool row, so the one control worth reaching
+   for is never the one that scrolled away. It is drawn out of the flow, so it
+   takes no space from either, and only appears with them. */
+.playlist-pin-play { position: absolute; z-index: 3; top: 0; right: 20px; transform: translateY(-50%); opacity: 0; transition: opacity .18s ease-out; pointer-events: none; }
+.playlist-pin.pinned .playlist-pin-play { opacity: 1; pointer-events: auto; }
+.playlist-pin.pinned .playlist-pin-play:disabled { opacity: .5; }
+.playlist-heading { margin: 0 0 14px; padding: 0 16px; font-size: 22px; letter-spacing: -.02em; }
+.playlist-sheet .playlist-hint, .playlist-sheet .error-card, .playlist-sheet .playlist-notice, .playlist-sheet .playlist-field, .playlist-sheet .playlist-toggle, .playlist-sheet .playlist-actions { margin-right: 16px; margin-left: 16px; }
+.playlist-sheet .playlist-members { margin-right: 16px; margin-left: 16px; }
 .playlist-save { flex: 0 0 auto; min-height: 38px; padding: 0 16px; color: #fff; background: #4c46a8; border: 0; border-radius: 19px; font: inherit; font-size: 13px; font-weight: 700; }
 .playlist-save:disabled { color: #55555d; background: #1d1d24; }
-.playlist-tools { display: flex; flex-wrap: wrap; gap: 7px; padding: 8px 16px 6px; }
+.playlist-tools { display: flex; flex-wrap: wrap; gap: 7px; padding: 8px 16px 10px; }
 .playlist-tools button { display: flex; align-items: center; gap: 6px; min-height: 34px; padding: 0 12px; color: #d8d8e0; background: #1d1d24; border: 1px solid #2c2c34; border-radius: 11px; font: inherit; font-size: 12px; }
 .playlist-tools button:active { background: #26262e; }
 .playlist-tools button span { color: #9a9aa3; font-size: 12px; font-weight: 600; }
-.playlist-add-form { display: flex; gap: 7px; padding: 10px 14px 8px; }
-.playlist-add-form input { flex: 1 1 auto; min-width: 0; padding: 10px 12px; color: #f7f7f8; background: #16161a; border: 1px solid #2c2c34; border-radius: 12px; font-size: 15px; }
-.playlist-add-form button { flex: 0 0 auto; padding: 0 15px; color: #d8d8e0; background: #1d1d24; border: 1px solid #2c2c34; border-radius: 12px; font-size: 13px; }
+/* The add screen: a header, three tabs, and one long list under them. */
+.add-view { position: fixed; z-index: 36; inset: 0; display: flex; flex-direction: column; overflow: hidden; background: #0b0b0e; animation: queue-in .22s ease-out; }
+/* The head and the tabs are chrome: the list is the only part that scrolls, so
+   they must not be squeezed when it turns out to be taller than the screen. */
+.add-head { padding: calc(env(safe-area-inset-top) + 10px) 14px 10px; display: flex; align-items: center; gap: 12px; flex: 0 0 auto; }
+.add-head .view-icon { width: 40px; height: 40px; flex: 0 0 auto; display: grid; place-items: center; color: #d8d8e0; background: rgba(255,255,255,.06); border: 0; border-radius: 50%; }
+.add-head .view-icon svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 1.9; stroke-linecap: round; }
+.add-head-copy { min-width: 0; }.add-head-copy strong, .add-head-copy small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.add-head-copy strong { font-size: 17px; }.add-head-copy small { margin-top: 3px; color: #9d9da7; font-size: 12px; }
+.add-tabs { display: flex; gap: 7px; padding: 0 14px 10px; overflow-x: auto; flex: 0 0 auto; }
+.add-tabs button { flex: 0 0 auto; min-height: 32px; padding: 0 14px; color: #b9b9c1; background: #1d1d24; border: 1px solid #2c2c34; border-radius: 16px; font: inherit; font-size: 12px; white-space: nowrap; }
+.add-tabs button.active { color: #fff; background: #4c46a8; border-color: #4c46a8; font-weight: 700; }
+.add-view .playlist-hint, .add-view .error-card { margin: 0 16px 8px; }
+.add-list { min-height: 0; flex: 1 1 auto; overflow-y: auto; overscroll-behavior-y: contain; padding: 0 6px calc(20px + env(safe-area-inset-bottom)); }
+/* The toggle is the row's fourth cell, inside the button, so the whole row -
+   icon included - is what toggles the track. */
+.add-row .track-open { grid-template-columns: 58px minmax(0, 1fr) 46px 34px; }
+.add-row .picker-toggle { justify-self: end; margin-right: 8px; }
+.card-art-empty { width: 100%; height: 100%; display: grid; place-items: center; color: #cdc8ff; background: linear-gradient(145deg, hsl(255 45% 32%), #17171d); font-size: 30px; }
+/* The author's words, as chips: each is added or taken back as a whole. */
+.playlist-tags > span { color: #9a9aa3; font-size: 12px; }
+.tag-chips { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 8px; background: #16161a; border: 1px solid #2c2c34; border-radius: 12px; }
+.tag-chip { display: flex; align-items: center; gap: 4px; max-width: 100%; padding: 5px 6px 5px 10px; color: #e6e6ec; background: #2a2a34; border-radius: 14px; font-size: 13px; }
+.tag-chip > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tag-chip button { width: 20px; height: 20px; flex: 0 0 auto; display: grid; place-items: center; padding: 0; color: #b3b3bb; background: transparent; border: 0; border-radius: 50%; }
+.tag-chip button svg { width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-width: 2.2; stroke-linecap: round; }
+.tag-chip button:active { color: #ff8a95; background: rgba(255,255,255,.1); }
+.tag-input { flex: 1 1 90px; min-width: 90px; padding: 4px 2px; color: #f7f7f8; background: transparent; border: 0; font: inherit; font-size: 14px; }
+.tag-input:focus { outline: none; }
 .picker-row { gap: 10px; }
 .picker-copy { display: grid; gap: 3px; }
 .picker-copy strong { font-size: 15px; font-weight: 600; }
 .picker-copy small { color: #85858d; font-size: 11px; }
 .picker-toggle { width: 26px; height: 26px; flex: 0 0 auto; display: block; color: #b3b3bb; }
-.picker-toggle svg { width: 26px; height: 26px; }
+/* Drawn here rather than inherited from a sheet row: the same control sits in the
+   full-screen add list, where nothing else gives it a stroke. */
+.picker-toggle svg { width: 26px; height: 26px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
 .picker-toggle .tick { opacity: 0; }
 .picker-toggle.on { color: #79d18b; }
 .picker-toggle.on .ring { fill: rgba(121,209,139,.16); }
@@ -329,7 +410,7 @@ svg .filled { fill: currentColor; stroke: none; }
 .album-glow { position: absolute; top: 0; right: 0; left: 0; height: 62%; background-color: hsl(var(--cover-hue) 45% 20%); background-position: center top; background-size: cover; filter: blur(46px) saturate(1.7) brightness(.72); }
 .album-glow-scrim { position: absolute; inset: 0; background: linear-gradient(180deg, rgba(11,11,14,.28) 0, rgba(11,11,14,.74) 34%, #0b0b0e 64%); }
 .view-head { position: absolute; z-index: 3; top: calc(env(safe-area-inset-top) + 8px); right: 14px; left: 14px; display: flex; align-items: center; justify-content: space-between; }
-.album-scroll { position: relative; z-index: 1; min-height: 0; padding: calc(env(safe-area-inset-top) + 58px) 0 calc(69px + var(--bar-height) + env(safe-area-inset-bottom) + 26px); flex: 1; overflow-y: auto; overscroll-behavior-y: contain; }
+.album-scroll { position: relative; z-index: 1; min-height: 0; padding: calc(env(safe-area-inset-top) + 58px) 0 calc(69px + var(--bar-height) + env(safe-area-inset-bottom) + 26px); flex: 1; overflow-x: clip; overflow-y: auto; overscroll-behavior-y: contain; }
 /* Room to breathe between the track list and the artist's other albums. */
 .album-scroll .album-shelf-block { margin-top: 30px; padding-top: 22px; border-top: 1px solid #1c1c22; }
 .album-art { width: min(70%, 31vh); margin: 0 auto; aspect-ratio: 1; overflow: hidden; background: #17171d; border-radius: 16px; box-shadow: 0 18px 44px rgba(0,0,0,.6); }
@@ -348,6 +429,10 @@ svg .filled { fill: currentColor; stroke: none; }
 .album-title-copy .album-meta { margin-top: 4px; color: #85858f; font-size: 12px; }
 .album-play-all { width: 58px; height: 58px; padding: 0; flex: 0 0 auto; display: grid; place-items: center; color: #0d0d10; background: #f5f5f6; border: 0; border-radius: 50%; font-size: 26px; }
 .album-play-all:disabled { opacity: .5; }
+/* A triangle drawn from a border has no width of its own, so centring the box
+   leaves the shape sitting left of the middle of the disc. Its mass sits a third
+   of the way in, which is the couple of pixels this gives back. */
+.album-play-all .icon-play { transform: translateX(3px); }
 .album-tracks { margin: 10px 0 0; padding: 0 10px; list-style: none; }
 .album-tracks li { display: flex; align-items: center; border-bottom: 1px solid #1c1c22; }
 .album-tracks li.playing { background: #171d24; border-radius: 10px; }
@@ -476,6 +561,9 @@ svg .filled { fill: currentColor; stroke: none; }
   /* The album preview is a sibling of `.app-shell`, not a descendant, so the
      column widths have to be declared somewhere both of them inherit from. */
   :root { --sidebar-width: 190px; }
+  /* The three columns have their own edges: a wash across the bottom of the
+     window would lie over the sidebar and the player rather than under them. */
+  .app-shell.desktop::after { content: none; }
   .app-shell.desktop {
     min-height: 100dvh;
     max-width: none;
