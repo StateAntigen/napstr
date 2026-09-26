@@ -113,7 +113,13 @@ for (const platform of ['android', 'linux']) {
       // open the sheet again before measuring the controls it carries.
       await openPlayer(page);
       const buttons = page.locator('.now-sheet-actions button');
-      expect((await buttons.evaluateAll((buttons) => buttons.slice(0, 5).map((button) => button.getAttribute('aria-label')))))
+      // Polled rather than read once: the sheet is visible a moment before its
+      // actions are, and a resize between the two can unmount it, which is a
+      // race this test lost under load rather than a wrong set of controls.
+      await expect
+        .poll(async () =>
+          buttons.evaluateAll((buttons) => buttons.slice(0, 5).map((button) => button.getAttribute('aria-label')))
+        )
         .toEqual(['Previous track', 'Back 15 seconds', 'Play', 'Forward 15 seconds', 'Next track']);
       let right = 0;
       for (const button of (await buttons.all()).slice(0, 5)) {
@@ -208,7 +214,7 @@ test('Napstrfy podcast duration hints cannot enable seeking or reach system cont
   await instrumentTiming(page);
   await page.route('**/fixture.wav', serveAudio);
   await page.goto('http://127.0.0.1:15174');
-  await page.locator('.bottom-nav button').nth(2).click();
+  await page.locator('.bottom-nav button[data-tab="podcasts"]').click();
   await page.locator('.podcast-open').first().click();
   await page.locator('.episode-copy').first().click();
   await expect.poll(() => page.locator('audio').evaluate((a) => a.paused)).toBe(false);
@@ -415,7 +421,7 @@ for (const app of ['napstr', 'napstrfy']) {
       // Ours opens settings from the header, and closes it with its own button.
       await page.locator('.settings-view .view-icon').click();
       await expect(page.locator('.track-copy strong').first()).toHaveText('Search');
-      await page.locator('.bottom-nav button').nth(2).click();
+      await page.locator('.bottom-nav button[data-tab="podcasts"]').click();
       await page.locator('.podcast-open').first().click();
       await expect(page.locator('.episode-download')).toBeDisabled();
       await expect(page.locator('.episode-download')).toHaveAttribute('title', 'Downloading');

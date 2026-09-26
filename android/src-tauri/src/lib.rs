@@ -5,10 +5,11 @@ use futures_util::StreamExt;
 use iroh::{endpoint::presets, Endpoint, EndpointAddr, EndpointId, SecretKey};
 use napstr_remote_protocol::{
     ClientRequest, PairingTicket, PlaybackCommand, RemoteAlbumCover, RemoteAudiobook,
-    RemoteAudiobookSummary, RemotePlaybackState, RemoteTrack, RemoteTransfer, ServerResponse,
-    ALPN, MAX_CONTROL_FRAME_BYTES, MAX_COVER_KEYS, MAX_PLAY_QUEUE, MAX_QR_SVG_BYTES,
-    MAX_REPORT_NOTE_CHARS,
-    REPORT_REASONS,
+    RemoteAudiobookSummary, RemotePlaybackState, RemotePlaylist, RemotePlaylistCoordinate,
+    RemotePlaylistSummary, RemoteTrack,
+    RemoteTransfer, ServerResponse, ALPN, MAX_CONTROL_FRAME_BYTES, MAX_COVER_KEYS,
+    MAX_PLAYLIST_MEMBERS, MAX_PLAYLIST_PAGE, MAX_PLAY_QUEUE, MAX_QR_SVG_BYTES, MAX_REPORT_NOTE_CHARS,
+    MAX_TRACKS_BY_ID, REPORT_REASONS,
 };
 use quick_xml::{events::Event, Reader};
 use qrcode::{render::svg, QrCode};
@@ -60,6 +61,13 @@ struct CompanionStatus {
 #[serde(rename_all = "camelCase")]
 struct LibraryPage {
     tracks: Vec<RemoteTrack>,
+    total: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlaylistPage {
+    playlists: Vec<RemotePlaylistSummary>,
     total: usize,
 }
 
@@ -1836,6 +1844,225 @@ async fn remote_library(
     }
 }
 
+/// The catalogue records for particular file ids, in the order asked for.
+///
+/// A queue handed over from the computer, and a playlist, both arrive as file
+/// ids: this is how the phone turns them into tracks it can show and play, and
+/// how it learns that a member is one the computer no longer holds. Requests are
+/// chunked so each one, and each answer, fits inside a single control frame.
+#[tauri::command]
+async fn remote_library_by_ids(
+    file_ids: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<RemoteTrack>, String> {
+    if file_ids.len() > MAX_PLAY_QUEUE {
+        return Err("That is more tracks than one queue can hold".into());
+    }
+    let mut tracks = Vec::with_capacity(file_ids.len());
+    for batch in file_ids.chunks(MAX_TRACKS_BY_ID) {
+        let response = state
+            .remote
+            .request(ClientRequest::LibraryByIds {
+                file_ids: batch.to_vec(),
+            })
+            .await?;
+        match response {
+            ServerResponse::LibraryByIds { tracks: batch } => tracks.extend(batch),
+            response => return Err(unexpected_response(&response)),
+        }
+    }
+    Ok(tracks)
+}
+
+/// Playlists this computer can see, newest first and without their members.
+#[tauri::command]
+async fn remote_playlists(
+    offset: usize,
+    limit: usize,
+    state: State<'_, AppState>,
+) -> Result<PlaylistPage, String> {
+    match state
+        .remote
+        .request(ClientRequest::Playlists { offset, limit })
+        .await?
+    {
+        ServerResponse::Playlists { playlists, total } => Ok(PlaylistPage { playlists, total }),
+        response => Err(unexpected_response(&response)),
+    }
+}
+
+/// One playlist, a page of its members at a time in the order it puts them in.
+///
+/// Named by its coordinate - its author and its id together - because the id is
+/// chosen by the author and two authors may choose the same one. Both come from
+/// the summary this phone was shown.
+#[tauri::command]
+async fn remote_playlist(
+    author: String,
+    playlist_id: String,
+    offset: usize,
+    limit: usize,
+    state: State<'_, AppState>,
+) -> Result<RemotePlaylist, String> {
+    let limit = limit.clamp(1, MAX_PLAYLIST_PAGE);
+    match state
+        .remote
+        .request(ClientRequest::Playlist {
+            author,
+            playlist_id,
+            offset,
+            limit,
+        })
+        .await?
+    {
+        ServerResponse::Playlist { playlist } => Ok(playlist),
+        response => Err(unexpected_response(&response)),
+    }
+}
+
+/// The playlists that already name a file, by coordinate.
+///
+/// The track menu's "add to playlist" picker draws a tick beside every playlist
+/// that holds the track, and this answers all of them in one request. It is a
+/// read, so a phone with read-only access can ask it and simply find nothing it
+/// is allowed to change.
+#[tauri::command]
+async fn remote_playlists_containing(
+    file_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<RemotePlaylistCoordinate>, String> {
+    match state
+        .remote
+        .request(ClientRequest::PlaylistsContaining { file_id })
+        .await?
+    {
+        ServerResponse::PlaylistsContaining { playlists } => Ok(playlists),
+        response => Err(unexpected_response(&response)),
+    }
+}
+
+/// A playlist request, refused here rather than at the computer for the two
+/// things a phone can get wrong that would otherwise be answered from far away
+/// in words that do not explain themselves: a member count over the spec's
+/// limit, and an edit too large to travel in one control frame.
+///
+/// Everything else about a playlist is the computer's to judge, because it owns
+/// the store and the keys - including who the author is, which the phone never
+/// gets to say.
+fn bounded_playlist_request(request: ClientRequest) -> Result<ClientRequest, String> {
+    let members = match &request {
+        ClientRequest::SavePlaylist { playlist }
+        | ClientRequest::PublishPlaylist { playlist, .. } => playlist.tracks.len(),
+        _ => 0,
+    };
+    if members > MAX_PLAYLIST_MEMBERS {
+        return Err(format!(
+            "A playlist may name at most {MAX_PLAYLIST_MEMBERS} tracks, and this one names {members}."
+        ));
+    }
+    let payload = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
+    if payload.len() > MAX_CONTROL_FRAME_BYTES {
+        return Err("This playlist is too large to edit from a phone.".into());
+    }
+    Ok(request)
+}
+
+/// An id for a playlist that does not exist yet.
+///
+/// The computer mints it: a playlist's identity is its name and role for its
+/// author rather than its contents, so there is nothing on this side to derive
+/// one from, and the computer is the side that files the playlist.
+#[tauri::command]
+async fn remote_new_playlist_id(state: State<'_, AppState>) -> Result<String, String> {
+    match state.remote.request(ClientRequest::NewPlaylistId).await? {
+        ServerResponse::PlaylistId { playlist_id } => Ok(playlist_id),
+        response => Err(unexpected_response(&response)),
+    }
+}
+
+/// Write a playlist down on the computer without publishing it.
+///
+/// The whole playlist travels, because a revision is the whole list. What comes
+/// back is what the computer stored - author and edit time stamped there - so
+/// this phone keeps the same copy the computer will answer with later.
+#[tauri::command]
+async fn remote_save_playlist(
+    playlist: RemotePlaylist,
+    state: State<'_, AppState>,
+) -> Result<RemotePlaylist, String> {
+    match state
+        .remote
+        .request(bounded_playlist_request(ClientRequest::SavePlaylist {
+            playlist,
+        })?)
+        .await?
+    {
+        ServerResponse::Playlist { playlist } => Ok(playlist),
+        response => Err(unexpected_response(&response)),
+    }
+}
+
+/// Sign a playlist and send it to the computer's relays.
+///
+/// `suggest_tags` is the author's answer to "suggest words from the title?".
+/// It is `false` when the phone does not ask, which is the safe direction: an
+/// event cannot carry the difference between "no" and "not asked", so the
+/// answer is remembered on this side rather than guessed at there.
+#[tauri::command]
+async fn remote_publish_playlist(
+    playlist: RemotePlaylist,
+    suggest_tags: Option<bool>,
+    state: State<'_, AppState>,
+) -> Result<RemotePlaylist, String> {
+    match state
+        .remote
+        .request(bounded_playlist_request(ClientRequest::PublishPlaylist {
+            playlist,
+            suggest_tags: suggest_tags.unwrap_or(false),
+        })?)
+        .await?
+    {
+        ServerResponse::Playlist { playlist } => Ok(playlist),
+        response => Err(unexpected_response(&response)),
+    }
+}
+
+/// Forget a playlist the computer holds and has never published.
+#[tauri::command]
+async fn remote_delete_playlist(
+    author: String,
+    playlist_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    match state
+        .remote
+        .request(ClientRequest::DeletePlaylist {
+            author,
+            playlist_id,
+        })
+        .await?
+    {
+        ServerResponse::PlaylistRemoved => Ok(()),
+        response => Err(unexpected_response(&response)),
+    }
+}
+
+/// Take a published playlist back off the computer's relays.
+#[tauri::command]
+async fn remote_withdraw_playlist(
+    playlist_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    match state
+        .remote
+        .request(ClientRequest::WithdrawPlaylist { playlist_id })
+        .await?
+    {
+        ServerResponse::PlaylistRemoved => Ok(()),
+        response => Err(unexpected_response(&response)),
+    }
+}
+
 #[tauri::command]
 async fn cached_library(state: State<'_, AppState>) -> Result<OfflineLibrary, String> {
     state.remote.offline_library().await
@@ -2648,6 +2875,15 @@ pub fn run() {
             pair_desktop,
             forget_desktop,
             remote_library,
+            remote_library_by_ids,
+            remote_playlists,
+            remote_playlist,
+            remote_playlists_containing,
+            remote_new_playlist_id,
+            remote_save_playlist,
+            remote_publish_playlist,
+            remote_delete_playlist,
+            remote_withdraw_playlist,
             cached_library,
             remote_covers,
             remote_playback_state,
@@ -2677,6 +2913,73 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A playlist is edited on a phone by sending the whole of it, so the one
+    /// size the phone can get wrong is its own: an edit too large to travel in a
+    /// control frame. The refusal names the real problem instead of leaving the
+    /// computer to answer with a protocol error the person cannot act on.
+    #[test]
+    fn a_playlist_too_large_for_one_frame_is_refused_here() {
+        let playlist = |members: Vec<napstr_remote_protocol::RemotePlaylistTrack>| RemotePlaylist {
+            playlist_id: "77abf082-7075-4d36-afe2-e9710ac6b33c".into(),
+            title: "rock".into(),
+            author: String::new(),
+            display_name: String::new(),
+            artist: String::new(),
+            mbid: String::new(),
+            image: String::new(),
+            tags: String::new(),
+            private: false,
+            published: false,
+            updated_at: 0,
+            total: members.len(),
+            tracks: members,
+        };
+        let member = |position: u32, hint: &str| napstr_remote_protocol::RemotePlaylistTrack {
+            position,
+            file_id: format!("{position:064x}"),
+            title: hint.to_string(),
+            artist: hint.to_string(),
+            album: hint.to_string(),
+        };
+        // Hints of an ordinary length always fit, even with the playlist full.
+        let ordinary = playlist(
+            (1..=MAX_PLAYLIST_MEMBERS as u32)
+                .map(|position| member(position, "Enter Sandman"))
+                .collect(),
+        );
+        assert!(
+            bounded_playlist_request(ClientRequest::SavePlaylist {
+                playlist: ordinary.clone()
+            })
+            .is_ok(),
+            "a full playlist of ordinary hints has to be editable from a phone"
+        );
+        // Hints at their maximum length are what makes a save too large - three
+        // of them per member, 500 members - and the answer has to say so rather
+        // than fail as an unexplained protocol error.
+        let longest = "t".repeat(256);
+        let enormous = playlist(
+            (1..=MAX_PLAYLIST_MEMBERS as u32)
+                .map(|position| member(position, &longest))
+                .collect(),
+        );
+        let refusal = bounded_playlist_request(ClientRequest::PublishPlaylist {
+            playlist: enormous,
+            suggest_tags: false,
+        })
+        .unwrap_err();
+        assert!(refusal.contains("too large"), "{refusal}");
+        // Over the member limit is a different refusal, and it names the limit.
+        let over = playlist(
+            (1..=MAX_PLAYLIST_MEMBERS as u32 + 1)
+                .map(|position| member(position, "Enter Sandman".into()))
+                .collect(),
+        );
+        let refusal = bounded_playlist_request(ClientRequest::SavePlaylist { playlist: over })
+            .unwrap_err();
+        assert!(refusal.contains(&MAX_PLAYLIST_MEMBERS.to_string()), "{refusal}");
+    }
 
     /// The QR the host draws has to survive the sanitiser, and nothing that
     /// could run in this page may.

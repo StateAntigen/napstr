@@ -99,8 +99,17 @@ export type PlaybackCommand =
   | { type: 'volume'; percent: number }
   | { type: 'repeat'; mode: RemoteRepeat }
   | { type: 'shuffle'; enabled: boolean }
-  /** Play one track, with the list the phone was showing as the queue. */
-  | { type: 'playTrack'; fileId: string; queue: string[] };
+  /**
+   * Take playback over from the computer: it stops, and answers with exactly
+   * what it was doing, queue and all, so this phone can carry on from there.
+   */
+  | { type: 'handoff' }
+  /**
+   * Play one track, with the list the phone was showing as the queue.
+   * `positionMs` is where to start inside the track, which is how a handover
+   * resumes rather than restarting.
+   */
+  | { type: 'playTrack'; fileId: string; queue: string[]; positionMs?: number };
 
 export type RemotePlaybackState = {
   active: boolean;
@@ -114,12 +123,95 @@ export type RemotePlaybackState = {
   volume: number;
   queueLen: number;
   queueIndex: number;
+  /**
+   * The computer's own record of the file it is playing, when it holds it.
+   * Fetching the audio needs the real record's size, format and MIME, so a
+   * track named by title alone could be shown here but never played.
+   */
+  track?: RemoteTrack | null;
+  /**
+   * File ids of the computer's queue, in its order. Only the answer to a
+   * handoff carries them: a queue is far too big to repeat on every poll.
+   */
+  queue?: string[];
   repeat: RemoteRepeat;
   shuffle: boolean;
   /** True while a phone has driven the host recently. */
   remoteControl: boolean;
   error: string;
   updatedAt: number;
+};
+
+/** What a playlist is called and who published it, without its members. */
+export type RemotePlaylistSummary = {
+  playlistId: string;
+  title: string;
+  /** Author of a public playlist; empty for one only this computer holds. */
+  author: string;
+  displayName: string;
+  /** The picture the playlist names, as a file id, or empty when it has none. */
+  image: string;
+  /**
+   * The file the playlist opens with, so the row can draw that album's cover.
+   * Only the id travels: the artist and album it is drawn from come off the
+   * library, which answers for many file ids at once. Empty while the playlist
+   * names nothing.
+   */
+  firstFileId: string;
+  trackCount: number;
+  /** True when it is private, so it only ever arrives from its own computer. */
+  private: boolean;
+  /** True once the coordinate has a revision the relays can answer with. */
+  published: boolean;
+  updatedAt: number;
+};
+
+/** A playlist named by its coordinate: the author and the id together. */
+export type RemotePlaylistCoordinate = {
+  author: string;
+  playlistId: string;
+};
+
+/** A page of playlist names, which is what a browse costs. */
+export type PlaylistPage = {
+  playlists: RemotePlaylistSummary[];
+  total: number;
+};
+
+/** One member of a playlist, in the order the playlist puts it in. */
+export type RemotePlaylistTrack = {
+  /** Where it sits in the playlist. The first member is 1. */
+  position: number;
+  fileId: string;
+  /** Display hints, which a catalogue entry always wins over. */
+  title: string;
+  artist: string;
+  album: string;
+};
+
+/** A playlist and one page of its members. */
+export type RemotePlaylist = {
+  playlistId: string;
+  title: string;
+  author: string;
+  displayName: string;
+  /** Album artist and release-group MBID, when it describes one release. */
+  artist: string;
+  mbid: string;
+  /** The picture it names, as a file id, or empty when it has none. */
+  image: string;
+  /**
+   * The author's own search words, comma-separated in the shape a catalogue
+   * entry uses. These are the author's choice and outrank anything a client
+   * would suggest, including the choice of having none.
+   */
+  tags: string;
+  private: boolean;
+  published: boolean;
+  updatedAt: number;
+  tracks: RemotePlaylistTrack[];
+  /** Members the whole playlist names, so a page says how many are still to come. */
+  total: number;
 };
 
 /** A read-only pairing code, minted by the computer, for another device. */

@@ -699,13 +699,16 @@ discriminator. Defined requests are:
 ```json
 {"type":"pair","token":"<token>","deviceName":"Napstrfy on Android phone"}
 {"type":"library","query":"metallica","offset":0,"limit":100}
+{"type":"libraryByIds","fileIds":["<fileId>","<fileId>"]}
 {"type":"search","query":"enter sandman"}
 {"type":"requestDownload","fileId":"<fileId>","sourcePubkeys":["<Nostr pubkey>"],"destinationFolder":"<optional audiobook folder>"}
 {"type":"transfers"}
 {"type":"fetchAudio","fileId":"<fileId>"}
 {"type":"available","fileIds":["<fileId>","<fileId>"]}
 {"type":"albumCovers","keys":["<artist|album>"]}
-{"type":"playback","command":{"type":"playTrack","fileId":"<fileId>","queue":["<fileId>"]}}
+{"type":"playlists","offset":0,"limit":100}
+{"type":"playlist","playlistId":"<playlistId>","offset":0,"limit":100}
+{"type":"playback","command":{"type":"playTrack","fileId":"<fileId>","queue":["<fileId>"],"positionMs":0}}
 {"type":"playbackState"}
 {"type":"status"}
 {"type":"ping"}
@@ -722,17 +725,26 @@ after reconnecting to reconcile its verified offline audio cache. A companion
 MUST preserve cached files when paired with an older desktop that does not
 support this request.
 
+`libraryByIds` answers with the catalogue records for particular file ids, in
+the order asked for, and accepts at most 100 of them per request: every field of
+every track may be at its maximum length, so a larger page could not be answered
+inside one control frame. File ids the desktop does not hold are omitted rather
+than refused, which is how a companion learns that a queue or a playlist has
+lost a member. This is the request that turns the file ids a handoff or a
+playlist carries into tracks a companion can show and play.
+
 `destinationFolder` is optional and is used for audiobook chapters. The desktop
 accepts only one sanitized path component and stores it beneath
 `Napstr/Audiobooks/`; it never accepts an absolute path or nested path from the
 companion. Omitting it keeps the normal music destination at the Napstr-folder
 root.
 
-Responses have `type` values `paired`, `library`, `search`, `status`,
-`downloadRequested`, `transfers`, `audioReady`, `available`, `pong`, or `error`. Track
-objects contain `fileId`, `filename`, `title`, `artist`, `album`, `format`,
-`mime`, `size`, `tags`, `local`, and a `sources` array whose entries contain
-only `pubkey` and `displayName`.
+Responses have `type` values `paired`, `library`, `libraryByIds`, `search`,
+`status`, `downloadRequested`, `transfers`, `audioReady`, `available`,
+`playlists`, `playlist`, `pong`, or `error`. Track objects contain `fileId`,
+`filename`, `title`, `artist`, `album`, `format`, `mime`, `size`, `tags`,
+`local`, and a `sources` array whose entries contain only `pubkey` and
+`displayName`.
 
 The lightweight `status` response contains `libraryRevision`, a monotonically
 increasing local-library revision. A companion MAY poll it and should reload
@@ -750,21 +762,36 @@ invalidated" rather than as a revision of zero.
 
 `playback` drives the desktop's own player, and only a pairing with write access
 may send it. Its `command.type` values are `play`, `pause`, `toggle`, `stop`,
-`next`, `previous`, `seek` (`positionMs`), `volume` (`percent`, 0 to 100),
-`repeat` (`mode` of `off`, `all` or `one`), `shuffle` (`enabled`), and
+`handoff`, `next`, `previous`, `seek` (`positionMs`), `volume` (`percent`, 0 to
+100), `repeat` (`mode` of `off`, `all` or `one`), `shuffle` (`enabled`), and
 `playTrack`. Both `playback` and `playbackState` answer with a `playback`
 response carrying the host's own state, which includes its `queueLen`,
-`queueIndex`, `repeat` and `shuffle`.
+`queueIndex`, `repeat` and `shuffle`, and its `track`: the catalogue record of
+the file it is playing, when this desktop holds it. A companion handed the
+`track` can fetch the audio itself, which is what makes taking playback over
+possible at all; one told only a title could show the track and never play it.
 
 `playTrack` is how a companion plays a chosen track on the desktop instead of on
-itself. `fileId` is the track to begin on and `queue` is the list the companion
-was showing, in order, at most 200 entries. The desktop adopts that list as its
+itself. `fileId` is the track to begin on, `queue` is the list the companion was
+showing, in order, at most 200 entries, and `positionMs` is where to start inside
+that track, so handing playback over resumes at the second the other device had
+reached rather than starting the track again. The desktop adopts the list as its
 queue, so "next" goes where the companion would have gone, but it plays only the
 entries it actually holds — exactly as it does for its own search results — and
 refuses a request whose track it does not have rather than playing something
 else. Commands the native player can carry out alone are applied directly;
-`next`, `previous`, `repeat`, `shuffle` and `playTrack` are handed to the
-desktop's window, because only the window knows the queue.
+`next`, `previous`, `repeat`, `shuffle`, `playTrack` and `handoff` are handed to
+the desktop's window, because only the window knows the queue.
+
+`handoff` is how a companion takes playback over from the desktop. One request
+stops the desktop's player and answers with what it was doing as it stopped: the
+state above, with `track` and with `queue` — the file ids of the desktop's queue,
+in its order, which every other answer leaves empty because a queue is far too
+big to repeat on every poll. Asking for the state and then asking the desktop to
+stop would be two requests, and between them the desktop may move on to the next
+track by itself and hand over the wrong one. The desktop's own queue survives a
+handoff, so `next` still means what it meant before; a companion MUST NOT read
+`stop` or `handoff` as the end of the queue.
 
 For `fetchAudio`, an `audioReady` control frame is immediately followed on the
 same receive stream by exactly `track.size` raw bytes and then stream finish.
@@ -773,6 +800,47 @@ currently selected Napstr folder. The phone writes to a temporary cache file,
 MUST reject excess or truncated bytes, and MUST verify that the complete
 SHA-256 digest equals `track.fileId` before playback. All other responses end
 after their control frame.
+
+## Playlists over the companion protocol
+
+A playlist is a named, ordered list of file ids, and this protocol carries one as
+a name plus a page of members. `playlists` lists what the desktop can see, newest
+first, without any members; `playlist` answers with one playlist and up to 100 of
+its members in `position` order, named by its coordinate — the author and the id
+this desktop reported — because an id is chosen by its author and two authors may
+choose the same one. A member carries its file id, its position and up to three
+display hints. The hints exist so that a member whose catalogue entry cannot be
+found still renders as something a person recognises; they are never
+authoritative, a catalogue record always wins, and a member named by its id alone
+is still a member. A member the desktop no longer holds is still listed, because
+the order is part of what a playlist means. A playlist also carries the author's
+own search tags, which are what it is published to be found by; a companion shows
+them as the author's and does not add suggestions of its own to them.
+
+A public playlist is published as a kind `30425` event whose `napstr-playlist`
+marker tag is mandatory in both directions: that kind is co-occupied by other
+protocols, so a query without the marker answers about their events. The desktop
+is the only side that talks to a relay, and it validates every event before it
+offers one. The format is specified in
+[NIP-NAPSTR-PLAYLIST.md](NIP-NAPSTR-PLAYLIST.md).
+
+A private playlist stays on the two devices that are its owner's: the desktop
+stores it, and a paired companion is served it over the same encrypted Iroh
+channel as everything else. A private playlist MUST NOT be published to a relay
+in any form — not as kind `30425`, and not as NIP-78 application data either. A
+relay always sees a coordinate, an event size and an edit timestamp, even when
+the body is encrypted, and a predictable coordinate would publish the existence
+and the scale of what a private playlist exists to conceal. Nothing is lost by
+withholding it: a companion needs no relay copy, because its own desktop is the
+source. `private` on a playlist summary or playlist is how a companion tells a
+private playlist from a published one.
+
+Playing one needs no request of its own. A companion asks for the members,
+resolves the file ids it wants with `libraryByIds`, and hands the resulting list
+over as a `queue` like any other: on itself, or to the desktop with `playTrack`.
+Members the desktop does not hold are what `available` and `requestDownload` are
+for, so a companion MAY ask the desktop to fetch them — which is what lets a
+playlist be played end to end on a computer that has never seen its tracks.
 
 ## Reports and local blocking
 

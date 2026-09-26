@@ -22,7 +22,7 @@
   import appIcon from '../src-tauri/icons/icon.png';
   import { artworkHue, coverFor, coverKey, invalidateCoverNegatives, loadFullCover, preloadArtwork, type AlbumCover } from './lib/artwork';
   import { reportReasons } from './lib/types';
-  import type { AudiobookLibraryPage, CachedAudio, CompanionStatus, CoverReport, LibraryPage, PlaybackCommand, PodcastDownload, PodcastEpisode, PodcastFeed, ReadOnlyTicketOffer, RemoteAudiobook, RemoteAudiobookSummary, RemotePlaybackState, RemoteRepeat, RemoteTrack, RemoteTransfer, ReportReason } from './lib/types';
+  import type { AudiobookLibraryPage, CachedAudio, CompanionStatus, CoverReport, LibraryPage, PlaybackCommand, PlaylistPage, PodcastDownload, PodcastEpisode, PodcastFeed, ReadOnlyTicketOffer, RemoteAudiobook, RemoteAudiobookSummary, RemotePlaybackState, RemotePlaylist, RemotePlaylistCoordinate, RemotePlaylistSummary, RemotePlaylistTrack, RemoteRepeat, RemoteTrack, RemoteTransfer, ReportReason } from './lib/types';
 
   const musicChips = ['Rock', 'Soundtrack', 'Punk', 'Folk', 'Upbeat'];
   const musicHistoryKey = 'napstrfy-played-albums';
@@ -55,15 +55,43 @@
   };
   type ArtistShelf = { name: string; representative: RemoteTrack; count: number };
   type PlayedAlbum = { key: string; artist: string; album: string };
+  /** A track that has been played on this phone, for the sheet's second tab. */
+  type PlayedTrack = { fileId: string; title: string; artist: string; album: string };
   const podcastGenres = ['Comedy', 'News', 'True Crime', 'Society & Culture', 'Technology', 'History', 'Business', 'Science', 'Arts', 'Sports', 'Education', 'Music'];
   const likedMusicKey = 'napstrfy-liked-music';
+  const playedTracksKey = 'napstrfy-played-tracks';
+  /** Tracks one "recently played" list holds before the oldest falls off. */
+  const PLAYED_TRACKS_KEPT = 100;
+  /** Tracks one page of the add sheet's full list carries. */
+  const ADD_PAGE_SIZE = 50;
   const likedPodcastsKey = 'napstrfy-liked-podcasts';
-  type AppTab = 'music' | 'search' | 'podcasts' | 'audiobooks';
+  type AppTab = 'music' | 'search' | 'playlists' | 'podcasts' | 'audiobooks';
   /** Repeating is a choice of three, and shuffling is independent of it. */
   type LoopMode = 'off' | 'all' | 'one';
   const LOOP_MODES: LoopMode[] = ['off', 'all', 'one'];
   /** Mirrors `MAX_PLAY_QUEUE` on the host: one request carries the whole list. */
   const MAX_DESKTOP_QUEUE = 200;
+  /** Mirrors `MAX_PLAYLIST_PAGE` on the host: the most members one answer carries. */
+  const PLAYLIST_PAGE = 100;
+  /** Mirrors `MAX_PLAYLIST_MEMBERS`: the spec's limit on a playlist's members. */
+  const MAX_PLAYLIST_MEMBERS = 500;
+  /** Mirrors `MAX_TRACKS_BY_ID`: the most file ids one resolve can carry. */
+  const MAX_TRACKS_BY_ID = 100;
+  /**
+   * The glyphs on a playlist's tool row.
+   *
+   * Named rather than written into the markup, because a stray `<` in a template
+   * is a tag rather than a character.
+   */
+  const PLAYLIST_TOOL_GLYPH = { add: '+', edit: '☰', sort: '</>' };
+  /**
+   * Which of the open playlist's screens is showing.
+   *
+   * One draft is held for all three, so opening a playlist, editing it and
+   * renaming it are the same object being looked at three ways rather than
+   * three copies that could disagree.
+   */
+  type PlaylistMode = 'view' | 'edit' | 'details';
   const LOOP_LABELS: Record<LoopMode, string> = {
     off: 'Repeat off',
     all: 'Repeat all',
@@ -234,6 +262,73 @@
   let albumGlow = $derived(albumView ? albumView.thumb || albumView.art : '');
   /** File ids held in this phone's audio cache, for the storage badge. */
   let cachedFileIds = $state<Set<string>>(new Set());
+
+  /**
+   * Playlists live on the Napstr computer: this phone lists them, opens one a
+   * page of members at a time, and writes edits back through the companion
+   * channel. Nothing about a playlist is stored here except what a screen is
+   * holding, so two devices never disagree about a playlist - they both read the
+   * one the computer keeps.
+   */
+  let playlists = $state<RemotePlaylistSummary[]>([]);
+  let playlistsLoading = $state(false);
+  let playlistsError: string | Message = $state('');
+  /** The playlist the editor is holding, or null while the list is showing. */
+  let playlistDraft = $state<RemotePlaylist | null>(null);
+  /** The members in the order the list shows, which is the order that is saved. */
+  let playlistMembers = $state<RemotePlaylistTrack[]>([]);
+  let playlistSaving = $state(false);
+  let playlistError: string | Message = $state('');
+  let playlistNotice: string | Message = $state('');
+  /**
+   * The author's answer to "suggest search words from the title?".
+   *
+   * An event cannot carry the difference between "no" and "not asked", both of
+   * which leave the same empty word list, so the answer is remembered here for
+   * as long as the playlist is open rather than being guessed at publish time.
+   */
+  let playlistSuggestTags = $state(true);
+  /**
+   * The sheets the playlist screens put over themselves.
+   *
+   * `showPlaylistAdd` lists what could go into the open playlist - the whole
+   * library a page at a time, what this phone has played, and what it has liked -
+   * and `showPlaylistSort` reorders what the playlist already names. Both write
+   * through to the computer at once, because each one is a single finished edit
+   * rather than the start of a draft.
+   */
+  let playlistMode = $state<PlaylistMode>('view');
+  let showPlaylistAdd = $state(false);
+  let showPlaylistSort = $state(false);
+  /** Which list the add sheet is showing, and the pages of the full one. */
+  type AddTab = 'songs' | 'recent' | 'liked';
+  let addTab = $state<AddTab>('songs');
+  let addTracks = $state<RemoteTrack[]>([]);
+  let addTotal = $state(0);
+  let addLoading = $state(false);
+  let playedTracks = $state<PlayedTrack[]>(readPlayedTracks());
+  /** The delete button asks first: one press should not lose a playlist. */
+  let showPlaylistDelete = $state(false);
+  /**
+   * The track a "add to playlist" picker was opened for, and the playlists that
+   * already hold it.
+   *
+   * Membership arrives as coordinates, so the key here is the same coordinate
+   * the picker toggles: a private playlist and a published one may share an id,
+   * and only the pair says which is which.
+   */
+  let pickerTrack = $state<RemoteTrack | null>(null);
+  let pickerMembership = $state<Set<string>>(new Set());
+  let pickerBusy = $state('');
+  let pickerLoading = $state(false);
+  let pickerError: string | Message = $state('');
+  /**
+   * The track each list row draws its cover from, by file id.
+   *
+   * The list carries the file a playlist opens with and nothing more, so these
+   * are resolved from the library when the list is read.
+   */
+  let playlistRowTracks = $state<Record<string, RemoteTrack>>({});
   let showSettings = $state(false);
   /** The computer's player, drawn by the same drawer as this phone's. */
   let remoteState = $state<RemotePlaybackState | null>(null);
@@ -278,6 +373,15 @@
    * choosing the source again costs one tap.
    */
   let playbackTarget = $state<PlaybackTarget>('phone');
+  /**
+   * A handover to the computer, waiting on it to fetch a track it does not have
+   * yet. This phone keeps playing until the file lands, because a handover that
+   * arrives late is still worth making and a silence in the meantime is not.
+   */
+  let pendingHandoff = $state<{ track: RemoteTrack; queue: RemoteTrack[]; positionMs: number } | null>(null);
+  let pendingHandoffTimer = 0;
+  /** How many times a waiting handover has checked, so it can give up. */
+  let pendingHandoffAttempts = 0;
   let showSourceOptions = $state(false);
   /** The track's own code, drawn when that row of the track menu is chosen. */
   let showTrackCode = $state(false);
@@ -543,6 +647,29 @@
     backPresses += 1;
     if (showReport) {
       showReport = false;
+      return;
+    }
+    // The playlist screens and the sheets over them: one press steps back one
+    // screen, and the list of playlists is the last step before the tab.
+    if (showPlaylistDelete) {
+      showPlaylistDelete = false;
+      return;
+    }
+    if (showPlaylistAdd) {
+      showPlaylistAdd = false;
+      return;
+    }
+    if (showPlaylistSort) {
+      showPlaylistSort = false;
+      return;
+    }
+    if (pickerTrack) {
+      closePlaylistPicker();
+      return;
+    }
+    if (playlistDraft) {
+      if (playlistMode === 'view') closePlaylistEditor();
+      else showPlaylistView();
       return;
     }
     // The source picker standing on its own, rather than inside the track menu.
@@ -1107,6 +1234,825 @@
     if (audiobooks.length === 0) await loadAudiobooks();
   }
 
+  /**
+   * The playlist page, and the editor that opens over it.
+   *
+   * Editing is not local: a playlist the computer holds is the playlist, so
+   * every write goes there and the answer is what this screen keeps. That keeps
+   * a phone and the desktop window from ever holding two versions of one
+   * playlist, which is the failure mode a second copy would introduce.
+   */
+  async function showPlaylists() {
+    activeTab = 'playlists';
+    playlistDraft = null;
+    closePlaylistPicker();
+    await refreshPlaylists();
+  }
+
+  async function refreshPlaylists() {
+    playlistsLoading = true;
+    playlistsError = '';
+    try {
+      const page = await invoke<PlaylistPage>('remote_playlists', { offset: 0, limit: 100 });
+      playlists = page.playlists;
+      void resolvePlaylistRowArt(page.playlists);
+    } catch (nextError) {
+      playlistsError = String(nextError);
+    } finally {
+      playlistsLoading = false;
+    }
+  }
+
+  /**
+   * The artwork a playlist row draws, resolved from the file it opens with.
+   *
+   * The list carries only that file id - a page of names has to fit in one
+   * control frame - so the artist and album a cover is looked up by come off the
+   * library, which answers for many file ids in one go. A member the computer
+   * does not hold leaves its row on the placeholder, which is the same thing it
+   * gets for a playlist that names nothing yet.
+   */
+  async function resolvePlaylistRowArt(rows: RemotePlaylistSummary[]) {
+    const resolved = await resolveTracks(rows.map((row) => row.firstFileId).filter(Boolean));
+    if (Object.keys(resolved).length > 0) playlistRowTracks = { ...playlistRowTracks, ...resolved };
+  }
+
+  /**
+   * One playlist with all of its members.
+   *
+   * The host answers a page at a time, because a playlist may name 500 members
+   * and one frame has to carry the answer; the editor is the one place that
+   * needs the whole list, so it is the one place that pages for it.
+   */
+  async function loadPlaylist(author: string, playlistId: string): Promise<RemotePlaylist> {
+    const first = await invoke<RemotePlaylist>('remote_playlist', {
+      author, playlistId, offset: 0, limit: PLAYLIST_PAGE
+    });
+    const members = [...first.tracks];
+    while (members.length < first.total && members.length < MAX_PLAYLIST_MEMBERS) {
+      const next = await invoke<RemotePlaylist>('remote_playlist', {
+        author, playlistId, offset: members.length, limit: PLAYLIST_PAGE
+      });
+      if (next.tracks.length === 0) break;
+      members.push(...next.tracks);
+    }
+    return { ...first, tracks: members, total: members.length };
+  }
+
+  /**
+   * Open a playlist to look at it.
+   *
+   * Clicking a row shows the playlist, the way clicking an album shows the
+   * album: what it holds, in order, with the handful of things one actually does
+   * to a playlist along the top. Editing is one of those things rather than what
+   * happens by default, because most of the time a playlist is opened it is to
+   * see it or to play it.
+   */
+  async function openPlaylistView(summary: { playlistId: string; author: string; title: string }) {
+    closePlaylistPicker();
+    playlistsError = '';
+    playlistError = '';
+    try {
+      const loaded = await loadPlaylist(summary.author, summary.playlistId);
+      playlistDraft = loaded;
+      playlistMembers = [...loaded.tracks];
+      playlistMode = 'view';
+      // A playlist that already carries words of its own has answered the
+      // suggestion question already: asking again would put our words back.
+      playlistSuggestTags = loaded.tags.trim() === '';
+      playlistNotice = '';
+      void resolveMemberTracks();
+    } catch (nextError) {
+      playlistsError = String(nextError);
+    }
+  }
+
+  async function openPlaylistEditor(summary: { playlistId: string; author: string; title: string }) {
+    closePlaylistPicker();
+    playlistsError = '';
+    try {
+      // A playlist already open is the same object: the editor is a way of
+      // looking at the draft, not a second copy of the playlist.
+      if (playlistDraft?.playlistId !== summary.playlistId) {
+        const loaded = await loadPlaylist(summary.author, summary.playlistId);
+        playlistDraft = loaded;
+        playlistMembers = [...loaded.tracks];
+        playlistSuggestTags = loaded.tags.trim() === '';
+        void resolveMemberTracks();
+      }
+      playlistMode = 'edit';
+      playlistError = '';
+      playlistNotice = '';
+    } catch (nextError) {
+      playlistsError = String(nextError);
+    }
+  }
+
+  /** The playlist's own description: what it is called, and whether it is out. */
+  function openPlaylistDetails() {
+    playlistMode = 'details';
+    playlistError = '';
+    playlistNotice = '';
+  }
+
+  /** Back to the playlist itself, keeping whatever the draft is holding. */
+  function showPlaylistView() {
+    playlistMode = 'view';
+    showPlaylistAdd = false;
+    showPlaylistSort = false;
+  }
+
+  /** An editor holding a playlist that does not exist anywhere yet. */
+  async function newPlaylist() {
+    playlistsError = '';
+    try {
+      playlistDraft = {
+        playlistId: await invoke<string>('remote_new_playlist_id'),
+        title: '',
+        author: '',
+        displayName: '',
+        artist: '',
+        mbid: '',
+        image: '',
+        tags: '',
+        private: false,
+        published: false,
+        updatedAt: 0,
+        tracks: [],
+        total: 0
+      };
+      playlistMembers = [];
+      playlistSuggestTags = true;
+      playlistError = '';
+      playlistNotice = '';
+      // A playlist with no name cannot be saved at all, so a blank one opens
+      // where it can be given one rather than on a screen whose Save button
+      // starts out refusing to work.
+      playlistMode = 'details';
+    } catch (nextError) {
+      playlistsError = String(nextError);
+    }
+  }
+
+  function closePlaylistEditor() {
+    playlistDraft = null;
+    playlistMembers = [];
+    playlistError = '';
+    playlistNotice = '';
+    playlistMode = 'view';
+    showPlaylistAdd = false;
+    showPlaylistSort = false;
+    showPlaylistDelete = false;
+  }
+
+  /** The draft as the computer stores it: positions are the order on screen. */
+  function playlistForHost(): RemotePlaylist {
+    const tracks = playlistMembers.map((member, index) => ({ ...member, position: index + 1 }));
+    return { ...(playlistDraft as RemotePlaylist), tracks, total: tracks.length };
+  }
+
+  /**
+   * One member, as a playlist stores it: the file id, plus the hints to draw it
+   * with when this phone has no catalogue entry for the file.
+   */
+  function memberFromTrack(track: RemoteTrack, position: number): RemotePlaylistTrack {
+    return {
+      position,
+      fileId: track.fileId,
+      // The playlist's own description of the track, which is all there is to
+      // go on when this phone does not hold the file: a hint, always, and one
+      // a catalogue entry overrides the moment there is one.
+      title: track.title || track.filename,
+      artist: track.artist,
+      album: track.album
+    };
+  }
+
+  /**
+   * A member drawn as a track, for the pieces that ask for one.
+   *
+   * A member is a file id and some hints rather than a catalogue entry, so this
+   * is what a row falls back on when the library cannot answer for the file. It
+   * is never `local`: a file the computer held would have been resolved, and a
+   * hint is not an answer about where anything is.
+   */
+  function trackFromHints(fileId: string, title: string, artist: string, album: string): RemoteTrack {
+    return {
+      fileId,
+      filename: title,
+      title,
+      artist,
+      album,
+      format: '',
+      mime: '',
+      size: 0,
+      tags: '',
+      local: false,
+      sources: []
+    };
+  }
+
+  function trackFromMember(member: RemotePlaylistTrack): RemoteTrack {
+    return trackFromHints(member.fileId, member.title, member.artist, member.album);
+  }
+
+  /** The track a list row draws its cover from, once the library has answered. */
+  function playlistRowTrack(summary: RemotePlaylistSummary): RemoteTrack | null {
+    return playlistRowTracks[summary.firstFileId] ?? null;
+  }
+
+  /**
+   * The catalogue entry behind a member, once the library has answered.
+   *
+   * Rows draw the same artwork and the same where-is-it badge from this, so a
+   * member looks like the track it is rather than like a name a playlist wrote
+   * down. The hints stand in only when nothing knows the file.
+   */
+  function memberTrack(member: RemotePlaylistTrack): RemoteTrack {
+    return playlistRowTracks[member.fileId] ?? trackFromMember(member);
+  }
+
+  /**
+   * Ask the library about file ids, and keep what it answers.
+   *
+   * One request per hundred, and nothing asked twice: a member that a screen has
+   * already resolved is resolved for every screen, which is what keeps a list of
+   * five hundred members from being five hundred questions.
+   */
+  async function resolveTracks(fileIds: string[]): Promise<Record<string, RemoteTrack>> {
+    const wanted = [...new Set(fileIds)].filter((fileId) => fileId && !playlistRowTracks[fileId]);
+    const resolved: Record<string, RemoteTrack> = {};
+    for (let offset = 0; offset < wanted.length; offset += MAX_TRACKS_BY_ID) {
+      for (const track of await tracksByIds(wanted.slice(offset, offset + MAX_TRACKS_BY_ID))) {
+        resolved[track.fileId] = track;
+      }
+    }
+    return resolved;
+  }
+
+  /** Resolve the members of the open playlist, so its rows can be drawn in full. */
+  async function resolveMemberTracks() {
+    if (playlistMembers.length === 0) return;
+    const resolved = await resolveTracks(playlistMembers.map((member) => member.fileId));
+    if (Object.keys(resolved).length > 0) playlistRowTracks = { ...playlistRowTracks, ...resolved };
+  }
+
+  /**
+   * The author's words, as the chips the details screen shows them in.
+   *
+   * Stored as the comma-separated list the catalogue and the NIP use, and edited
+   * as one chip per word: a word is added, removed or taken back as a whole, so
+   * a comma is punctuation rather than something to type around.
+   */
+  let playlistTagDraft = $state('');
+
+  function playlistTagList(): string[] {
+    const words = (playlistDraft?.tags ?? '').split(',').map((word) => word.trim()).filter(Boolean);
+    return [...new Set(words)];
+  }
+
+  function addPlaylistTag() {
+    if (!playlistDraft) return;
+    const word = playlistTagDraft.trim().replace(/,+$/, '').trim();
+    playlistTagDraft = '';
+    if (!word) return;
+    const words = playlistTagList();
+    if (words.includes(word)) return;
+    playlistDraft.tags = [...words, word].join(', ');
+  }
+
+  function removePlaylistTag(word: string) {
+    if (!playlistDraft) return;
+    playlistDraft.tags = playlistTagList().filter((tag) => tag !== word).join(', ');
+  }
+
+  function onPlaylistTagKey(event: KeyboardEvent) {
+    if (event.key === 'Enter' || event.key === ',') {
+      event.preventDefault();
+      addPlaylistTag();
+      return;
+    }
+    // A box that is already empty takes the last word back, which is how a chip
+    // is deleted when the pointer is nowhere near it.
+    if (event.key === 'Backspace' && playlistTagDraft === '') {
+      const words = playlistTagList();
+      if (words.length > 0) removePlaylistTag(words[words.length - 1]);
+    }
+  }
+
+  function addPlaylistMember(track: RemoteTrack) {
+    if (playlistMembers.some((member) => member.fileId === track.fileId)) return;
+    playlistMembers = [...playlistMembers, memberFromTrack(track, playlistMembers.length + 1)];
+  }
+
+  /**
+   * Append a track to the open playlist and write it down at once.
+   *
+   * The sheets over the playlist are single finished edits rather than the start
+   * of a draft, so each one saves on its own: nothing is left holding an edit the
+   * author has not been told about. A playlist with no name cannot be stored at
+   * all, so that is said here rather than left to the computer to refuse.
+   */
+  async function toggleOpenPlaylistMember(track: RemoteTrack) {
+    if (!playlistDraft) return;
+    if (playlistDraft.title.trim() === '') {
+      playlistError = msg("Give this playlist a name before adding tracks to it");
+      return;
+    }
+    const index = playlistMembers.findIndex((member) => member.fileId === track.fileId);
+    if (index >= 0) removePlaylistMember(index);
+    else playlistMembers = [...playlistMembers, memberFromTrack(track, playlistMembers.length + 1)];
+    await savePlaylist();
+  }
+
+  /** Whether the open playlist already names this file. */
+  function playlistHas(fileId: string) {
+    return playlistMembers.some((member) => member.fileId === fileId);
+  }
+
+  /**
+   * The rows the add sheet is showing.
+   *
+   * The full list is the library, a page at a time; the other two are what this
+   * phone already knows, which is why they answer without asking anybody.
+   */
+  function addRows(): RemoteTrack[] {
+    if (addTab === 'liked') return likedMusic;
+    if (addTab === 'recent') {
+      return playedTracks.map((entry) =>
+        trackFromHints(entry.fileId, entry.title, entry.artist, entry.album)
+      );
+    }
+    return addTracks;
+  }
+
+  function openPlaylistAdd() {
+    showPlaylistAdd = true;
+    addTab = 'songs';
+    void loadAddTracks();
+  }
+
+  function chooseAddTab(tab: AddTab) {
+    addTab = tab;
+    if (tab === 'songs' && addTracks.length === 0) void loadAddTracks();
+  }
+
+  /**
+   * The library, one page at a time, in the order the computer keeps it.
+   *
+   * A library is larger than one frame and larger than one screen, so the sheet
+   * asks for what it is about to show rather than for everything: the end of the
+   * list is where the next page is asked for.
+   */
+  async function loadAddTracks(more = false) {
+    if (addLoading) return;
+    if (more && addTracks.length >= addTotal) return;
+    addLoading = true;
+    playlistError = '';
+    try {
+      const page = await invoke<LibraryPage>('remote_library', {
+        query: '',
+        offset: more ? addTracks.length : 0,
+        limit: ADD_PAGE_SIZE
+      });
+      addTracks = more ? [...addTracks, ...page.tracks] : page.tracks;
+      addTotal = page.total;
+    } catch (nextError) {
+      playlistError = String(nextError);
+    } finally {
+      addLoading = false;
+    }
+  }
+
+  function onAddScroll(event: Event) {
+    if (addTab !== 'songs') return;
+    const box = event.currentTarget as HTMLElement;
+    // A screen ahead of the end is close enough: the next page is in flight by
+    // the time the finger gets there.
+    if (box.scrollTop + box.clientHeight >= box.scrollHeight - 320) void loadAddTracks(true);
+  }
+
+  /**
+   * Reorder the members of the open playlist, then write it down.
+   *
+   * Sorting is applied to what the playlist names rather than to what this phone
+   * happens to hold, so a member it cannot play still keeps its place in the
+   * order the author asked for.
+   */
+  async function sortPlaylist(by: 'title' | 'artist' | 'album' | 'reverse') {
+    showPlaylistSort = false;
+    const wanted = [...playlistMembers];
+    if (by === 'reverse') wanted.reverse();
+    else {
+      wanted.sort((left, right) => {
+        const mine = left[by].trim().toLowerCase();
+        const theirs = right[by].trim().toLowerCase();
+        // A member with nothing to sort by keeps its place at the end rather
+        // than being scattered through the list on every sort.
+        if (!mine && !theirs) return left.position - right.position;
+        if (!mine) return 1;
+        if (!theirs) return -1;
+        return mine.localeCompare(theirs);
+      });
+    }
+    playlistMembers = wanted.map((member, index) => ({ ...member, position: index + 1 }));
+    await savePlaylist();
+  }
+
+  function playlistKey(author: string, playlistId: string) {
+    return `${author}|${playlistId}`;
+  }
+
+  /**
+   * The playlists the picker offers.
+   *
+   * Today every one of them is the computer's, read back the way the Playlists
+   * page reads them. A private playlist belongs on this phone and never on the
+   * computer, so when those live here they are appended at this one point, and
+   * nothing else about the picker has to change.
+   */
+  function pickerRows(): RemotePlaylistSummary[] {
+    return playlists;
+  }
+
+  /**
+   * Open the picker beside a track, and learn which playlists already hold it.
+   *
+   * The list is whatever this phone last read, drawn at once rather than behind
+   * a spinner, and the membership answer comes from one lookup on the computer
+   * rather than from opening every playlist in turn.
+   */
+  async function openPlaylistPicker(track: RemoteTrack) {
+    closeActions();
+    pickerTrack = track;
+    pickerError = '';
+    pickerMembership = new Set();
+    pickerLoading = true;
+    try {
+      const [page, holding] = await Promise.all([
+        invoke<PlaylistPage>('remote_playlists', { offset: 0, limit: PLAYLIST_PAGE }),
+        invoke<RemotePlaylistCoordinate[]>('remote_playlists_containing', { fileId: track.fileId })
+      ]);
+      playlists = page.playlists;
+      pickerMembership = new Set(holding.map((held) => playlistKey(held.author, held.playlistId)));
+    } catch (nextError) {
+      pickerError = String(nextError);
+    } finally {
+      pickerLoading = false;
+    }
+  }
+
+  function closePlaylistPicker() {
+    pickerTrack = null;
+    pickerMembership = new Set();
+    pickerError = '';
+    pickerBusy = '';
+  }
+
+  /**
+   * Add or drop one track in one playlist, without opening it.
+   *
+   * A toggle is one finished edit, so it is written through rather than held as
+   * a draft, and a playlist that has grown past the point of fitting in one
+   * frame is refused by the computer rather than half-saved.
+   */
+  async function togglePlaylistMembership(playlist: RemotePlaylistSummary) {
+    const track = pickerTrack;
+    if (!track) return;
+    const key = playlistKey(playlist.author, playlist.playlistId);
+    const wanted = !pickerMembership.has(key);
+    pickerBusy = key;
+    pickerError = '';
+    try {
+      const loaded = await loadPlaylist(playlist.author, playlist.playlistId);
+      const members = wanted
+        ? [...loaded.tracks, memberFromTrack(track, loaded.tracks.length + 1)]
+        : loaded.tracks
+            .filter((member) => member.fileId !== track.fileId)
+            .map((member, index) => ({ ...member, position: index + 1 }));
+      const saved = await invoke<RemotePlaylist>('remote_save_playlist', {
+        playlist: { ...loaded, tracks: members, total: members.length }
+      });
+      const next = new Set(pickerMembership);
+      if (wanted) next.add(key);
+      else next.delete(key);
+      pickerMembership = next;
+      // The row carries the member count, so the count moves with the edit. A
+      // member is appended, and dropping one renumbers the rest.
+      playlists = playlists.map((row) =>
+        row.author === playlist.author && row.playlistId === playlist.playlistId
+          ? { ...row, trackCount: saved.total, updatedAt: saved.updatedAt }
+          : row
+      );
+      // An open copy of this playlist is now out of date.
+      if (playlistDraft?.playlistId === playlist.playlistId) playlistDraft = saved;
+    } catch (nextError) {
+      pickerError = String(nextError);
+    } finally {
+      pickerBusy = '';
+    }
+  }
+
+  function removePlaylistMember(index: number) {
+    playlistMembers = playlistMembers.filter((_, position) => position !== index);
+  }
+
+  /**
+   * Dragging a row up and down is how a playlist is put in order.
+   *
+   * The rows are the order, so a drag moves the member in the list as it goes
+   * rather than drawing a floating copy over the top: what is under the finger
+   * is the playlist. The offsets are rebased after every step, because the row
+   * itself has just moved by that step and the pointer has not.
+   */
+  let dragIndex = $state(-1);
+  let dragOffset = $state(0);
+  let dragStartY = 0;
+  let dragStep = 56;
+
+  function startMemberDrag(event: PointerEvent, index: number) {
+    if (event.button !== 0) return;
+    // A press on a control belongs to that control: the round minus is inside
+    // the row, and taking a track out is not the first step of moving it.
+    if ((event.target as HTMLElement).closest('button')) return;
+    const handle = event.currentTarget as HTMLElement;
+    dragStep = handle.closest('li')?.getBoundingClientRect().height || 56;
+    dragIndex = index;
+    dragOffset = 0;
+    dragStartY = event.clientY;
+    handle.setPointerCapture(event.pointerId);
+  }
+
+  function moveMemberDrag(event: PointerEvent) {
+    if (dragIndex < 0) return;
+    const steps = Math.round((event.clientY - dragStartY) / dragStep);
+    if (steps !== 0) {
+      const target = Math.max(0, Math.min(playlistMembers.length - 1, dragIndex + steps));
+      if (target !== dragIndex) {
+        const moved = [...playlistMembers];
+        const [member] = moved.splice(dragIndex, 1);
+        moved.splice(target, 0, member);
+        playlistMembers = moved;
+        dragIndex = target;
+        dragStartY += steps * dragStep;
+      }
+    }
+    dragOffset = event.clientY - dragStartY;
+  }
+
+  function endMemberDrag() {
+    if (dragIndex < 0) return;
+    dragIndex = -1;
+    dragOffset = 0;
+    // Renumbered from the top, so the positions in the draft are the order on
+    // screen. Saving is still the thing that writes it down.
+    playlistMembers = playlistMembers.map((member, index) => ({ ...member, position: index + 1 }));
+  }
+
+  /** Write the draft down on the computer. Saving is what makes it exist. */
+  async function savePlaylist(): Promise<boolean> {
+    if (!playlistDraft) return false;
+    playlistSaving = true;
+    playlistError = '';
+    playlistNotice = '';
+    try {
+      playlistDraft = await invoke<RemotePlaylist>('remote_save_playlist', {
+        playlist: playlistForHost()
+      });
+      playlistMembers = [...playlistDraft.tracks];
+      void resolveMemberTracks();
+      playlistNotice = msg("Saved on your computer");
+      return true;
+    } catch (nextError) {
+      playlistError = String(nextError);
+      return false;
+    } finally {
+      playlistSaving = false;
+    }
+  }
+
+  async function publishPlaylist() {
+    if (!playlistDraft) return;
+    playlistSaving = true;
+    playlistError = '';
+    playlistNotice = '';
+    try {
+      playlistDraft = await invoke<RemotePlaylist>('remote_publish_playlist', {
+        playlist: playlistForHost(),
+        suggestTags: playlistSuggestTags
+      });
+      playlistMembers = [...playlistDraft.tracks];
+      playlistNotice = msg("Published to the relays");
+    } catch (nextError) {
+      playlistError = String(nextError);
+    } finally {
+      playlistSaving = false;
+    }
+  }
+
+  /**
+   * Get rid of a playlist.
+   *
+   * A playlist the relays have seen is withdrawn rather than forgotten: deleting
+   * it on the computer alone would leave the published revision standing, and the
+   * next client to look would find a playlist its author believes they threw
+   * away.
+   */
+  async function deletePlaylist(playlist: { playlistId: string; author: string; published: boolean }) {
+    playlistsError = '';
+    showPlaylistDelete = false;
+    try {
+      if (playlist.published) await invoke('remote_withdraw_playlist', { playlistId: playlist.playlistId });
+      else await invoke('remote_delete_playlist', { author: playlist.author, playlistId: playlist.playlistId });
+      if (playlistDraft?.playlistId === playlist.playlistId) closePlaylistEditor();
+      await refreshPlaylists();
+    } catch (nextError) {
+      playlistsError = String(nextError);
+    }
+  }
+
+  /**
+   * The members this phone can actually play, in the order the playlist puts
+   * them.
+   *
+   * A playlist may name files the computer holds and this phone does not, so the
+   * members are resolved before anything is queued: what comes back is what can
+   * be played, and it keeps its order. Nothing is queued for a member the phone
+   * has never fetched, because a queue that stops on a track it cannot open is
+   * worse than a queue that never named it.
+   */
+  async function playlistPlayable(): Promise<RemoteTrack[]> {
+    const playable: RemoteTrack[] = [];
+    const fileIds = playlistMembers.map((member) => member.fileId);
+    for (let offset = 0; offset < fileIds.length; offset += MAX_TRACKS_BY_ID) {
+      const answered = await tracksByIds(fileIds.slice(offset, offset + MAX_TRACKS_BY_ID));
+      playable.push(...answered.filter((track) => track.local));
+    }
+    return playable;
+  }
+
+  /**
+   * Play a playlist, from the top or from a member that was tapped.
+   *
+   * The playlist itself becomes the queue, so what plays after this track is
+   * what the playlist says comes after it rather than the whole library.
+   */
+  async function playPlaylist(member?: RemotePlaylistTrack) {
+    if (!playlistDraft || playlistMembers.length === 0) return;
+    playlistError = '';
+    if (playbackTarget === 'desktop') {
+      const onDesktop = member ?? playlistMembers[0];
+      const resolved = await tracksByIds([onDesktop.fileId]);
+      if (resolved.length > 0) await playOnDesktop(resolved[0]);
+      return;
+    }
+    const playable = await playlistPlayable();
+    if (playable.length === 0) {
+      playlistError = msg("None of this playlist is on this phone yet");
+      return;
+    }
+    const wanted = member ? playable.findIndex((track) => track.fileId === member.fileId) : 0;
+    const index = wanted >= 0 ? wanted : 0;
+    playerQueue = playable;
+    playerQueueLibraryVisible = true;
+    playerIndex = index;
+    selected = playable[index];
+    resetRandomOrder();
+    await playTrack(playable[index]);
+  }
+
+  /** The track menu for one member of the open playlist. */
+  async function openMemberActions(member: RemotePlaylistTrack) {
+    const resolved = await tracksByIds([member.fileId]);
+    if (resolved.length === 0) return;
+    openActions(resolved[0]);
+  }
+
+  /**
+   * The cover the playlist page draws, taken from the member it lists first.
+   *
+   * The thumbnail is stretched and blurred behind the page the way the album
+   * sheet and the player drawer do it, and the full rendition fades in over it,
+   * so the header is a picture from the first frame rather than after a fetch.
+   */
+  let playlistArt = $state('');
+  let playlistThumb = $state('');
+  let playlistArtLoaded = $state('');
+  let playlistArtKey = '';
+
+  $effect(() => {
+    const first = playlistMembers[0];
+    const key = first ? `${first.artist}|${first.album}` : '';
+    if (key === playlistArtKey) return;
+    playlistArtKey = key;
+    playlistArt = '';
+    playlistThumb = '';
+    playlistArtLoaded = '';
+    if (!key || !first) return;
+    void coverFor(trackFromMember(first))
+      .then((cover) => {
+        // A playlist that changed while this was in flight keeps the newer cover.
+        if (playlistArtKey !== key) return;
+        playlistThumb = cover?.thumb ?? '';
+        playlistArt = cover?.art || cover?.thumb || '';
+      })
+      .catch(() => {
+        if (playlistArtKey === key) {
+          playlistThumb = '';
+          playlistArt = '';
+        }
+      });
+  });
+
+  /**
+   * Open a playlist from the shelf on the home screen.
+   *
+   * A playlist is a page of its own, so the shelf moves to that tab and opens it
+   * there rather than drawing a second copy of it over the library.
+   */
+  async function openPlaylistFromHome(playlist: RemotePlaylistSummary) {
+    activeTab = 'playlists';
+    await openPlaylistView(playlist);
+  }
+
+  /**
+   * The shelves need the playlists whether or not the Playlists page has been
+   * opened, so they are asked for once the computer is there - connected, not
+   * merely paired, because the artwork on a card is resolved through the library
+   * and a question asked before the connection is up is answered with nothing.
+   */
+  let playlistsAsked = false;
+  $effect(() => {
+    if (!status.connected) {
+      playlistsAsked = false;
+      return;
+    }
+    if (playlistsAsked) return;
+    playlistsAsked = true;
+    void refreshPlaylists();
+  });
+
+  /**
+   * The tool row, and the bar it pins to.
+   *
+   * The playlist sheet is the album sheet, whose own header is a floating arrow
+   * and no bar at all: a sticky row therefore had nothing to stop at and sat in
+   * the middle of the page. So the name gets a bar in the status area and the
+   * tools pin under that, which is where a header belongs.
+   */
+  let playlistPinned = $state(false);
+  let playlistPin = $state<HTMLDivElement | undefined>(undefined);
+  let playlistScroller = $state<HTMLDivElement | undefined>(undefined);
+  let playlistPinFrame = 0;
+
+  $effect(() => {
+    // A screen is a new page: nothing is pinned until this one is scrolled, and
+    // it does not open where the last one was left.
+    const key = `${playlistDraft?.playlistId ?? ''}|${playlistMode}`;
+    const box = playlistScroller;
+    if (key && box) box.scrollTop = 0;
+    playlistPinned = false;
+  });
+
+  /**
+   * Whether the tool row has reached the top and the bar has taken the status
+   * area over.
+   *
+   * Measured with rectangles rather than `offsetTop`, because `offsetTop`
+   * reports where a sticky element has been offset to: it can never say where
+   * the element would have been, which is the whole question.
+   */
+  function onPlaylistScroll(event: Event) {
+    const box = event.currentTarget as HTMLDivElement;
+    if (playlistPinFrame) return;
+    // Once a frame: a handler that measures on every event measures far more
+    // often than the screen can show it.
+    playlistPinFrame = requestAnimationFrame(() => {
+      playlistPinFrame = 0;
+      const pin = playlistPin;
+      if (!pin) return;
+      const offset = Number.parseFloat(getComputedStyle(pin).top) || 0;
+      playlistPinned = pin.getBoundingClientRect().top - box.getBoundingClientRect().top <= offset + 0.5;
+    });
+  }
+
+  /**
+   * How much audio a playlist names, as far as anything here knows.
+   *
+   * Sizes come from the catalogue entries of the members the library answered
+   * for, so a member nothing holds is not counted and the answer is a lower
+   * bound - which is what the trailing `+` says. A running time cannot be shown
+   * at all: neither the catalogue nor the companion protocol carries a track's
+   * duration, so there is nothing to add up even when every member is known.
+   */
+  function playlistSizeLabel(): string {
+    const sizes = playlistMembers.map((member) => playlistRowTracks[member.fileId]?.size ?? 0);
+    const total = sizes.reduce((sum, size) => sum + size, 0);
+    if (total === 0) return '';
+    const unknown = sizes.filter((size) => size === 0).length;
+    return ` · ${readableSize(total)}${unknown > 0 ? '+' : ''}`;
+  }
+
   async function loadAudiobooks() {
     if (!status.connected || audiobookLoading) return;
     audiobookLoading = true;
@@ -1180,6 +2126,7 @@
       current = cached.track;
       // The file is on this phone now, so the badge has to stop saying otherwise.
       noteCachedOnPhone(cached.track.fileId);
+      rememberPlayedTrack(cached.track);
       // The new source has no length until it reports one: keeping the old one
       // would show the previous track's length, and seek against it.
       duration = 0;
@@ -1190,6 +2137,9 @@
       await audio.play();
       playing = true;
       rememberPlayedAlbum(cached.track);
+      // The add sheet offers back what has been played, so the track that just
+      // started is the newest thing on that list.
+      rememberPlayedTrack(cached.track);
       const nextIndex = shuffle
         ? randomUpcoming
         : playerQueue.length > 1
@@ -1736,6 +2686,10 @@
    */
   let backHasDestination = $derived(
     showReport ||
+      showPlaylistDelete ||
+      showPlaylistAdd ||
+      showPlaylistSort ||
+      !!pickerTrack ||
       (showSourceOptions && !showActions) ||
       showSettings ||
       showActions ||
@@ -1743,6 +2697,7 @@
       showQueue ||
       (showNowPlaying && !sheetClosing) ||
       showingLikedMusic ||
+      !!playlistDraft ||
       activeTab !== 'music'
   );
 
@@ -2208,17 +3163,214 @@
   }
 
   function choosePlaybackTarget(target: PlaybackTarget) {
+    if (target === playbackTarget) {
+      showSourceOptions = false;
+      return;
+    }
     playbackTarget = target;
     showSourceOptions = false;
     remoteVolume = -1;
-    // One player at a time: handing over stops this phone. The drawer stays
-    // open, because from here on it is showing the computer's player instead.
-    if (target === 'desktop') {
-      audio?.pause();
-      playing = false;
-      void refreshRemote();
-    }
+    cancelPendingHandoff();
+    // One player at a time, and each direction stops the device that is giving
+    // playback up - but only once the other one has agreed to take it, because a
+    // handover that fails has to leave the music playing where it already was.
+    if (target === 'desktop') void handOverToDesktop();
+    else void takeOverFromDesktop();
     syncSystemMedia(true);
+  }
+
+  /**
+   * Turn a list of file ids into tracks this phone can show and play.
+   *
+   * The computer answers for the files it still holds, in the order asked, so a
+   * queue it has lost a member from arrives shorter rather than broken. A
+   * computer too old to answer at all says so, and the caller falls back to the
+   * one track it was told about.
+   */
+  async function tracksByIds(fileIds: string[]): Promise<RemoteTrack[]> {
+    const wanted = fileIds.filter((fileId) => fileId);
+    if (wanted.length === 0 || !remoteAvailable()) return [];
+    try {
+      return await invoke<RemoteTrack[]>('remote_library_by_ids', { fileIds: wanted });
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Hand what this phone is playing to the computer.
+   *
+   * The track, the list around it and the second it had reached go over
+   * together, so the computer resumes rather than starts again. A computer can
+   * only play what it holds, so a track it does not have is asked for first: the
+   * phone keeps playing while it is fetched and the handover happens when it
+   * arrives.
+   */
+  async function handOverToDesktop() {
+    if (!desktopTargetAvailable()) return;
+    // A podcast episode is streamed from its feed and is not a file the computer
+    // can hold, so there is nothing here for it to take over.
+    if (activeMedia === 'podcast' && currentPodcast) {
+      notice = 'Napstr cannot play a podcast · it keeps playing here';
+      syncSystemMedia(true);
+      return;
+    }
+    const track = current;
+    if (!track || !playing) {
+      // Nothing is playing here, so what the drawer should show is the
+      // computer's own player.
+      void refreshRemote();
+      return;
+    }
+    const queue = playerQueue.length > 0 ? playerQueue : [track];
+    const positionMs = Math.round((audio?.currentTime ?? currentTime) * 1000);
+    if ((await tracksByIds([track.fileId])).length > 0) {
+      await sendHandoff(track, queue, positionMs, false);
+      return;
+    }
+    // The computer does not have this track. Asking it to fetch the file is the
+    // only way it can ever play it, and this phone is the side that knows who
+    // seeds it.
+    await requestDownload(track);
+    if (!pending.has(track.fileId)) {
+      // The request did not start, so that track is never going to arrive and
+      // waiting for it would only keep the source pointed at a silent computer.
+      playbackTarget = 'phone';
+      syncSystemMedia(true);
+      return;
+    }
+    watchPendingHandoff({ track, queue, positionMs });
+    notice = `Napstr is fetching ${title(track)} · it takes over when it arrives`;
+  }
+
+  /** Ask the computer to take over, and stop this phone only once it has. */
+  async function sendHandoff(
+    track: RemoteTrack,
+    queue: RemoteTrack[],
+    positionMs: number,
+    fetched: boolean
+  ) {
+    const order = queue.slice(0, MAX_DESKTOP_QUEUE);
+    const sent = await sendPlaybackState({
+      type: 'playTrack',
+      fileId: track.fileId,
+      queue: order.map((item) => item.fileId),
+      positionMs
+    });
+    if (!sent) {
+      // The computer refused, so this phone is still the one playing: keeping it
+      // as the source says that honestly.
+      playbackTarget = 'phone';
+      notice = remoteError || 'Napstr could not take playback over';
+      syncSystemMedia(true);
+      return;
+    }
+    remoteQueue = order;
+    audio?.pause();
+    playing = false;
+    selected = track;
+    notice = fetched ? `Napstr took over ${title(track)}` : '';
+    syncSystemMedia(true);
+  }
+
+  /** Wait for a track the computer is fetching, then hand playback over. */
+  function watchPendingHandoff(pending: {
+    track: RemoteTrack;
+    queue: RemoteTrack[];
+    positionMs: number;
+  }) {
+    pendingHandoff = pending;
+    pendingHandoffAttempts = 0;
+    window.clearInterval(pendingHandoffTimer);
+    pendingHandoffTimer = window.setInterval(() => void advancePendingHandoff(), 5000);
+  }
+
+  async function advancePendingHandoff() {
+    const pending = pendingHandoff;
+    if (!pending) return;
+    if (!desktopTargetAvailable()) {
+      cancelPendingHandoff();
+      return;
+    }
+    if ((await tracksByIds([pending.track.fileId])).length > 0) {
+      cancelPendingHandoff();
+      await sendHandoff(pending.track, pending.queue, pending.positionMs, true);
+      return;
+    }
+    pendingHandoffAttempts += 1;
+    // Five minutes is longer than a track of this size takes to arrive, and
+    // giving up says so rather than waiting forever on a download that stalled.
+    if (pendingHandoffAttempts >= 60) {
+      cancelPendingHandoff();
+      notice = `Napstr never finished fetching ${title(pending.track)}`;
+    }
+  }
+
+  function cancelPendingHandoff() {
+    pendingHandoff = null;
+    pendingHandoffAttempts = 0;
+    window.clearInterval(pendingHandoffTimer);
+    pendingHandoffTimer = 0;
+  }
+
+  /**
+   * Take playback over from the computer.
+   *
+   * One request, because the computer is asked to stop and to say what it was
+   * doing in the same breath: asked twice, it could move on to the next track in
+   * between and hand over the wrong one. The answer carries the track itself -
+   * which is what this phone needs to fetch the audio - along with the queue it
+   * was playing and the second it had reached.
+   */
+  async function takeOverFromDesktop() {
+    if (!desktopTargetAvailable()) return;
+    if (!remoteState?.active) {
+      // Nothing to take over, so the drawer shows the computer's own player.
+      void refreshRemote();
+      return;
+    }
+    const handed = await sendPlaybackState({ type: 'handoff' });
+    if (!handed) {
+      notice = remoteError || 'Napstr would not hand playback over';
+      return;
+    }
+    const track = handed.track;
+    if (!track || !track.local) {
+      notice = 'Napstr was not playing anything this phone can hold';
+      return;
+    }
+    // The queue comes as ids because a queue is too big to repeat on every
+    // poll; it is resolved here, and the one playing is always in it even when
+    // the computer no longer holds a member or two.
+    const queue = await tracksByIds(handed.queue ?? []);
+    const order = queue.some((item) => item.fileId === track.fileId) ? queue : [track];
+    playerQueue = order;
+    playerQueueLibraryVisible = false;
+    playerIndex = Math.max(0, order.findIndex((item) => item.fileId === track.fileId));
+    resetRandomOrder();
+    await playTrack(track);
+    if (!playing) return;
+    await seekLocalTo(handed.positionMs / 1000);
+    notice = `Took over from ${status.desktopName || 'the computer'}`;
+    syncSystemMedia(true);
+  }
+
+  /**
+   * Pick up where the computer left off.
+   *
+   * The audio element has no length until it has read the file's header, and a
+   * position cannot be set before that, so this waits for a length and gives up
+   * rather than holding the handover open.
+   */
+  async function seekLocalTo(seconds: number) {
+    if (!Number.isFinite(seconds) || seconds <= 0) return;
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      if (audio && Number.isFinite(audio.duration) && audio.duration > 0) {
+        seek(Math.min(seconds, audio.duration));
+        return;
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, 50));
+    }
   }
 
   /**
@@ -2270,13 +3422,26 @@
 
   /** Every transport button lands here, so the view never has to guess. */
   async function sendPlayback(command: PlaybackCommand) {
-    if (remoteBusy) return;
+    await sendPlaybackState(command);
+  }
+
+  /**
+   * The same, for callers that have to know whether it landed and what the
+   * computer said afterwards.
+   */
+  async function sendPlaybackState(
+    command: PlaybackCommand
+  ): Promise<RemotePlaybackState | null> {
+    if (remoteBusy) return null;
     remoteBusy = true;
     try {
-      applyRemoteState(await invoke<RemotePlaybackState>('remote_playback', { command }));
+      const state = await invoke<RemotePlaybackState>('remote_playback', { command });
+      applyRemoteState(state);
       remoteError = '';
+      return state;
     } catch (nextError) {
       remoteError = String(nextError);
+      return null;
     } finally {
       remoteBusy = false;
     }
@@ -2588,6 +3753,38 @@
     ].slice(0, 24);
     try {
       window.localStorage.setItem(musicHistoryKey, JSON.stringify(playedAlbums));
+    } catch {
+      // A history that cannot be stored is only a lost convenience.
+    }
+  }
+
+  function readPlayedTracks(): PlayedTrack[] {
+    try {
+      const raw = window.localStorage.getItem(playedTracksKey);
+      const parsed = raw ? (JSON.parse(raw) as PlayedTrack[]) : [];
+      return Array.isArray(parsed)
+        ? parsed.filter((entry) => entry && typeof entry.fileId === 'string')
+        : [];
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * The tracks this phone has played, newest first.
+   *
+   * The host keeps no play history to ask for, and the album history above is
+   * not enough to offer a track back: what the sheet lists has to be a track it
+   * can add to a playlist, so the file id and the three hints to draw it with
+   * are kept here.
+   */
+  function rememberPlayedTrack(track: RemoteTrack) {
+    playedTracks = [
+      { fileId: track.fileId, title: title(track), artist: track.artist, album: track.album },
+      ...playedTracks.filter((entry) => entry.fileId !== track.fileId)
+    ].slice(0, PLAYED_TRACKS_KEPT);
+    try {
+      window.localStorage.setItem(playedTracksKey, JSON.stringify(playedTracks));
     } catch {
       // A history that cannot be stored is only a lost convenience.
     }
@@ -3147,6 +4344,7 @@
       window.clearInterval(transferTimer);
       window.clearInterval(podcastTimer);
       window.clearInterval(sleepTimer);
+      window.clearInterval(pendingHandoffTimer);
       document.removeEventListener('visibilitychange', foreground);
       window.removeEventListener('napstrfy-media-action', handleSystemMediaAction);
       window.removeEventListener('napstrfy-back', handleSystemBack);
@@ -3223,9 +4421,11 @@
           ? 'Not reachable'
           : status.streamOnly
             ? 'Read-only pairing'
-            : playbackTarget === 'desktop'
-              ? 'Playing there'
-              : 'Play its library here'}
+            : pendingHandoff
+              ? 'Fetching a track…'
+              : playbackTarget === 'desktop'
+                ? 'Playing there'
+                : 'Play its library here'}
     </small>
   </button>
 {/snippet}
@@ -3351,7 +4551,7 @@
           {/if}
         </section>
   
-        {#if !showingLikedMusic && (discoverAlbums.length > 0 || lastPlayed.length > 0)}
+        {#if !showingLikedMusic && (discoverAlbums.length > 0 || lastPlayed.length > 0 || playlists.length > 0)}
           <section class="album-shelves">
             {#if lastPlayed.length > 0}
               <div class="album-shelf-block">
@@ -3365,6 +4565,26 @@
                       </button>
                       <strong>{album.album}</strong>
                       <small>{album.artist || 'Unknown artist'}</small>
+                    </div>
+                  {/each}
+                </div>
+              </div>
+            {/if}
+            {#if playlists.length > 0}
+              <div class="album-shelf-block">
+                <div class="section-label"><b>{$t("Playlists")}</b><span>{playlists.length} {$t("on your computer")}</span></div>
+                <div class="album-shelf">
+                  {#each playlists as playlist (playlist.author + playlist.playlistId)}
+                    <div class="album-card">
+                      <button class="album-open" onclick={() => void openPlaylistFromHome(playlist)} aria-label={`${$t("Open the playlist")} ${playlist.title}`}>
+                        {#if playlistRowTrack(playlist)}
+                          <TrackArtwork track={playlistRowTrack(playlist) as RemoteTrack} lookup />
+                        {:else}
+                          <span class="card-art-empty" aria-hidden="true">♪</span>
+                        {/if}
+                      </button>
+                      <strong>{playlist.title}</strong>
+                      <small>{playlist.trackCount} {$t("Tracks")}</small>
                     </div>
                   {/each}
                 </div>
@@ -3454,7 +4674,7 @@
             {#if !podcastLoading && podcastFeeds.length === 0}<div class="empty-library"><h2>{showingLikedPodcasts ? 'No liked podcasts yet' : 'Search podcasts'}</h2><p>{showingLikedPodcasts ? 'Tap the heart beside a podcast to keep it here.' : 'Napstrfy searches podcasts directly over this phone\'s internet connection.'}</p></div>{/if}
           </section>
         {/if}
-      {:else}
+      {:else if activeTab === 'audiobooks'}
         <section class="search-area audiobook-search">
           <form onsubmit={(event) => { event.preventDefault(); event.currentTarget.querySelector('input')?.blur(); void loadAudiobooks(); }}>
             <span>⌕</span><input bind:value={audiobookQuery} placeholder={$t("Search audiobooks")} aria-label={$t("Search audiobooks")} />
@@ -3493,14 +4713,304 @@
             {#if !audiobookLoading && audiobooks.length === 0}<div class="empty-library"><h2>{$t("No audiobooks found")}</h2><p>{$t("Group a chapter folder in Napstr, or add the tag “audiobook” to a complete one-file book.")}</p></div>{/if}
           </section>
         {/if}
+      {:else if activeTab === 'playlists'}
+        {#if playlistDraft && playlistMode === 'view'}
+          <!-- The playlist is the album sheet with a playlist in it: the same
+               overlay, the same stretched cover behind it, the same scrolling
+               body and the same round back button, so the two are one kind of
+               screen rather than two that look alike. -->
+          <div
+            class="album-view playlist-sheet"
+            class:desktop={desktopShell}
+            style={`--cover-hue:${artworkHue(playlistMembers[0]?.fileId ?? playlistDraft.playlistId)}`}
+            role="dialog"
+            aria-modal="true"
+            aria-label={playlistDraft.title || $t("Playlist")}
+          >
+            <div class="album-glow" style={playlistThumb ? `background-image:url(${playlistThumb})` : ''}></div>
+            <div class="album-glow-scrim"></div>
+
+            <header class="view-head">
+              <button class="view-icon" onclick={closePlaylistEditor} aria-label={$t("Close the playlist")}>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14.5 5 8 12l6.5 7" /></svg>
+              </button>
+            </header>
+
+            <div class="album-scroll playlist-view" onscroll={onPlaylistScroll} bind:this={playlistScroller}>
+              <div class="album-art">
+                {#if playlistThumb}
+                  <img class="album-art-backdrop" src={playlistThumb} alt="" aria-hidden="true" />
+                {/if}
+                {#if playlistArt && playlistArt !== playlistThumb}
+                  {@const art = playlistArt}
+                  <img
+                    class="album-art-full"
+                    class:ready={playlistArtLoaded === art}
+                    src={art}
+                    alt=""
+                    decoding="async"
+                    onload={() => (playlistArtLoaded = art)}
+                  />
+                {:else if !playlistThumb}
+                  <div class="album-art-empty">♪</div>
+                {/if}
+              </div>
+
+              <div class="album-title-row">
+                <div class="album-title-copy">
+                  <h1>{playlistDraft.title || $t("New playlist")}</h1>
+                  {#if playlistDraft.artist}<p>{playlistDraft.artist}</p>{/if}
+                  <p class="album-meta">{playlistMembers.length} {$t("Tracks")}{playlistSizeLabel()} · {playlistDraft.published ? $t("Published") : $t("Draft")}</p>
+                </div>
+                <button class="album-play-all" onclick={() => void playPlaylist()} disabled={playlistMembers.length === 0 || caching} aria-label={$t("Play the playlist")}>
+                  {#if caching}<span class="icon-busy"></span>{:else}<span class="icon-play"></span>{/if}
+                </button>
+              </div>
+
+              <!-- The tool row pins, and the bar above it is what it pins to: the
+                   album sheet's header is a floating arrow with no bar of its own,
+                   which left this row stuck in the middle of nowhere once the
+                   artwork had scrolled away. The bar is out of the flow and takes
+                   no space until it is needed, so nothing moves when it appears. -->
+              <div class="playlist-pin" class:pinned={playlistPinned} bind:this={playlistPin}>
+                <!-- The title row's disc, held at the foot of the bar once that
+                     row has scrolled away. It is the same control in the same
+                     place, so nothing is learned or unlearned: the in-flow one is
+                     what a keyboard and a screen reader reach. -->
+                <button
+                  class="album-play-all playlist-pin-play"
+                  aria-hidden="true"
+                  tabindex="-1"
+                  disabled={playlistMembers.length === 0 || caching}
+                  onclick={() => void playPlaylist()}
+                >
+                  {#if caching}<span class="icon-busy"></span>{:else}<span class="icon-play"></span>{/if}
+                </button>
+                <div class="playlist-titlebar" aria-hidden="true">
+                  <strong>{playlistDraft.title || $t("New playlist")}</strong>
+                </div>
+                <div class="playlist-tools">
+                  <button onclick={openPlaylistAdd}><span aria-hidden="true">{PLAYLIST_TOOL_GLYPH.add}</span>{$t("Add")}</button>
+                  <button onclick={() => void openPlaylistEditor(playlistDraft as RemotePlaylist)}><span aria-hidden="true">{PLAYLIST_TOOL_GLYPH.edit}</span>{$t("Edit")}</button>
+                  <button onclick={() => (showPlaylistSort = true)}><span aria-hidden="true">{PLAYLIST_TOOL_GLYPH.sort}</span>{$t("Sort")}</button>
+                  <button onclick={openPlaylistDetails}>{$t("Name & details")}</button>
+                </div>
+              </div>
+
+              {#if playlistError}<p class="error-card">{$t(playlistError)}</p>{/if}
+              {#if playlistNotice}<p class="playlist-notice" role="status">{$t(playlistNotice)}</p>{/if}
+
+              <ol class="album-tracks playlist-tracks">
+                {#each playlistMembers as member (member.fileId)}
+                  <!-- The same row a track gets on the music page: the artwork the
+                       catalogue has, where the file actually is, and the menu. The
+                       album sits on the third line because the second one carries
+                       the artist, and a playlist is read by artist first. -->
+                  <li class:playing={current?.fileId === member.fileId} class="track-row">
+                    <button class="track-open" onclick={() => void playPlaylist(member)}>
+                      <TrackArtwork track={memberTrack(member)} lookup />
+                      <span class="track-copy">
+                        <strong>{member.title || member.fileId.slice(0, 12)}</strong>
+                        <small>{member.artist}</small>
+                        <span class="track-meta">{member.album}</span>
+                      </span>
+                      <TrackBadge track={memberTrack(member)} cached={cachedFileIds.has(member.fileId)} />
+                    </button>
+                    <button class="track-more" onclick={() => void openMemberActions(member)} aria-label={`${$t("Track options")} · ${member.title || member.fileId.slice(0, 12)}`}>
+                      <svg viewBox="0 0 24 24" aria-hidden="true"><circle class="filled" cx="12" cy="5.6" r="1.5" /><circle class="filled" cx="12" cy="12" r="1.5" /><circle class="filled" cx="12" cy="18.4" r="1.5" /></svg>
+                    </button>
+                  </li>
+                {/each}
+              </ol>
+              {#if playlistMembers.length === 0}<p class="queue-empty">{$t("No tracks yet")}</p>{/if}
+            </div>
+          </div>
+        {:else if playlistDraft && playlistMode === 'details'}
+          <div class="album-view playlist-sheet" class:desktop={desktopShell} role="dialog" aria-modal="true" aria-label={$t("Name & details")}>
+            <div class="album-glow" style={playlistThumb ? `background-image:url(${playlistThumb})` : ''}></div>
+            <div class="album-glow-scrim"></div>
+
+            <header class="view-head">
+              <button class="view-icon" onclick={showPlaylistView} aria-label={$t("Back to the playlist")}>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14.5 5 8 12l6.5 7" /></svg>
+              </button>
+            </header>
+
+            <div class="album-scroll">
+              <h1 class="playlist-heading">{$t("Name & details")}</h1>
+
+              {#if playlistError}<p class="error-card">{$t(playlistError)}</p>{/if}
+              {#if playlistNotice}<p class="playlist-notice" role="status">{$t(playlistNotice)}</p>{/if}
+
+              <label class="playlist-field">{$t("Title")}
+                <input bind:value={playlistDraft.title} maxlength="256" placeholder={$t("Title")} />
+              </label>
+              <label class="playlist-field">{$t("Album artist")}
+                <input bind:value={playlistDraft.artist} maxlength="256" />
+              </label>
+              <label class="playlist-field">{$t("Release group MBID")}
+                <input bind:value={playlistDraft.mbid} maxlength="36" />
+              </label>
+
+              <!-- A word is a chip: it is added, taken back or deleted as a whole,
+                   and the commas between them are the storage format rather than
+                   something anybody types. -->
+              <div class="playlist-field playlist-tags">
+                <span>{$t("Search words")}</span>
+                <div class="tag-chips">
+                  {#each playlistTagList() as word (word)}
+                    <span class="tag-chip">
+                      <span>{word}</span>
+                      <button onclick={() => removePlaylistTag(word)} aria-label={`${$t("Remove")} · ${word}`}>
+                        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7.4 7.4l9.2 9.2" /><path d="M16.6 7.4l-9.2 9.2" /></svg>
+                      </button>
+                    </span>
+                  {/each}
+                  <input
+                    class="tag-input"
+                    value={playlistTagDraft}
+                    oninput={(event) => (playlistTagDraft = event.currentTarget.value)}
+                    onkeydown={onPlaylistTagKey}
+                    onblur={addPlaylistTag}
+                    maxlength="500"
+                    placeholder={playlistTagList().length === 0 ? $t("Add a word") : ''}
+                    aria-label={$t("Search words")}
+                  />
+                </div>
+              </div>
+              {#if playlistDraft.tags.trim() === ''}
+                <p class="playlist-hint">{$t("With no words of your own, this playlist is found by its name and its members alone.")}</p>
+              {/if}
+              <label class="playlist-toggle">
+                <input type="checkbox" bind:checked={playlistSuggestTags} disabled={playlistDraft.tags.trim() !== ''} />
+                <span>{$t("Suggest words from the title")}</span>
+              </label>
+
+              <label class="playlist-toggle">
+                <input type="checkbox" bind:checked={playlistDraft.private} />
+                <span>{$t("Private")}</span>
+              </label>
+              {#if playlistDraft.private}
+                <!-- A private playlist is refused at the relay rather than sent, so
+                     the button that would send it is off before it is pressed. -->
+                <p class="playlist-hint">{$t("A private playlist stays on this computer and the phone it is paired with, and is never published.")}</p>
+              {/if}
+
+              <div class="playlist-actions">
+                <button class="primary" disabled={playlistSaving || !playlistDraft.title.trim()} onclick={() => void savePlaylist()}>{playlistSaving ? $t("Saving…") : $t("Save")}</button>
+                <button disabled={playlistSaving || playlistDraft.private || !playlistDraft.title.trim() || !status.connected} onclick={() => void publishPlaylist()}>{$t("Publish")}</button>
+                <button disabled={playlistSaving} onclick={() => (showPlaylistDelete = true)}>{playlistDraft.published ? $t("Withdraw") : $t("Delete")}</button>
+              </div>
+            </div>
+          </div>
+        {:else if playlistDraft}
+          <!-- What the playlist names, in the order it names them. A drag moves a
+               row, the round minus takes one out, and Save sits where the album
+               sheet keeps its own controls. -->
+          <div class="album-view playlist-sheet" class:desktop={desktopShell} role="dialog" aria-modal="true" aria-label={$t("Edit playlist")}>
+            <div class="album-glow" style={playlistThumb ? `background-image:url(${playlistThumb})` : ''}></div>
+            <div class="album-glow-scrim"></div>
+
+            <header class="view-head">
+              <button class="view-icon" onclick={showPlaylistView} aria-label={$t("Back to the playlist")}>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14.5 5 8 12l6.5 7" /></svg>
+              </button>
+              <button
+                class="playlist-save"
+                disabled={playlistSaving || !playlistDraft.title.trim()}
+                onclick={() => void savePlaylist()}
+              >{playlistSaving ? $t("Saving…") : $t("Save")}</button>
+            </header>
+
+            <div class="album-scroll">
+              <h1 class="playlist-heading">{$t("Edit playlist")}</h1>
+
+              {#if playlistError}<p class="error-card">{$t(playlistError)}</p>{/if}
+              {#if playlistNotice}<p class="playlist-notice" role="status">{$t(playlistNotice)}</p>{/if}
+
+              <ol class="playlist-members">
+                {#each playlistMembers as member, index (member.fileId)}
+                  <li
+                    class="playlist-member"
+                    class:dragging={dragIndex === index}
+                    style={dragIndex === index ? `transform: translateY(${dragOffset}px)` : ''}
+                    onpointerdown={(event) => startMemberDrag(event, index)}
+                    onpointermove={moveMemberDrag}
+                    onpointerup={endMemberDrag}
+                    onpointercancel={endMemberDrag}
+                  >
+                    <button class="playlist-remove" onclick={() => removePlaylistMember(index)} aria-label={`${$t("Remove")} · ${member.title || member.fileId.slice(0, 12)}`}>
+                      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9.2" /><path d="M8.2 12h7.6" /></svg>
+                    </button>
+                    <span class="playlist-member-art">
+                      <!-- A member carries its own artist and album, which is what a
+                           cover is looked up by, so this asks for no extra request. -->
+                      <TrackArtwork track={memberTrack(member)} lookup />
+                    </span>
+                    <div class="playlist-member-copy">
+                      <strong>{member.title || member.fileId.slice(0, 12)}</strong>
+                      <small>{member.artist}{member.album ? ` · ${member.album}` : ''}</small>
+                    </div>
+                    {#if !cachedFileIds.has(member.fileId)}
+                      <i class="playlist-badge">{$t("Not on this phone")}</i>
+                    {/if}
+                    <TrackBadge track={memberTrack(member)} cached={cachedFileIds.has(member.fileId)} />
+                    <span class="playlist-grip" aria-hidden="true">
+                      <svg viewBox="0 0 24 24"><path d="M8 8.5h8" /><path d="M8 12h8" /><path d="M8 15.5h8" /></svg>
+                    </span>
+                  </li>
+                {/each}
+                {#if playlistMembers.length === 0}
+                  <li class="playlist-hint">{$t("No tracks yet")}</li>
+                {/if}
+              </ol>
+            </div>
+          </div>
+        {:else}
+          <section class="playlist-view" aria-busy={playlistsLoading}>
+            <header class="library-heading">
+              <div><p>{$t("YOUR NAPSTR")}</p><h1>{$t("Playlists")}</h1></div>
+              <button class="playlist-new" onclick={() => void newPlaylist()} aria-label={$t("New playlist")}>+</button>
+            </header>
+
+            {#if playlistsError}<p class="error-card">{$t(playlistsError)}</p>{/if}
+            {#if playlistsLoading}<div class="loading-list"><i></i><span>{$t("Asking Napstr…")}</span></div>{/if}
+
+            {#each playlists as playlist (playlist.author + playlist.playlistId)}
+              <div class="playlist-row">
+                <button class="playlist-open" onclick={() => void openPlaylistView(playlist)}>
+                  <span class="playlist-row-art">
+                    {#if playlistRowTrack(playlist)}
+                      <TrackArtwork track={playlistRowTrack(playlist) as RemoteTrack} lookup />
+                    {:else}
+                      <span class="playlist-row-art-empty" aria-hidden="true">♪</span>
+                    {/if}
+                  </span>
+                  <span class="playlist-row-copy">
+                    <strong>{playlist.title}</strong>
+                    <small>{playlist.trackCount} {$t("Tracks")} · {playlist.published ? $t("Published") : $t("Draft")}</small>
+                  </span>
+                </button>
+              </div>
+            {/each}
+
+            {#if !playlistsLoading && playlists.length === 0}
+              <div class="empty-library">
+                <h2>{$t("No playlists yet")}</h2>
+                <p>{$t("Make one here, and your computer keeps it.")}</p>
+              </div>
+            {/if}
+          </section>
+        {/if}
       {/if}
     </div>
 
     <nav class:dragging={sheetDragging || barDragging} style={`--nav-shift:${navShift}`} class="bottom-nav" aria-label={$t("Napstrfy navigation")}>
-      <button class:active={activeTab === 'music'} onclick={showMusic}><span>♫</span>{$t("Music")}</button>
-      <button class:active={activeTab === 'search'} onclick={showSearch}><span class="nav-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.4" /><path d="M15.9 15.9 20.6 20.6" /></svg></span>{$t("Search")}</button>
-      <button class:active={activeTab === 'podcasts'} onclick={showPodcasts}><span>◉</span>{$t("Podcasts")}</button>
-      <button class:active={activeTab === 'audiobooks'} onclick={showAudiobooks}><span>▥</span>{$t("Audiobooks")}</button>
+      <button data-tab="music" class:active={activeTab === 'music'} onclick={showMusic}><span>♫</span>{$t("Music")}</button>
+      <button data-tab="search" class:active={activeTab === 'search'} onclick={showSearch}><span class="nav-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.4" /><path d="M15.9 15.9 20.6 20.6" /></svg></span>{$t("Search")}</button>
+      <button data-tab="playlists" class:active={activeTab === 'playlists'} onclick={showPlaylists}><span class="nav-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6.5h16" /><path d="M4 12h16" /><path d="M4 17.5h9" /></svg></span>{$t("Playlists")}</button>
+      <button data-tab="podcasts" class:active={activeTab === 'podcasts'} onclick={showPodcasts}><span>◉</span>{$t("Podcasts")}</button>
+      <button data-tab="audiobooks" class:active={activeTab === 'audiobooks'} onclick={showAudiobooks}><span>▥</span>{$t("Audiobooks")}</button>
     </nav>
 
     {#if !pinned}
@@ -3985,6 +5495,152 @@
   </div>
 {/if}
 
+{#if showPlaylistAdd && playlistDraft}
+  <!-- A screen of its own rather than a drawer: it is a list somebody scrolls,
+       with three sources and a control on every row. -->
+  <div class="add-view" class:desktop={desktopShell} role="dialog" aria-modal="true" aria-label={$t("Add a track")}>
+    <header class="add-head">
+      <button class="view-icon" onclick={() => (showPlaylistAdd = false)} aria-label={$t("Close the add a track sheet")}>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6.5 6.5l11 11" /><path d="M17.5 6.5l-11 11" /></svg>
+      </button>
+      <div class="add-head-copy">
+        <strong>{$t("Add a track")}</strong>
+        <small>{playlistDraft.title || $t("New playlist")}</small>
+      </div>
+    </header>
+
+    <!-- Three ways in: everything this computer holds, what this phone has
+         played, and what it has liked. Each is a list of tracks with the same
+         control, so the screen is one screen whatever is being looked at. -->
+    <div class="add-tabs" role="tablist">
+      <button role="tab" aria-selected={addTab === 'songs'} class:active={addTab === 'songs'} onclick={() => chooseAddTab('songs')}>{$t("Songs")}</button>
+      <button role="tab" aria-selected={addTab === 'recent'} class:active={addTab === 'recent'} onclick={() => chooseAddTab('recent')}>{$t("Recently played")}</button>
+      <button role="tab" aria-selected={addTab === 'liked'} class:active={addTab === 'liked'} onclick={() => chooseAddTab('liked')}>{$t("Liked Songs")}</button>
+    </div>
+
+    {#if playlistError}<p class="error-card">{$t(playlistError)}</p>{/if}
+    {#if playlistMembers.length >= MAX_PLAYLIST_MEMBERS}
+      <p class="playlist-hint">{$t("A playlist may name at most 500 tracks.")}</p>
+    {/if}
+
+    <div class="add-list" onscroll={onAddScroll}>
+      {#each addRows() as row (row.fileId)}
+        {@const already = playlistHas(row.fileId)}
+        <div class="track-row add-row">
+          <button
+            class="track-open"
+            aria-pressed={already}
+            disabled={playlistSaving}
+            onclick={() => void toggleOpenPlaylistMember(row)}
+          >
+            <TrackArtwork track={row} lookup />
+            <span class="track-copy">
+              <strong>{title(row)}</strong>
+              <small>{artist(row)}{row.album ? ` · ${row.album}` : ''}</small>
+            </span>
+            <TrackBadge track={row} cached={cachedFileIds.has(row.fileId)} pending={pending.has(row.fileId)} />
+            <!-- Inside the button, because the icon is part of what the row does:
+                 a toggle beside the press target is a toggle that does not work. -->
+            <i class="picker-toggle" class:on={already} aria-hidden="true">
+              <svg viewBox="0 0 24 24">
+                <circle class="ring" cx="12" cy="12" r="10.2" />
+                <path class="plus" d="M12 6.6v10.8" />
+                <path class="plus" d="M6.6 12h10.8" />
+                <path class="tick" d="M7.4 12.4 10.6 15.6 16.8 9.2" />
+              </svg>
+            </i>
+          </button>
+        </div>
+      {/each}
+      {#if addLoading}<div class="loading-list"><i></i><span>{$t("Asking Napstr…")}</span></div>{/if}
+      {#if !addLoading && addRows().length === 0}
+        <p class="playlist-hint">{addTab === 'recent' ? $t("Nothing has been played on this phone yet.") : addTab === 'liked' ? $t("Nothing liked yet.") : $t("No tracks yet")}</p>
+      {/if}
+    </div>
+  </div>
+{/if}
+
+{#if showPlaylistDelete && playlistDraft}
+  <div class="actions-view" role="dialog" aria-modal="true" aria-label={$t("Delete this playlist?")}>
+    <button class="actions-scrim" onclick={() => (showPlaylistDelete = false)} aria-label={$t("Cancel")}></button>
+    <div class="actions-panel">
+      <div class="actions-head">
+        <div class="actions-head-copy">
+          <strong>{playlistDraft.title || $t("New playlist")}</strong>
+          <!-- Which of the two this is, said before it happens: a draft goes
+               quietly, and a published playlist is taken back off the relays. -->
+          <small>{playlistDraft.published
+            ? $t("This is published, so it will be withdrawn from the relays as well.")
+            : $t("Nothing on the relays points at this one, so it is only forgotten here.")}</small>
+        </div>
+      </div>
+      <div class="actions-divider"></div>
+      <button class="actions-row" onclick={() => (showPlaylistDelete = false)}><span>{$t("Cancel")}</span></button>
+      <button class="actions-row danger" onclick={() => void deletePlaylist(playlistDraft as RemotePlaylist)}>
+        <span>{playlistDraft.published ? $t("Withdraw") : $t("Delete")}</span>
+      </button>
+    </div>
+  </div>
+{/if}
+
+{#if showPlaylistSort}
+  <div class="actions-view" role="dialog" aria-modal="true" aria-label={$t("Sort")}>
+    <button class="actions-scrim" onclick={() => (showPlaylistSort = false)} aria-label={$t("Close the sort options")}></button>
+    <div class="actions-panel">
+      <div class="actions-head">
+        <div class="actions-head-copy"><strong>{$t("Sort")}</strong></div>
+      </div>
+      <div class="actions-divider"></div>
+      <button class="actions-row" onclick={() => void sortPlaylist('title')}><span>{$t("Title A to Z")}</span></button>
+      <button class="actions-row" onclick={() => void sortPlaylist('artist')}><span>{$t("Artist A to Z")}</span></button>
+      <button class="actions-row" onclick={() => void sortPlaylist('album')}><span>{$t("Album A to Z")}</span></button>
+      <button class="actions-row" onclick={() => void sortPlaylist('reverse')}><span>{$t("Reverse the order")}</span></button>
+    </div>
+  </div>
+{/if}
+
+{#if pickerTrack}
+  <div class="actions-view" role="dialog" aria-modal="true" aria-label={$t("Add to playlist")}>
+    <button class="actions-scrim" onclick={closePlaylistPicker} aria-label={$t("Close the playlist picker")}></button>
+    <div class="actions-panel">
+      <div class="actions-head">
+        <TrackArtwork track={pickerTrack} lookup />
+        <div class="actions-head-copy"><strong>{title(pickerTrack)}</strong><small>{artist(pickerTrack)}</small></div>
+      </div>
+      <div class="actions-divider"></div>
+      {#if pickerError}<p class="error">{$t(pickerError)}</p>{/if}
+      {#each pickerRows() as playlist (playlistKey(playlist.author, playlist.playlistId))}
+        <button
+          class="actions-row picker-row"
+          aria-pressed={pickerMembership.has(playlistKey(playlist.author, playlist.playlistId))}
+          disabled={pickerBusy !== ''}
+          onclick={() => void togglePlaylistMembership(playlist)}
+        >
+          <span class="picker-copy">
+            <strong>{playlist.title}</strong>
+            <small>{playlist.trackCount} {$t("Tracks")} · {playlist.published ? $t("Published") : $t("Draft")}</small>
+          </span>
+          <!-- A circle with a plus to add, and a filled circle with a tick once
+               the track is in this playlist. Tapping the row does the same thing
+               as tapping the circle, which is how these lists are used. -->
+          <i class="picker-toggle" class:on={pickerMembership.has(playlistKey(playlist.author, playlist.playlistId))} aria-hidden="true">
+            <svg viewBox="0 0 24 24">
+              <circle class="ring" cx="12" cy="12" r="10.2" />
+              <path class="plus" d="M12 6.6v10.8" />
+              <path class="plus" d="M6.6 12h10.8" />
+              <path class="tick" d="M7.4 12.4 10.6 15.6 16.8 9.2" />
+            </svg>
+          </i>
+        </button>
+      {/each}
+      {#if pickerLoading}<div class="loading-list"><i></i><span>{$t("Asking Napstr…")}</span></div>{/if}
+      {#if !pickerLoading && pickerRows().length === 0}
+        <p class="playlist-hint">{$t("No playlists yet")}</p>
+      {/if}
+    </div>
+  </div>
+{/if}
+
 {#if showActions && menuTrack}
   <div class="actions-view" role="dialog" aria-modal="true" aria-label={$t("Track options")}>
     <button class="actions-scrim" onclick={closeActions} aria-label={$t("Close the track options")}></button>
@@ -4039,9 +5695,10 @@
           <svg class:filled={isTrackLiked(menuTrack)} viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20.3c-1.4-1-7.2-5.2-7.2-9.4A4.2 4.2 0 0 1 12 8.2a4.2 4.2 0 0 1 7.2 2.7c0 4.2-5.8 8.4-7.2 9.4z" /></svg>
           <span>{isTrackLiked(menuTrack) ? 'Remove from Liked Songs' : 'Add to Liked Songs'}</span>
         </button>
-        <button class="actions-row" disabled>
+        <button class="actions-row" disabled={!remoteAvailable()} onclick={() => void openPlaylistPicker(menuTrack as RemoteTrack)}>
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6.5h11" /><path d="M4 12h11" /><path d="M4 17.5h7" /><path d="M17 14v6" /><path d="M14 17h6" /></svg>
-          <span>{$t("Add to playlist")}</span><small>{$t("Coming soon")}</small>
+          <span>{$t("Add to playlist")}</span>
+          {#if !remoteAvailable()}<small>{$t("Needs a connection")}</small>{/if}
         </button>
         <button class="actions-row" onclick={() => void goToAlbum(menuTrack)}>
           <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8" /><circle class="filled" cx="12" cy="12" r="2.4" /></svg>

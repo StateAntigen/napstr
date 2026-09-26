@@ -28,6 +28,44 @@ async function openPlaylist(page) {
   await page.getByRole('button', { name: 'Open the playlist' }).click();
 }
 
+/**
+ * The bottom of the phone screen: the player bar and the nav. Neither has an
+ * edge of its own any more - the bar is a card, and the nav's colour fades in -
+ * so the page dissolves into them rather than stopping at a line.
+ */
+test('the nav has no edge and the page fades into the player', async ({ page }) => {
+  await page.setViewportSize({ width: 412, height: 892 });
+  await mockNative(page, { platform: 'android' });
+  await page.goto('http://127.0.0.1:15174');
+  const nav = page.locator('.bottom-nav');
+  await expect(nav).toBeVisible();
+
+  // No hairline on its top edge, and no solid panel either: the bar's own colour
+  // fades in from fully transparent.
+  await expect(nav).toHaveCSS('border-top-width', '0px');
+  const navFade = await nav.evaluate((node) => getComputedStyle(node).backgroundImage);
+  expect(navFade).toContain('linear-gradient');
+  expect(navFade, 'the top of the bar is not painted at all').toMatch(/rgba\(8, 8, 10, 0\)/);
+
+  // And the wash above it reaches well past the player bar, so what is left
+  // visible of it is the fade above the bar. It never takes a press.
+  const wash = await page.evaluate(() => {
+    const style = getComputedStyle(document.querySelector('.app-shell'), '::after');
+    return {
+      content: style.content,
+      background: style.backgroundImage,
+      height: Number.parseFloat(style.height),
+      z: Number(style.zIndex),
+      events: style.pointerEvents
+    };
+  });
+  expect(wash.content, 'the wash is drawn').not.toBe('none');
+  expect(wash.background).toContain('linear-gradient');
+  expect(wash.height, 'it starts high up').toBeGreaterThan(200);
+  expect(wash.z, 'behind the player bar, which is at 5').toBeLessThan(5);
+  expect(wash.events).toBe('none');
+});
+
 const geometry = (page, selector) => page.evaluate((selector) => {
   const box = (target) => {
     const node = document.querySelector(target);
