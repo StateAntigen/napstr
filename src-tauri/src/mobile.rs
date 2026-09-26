@@ -495,15 +495,22 @@ impl MobileService {
     /// must not be able to file a playlist under somebody else's key. What comes
     /// back is what was stored, so a phone that keeps the returned copy and the
     /// list the host will answer with cannot disagree about a title or a member.
+    ///
+    /// A playlist the phone opened is somebody else's public playlist as often
+    /// as not, now that the host reads them from the relays. Editing one of
+    /// those is copying it: it is filed under an id of its own, and the phone
+    /// learns that from the answer rather than from a flag - the copy it gets
+    /// back names itself.
     fn save_playlist(
         &self,
-        mut playlist: napstr_remote_protocol::RemotePlaylist,
+        playlist: napstr_remote_protocol::RemotePlaylist,
     ) -> Result<napstr_remote_protocol::RemotePlaylist, String> {
-        playlist.author = crate::network::own_pubkey()?;
-        playlist.updated_at = Utc::now().timestamp();
-        let connection = open_connection(&self.db_path)?;
-        crate::playlist::save(&connection, &playlist)?;
-        Ok(playlist)
+        crate::playlist::file_revision(
+            &open_connection(&self.db_path)?,
+            playlist,
+            &crate::network::own_pubkey()?,
+            Utc::now().timestamp(),
+        )
     }
 
     async fn serve_request(

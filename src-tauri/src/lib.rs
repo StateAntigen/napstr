@@ -2259,16 +2259,22 @@ fn playlist(
 /// rather than taken from the caller: the coordinate has to be the one a later
 /// publication will use, or publishing a draft would leave two rows behind under
 /// one id, only one of which is the author's.
+///
+/// A revision of somebody else's playlist is filed as a copy under an id of its
+/// own, which is what `playlist::file_revision` is for. A window in front of a
+/// public playlist may press Save, but nothing here ever signs for a coordinate
+/// this identity does not own.
 #[tauri::command]
 fn save_playlist(
-    mut playlist: napstr_remote_protocol::RemotePlaylist,
+    playlist: napstr_remote_protocol::RemotePlaylist,
     state: State<'_, AppState>,
 ) -> Result<napstr_remote_protocol::RemotePlaylist, String> {
-    playlist.author = network::own_pubkey()?;
-    playlist.updated_at = Utc::now().timestamp();
-    let connection = open_db(&state)?;
-    playlist::save(&connection, &playlist)?;
-    Ok(playlist)
+    playlist::file_revision(
+        &open_db(&state)?,
+        playlist,
+        &network::own_pubkey()?,
+        Utc::now().timestamp(),
+    )
 }
 
 /// Forget a playlist this computer holds and has never published.
@@ -2281,6 +2287,58 @@ fn delete_playlist(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     playlist::remove(&open_db(&state)?, &author, &playlist_id)
+}
+
+/// Read the public playlists the relays answer with, and file other authors'.
+///
+/// Best effort: a network that cannot answer is reported to the page, which
+/// keeps showing whatever this computer holds - and keeps quiet about which of
+/// its own playlists the relays do or do not have, because that question was
+/// not answered.
+#[tauri::command]
+async fn read_playlists(
+    state: State<'_, AppState>,
+) -> Result<network::PlaylistReadReport, String> {
+    state.network.read_public_playlists().await
+}
+
+/// This identity's own playlists as the relays last answered for them, or
+/// nothing at all while the relays have not been read.
+///
+/// The difference matters and is why this is not a plain list: "we never looked"
+/// and "the relays do not have any of your playlists" would otherwise be the
+/// same answer, and the second one is what invites a withdrawal.
+#[tauri::command]
+async fn playlist_reconciliation(
+    state: State<'_, AppState>,
+) -> Result<Option<Vec<napstr_remote_protocol::RemotePlaylistSummary>>, String> {
+    Ok(state.network.playlist_reconciliation().await)
+}
+
+/// Import one of this identity's own playlists from the relays.
+///
+/// The user-confirmed half of the reconciliation the NIP describes: a
+/// coordinate that exists on a relay and not here can be brought back, and
+/// nothing does this by itself.
+#[tauri::command]
+async fn restore_playlist(
+    playlist_id: String,
+    state: State<'_, AppState>,
+) -> Result<napstr_remote_protocol::RemotePlaylist, String> {
+    state.network.restore_playlist(&playlist_id).await
+}
+
+/// How many live seeders each member of an open playlist has right now.
+///
+/// A playlist asserts nothing about who holds its members, so this is the
+/// ordinary kind `30422` availability answer for a bounded set of file ids; the
+/// page draws it beside the members it is already showing.
+#[tauri::command]
+async fn playlist_member_availability(
+    file_ids: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<network::PlaylistMemberAvailability>, String> {
+    state.network.playlist_member_availability(file_ids).await
 }
 
 /// The albums the cover worker would act on next, for the Covers tab.
@@ -2552,6 +2610,10 @@ pub fn run() {
             playlist,
             save_playlist,
             delete_playlist,
+            read_playlists,
+            playlist_reconciliation,
+            restore_playlist,
+            playlist_member_availability,
             cover_candidates,
             cover_status,
             set_cover_preferences,

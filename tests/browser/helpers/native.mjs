@@ -52,6 +52,30 @@ export async function mockNative(page, { app = 'napstrfy', nativeLocale = 'en-GB
         (row) => !(row.playlistId === playlistId && (!author || row.author === author))
       );
     };
+    // What the relays answer about this identity's own playlists, as the reader
+    // reports it. Empty is "they were read, and have none of ours"; a test that
+    // seeds rows models coordinates that exist there and not here, which is what
+    // the Restore button is for. `window.playlistRelayReadFails` models a look
+    // that never happened, which has to stay different from an empty answer.
+    const playlistRelayOwn = () => window.playlistRelayOwn ?? [];
+    // A withdrawal is the end of the coordinate everywhere, the relay answer
+    // included: a playlist this computer just took back is not one to restore.
+    const forgetRelayPlaylist = (playlistId) => {
+      window.playlistRelayOwn = playlistRelayOwn().filter((row) => row.playlistId !== playlistId);
+    };
+    // A copy is a new playlist of this identity's, so the host mints the id: the
+    // mock does the same rather than filing the copy under somebody else's.
+    const filePlaylistRevision = (playlist, extra = {}) => {
+      const foreign = Boolean(playlist.author) && playlist.author !== ownPlaylistAuthor();
+      return savePlaylistRow({
+        ...playlist,
+        playlistId: foreign ? window.nextCopyPlaylistId ?? '33333333-3333-4333-8333-333333333333' : playlist.playlistId,
+        author: ownPlaylistAuthor(),
+        published: foreign ? false : (extra.published ?? playlist.published ?? false),
+        updatedAt: 1787000000,
+        ...extra
+      });
+    };
     const playlistSummaries = () =>
       playlistRows().map((row) => ({
         playlistId: row.playlistId,
@@ -142,6 +166,24 @@ export async function mockNative(page, { app = 'napstrfy', nativeLocale = 'en-GB
           case 'remote_download': return 'request-1';
           case 'own_playlist_author': return ownPlaylistAuthor();
           case 'new_playlist_id': return window.nextPlaylistId ?? '11111111-1111-4111-8111-111111111111';
+          // The relays, as the desktop's reader reports them. Both of the two
+          // desktop calls answer from the same seeded state, so a test can tell
+          // "the relays said none of yours" apart from "nobody looked".
+          case 'read_playlists': {
+            if (window.playlistRelayReadFails) throw 'playlist discovery failed: no relay answered';
+            return { stored: 0, withdrawn: 0, own: playlistRelayOwn() };
+          }
+          case 'playlist_reconciliation':
+            return window.playlistRelayReadFails ? null : playlistRelayOwn();
+          case 'restore_playlist': {
+            const found = playlistRelayOwn().find((known) => known.playlistId === args.playlistId);
+            if (!found) throw 'The relays do not have that playlist';
+            return savePlaylistRow({ ...found, author: ownPlaylistAuthor(), published: true });
+          }
+          case 'playlist_member_availability': {
+            const counts = window.playlistMemberAvailability ?? [];
+            return counts.filter((entry) => args.fileIds.includes(entry.fileId));
+          }
           // The phone reads and writes the same store the desktop page does, one
           // command at a time; only the shapes differ.
           case 'remote_new_playlist_id': return window.nextPlaylistId ?? '11111111-1111-4111-8111-111111111111';
@@ -164,34 +206,22 @@ export async function mockNative(page, { app = 'napstrfy', nativeLocale = 'en-GB
               .filter((row) => (row.tracks ?? []).some((member) => member.fileId === args.fileId))
               .map((row) => ({ author: row.author ?? ownPlaylistAuthor(), playlistId: row.playlistId }));
           case 'remote_save_playlist':
-            return savePlaylistRow({
-              ...args.playlist,
-              author: ownPlaylistAuthor(),
-              updatedAt: 1787000000
-            });
+            return filePlaylistRevision(args.playlist);
           case 'remote_publish_playlist':
-            return savePlaylistRow({
-              ...args.playlist,
-              author: ownPlaylistAuthor(),
-              published: true,
-              updatedAt: 1787000000
-            });
+            return filePlaylistRevision(args.playlist, { published: true });
           case 'remote_delete_playlist': dropPlaylistRow(args.author, args.playlistId); return null;
-          case 'remote_withdraw_playlist': dropPlaylistRow('', args.playlistId); return null;
+          case 'remote_withdraw_playlist': dropPlaylistRow('', args.playlistId); forgetRelayPlaylist(args.playlistId); return null;
           case 'playlists': return playlistSummaries();
           case 'playlist': return findPlaylist(args.author, args.playlistId);
           // Both desktop writes stamp the author the way the host does, so a page
-          // under test sees the coordinate it will really get back.
+          // under test sees the coordinate it will really get back - including a
+          // copy filed under an id of its own when the revision is not this
+          // identity's playlist.
           case 'save_playlist':
-            return savePlaylistRow({ ...args.playlist, author: ownPlaylistAuthor(), updatedAt: 1787000000 });
+            return filePlaylistRevision(args.playlist);
           case 'publish_playlist':
-            return savePlaylistRow({
-              ...args.playlist,
-              author: ownPlaylistAuthor(),
-              published: true,
-              updatedAt: 1787000000
-            });
-          case 'withdraw_playlist': dropPlaylistRow('', args.playlistId); return null;
+            return filePlaylistRevision(args.playlist, { published: true });
+          case 'withdraw_playlist': dropPlaylistRow('', args.playlistId); forgetRelayPlaylist(args.playlistId); return null;
           case 'delete_playlist': dropPlaylistRow(args.author, args.playlistId); return null;
           case 'podcast_downloads': return [{ episode, ready: false, status: 'Downloading', progress: 20 }];
           case 'podcast_parse_search': return [{ id: 1, title: 'Original podcast', author: 'Original author', feedUrl: 'https://example.com/feed', image: '', description: '', language: 'en', episodeCount: 1, genres: ['Music'] }];

@@ -3,7 +3,9 @@ use ::rand::seq::SliceRandom;
 use chrono::Utc;
 use futures_util::{stream, StreamExt};
 use keyring::Entry;
-use napstr_remote_protocol::{RemotePlaylist, MAX_REPORT_NOTE_CHARS, REPORT_REASONS};
+use napstr_remote_protocol::{
+    RemotePlaylist, RemotePlaylistSummary, MAX_REPORT_NOTE_CHARS, REPORT_REASONS,
+};
 use nostr_sdk::prelude::*;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -61,6 +63,22 @@ const COVER_KEY_BATCH_SIZE: usize = 75;
 const COVER_KEY_CONCURRENCY: usize = 4;
 const COVER_QUERY_LIMIT: usize = 500;
 const COVER_QUERY_TIMEOUT: Duration = Duration::from_secs(8);
+/// Public playlists one look at the relays may answer with. The marker is the
+/// only supported discovery path, and a playlist list is bounded the same way a
+/// catalogue browse is - not because the relays would refuse more, but because
+/// "list every playlist on the network" is not a thing a client is meant to do.
+const PLAYLIST_DISCOVERY_LIMIT: usize = 500;
+const PLAYLIST_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
+const PLAYLIST_PROFILE_TIMEOUT: Duration = Duration::from_secs(3);
+const PLAYLIST_PROFILE_CONCURRENCY: usize = 16;
+const PLAYLIST_PROFILE_LIMIT: usize = 128;
+/// How long one look at the relays stands before another is made.
+///
+/// A read is a query per relay, so the Playlists page asking on every visit, a
+/// window that reconnects, and a phone that keeps asking must not each become
+/// one. What is between looks is offered from the last one, and the cache is the
+/// same state the reconciliation is answered from.
+const PLAYLIST_READ_LIFETIME: Duration = Duration::from_secs(30);
 const CATALOGUE_BROWSE_SESSION_LIFETIME: Duration = Duration::from_secs(10 * 60);
 const CATALOGUE_BROWSE_SESSION_LIMIT: usize = 8;
 const NETWORK_SEARCH_RESULT_LIMIT: usize = 500;
@@ -741,6 +759,206 @@ struct AvailabilitySnapshot {
     available_by_file: HashMap<String, HashSet<String>>,
 }
 
+/// The one query that finds public playlists: the marker, and nothing else.
+///
+/// `#t` rather than `#d`, because a playlist's coordinate is not known before it
+/// is found, and the marker is the only discovery path the NIP supports.
+fn playlist_discovery_filter() -> Filter {
+    Filter::new()
+        .kind(Kind::from(playlist::PLAYLIST_KIND))
+        .hashtag(playlist::PLAYLIST_MARKER)
+        .limit(PLAYLIST_DISCOVERY_LIMIT)
+}
+
+/// This identity's own playlists, which are what the reconciliation is about.
+///
+/// Asked for separately rather than read out of the discovery answer: a bounded
+/// list can leave an author's own playlists out, and "the relays do not have
+/// this" decided by a page limit is exactly the mistake reconciliation exists
+/// to avoid.
+fn playlist_own_filter(author: PublicKey) -> Filter {
+    playlist_discovery_filter().author(author)
+}
+
+/// The newest valid event per coordinate, with the time it claims.
+///
+/// A coordinate is `(author, d)` and the newest event at it is that author's
+/// last word about the playlist, which is what makes a withdrawal final for
+/// every older revision of it - wherever a relay still answers with one.
+///
+/// Only events this host reads as playlists take part, marker and all. The kind
+/// is co-occupied, and an event that is not a playlist of ours must never be
+/// able to shadow one authors do publish. A tie on time is broken by the id, so
+/// two events of the same second cannot both be the winner.
+fn newest_playlist_revisions(
+    events: impl IntoIterator<Item = Event>,
+) -> Vec<(i64, playlist::PlaylistEvent)> {
+    let mut newest: HashMap<(String, String), (i64, String, playlist::PlaylistEvent)> =
+        HashMap::new();
+    for event in events {
+        let Some(parsed) = playlist::playlist_event(&event) else {
+            continue;
+        };
+        let (author, playlist_id) = match &parsed {
+            playlist::PlaylistEvent::Playlist(read) => {
+                (read.author.clone(), read.playlist_id.clone())
+            }
+            playlist::PlaylistEvent::Withdrawn {
+                playlist_id,
+                author,
+            } => (author.clone(), playlist_id.clone()),
+        };
+        let candidate = (event.created_at.as_secs() as i64, event.id.to_hex(), parsed);
+        match newest.get(&(author.clone(), playlist_id.clone())) {
+            Some(held) if (held.0, &held.1) >= (candidate.0, &candidate.1) => {}
+            _ => {
+                newest.insert((author, playlist_id), candidate);
+            }
+        }
+    }
+    let mut revisions = newest
+        .into_values()
+        .map(|(created_at, _, parsed)| (created_at, parsed))
+        .collect::<Vec<_>>();
+    revisions.sort_by(|left, right| right.0.cmp(&left.0));
+    revisions
+}
+
+/// A profile name as a playlist row may carry it: bounded, and stripped of the
+/// characters that would let one rearrange what is drawn around it.
+fn playlist_display_name(metadata: &Metadata) -> Option<String> {
+    let name = metadata.display_name.as_ref().or(metadata.name.as_ref())?;
+    let name = crate::audio::sanitise_public_text(name);
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some(name.chars().take(256).collect())
+}
+
+/// What the relays currently answer about this identity's own playlists.
+///
+/// Held in memory rather than written down on purpose. It is a reading of
+/// somebody else's state - what the relays have - and a stored copy of it would
+/// be a second, quietly diverging source of truth beside `playlists`. Nothing
+/// here is this computer's own until the author restores it, which is also why
+/// a restart means "not looked at yet" rather than a wrong answer about which
+/// playlists exist.
+struct RelayPlaylists {
+    fetched_at: Instant,
+    /// Live revisions of this identity's playlists by id, whether or not this
+    /// computer holds them. A withdrawn coordinate is not here: a withdrawal is
+    /// the end of it.
+    own: HashMap<String, RemotePlaylist>,
+}
+
+impl RelayPlaylists {
+    fn new(own: HashMap<String, RemotePlaylist>) -> Self {
+        Self {
+            fetched_at: Instant::now(),
+            own,
+        }
+    }
+
+    fn own_summaries(&self) -> Vec<RemotePlaylistSummary> {
+        let mut summaries = self
+            .own
+            .values()
+            .map(RemotePlaylist::summary)
+            .collect::<Vec<_>>();
+        summaries.sort_by(|left, right| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| left.playlist_id.cmp(&right.playlist_id))
+        });
+        summaries
+    }
+}
+
+/// What one look at the relays did.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaylistReadReport {
+    /// Playlists of other authors this look filed here.
+    pub stored: usize,
+    /// Coordinates the relays had withdrawn, forgotten here.
+    pub withdrawn: usize,
+    /// This identity's live coordinates on the relays, whether or not this
+    /// computer holds them. One that is here and not in this list is a playlist
+    /// nobody offers any more; one that is in this list and not here is one this
+    /// computer does not hold and may restore.
+    pub own: Vec<RemotePlaylistSummary>,
+}
+
+/// How many live seeders one member of a playlist has right now.
+///
+/// A playlist is a curation, not a seeder claim, so this is resolved from kind
+/// `30422` heartbeats from **any** author - the playlist's own author has no
+/// part in it - and a member with none is still a member.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaylistMemberAvailability {
+    pub file_id: String,
+    pub seeders: usize,
+}
+
+/// File one look's answers.
+///
+/// Everybody else's playlists become rows here, under their own author: the
+/// relays are where a public playlist lives, and this computer holds a reading
+/// of what they say. This identity's own are returned rather than stored, which
+/// is the whole of the reconciliation - they are what the author is offered to
+/// restore, and writing them down would decide it for them.
+///
+/// A withdrawal is remembered against the coordinate and its author's row is
+/// forgotten. A withdrawal of **this identity's own** is only remembered: the
+/// row here is left exactly as it is, because the installation that signed it
+/// may not be this one - two installations of one identity are the hazard the
+/// NIP names, and a copy here can hold edits nobody has published. It stops
+/// being offered from the relays, which is what the withdrawal says, and
+/// nothing more.
+///
+/// Takes the names the profile lookup resolved rather than fetching them, so the
+/// policy is one function with no network in it.
+fn apply_playlist_revisions(
+    connection: &Connection,
+    revisions: Vec<(i64, playlist::PlaylistEvent)>,
+    names: &HashMap<String, String>,
+    own: &str,
+) -> Result<(PlaylistReadReport, RelayPlaylists), String> {
+    let mut report = PlaylistReadReport::default();
+    let mut own_playlists = HashMap::new();
+    for (created_at, revision) in revisions {
+        match revision {
+            playlist::PlaylistEvent::Withdrawn {
+                playlist_id,
+                author,
+            } => {
+                playlist::mark_withdrawn(connection, &author, &playlist_id, created_at)?;
+                if author == own {
+                    continue;
+                }
+                playlist::remove(connection, &author, &playlist_id)?;
+                report.withdrawn += 1;
+            }
+            playlist::PlaylistEvent::Playlist(mut read) => {
+                read.display_name = names.get(&read.author).cloned().unwrap_or_default();
+                if read.author == own {
+                    own_playlists.insert(read.playlist_id.clone(), *read);
+                    continue;
+                }
+                if playlist::store_from_relay(connection, &read)? {
+                    report.stored += 1;
+                }
+            }
+        }
+    }
+    let cache = RelayPlaylists::new(own_playlists);
+    report.own = cache.own_summaries();
+    Ok((report, cache))
+}
+
 pub struct NetworkService {
     db_path: PathBuf,
     transfers: Arc<TransferService>,
@@ -757,6 +975,10 @@ pub struct NetworkService {
     catalogue_browse_sessions: Mutex<HashMap<String, CatalogueBrowseSession>>,
     availability_cache: RwLock<Option<Arc<AvailabilitySnapshot>>>,
     availability_fetch_lock: Mutex<()>,
+    /// Serialises a look at the relays, and stands between one look and the
+    /// next for as long as the reading is fresh.
+    playlist_read_lock: Mutex<()>,
+    relay_playlists: RwLock<Option<RelayPlaylists>>,
     trollbox_cache_lock: Mutex<()>,
     track_discussion_subscription_lock: Mutex<()>,
     download_restart_lock: Mutex<()>,
@@ -789,6 +1011,8 @@ impl NetworkService {
             catalogue_browse_sessions: Mutex::new(HashMap::new()),
             availability_cache: RwLock::new(None),
             availability_fetch_lock: Mutex::new(()),
+            playlist_read_lock: Mutex::new(()),
+            relay_playlists: RwLock::new(None),
             trollbox_cache_lock: Mutex::new(()),
             track_discussion_subscription_lock: Mutex::new(()),
             download_restart_lock: Mutex::new(()),
@@ -1064,6 +1288,13 @@ impl NetworkService {
             }
         });
         self.queue_catalogue_publish(true);
+        // Public playlists are read once the relays answer, without waiting for
+        // the Playlists page to be opened: a paired phone lists them too, and it
+        // has no way to ask for the reading itself.
+        let playlists = self.clone();
+        tauri::async_runtime::spawn(async move {
+            let _ = playlists.read_public_playlists().await;
+        });
         let heartbeat = self.clone();
         tokio::spawn(async move {
             while heartbeat.connected.load(Ordering::SeqCst)
@@ -3147,9 +3378,19 @@ impl NetworkService {
     ///
     /// The coordinate is replaced by the withdrawal body rather than deleted, so
     /// a client that already has an older revision cannot be offered it again.
+    ///
+    /// Only a coordinate this identity actually holds is withdrawn. A withdrawal
+    /// names one `d` and is signed, so it is this author's last word about that
+    /// id: signing one for a playlist somebody else wrote would be a claim about
+    /// a coordinate this identity never had - and it would silently retract this
+    /// identity's own use of that id for good.
     pub async fn withdraw_playlist(&self, playlist_id: &str) -> Result<(), String> {
         let keys = load_or_create_identity()?;
         let author = keys.public_key().to_hex();
+        let connection = super::open_connection(&self.db_path)?;
+        if playlist::page(&connection, &author, playlist_id, 0, 1)?.is_none() {
+            return Err("That playlist is not one this computer holds".into());
+        }
         let event = playlist::playlist_withdrawal_builder(playlist_id, &keys)?;
         self.client
             .read()
@@ -3159,9 +3400,221 @@ impl NetworkService {
             .send_event(&event)
             .await
             .map_err(|error| format!("playlist withdrawal failed: {error}"))?;
+        // Written down before it is forgotten, so a relay that still answers
+        // with the older revision cannot put it back on the next look.
+        playlist::mark_withdrawn(
+            &connection,
+            &author,
+            playlist_id,
+            event.created_at.as_secs() as i64,
+        )?;
         // Forgotten by coordinate: this identity's playlist under that id, not
         // anybody else's that happens to share the id.
-        playlist::remove(&super::open_connection(&self.db_path)?, &author, playlist_id)
+        playlist::remove(&connection, &author, playlist_id)?;
+        // And it is nothing to restore any more.
+        if let Some(cache) = self.relay_playlists.write().await.as_mut() {
+            cache.own.remove(playlist_id);
+        }
+        Ok(())
+    }
+
+    /// Read the public playlists the relays answer with, and file everybody
+    /// else's on this computer.
+    ///
+    /// This is the reading half of the kind `30425` codec. Every event goes
+    /// through `playlist::playlist_event`, the same validator the publishing
+    /// half is checked against, and what survives is stored through
+    /// `playlist::store_from_relay`, so a playlist read from a relay and one
+    /// written here are one row in one shape.
+    ///
+    /// This identity's **own** playlists are deliberately not stored by this.
+    /// Restoring one, or withdrawing one, is a decision about what this computer
+    /// holds, and two installations of one identity with different local state
+    /// would otherwise make it for each other - the hazard the NIP names. They
+    /// are held as the answer the page reconciles against instead, and it takes
+    /// the author to move one either way.
+    ///
+    /// Both queries must answer before anything is stored or forgotten: a relay
+    /// that could not answer must never read as "that playlist does not exist",
+    /// which is also why the page only offers to restore or withdraw after a
+    /// look that actually happened.
+    pub async fn read_public_playlists(&self) -> Result<PlaylistReadReport, String> {
+        let _read_guard = self.playlist_read_lock.lock().await;
+        if let Some(cached) = self.relay_playlists.read().await.as_ref() {
+            if cached.fetched_at.elapsed() < PLAYLIST_READ_LIFETIME {
+                return Ok(PlaylistReadReport {
+                    own: cached.own_summaries(),
+                    ..PlaylistReadReport::default()
+                });
+            }
+        }
+        let client = self
+            .client
+            .read()
+            .await
+            .clone()
+            .ok_or("Nostr is not connected")?;
+        let own = own_pubkey()?;
+        let own_key = PublicKey::from_str(&own).map_err(|error| error.to_string())?;
+        let (discovery, mine) = tokio::join!(
+            client.fetch_events(playlist_discovery_filter(), PLAYLIST_QUERY_TIMEOUT),
+            client.fetch_events(playlist_own_filter(own_key), PLAYLIST_QUERY_TIMEOUT),
+        );
+        let discovery =
+            discovery.map_err(|error| format!("playlist discovery failed: {error}"))?;
+        let mine = mine.map_err(|error| {
+            format!("this identity's own playlists could not be read: {error}")
+        })?;
+        let mut events = discovery;
+        events.extend(mine);
+        let revisions = newest_playlist_revisions(events);
+        // Only the other authors need a name looked up: a row of our own is
+        // drawn from this computer's own settings, which is where it came from.
+        let authors = revisions
+            .iter()
+            .filter_map(|(_, revision)| match revision {
+                playlist::PlaylistEvent::Playlist(read) => Some(read.author.clone()),
+                playlist::PlaylistEvent::Withdrawn { .. } => None,
+            })
+            .filter(|author| author != &own);
+        let names = self.playlist_author_names(&client, authors).await;
+        let connection = super::open_connection(&self.db_path)?;
+        let (report, cache) = apply_playlist_revisions(&connection, revisions, &names, &own)?;
+        *self.relay_playlists.write().await = Some(cache);
+        Ok(report)
+    }
+
+    /// This identity's own playlists as the relays last answered for them, or
+    /// `None` while the relays have not been read successfully.
+    ///
+    /// `None` is not "there are none": a page nobody has looked at yet, or a
+    /// look that failed, must not be read as a reason to withdraw everything
+    /// this computer holds.
+    pub async fn playlist_reconciliation(&self) -> Option<Vec<RemotePlaylistSummary>> {
+        self.relay_playlists
+            .read()
+            .await
+            .as_ref()
+            .map(RelayPlaylists::own_summaries)
+    }
+
+    /// Import one of this identity's own playlists from the relays.
+    ///
+    /// The revision is taken from the last look at the relays when it is there,
+    /// so restoring costs nothing on the network, and read back by coordinate
+    /// when it is not - a window that has just started has not looked yet. What
+    /// is stored is the revision the relays answer with, `published` and all,
+    /// because that is what it is.
+    pub async fn restore_playlist(&self, playlist_id: &str) -> Result<RemotePlaylist, String> {
+        let own = own_pubkey()?;
+        let cached = self
+            .relay_playlists
+            .read()
+            .await
+            .as_ref()
+            .and_then(|cache| cache.own.get(playlist_id).cloned());
+        let playlist = match cached {
+            Some(playlist) => playlist,
+            None => {
+                let client = self
+                    .client
+                    .read()
+                    .await
+                    .clone()
+                    .ok_or("Nostr is not connected")?;
+                let author = PublicKey::from_str(&own).map_err(|error| error.to_string())?;
+                let filter = playlist_own_filter(author)
+                    .identifiers([playlist_id.to_string()])
+                    .limit(1);
+                let events = client
+                    .fetch_events(filter, PLAYLIST_QUERY_TIMEOUT)
+                    .await
+                    .map_err(|error| format!("that playlist could not be read back: {error}"))?;
+                match newest_playlist_revisions(events).into_iter().next() {
+                    Some((_, playlist::PlaylistEvent::Playlist(read))) if read.author == own => *read,
+                    Some((_, playlist::PlaylistEvent::Withdrawn { .. })) => {
+                        return Err("That playlist has been withdrawn, so there is nothing to \
+                                    restore"
+                            .into())
+                    }
+                    _ => return Err("The relays do not have that playlist".into()),
+                }
+            }
+        };
+        playlist::save(&super::open_connection(&self.db_path)?, &playlist)?;
+        Ok(playlist)
+    }
+
+    /// How many live seeders each of `file_ids` has, for the members of a
+    /// playlist.
+    ///
+    /// Availability comes from kind `30422` heartbeats from any author, exactly
+    /// as it does for a catalogue row: a playlist asserts nothing about who
+    /// holds its members, and a member nobody seeds is still a member.
+    pub async fn playlist_member_availability(
+        &self,
+        file_ids: Vec<String>,
+    ) -> Result<Vec<PlaylistMemberAvailability>, String> {
+        let client = self
+            .client
+            .read()
+            .await
+            .clone()
+            .ok_or("Nostr is not connected")?;
+        let snapshot = self.availability_snapshot(&client).await?;
+        Ok(file_ids
+            .into_iter()
+            .take(playlist::PLAYLIST_MEMBER_LIMIT)
+            .map(|file_id| PlaylistMemberAvailability {
+                seeders: snapshot
+                    .available_by_file
+                    .get(&file_id)
+                    .map_or(0, HashSet::len),
+                file_id,
+            })
+            .collect())
+    }
+
+    /// Display names for the authors one look at the relays found.
+    ///
+    /// The same profile lookup the catalogue uses, so a public playlist carries
+    /// the name its author chose rather than a truncated key. A profile that
+    /// cannot be fetched is simply a row with no name, which is what a reader
+    /// falls back to.
+    async fn playlist_author_names(
+        &self,
+        client: &Client,
+        authors: impl IntoIterator<Item = String>,
+    ) -> HashMap<String, String> {
+        let keys = authors
+            .into_iter()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .filter_map(|author| PublicKey::from_str(&author).ok())
+            .take(PLAYLIST_PROFILE_LIMIT)
+            .collect::<Vec<_>>();
+        let profiles: HashMap<String, Metadata> = stream::iter(keys)
+            .map(|public_key| {
+                let client = client.clone();
+                async move {
+                    client
+                        .fetch_metadata(public_key, PLAYLIST_PROFILE_TIMEOUT)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|metadata| (public_key.to_hex(), metadata))
+                }
+            })
+            .buffer_unordered(PLAYLIST_PROFILE_CONCURRENCY)
+            .filter_map(|profile| async move { profile })
+            .collect()
+            .await;
+        profiles
+            .into_iter()
+            .filter_map(|(key, metadata)| {
+                playlist_display_name(&metadata).map(|name| (key, name))
+            })
+            .collect()
     }
 
     /// NIP-56: report the winning cover published for one album key.
@@ -5036,6 +5489,256 @@ mod tests {
             fingerprint,
             catalogue_event_fingerprint("catalogue", &["sandman".to_string()])
         );
+    }
+
+    /// A playlist of one member, for the reader's own tests.
+    fn playlist_fixture(playlist_id: &str, title: &str) -> RemotePlaylist {
+        RemotePlaylist {
+            playlist_id: playlist_id.into(),
+            title: title.into(),
+            tracks: vec![napstr_remote_protocol::RemotePlaylistTrack {
+                position: 1,
+                file_id: "a".repeat(64),
+                ..Default::default()
+            }],
+            total: 1,
+            ..Default::default()
+        }
+    }
+
+    /// The same body, signed for a chosen moment, so an ordering rule can be
+    /// checked without waiting for a clock.
+    fn signed_at(event: Event, created_at: u64, keys: &Keys) -> Event {
+        EventBuilder::new(event.kind, event.content.clone())
+            .tags(event.tags.iter().cloned().collect::<Vec<_>>())
+            .custom_created_at(Timestamp::from(created_at))
+            .sign_with_keys(keys)
+            .unwrap()
+    }
+
+    /// A playlist revision signed by `keys` at a chosen moment.
+    fn playlist_at(playlist_id: &str, title: &str, created_at: u64, keys: &Keys) -> Event {
+        signed_at(
+            playlist::playlist_event_builder(&playlist_fixture(playlist_id, title), false, keys)
+                .unwrap(),
+            created_at,
+            keys,
+        )
+    }
+
+    #[test]
+    fn playlist_discovery_asks_for_the_marker_and_stays_bounded() {
+        let discovery = serde_json::to_value(playlist_discovery_filter()).unwrap();
+        assert_eq!(discovery["kinds"], serde_json::json!([playlist::PLAYLIST_KIND]));
+        assert_eq!(
+            discovery["#t"],
+            serde_json::json!([playlist::PLAYLIST_MARKER]),
+            "the marker is the only supported discovery path"
+        );
+        assert_eq!(discovery["limit"], PLAYLIST_DISCOVERY_LIMIT);
+        // Nothing else narrows it: `d` is a playlist's own coordinate and is
+        // unknown until it has been found.
+        assert!(discovery.get("#d").is_none());
+        assert!(discovery.get("authors").is_none());
+
+        // This identity's own playlists are asked for separately, so a bounded
+        // discovery list cannot make an author's own look absent - which is the
+        // one answer reconciliation must never get wrong.
+        let own = serde_json::to_value(playlist_own_filter(Keys::generate().public_key())).unwrap();
+        assert_eq!(own["kinds"], serde_json::json!([playlist::PLAYLIST_KIND]));
+        assert_eq!(own["#t"], serde_json::json!([playlist::PLAYLIST_MARKER]));
+        assert_eq!(own["limit"], PLAYLIST_DISCOVERY_LIMIT);
+        assert_eq!(own["authors"].as_array().map(Vec::len), Some(1));
+    }
+
+    /// What one look at the relays does with what it found.
+    ///
+    /// The store policy, without a relay: everybody else's playlists are filed
+    /// here, this identity's own are only offered back, and a withdrawal ends a
+    /// coordinate for good - except that it never deletes a copy this computer
+    /// holds of one of its own, because the installation that signed it may not
+    /// be this one.
+    #[test]
+    fn a_look_files_everybody_elses_playlists_and_keeps_our_own_to_offer_back() {
+        let directory =
+            std::env::temp_dir().join(format!("napstr-playlists-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let db = directory.join("napstr.sqlite3");
+        crate::initialise_database(&db, &directory).unwrap();
+        let connection = super::super::open_connection(&db).unwrap();
+        const THEIRS: &str = "77abf082-7075-4d36-afe2-e9710ac6b33c";
+        const OURS: &str = "eb738de4-c6b7-47b0-ba32-b8948d06cbef";
+        let mine = Keys::generate();
+        let theirs = Keys::generate();
+        let own = mine.public_key().to_hex();
+        let their_hex = theirs.public_key().to_hex();
+        let names = HashMap::from([(their_hex.clone(), "Sean Parker".to_string())]);
+
+        // Their playlist is filed here, under their author, with the name their
+        // profile carries.
+        let look = |events: Vec<Event>| {
+            apply_playlist_revisions(
+                &connection,
+                newest_playlist_revisions(events),
+                &names,
+                &own,
+            )
+            .unwrap()
+        };
+        let (report, own_playlists) = look(vec![playlist_at(THEIRS, "rock", 1_000, &theirs)]);
+        assert_eq!(report.stored, 1);
+        assert!(own_playlists.own.is_empty());
+        let stored = playlist::page(&connection, &their_hex, THEIRS, 0, 10)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.title, "rock");
+        assert_eq!(stored.display_name, "Sean Parker");
+        assert!(stored.published, "it came off a relay, so a revision exists there");
+
+        // This identity's own is not filed: it is the reconciliation, and the
+        // author is the one who decides whether this computer holds it.
+        let (report, own_playlists) = look(vec![playlist_at(OURS, "Night_Rider", 2_000, &mine)]);
+        assert_eq!(report.stored, 0);
+        assert_eq!(report.own.len(), 1);
+        assert_eq!(report.own[0].playlist_id, OURS);
+        assert_eq!(
+            own_playlists.own.get(OURS).map(|row| row.title.as_str()),
+            Some("Night_Rider")
+        );        assert!(playlist::page(&connection, &own, OURS, 0, 1).unwrap().is_none());
+
+        // A withdrawal of theirs forgets the row here and is remembered against
+        // the coordinate, so the older revision cannot come back.
+        let (report, _) = look(vec![signed_at(
+            playlist::playlist_withdrawal_builder(THEIRS, &theirs).unwrap(),
+            1_100,
+            &theirs,
+        )]);
+        assert_eq!(report.withdrawn, 1);
+        assert!(playlist::page(&connection, &their_hex, THEIRS, 0, 10).unwrap().is_none());
+        let (report, _) = look(vec![playlist_at(THEIRS, "rock", 1_000, &theirs)]);
+        assert_eq!(report.stored, 0, "a withdrawn coordinate is not filed again");
+        // And a revision published after the withdrawal is a live playlist.
+        let (report, _) = look(vec![playlist_at(THEIRS, "rock, again", 1_200, &theirs)]);
+        assert_eq!(report.stored, 1);
+
+        // A withdrawal of ours ends the coordinate on the relays without
+        // touching what this computer holds: another installation signed it, and
+        // a copy here can hold edits nobody has published.
+        let mut held = playlist_fixture(OURS, "Bring me the playlist");
+        held.author = own.clone();
+        held.published = true;
+        playlist::save(&connection, &held).unwrap();
+        let (report, own_playlists) = look(vec![signed_at(
+            playlist::playlist_withdrawal_builder(OURS, &mine).unwrap(),
+            2_100,
+            &mine,
+        )]);
+        assert!(report.own.is_empty(), "it is not on the relays any more");
+        assert!(own_playlists.own.is_empty());
+        assert!(
+            playlist::page(&connection, &own, OURS, 0, 10).unwrap().is_some(),
+            "a withdrawal read from a relay must not delete another installation's copy"
+        );
+
+        drop(connection);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// One coordinate, one answer: the newest valid event at it.
+    #[test]
+    fn a_playlist_read_keeps_the_newest_event_per_coordinate() {
+        let keys = Keys::generate();
+        let other = Keys::generate();
+        let author = keys.public_key().to_hex();
+        const ID: &str = "77abf082-7075-4d36-afe2-e9710ac6b33c";
+
+        fn playlist(playlist_id: &str, title: &str) -> RemotePlaylist {
+            playlist_fixture(playlist_id, title)
+        }
+        let at = signed_at;
+        let revision = |created_at: u64, title: &str| {
+            at(
+                playlist::playlist_event_builder(&playlist(ID, title), false, &keys).unwrap(),
+                created_at,
+                &keys,
+            )
+        };
+        let withdrawal = at(
+            playlist::playlist_withdrawal_builder(ID, &keys).unwrap(),
+            3_000,
+            &keys,
+        );
+
+        // Two revisions of one coordinate are one playlist, and the newest of
+        // them is what its author last said.
+        let revisions = newest_playlist_revisions(vec![revision(1_000, "rock"), revision(2_000, "rock and roll")]);
+        assert_eq!(revisions.len(), 1);
+        assert_eq!(revisions[0].0, 2_000);
+        assert!(matches!(
+            &revisions[0].1,
+            playlist::PlaylistEvent::Playlist(read) if read.title == "rock and roll"
+        ));
+
+        // A withdrawal is the author's last word about the coordinate, so every
+        // older revision of it goes with it - including the newest one here.
+        let revisions = newest_playlist_revisions(vec![
+            revision(1_000, "rock"),
+            revision(2_000, "rock and roll"),
+            withdrawal.clone(),
+        ]);
+        assert_eq!(revisions.len(), 1);
+        assert_eq!(
+            revisions[0].1,
+            playlist::PlaylistEvent::Withdrawn {
+                playlist_id: ID.into(),
+                author: author.clone(),
+            }
+        );
+
+        // Publishing again afterwards is a live playlist: a withdrawal is the
+        // author's last word *at the time it was written*, not a life sentence.
+        let revisions = newest_playlist_revisions(vec![
+            withdrawal.clone(),
+            revision(4_000, "rock, again"),
+        ]);
+        assert!(matches!(
+            &revisions[0].1,
+            playlist::PlaylistEvent::Playlist(read) if read.title == "rock, again"
+        ));
+
+        // The same `d` under two authors is two playlists, and one author's
+        // withdrawal says nothing about the other's revision.
+        let theirs = at(
+            playlist::playlist_event_builder(&playlist(ID, "rock"), false, &other).unwrap(),
+            500,
+            &other,
+        );
+        let revisions = newest_playlist_revisions(vec![withdrawal.clone(), theirs]);
+        assert_eq!(revisions.len(), 2, "the coordinate carries the author");
+        assert_eq!(revisions[0].0, 3_000);
+        assert_eq!(revisions[1].0, 500);
+
+        // An event that is not a playlist of ours cannot shadow one that is,
+        // however new it claims to be: this kind is co-occupied, and the marker
+        // is what tells them apart.
+        let unmarked = EventBuilder::new(
+            Kind::from(playlist::PLAYLIST_KIND),
+            r#"{"protocol":"something-else/1"}"#,
+        )
+        .tags(vec![
+            Tag::parse(["d", ID]).unwrap(),
+            Tag::parse(["t", "napstr-something-else"]).unwrap(),
+        ])
+        .custom_created_at(Timestamp::from(9_000))
+        .sign_with_keys(&keys)
+        .unwrap();
+        let revisions = newest_playlist_revisions(vec![revision(2_000, "rock and roll"), unmarked]);
+        assert_eq!(revisions.len(), 1);
+        assert_eq!(revisions[0].0, 2_000);
+
+        // An empty answer is an empty answer rather than a panic, which is what
+        // a relay with nothing to say gives.
+        assert!(newest_playlist_revisions(Vec::new()).is_empty());
     }
 
     #[test]

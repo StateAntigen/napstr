@@ -135,7 +135,11 @@ pub fn initialise_schema(connection: &Connection) -> Result<(), String> {
     // playlist the first had already stored here.
     if previous_shape_present(connection)? {
         connection
-            .execute_batch("DROP TABLE IF EXISTS playlist_tracks; DROP TABLE IF EXISTS playlists;")
+            .execute_batch(
+                "DROP TABLE IF EXISTS playlist_tracks;
+                 DROP TABLE IF EXISTS playlists;
+                 DROP TABLE IF EXISTS playlist_withdrawals;",
+            )
             .map_err(|error| error.to_string())?;
     }
     connection
@@ -165,7 +169,22 @@ pub fn initialise_schema(connection: &Connection) -> Result<(), String> {
                PRIMARY KEY (playlist_id, author, position)
              );
              CREATE INDEX IF NOT EXISTS idx_playlist_tracks_file
-               ON playlist_tracks(file_id);",
+               ON playlist_tracks(file_id);
+             -- The newest withdrawal an author published for one coordinate.
+             --
+             -- A revision is read from whichever relay still answers with it,
+             -- and a relay that never received the withdrawal has no way to
+             -- know it should stop serving the older revision. So the fact
+             -- that a coordinate was withdrawn is kept here, and an older
+             -- revision is refused for as long as it stands. It is not a
+             -- stored playlist: it says one thing about a coordinate, which is
+             -- that its author has taken it back.
+             CREATE TABLE IF NOT EXISTS playlist_withdrawals (
+               playlist_id TEXT NOT NULL,
+               author TEXT NOT NULL,
+               withdrawn_at INTEGER NOT NULL,
+               PRIMARY KEY (playlist_id, author)
+             );",
         )
         .map_err(|error| error.to_string())
 }
@@ -279,6 +298,130 @@ pub fn remove(connection: &Connection, author: &str, playlist_id: &str) -> Resul
         )
         .map_err(|error| error.to_string())?;
     transaction.commit().map_err(|error| error.to_string())
+}
+
+/// Write a revision down on behalf of whoever is asking, as their own.
+///
+/// The author and the edit time are stamped here rather than taken from the
+/// caller: the coordinate has to be the one a later publication will use, or
+/// saving a draft and publishing it would leave two rows behind under one id,
+/// only one of which is the author's.
+///
+/// A revision handed in under somebody else's coordinate is a **copy**, not a
+/// revision of theirs, and gets an id of its own. An id is chosen by the author
+/// and travels as `d` for as long as the playlist exists, so a second author
+/// reusing one is legal - two playlists may share an `d` under different
+/// authors - but it is never what somebody meant: editing a playlist you do not
+/// own means "keep one of these for myself", and the copy has to be findable
+/// under a name of its own rather than colliding with the revision it came
+/// from. Nothing is ever signed for a coordinate this identity does not own.
+pub fn file_revision(
+    connection: &Connection,
+    mut playlist: RemotePlaylist,
+    author: &str,
+    updated_at: i64,
+) -> Result<RemotePlaylist, String> {
+    if !playlist.author.is_empty() && playlist.author != author {
+        playlist.playlist_id = new_playlist_id();
+        // A copy has never been signed by this identity, whatever the original
+        // coordinate's history was.
+        playlist.published = false;
+    }
+    playlist.author = author.to_string();
+    playlist.updated_at = updated_at;
+    save(connection, &playlist)?;
+    Ok(playlist)
+}
+
+/// The revision this computer holds of one coordinate, or `None`.
+fn stored_updated_at(
+    connection: &Connection,
+    author: &str,
+    playlist_id: &str,
+) -> Result<Option<i64>, String> {
+    connection
+        .query_row(
+            "SELECT updated_at FROM playlists WHERE playlist_id=?1 AND author=?2",
+            params![playlist_id, author],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())
+}
+
+/// The newest withdrawal an author published for one coordinate, or `None` if
+/// this computer has never seen one.
+///
+/// A withdrawal is the author's last word about a coordinate, so every older
+/// revision of it is finished. It is stored as a time rather than a naked flag
+/// because an author may publish the playlist again afterwards: a revision
+/// newer than the withdrawal is a live playlist, and anything at or before it
+/// is not.
+pub fn withdrawn_at(
+    connection: &Connection,
+    author: &str,
+    playlist_id: &str,
+) -> Result<Option<i64>, String> {
+    connection
+        .query_row(
+            "SELECT withdrawn_at FROM playlist_withdrawals WHERE playlist_id=?1 AND author=?2",
+            params![playlist_id, author],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())
+}
+
+/// Remember that an author took one coordinate back.
+///
+/// Deliberately says nothing about what this computer holds: a withdrawal read
+/// from a relay is a fact about the relays, and forgetting a playlist because a
+/// *different* installation of the same identity withdrew it is the hazard the
+/// NIP names. Whether the local revision goes is the caller's decision, taken
+/// where the identity is known.
+pub fn mark_withdrawn(
+    connection: &Connection,
+    author: &str,
+    playlist_id: &str,
+    withdrawn_at: i64,
+) -> Result<(), String> {
+    connection
+        .execute(
+            "INSERT INTO playlist_withdrawals(playlist_id,author,withdrawn_at) VALUES(?1,?2,?3)
+             ON CONFLICT(playlist_id,author) DO UPDATE SET
+               withdrawn_at=MAX(withdrawn_at,excluded.withdrawn_at)",
+            params![playlist_id, author, withdrawn_at],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// Store a revision read from a relay, unless it has been overtaken.
+///
+/// Answers whether it was stored, because "the store already had a newer one"
+/// and "the author has withdrawn this" are ordinary answers rather than
+/// failures. Two things can overtake a revision off a relay, and both are facts
+/// this computer knows and the relay may not: the coordinate was withdrawn
+/// after it, or this computer already holds a newer revision of it. A relay
+/// that never received the newest revision must not be able to talk this
+/// computer back into an older one - the same reason `list` orders by
+/// `updated_at` at all.
+pub fn store_from_relay(
+    connection: &Connection,
+    playlist: &RemotePlaylist,
+) -> Result<bool, String> {
+    if let Some(withdrawn_at) = withdrawn_at(connection, &playlist.author, &playlist.playlist_id)? {
+        if withdrawn_at >= playlist.updated_at {
+            return Ok(false);
+        }
+    }
+    if let Some(stored) = stored_updated_at(connection, &playlist.author, &playlist.playlist_id)? {
+        if stored > playlist.updated_at {
+            return Ok(false);
+        }
+    }
+    save(connection, playlist)?;
+    Ok(true)
 }
 
 /// Playlists by name, newest first, without their members.
@@ -1481,6 +1624,127 @@ mod tests {
         };
         assert_eq!(read.image, "");
         assert_eq!(read.tracks.len(), 1);
+
+        drop(connection);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A withdrawal is the author's last word about a coordinate.
+    ///
+    /// A relay that never received it keeps serving the older revision, so the
+    /// fact that the coordinate was withdrawn is what stops this computer from
+    /// storing it again - and an author who republishes afterwards is a live
+    /// playlist rather than a withdrawal that outlives its author's mind.
+    #[test]
+    fn a_withdrawn_coordinate_is_never_offered_again() {
+        let directory =
+            std::env::temp_dir().join(format!("napstr-playlist-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let db_path = directory.join("napstr.sqlite3");
+        crate::initialise_database(&db_path, &directory).unwrap();
+        let connection = crate::open_connection(&db_path).unwrap();
+
+        let theirs = |updated_at: i64| RemotePlaylist {
+            updated_at,
+            ..playlist()
+        };
+        assert!(store_from_relay(&connection, &theirs(1_000)).unwrap());
+        assert_eq!(list(&connection, 0, 10).unwrap().1, 1);
+
+        // The withdrawal is what the relays answer with from now on, and the
+        // revision it replaced is gone with it.
+        mark_withdrawn(&connection, &theirs(0).author, PLAYLIST_ID, 1_100).unwrap();
+        remove(&connection, &theirs(0).author, PLAYLIST_ID).unwrap();
+        assert_eq!(withdrawn_at(&connection, &theirs(0).author, PLAYLIST_ID).unwrap(), Some(1_100));
+        // A relay that still answers with the older revision cannot put it back.
+        assert!(!store_from_relay(&connection, &theirs(1_000)).unwrap());
+        assert_eq!(list(&connection, 0, 10).unwrap().1, 0);
+        assert!(page(&connection, &theirs(0).author, PLAYLIST_ID, 0, 10)
+            .unwrap()
+            .is_none());
+        // An author who publishes the coordinate again is newer than the
+        // withdrawal, which is the one thing a withdrawal does not forbid.
+        assert!(store_from_relay(&connection, &theirs(1_200)).unwrap());
+        assert_eq!(list(&connection, 0, 10).unwrap().1, 1);
+
+        drop(connection);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// An older revision from a relay must not undo a newer one already here.
+    #[test]
+    fn a_relay_cannot_talk_this_computer_back_to_an_older_revision() {
+        let directory =
+            std::env::temp_dir().join(format!("napstr-playlist-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let db_path = directory.join("napstr.sqlite3");
+        crate::initialise_database(&db_path, &directory).unwrap();
+        let connection = crate::open_connection(&db_path).unwrap();
+
+        let mut newer = playlist();
+        newer.author = "b".repeat(64);
+        newer.updated_at = 2_000;
+        newer.title = "the newest one".into();
+        assert!(store_from_relay(&connection, &newer).unwrap());
+        let mut older = newer.clone();
+        older.updated_at = 1_500;
+        older.title = "what a slow relay still has".into();
+        assert!(!store_from_relay(&connection, &older).unwrap());
+        let (listed, _) = list(&connection, 0, 10).unwrap();
+        assert_eq!(listed[0].title, "the newest one");
+        // The same revision again is not older than itself, so re-reading the
+        // relays is idempotent rather than a fight over which copy wins.
+        assert!(store_from_relay(&connection, &newer).unwrap());
+
+        drop(connection);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Editing a playlist somebody else wrote makes a copy of its own.
+    ///
+    /// An id is what its author chose and what a reader sends back, so a
+    /// revision of somebody else's coordinate is never signed for and never
+    /// filed under it: it becomes this identity's playlist under an id of its
+    /// own, which is what stops two authors' rows from being confused for one.
+    #[test]
+    fn a_revision_of_another_authors_playlist_becomes_a_copy() {
+        let directory =
+            std::env::temp_dir().join(format!("napstr-playlist-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let db_path = directory.join("napstr.sqlite3");
+        crate::initialise_database(&db_path, &directory).unwrap();
+        let connection = crate::open_connection(&db_path).unwrap();
+
+        let mine = "c".repeat(64);
+        let mut theirs = playlist();
+        theirs.author = "b".repeat(64);
+        theirs.published = true;
+        save(&connection, &theirs).unwrap();
+
+        let copy = file_revision(&connection, theirs.clone(), &mine, 99).unwrap();
+        assert_ne!(copy.playlist_id, theirs.playlist_id, "a copy needs its own id");
+        assert!(is_canonical_uuid(&copy.playlist_id));
+        assert_eq!(copy.author, mine);
+        assert_eq!(copy.updated_at, 99);
+        assert!(
+            !copy.published,
+            "nothing of the copy has been signed by this identity"
+        );
+        assert_eq!(copy.title, theirs.title);
+        assert_eq!(copy.tracks, theirs.tracks);
+        assert!(page(&connection, &mine, &copy.playlist_id, 0, 10)
+            .unwrap()
+            .is_some());
+        // Their own revision is untouched by the copy.
+        assert!(page(&connection, &theirs.author, &theirs.playlist_id, 0, 10)
+            .unwrap()
+            .is_some());
+
+        // A revision of this identity's own playlist keeps its coordinate, or
+        // an edit would leave a second row behind under a new id.
+        let revision = file_revision(&connection, copy.clone(), &mine, 120).unwrap();
+        assert_eq!(revision.playlist_id, copy.playlist_id);
+        assert_eq!(list(&connection, 0, 10).unwrap().1, 2);
 
         drop(connection);
         std::fs::remove_dir_all(directory).unwrap();

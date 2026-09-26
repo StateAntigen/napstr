@@ -50,6 +50,23 @@ function member(fileId, title, artist) {
   return { position: 1, fileId, title, artist, album: '' };
 }
 
+/** One of this identity's own coordinates as the relays answer for it. */
+function relayRow(overrides = {}) {
+  return {
+    playlistId: '11111111-1111-4111-8111-111111111111',
+    title: 'Driving',
+    author: 'c'.repeat(64),
+    displayName: '',
+    image: '',
+    firstFileId: '',
+    trackCount: 0,
+    private: false,
+    published: true,
+    updatedAt: 1787000000,
+    ...overrides
+  };
+}
+
 function calls(page, cmd) {
   return page.evaluate((name) => window.calls.filter((call) => call.cmd === name).map((call) => call.args), cmd);
 }
@@ -61,6 +78,11 @@ const back = (page) => page.locator('.playlist-title [title="Back to playlists"]
 
 test('the page lists what this computer holds, and says what each row is', async ({ page }) => {
   await openPlaylists(page);
+  // What the relays answered for this identity: the published one is there and
+  // the draft has never been anywhere, which are two different kinds of row.
+  await page.evaluate((known) => {
+    window.playlistRelayOwn = known;
+  }, [relayRow({ playlistId: NEW_ID, title: 'Published mix' })]);
   await seed(page, [row({ private: true }), row({ playlistId: NEW_ID, title: 'Published mix', published: true })]);
   await refresh(page);
 
@@ -68,12 +90,164 @@ test('the page lists what this computer holds, and says what each row is', async
   await expect(rows).toHaveCount(2);
   const draft = rows.filter({ hasText: 'Driving' });
   await expect(draft.locator('b')).toHaveText('Driving');
-  // A row says whether the relays have a copy of it, and nothing else: the
-  // window has no opinion about a playlist being private.
+  // A row nothing has ever been sent for is a draft, and says so: the window has
+  // no opinion about a playlist being private, and nothing to offer to withdraw.
   await expect(draft.locator('.playlist-badge')).toHaveText(['Draft']);
-  // A playlist whose author is this computer is editable, so opening it lands in
-  // the editor rather than in a read-only view.
-  await expect(rows.filter({ hasText: 'Published mix' }).locator('.playlist-badge')).toHaveText(['Published']);
+  // A row the relays answer for is labelled where it lives, and keeps the
+  // published/draft state beside it.
+  await expect(rows.filter({ hasText: 'Published mix' }).locator('.playlist-badge')).toHaveText([
+    'Held locally',
+    'Published'
+  ]);
+  // Both tiers are told apart: ours first, then everybody else's.
+  await expect(page.locator('.playlist-group')).toHaveText(['Your playlists']);
+});
+
+test('a public playlist somebody else published is listed read-only, and saving one keeps a copy', async ({ page }) => {
+  const theirs = '70e320fe962a67c58c61269ca1c5b4f0e128931267f32a92809aaf904425e376';
+  await openPlaylists(page);
+  await seed(page, [
+    row({
+      title: 'rock',
+      author: theirs,
+      displayName: 'Sean Parker',
+      published: true,
+      updatedAt: 1787000100,
+      tracks: [member(TRACK, 'Enter Sandman', 'Metallica')],
+      total: 1
+    })
+  ]);
+  await refresh(page);
+
+  // The second tier: somebody else's, with the name they publish under.
+  await expect(page.locator('.playlist-group')).toHaveText(['From everyone else']);
+  const rowEl = page.locator('.playlist-row').filter({ hasText: 'rock' });
+  await expect(rowEl.locator('.playlist-badge')).toHaveText(['Read-only']);
+  await expect(rowEl.locator('small')).toContainText('Sean Parker');
+  // Nothing of theirs is deleted from here: the row has no remove button at all.
+  await expect(rowEl.locator('.classic-button')).toHaveCount(0);
+
+  // Opening it is a look, not an edit.
+  await rowEl.locator('.playlist-open').click();
+  await expect(page.getByLabel('Title', { exact: true })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Publish', exact: true })).toHaveCount(0);
+  await expect(page.locator('.playlist-member [title="Move down"]')).toBeDisabled();
+  // The only write on offer is the one that keeps a copy.
+  await page.getByRole('button', { name: 'Save a copy' }).click();
+
+  // Saving it files a copy of this identity's own, under an id of its own: the
+  // revision never lands on the coordinate its author published under.
+  const [saved] = await calls(page, 'save_playlist');
+  expect(saved.playlist.author).toBe(theirs);
+  await expect(page.locator('.playlist-id code')).toHaveText('33333333-3333-4333-8333-333333333333');
+  await expect(page.locator('.playlist-notice')).toHaveText('Saved on this computer');
+  await back(page);
+  const mineRow = page.locator('.playlist-row').filter({ hasText: 'rock' });
+  await expect(mineRow).toHaveCount(2);
+  await expect(page.locator('.playlist-row').filter({ hasText: 'rock' }).locator('.playlist-badge')).toHaveText([
+    'Draft',
+    'Read-only'
+  ]);
+});
+
+test('a playlist only the relays have can be restored, and one only here can be withdrawn', async ({ page }) => {
+  await openPlaylists(page);
+  // The relays have Night_Rider and this computer does not; this computer has
+  // 'Bring me the playlist', which the relays answered without.
+  await page.evaluate((known) => {
+    window.playlistRelayOwn = known;
+  }, [
+    relayRow({
+      playlistId: 'eb738de4-c6b7-47b0-ba32-b8948d06cbef',
+      title: 'Night_Rider',
+      trackCount: 100,
+      updatedAt: 1787000200
+    })
+  ]);
+  await seed(page, [row({ title: 'Bring me the playlist', published: true })]);
+  await refresh(page);
+
+  const night = page.locator('.playlist-row').filter({ hasText: 'Night_Rider' });
+  await expect(night.locator('.playlist-badge')).toHaveText(['On the relays only']);
+  const held = page.locator('.playlist-row').filter({ hasText: 'Bring me the playlist' });
+  await expect(held.locator('.playlist-badge')).toHaveText(['Only on this computer']);
+  await expect(held.locator('[title="Withdraw"]')).toHaveCount(1);
+
+  // Restoring imports the revision the relays hold, under this identity's own
+  // coordinate, and the row becomes one this computer holds rather than two.
+  await night.locator('.classic-button').click();
+  await expect(page.locator('.playlist-row').filter({ hasText: 'Night_Rider' })).toHaveCount(1);
+  const [restored] = await calls(page, 'restore_playlist');
+  expect(restored.playlistId).toBe('eb738de4-c6b7-47b0-ba32-b8948d06cbef');
+  await expect(page.locator('.playlist-row').filter({ hasText: 'Night_Rider' }).locator('.playlist-badge')).toHaveText([
+    'Held locally',
+    'Published'
+  ]);
+  // Ours are listed before theirs, newest first inside each tier.
+  await expect(page.locator('.playlist-row b').first()).toHaveText('Night_Rider');
+
+  // Withdrawing is asked for, because the relays are told and it is not a local
+  // delete: a dismissed confirmation changes nothing.
+  page.once('dialog', (dialog) => dialog.dismiss());
+  await held.locator('[title="Withdraw"]').click();
+  await expect(page.locator('.playlist-row').filter({ hasText: 'Bring me the playlist' })).toHaveCount(1);
+  expect(await calls(page, 'withdraw_playlist')).toHaveLength(0);
+
+  page.once('dialog', (dialog) => dialog.accept());
+  await held.locator('[title="Withdraw"]').click();
+  await expect(page.locator('.playlist-row').filter({ hasText: 'Bring me the playlist' })).toHaveCount(0);
+  expect(await calls(page, 'withdraw_playlist')).toHaveLength(1);
+});
+
+test('a look that failed never offers to withdraw anything', async ({ page }) => {
+  await openPlaylists(page);
+  await page.evaluate(() => {
+    window.playlistRelayReadFails = true;
+  });
+  await seed(page, [row({ title: 'Published mix', published: true })]);
+  await refresh(page);
+
+  // "Nobody looked" is not "the relays do not have it".
+  await expect(page.locator('.playlist-row').locator('.playlist-badge')).toHaveText([
+    'Held locally',
+    'Published'
+  ]);
+  await expect(page.locator('.playlist-row [title="Withdraw"]')).toHaveCount(0);
+  await expect(page.locator('.playlist-row [title="Delete"]')).toHaveCount(1);
+});
+
+test('a member nobody seeds is shown as unavailable rather than dropped', async ({ page }) => {
+  const seeded = 'd'.repeat(64);
+  const gone = 'e'.repeat(64);
+  await openPlaylists(page);
+  // One member this computer holds, one others seed, and one nobody seeds at
+  // all: all three are drawn, in position order, and each says what is out
+  // there - an unavailable member is a member.
+  await seed(page, [
+    row({
+      tracks: [
+        member(TRACK, 'Search', 'Settings'),
+        member(seeded, 'Rooster', 'Alice In Chains'),
+        member(gone, 'Nothing at all', 'Nobody')
+      ],
+      total: 3
+    })
+  ]);
+  await page.evaluate((counts) => {
+    window.playlistMemberAvailability = counts;
+  }, [
+    { fileId: seeded, seeders: 3 },
+    { fileId: gone, seeders: 0 }
+  ]);
+  await refresh(page);
+  await page.locator('.playlist-open').click();
+
+  const members = page.locator('.playlist-member');
+  await expect(members).toHaveCount(3);
+  // The member this computer holds needs no explanation.
+  await expect(members.first().locator('.playlist-badge')).toHaveText(['This computer']);
+  await expect(members.nth(1).locator('.playlist-badge')).toHaveText(['From the playlist', '3 seeders']);
+  await expect(members.nth(2).locator('.playlist-badge')).toHaveText(['From the playlist', 'Unavailable']);
 });
 
 test('an empty list says so rather than looking broken', async ({ page }) => {
@@ -258,6 +432,11 @@ test('deleting withdraws a published playlist and only forgets a draft', async (
     row({ title: 'Published mix', published: true }),
     row({ playlistId: NEW_ID, title: 'Draft mix' })
   ]);
+  // The relays have the published one, so removing it is a withdrawal; the draft
+  // has never been anywhere and is only forgotten.
+  await page.evaluate((known) => {
+    window.playlistRelayOwn = known;
+  }, [relayRow({ title: 'Published mix' })]);
   await refresh(page);
 
   // The draft goes quietly: nothing was ever sent anywhere for it.
@@ -267,7 +446,9 @@ test('deleting withdraws a published playlist and only forgets a draft', async (
   expect(await calls(page, 'withdraw_playlist')).toHaveLength(0);
 
   // The published one has to be taken back from the relays as well, or its
-  // author would find it again on the next client that looked.
+  // author would find it again on the next client that looked. Taking it back is
+  // the author's decision, so it is confirmed first.
+  page.once('dialog', (dialog) => dialog.accept());
   await page.locator('.playlist-row').filter({ hasText: 'Published mix' }).locator('[title="Delete"]').click();
   await expect(page.locator('.playlist-row')).toHaveCount(0);
   expect(await calls(page, 'withdraw_playlist')).toHaveLength(1);
