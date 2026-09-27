@@ -17,6 +17,7 @@ use std::{
 use tauri::{Emitter, Manager, State};
 use walkdir::WalkDir;
 
+mod art_cache;
 mod audio;
 mod cover;
 mod cover_publish;
@@ -2356,6 +2357,15 @@ pub fn run() {
             let mobile = mobile::MobileService::new(
                 db_path.clone(),
                 app_data.clone(),
+                // The cache directory, because art bytes are evictable by
+                // design: every one can be fetched again, and clearing them must
+                // be an ordinary action rather than a repair. A platform that
+                // will not name a cache directory gets a subdirectory of the app
+                // data instead, which still works and is still clearable.
+                app.path()
+                    .app_cache_dir()
+                    .map(|dir| dir.join(art_cache::ART_DIRECTORY))
+                    .unwrap_or_else(|_| app_data.join(art_cache::ART_DIRECTORY)),
                 network.clone(),
                 covers.clone(),
                 playback.clone(),

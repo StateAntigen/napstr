@@ -3933,6 +3933,7 @@ pub fn initialise_network_schema(connection: &Connection) -> Result<(), String> 
     .and_then(|_| super::ensure_column(connection, "published_catalogue", "fingerprint", "TEXT NOT NULL DEFAULT ''"))
     .and_then(|_| super::ensure_column(connection, "network_downloads", "destination_folder", "TEXT NOT NULL DEFAULT ''"))
     .and_then(|_| super::cover::initialise_cover_schema(connection))
+    .and_then(|_| super::art_cache::initialise_schema(connection))
 }
 
 pub fn load_network_transfers(connection: &Connection) -> Result<Vec<super::Transfer>, String> {

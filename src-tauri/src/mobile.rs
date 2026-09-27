@@ -8,8 +8,8 @@ use iroh::{endpoint::presets, Endpoint, SecretKey};
 use napstr_remote_protocol::{
     ClientRequest, CoverReportResult, PairingTicket, PlaybackCommand, RemoteAlbumCover,
     RemoteAudiobook, RemoteAudiobookSummary, RemoteSource, RemoteTrack, RemoteTransfer,
-    ServerResponse, ALPN, MAX_CONTROL_FRAME_BYTES, MAX_COVER_KEYS, MAX_PAGE_SIZE, MAX_PLAY_QUEUE,
-    PROTOCOL_VERSION,
+    ServerResponse, ALPN, MAX_ART_KEY_CHARS, MAX_CONTROL_FRAME_BYTES, MAX_COVER_KEYS, MAX_PAGE_SIZE,
+    MAX_PLAY_QUEUE, PROTOCOL_VERSION,
 };
 use qrcode::{render::svg, QrCode};
 use rusqlite::{params, OptionalExtension};
@@ -26,6 +26,11 @@ const PAIRING_LIFETIME_SECONDS: i64 = 5 * 60;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How much art travels per frame. Smaller than the audio chunk on purpose: art
+/// is tens of kilobytes, so this is one frame for a thumbnail and a handful for
+/// a full rendition, and a smaller frame keeps a slow link from holding a large
+/// buffer between permission checks.
+const ART_CHUNK_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -79,6 +84,10 @@ struct MusicLibraryCache {
 
 pub struct MobileService {
     db_path: PathBuf,
+    /// Where the art this service hands to phones lives. The app's cache
+    /// directory, because these bytes are evictable by design: every one of them
+    /// can be fetched again, and a person must be able to clear them.
+    art_root: PathBuf,
     key_path: PathBuf,
     network: Arc<crate::network::NetworkService>,
     /// The cover worker, so a phone's own results join the queue the window
@@ -102,6 +111,7 @@ impl MobileService {
     pub fn new(
         db_path: PathBuf,
         app_data: PathBuf,
+        art_root: PathBuf,
         network: Arc<crate::network::NetworkService>,
         covers: Arc<CoverPublisher>,
         playback: Arc<crate::playback_bridge::PlaybackBridge>,
@@ -109,6 +119,7 @@ impl MobileService {
         initialise_schema(&db_path)?;
         Ok(Arc::new(Self {
             db_path,
+            art_root,
             key_path: app_data.join("iroh-identity"),
             network,
             covers,
@@ -774,6 +785,61 @@ impl MobileService {
                     .collect();
                 write_response(send, &ServerResponse::AlbumCovers { covers }).await
             }
+            ClientRequest::FetchArt { key, rendition } => {
+                if key.is_empty() || key.chars().count() > MAX_ART_KEY_CHARS {
+                    return Err("Invalid art request".into());
+                }
+                let connection = open_connection(&self.db_path)?;
+                let Some(art) =
+                    crate::art_cache::lookup(&connection, &self.art_root, &key, rendition)?
+                else {
+                    // A considered answer, not an error: a phone may ask about an
+                    // album this computer has not fetched art for yet, and the
+                    // right thing for it to do is paint its placeholder and ask
+                    // again when the cover revision moves.
+                    return write_response(send, &ServerResponse::ArtMissing { key }).await;
+                };
+                // Handing them out is what "used" means, and it is what eviction
+                // orders by — so a library's own art outlives art for albums this
+                // computer merely browsed past.
+                let _ = crate::art_cache::touch(&connection, &key, rendition);
+                write_response(
+                    send,
+                    &ServerResponse::ArtReady {
+                        key: key.clone(),
+                        rendition,
+                        hash: art.hash.clone(),
+                        mime: art.mime.clone(),
+                        length: art.bytes,
+                    },
+                )
+                .await?;
+                let mut file = tokio::fs::File::open(&art.path)
+                    .await
+                    .map_err(|error| format!("could not open the artwork: {error}"))?;
+                let mut buffer = vec![0u8; ART_CHUNK_BYTES];
+                loop {
+                    // Asked again for every chunk, exactly as audio is: a pairing
+                    // that is revoked mid-transfer stops at the next frame rather
+                    // than at the end of the file.
+                    check_request_permission(
+                        self.authorise(remote_id)?,
+                        &ClientRequest::FetchArt {
+                            key: key.clone(),
+                            rendition,
+                        },
+                    )?;
+                    let count = file
+                        .read(&mut buffer)
+                        .await
+                        .map_err(|error| format!("could not read the artwork: {error}"))?;
+                    if count == 0 {
+                        break;
+                    }
+                    write_bytes(send, &buffer[..count]).await?;
+                }
+                Ok(())
+            }
             ClientRequest::Status => {
                 write_response(
                     send,
@@ -950,6 +1016,10 @@ fn check_request_permission(stream_only: bool, request: &ClientRequest) -> Resul
         | ClientRequest::FetchAudio { .. }
         | ClientRequest::Available { .. }
         | ClientRequest::AlbumCovers { .. }
+        // Art is a read, and a phone lent read-only access should see covers:
+        // the bytes come from this computer, so this reveals nothing the phone
+        // could not already ask for by key.
+        | ClientRequest::FetchArt { .. }
         // Seeing what the computer is playing is not a way of changing it.
         | ClientRequest::PlaybackState
         | ClientRequest::Status

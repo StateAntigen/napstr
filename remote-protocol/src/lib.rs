@@ -8,6 +8,25 @@ pub const MAX_PAGE_SIZE: usize = 200;
 /// Album covers per request. Bounded so a full answer always fits in one
 /// control frame even when every URL is at its maximum length.
 pub const MAX_COVER_KEYS: usize = 40;
+/// Longest cover key a phone may ask for art by. The NIP bounds a `d` value at
+/// 300 characters, so anything longer is not a key this host ever stored and is
+/// refused rather than searched for.
+pub const MAX_ART_KEY_CHARS: usize = 300;
+
+/// Which of an album's two renditions a phone is asking for.
+///
+/// Named rather than a boolean because the difference is a policy about what
+/// this computer asks a third party about: a thumbnail is fetched for every
+/// album that comes on screen, and the full rendition only for one somebody
+/// engaged with. A call site should have to say which it means.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub enum ArtRendition {
+    /// What a grid tile, a list row or a backdrop draws.
+    Thumb,
+    /// What the player and the album sheet draw.
+    Full,
+}
 /// Longest queue a phone may hand to the host when it asks the host to play
 /// something. 200 file ids of the 64 characters a SHA-256 takes is about 13 KB,
 /// so a full queue always fits in one control frame.
@@ -288,6 +307,14 @@ pub enum ClientRequest {
     FetchAudio {
         file_id: String,
     },
+    /// The pixels of one album's art, which this host holds. The phone asks for
+    /// the rendition it is about to draw instead of fetching the URL itself: the
+    /// album it is looking at, and its own address, are not a third party's
+    /// business.
+    FetchArt {
+        key: String,
+        rendition: ArtRendition,
+    },
     Available {
         file_ids: Vec<String>,
     },
@@ -364,6 +391,26 @@ pub enum ServerResponse {
     AlbumCovers {
         covers: Vec<RemoteAlbumCover>,
     },
+    /// The header an art transfer begins with: the bytes follow it in chunks,
+    /// exactly as audio does. `hash` is what the phone stores them under, so two
+    /// albums sharing one picture cost one of them, and `length` is how much to
+    /// expect before the stream is done.
+    ArtReady {
+        key: String,
+        rendition: ArtRendition,
+        /// Lowercase SHA-256 of the bytes that follow.
+        hash: String,
+        mime: String,
+        length: u64,
+    },
+    /// This host holds no art for that album — nothing claimed one, or the pass
+    /// that fills the cache has not reached it. A considered answer rather than
+    /// an error: the phone paints its placeholder and asks again when the host's
+    /// cover revision moves, which is the signal it already uses for "the host
+    /// has none".
+    ArtMissing {
+        key: String,
+    },
     Playback {
         state: RemotePlaybackState,
     },
@@ -401,6 +448,64 @@ pub enum ServerResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_art_request_and_its_header_round_trip() {
+        // The phone names the rendition, because that is what decides how much
+        // this computer asks a third party about.
+        for (rendition, name) in [(ArtRendition::Thumb, "thumb"), (ArtRendition::Full, "full")] {
+            let asked = format!(
+                r#"{{"type":"fetchArt","key":"KREAM|Annihilation","rendition":"{name}"}}"#
+            );
+            assert_eq!(
+                serde_json::from_str::<ClientRequest>(&asked).unwrap(),
+                ClientRequest::FetchArt {
+                    key: "KREAM|Annihilation".into(),
+                    rendition
+                },
+                "{asked}"
+            );
+        }
+        // The header a phone reads before the bytes: the hash it stores them
+        // under, and the length to expect.
+        let header = ServerResponse::ArtReady {
+            key: "KREAM|Annihilation".into(),
+            rendition: ArtRendition::Thumb,
+            hash: "a".repeat(64),
+            mime: "image/jpeg".into(),
+            length: 24_576,
+        };
+        let round_tripped: ServerResponse =
+            serde_json::from_str(&serde_json::to_string(&header).unwrap()).unwrap();
+        assert_eq!(round_tripped, header);
+        // And "this host has none" is an answer, not an error.
+        let missing = ServerResponse::ArtMissing {
+            key: "KREAM|Annihilation".into(),
+        };
+        let round_tripped: ServerResponse =
+            serde_json::from_str(&serde_json::to_string(&missing).unwrap()).unwrap();
+        assert_eq!(round_tripped, missing);
+    }
+
+    #[test]
+    fn an_art_header_fits_in_one_control_frame() {
+        // The bytes stream after the header, in chunks, so only the header has
+        // to fit one frame. Worst case: a maximum-length key, a full hash and a
+        // mime.
+        let worst = ServerResponse::ArtReady {
+            key: "k".repeat(MAX_ART_KEY_CHARS),
+            rendition: ArtRendition::Full,
+            hash: "f".repeat(64),
+            mime: "image/webp".into(),
+            length: u64::MAX,
+        };
+        let payload = serde_json::to_vec(&worst).unwrap();
+        assert!(
+            payload.len() <= MAX_CONTROL_FRAME_BYTES,
+            "an art header is {} bytes, over the {MAX_CONTROL_FRAME_BYTES} byte frame limit",
+            payload.len()
+        );
+    }
 
     #[test]
     fn older_pairing_and_status_messages_keep_full_access() {
