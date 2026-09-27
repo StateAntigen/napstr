@@ -2750,6 +2750,57 @@ mod tests {
         );
     }
 
+    /// How long a live test waits before asking a busy service again.
+    const LIVE_RETRY_WAIT: Duration = Duration::from_secs(20);
+
+    /// Ask MusicBrainz for one query, waiting out a refusal instead of failing.
+    ///
+    /// A 503 and an unanswered request are the service talking about itself, not
+    /// about the query, and the live service really does send both — measured,
+    /// and often enough that these tests failed on it. Retried three times, so
+    /// the assertion still means something when it passes and still fails when
+    /// the service is genuinely down.
+    async fn live_groups(client: &reqwest::Client, query: &str) -> Vec<MusicBrainzGroup> {
+        let mut last = String::new();
+        for attempt in 1..=3 {
+            match search_groups(client, query).await {
+                Ok(groups) => return groups,
+                Err(error) => {
+                    last = format!("{error:?}");
+                    let back_pressure = matches!(
+                        error,
+                        LookupError::Throttled { .. } | LookupError::Unanswered { .. }
+                    );
+                    if !back_pressure || attempt == 3 {
+                        break;
+                    }
+                    tokio::time::sleep(LIVE_RETRY_WAIT).await;
+                }
+            }
+        }
+        panic!("MusicBrainz would not answer about {query}: {last}");
+    }
+
+    /// `resolve` under the same tolerance, for the tests that run the whole
+    /// chain: the refusal can come from any of its three requests.
+    async fn live_resolve(
+        client: &reqwest::Client,
+        candidate: &CoverCandidate,
+    ) -> Result<Option<ArtLookup>, LookupError> {
+        for attempt in 1..=3 {
+            match resolve(client, candidate).await {
+                Err(error @ (LookupError::Throttled { .. } | LookupError::Unanswered { .. }))
+                    if attempt < 3 =>
+                {
+                    let _ = error;
+                    tokio::time::sleep(LIVE_RETRY_WAIT).await;
+                }
+                other => return other,
+            }
+        }
+        resolve(client, candidate).await
+    }
+
     /// The queries two tags produce, against the live MusicBrainz. Both of these
     /// are searches that used to find nothing at all.
     ///
@@ -2766,9 +2817,7 @@ mod tests {
         let client = cover_http_client().expect("a lookup client");
         // A joint credit, which MusicBrainz holds as two credited artists.
         let joint = default_query("The Chainsmokers, Oaks", "Love Is Kind");
-        let groups = search_groups(&client, &joint)
-            .await
-            .expect("MusicBrainz has to answer");
+        let groups = live_groups(&client, &joint).await;
         assert!(
             groups
                 .iter()
@@ -2779,9 +2828,7 @@ mod tests {
         // A credit the tag overstates: MusicBrainz knows no artist called
         // Korolova at all, and credits this record to KREAM alone.
         let overstated = default_query("KREAM / Korolova", "Annihilation");
-        let groups = search_groups(&client, &overstated)
-            .await
-            .expect("MusicBrainz has to answer");
+        let groups = live_groups(&client, &overstated).await;
         assert!(
             groups
                 .iter()
@@ -3141,7 +3188,7 @@ mod tests {
             track_count: 1,
             source: "library".to_string(),
         };
-        let found = resolve(&client, &candidate)
+        let found = live_resolve(&client, &candidate)
             .await
             .expect("the lookup has to answer rather than fail")
             .expect("Apple sells this single, so the album has a cover");
