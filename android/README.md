@@ -12,7 +12,8 @@ From `android/`, with the [Tauri prerequisites](https://v2.tauri.app/start/prere
 npm ci
 npm run desktop          # Develop
 npm run bundle:windows   # EXE (on Windows)
-npm run bundle:macos     # DMG (on macOS)
+npm run macos-build      # Ad-hoc community DMG (on macOS)
+npm run macos-build:signed # Signed, notarized, and stapled DMG (on macOS)
 npm run appimage:build   # AppImage (Linux with Docker)
 ```
 
@@ -26,7 +27,12 @@ The development shell includes the GStreamer plugins WebKit needs for audio
 playback. After changing the shell dependencies, stop the running client and
 run this command again to load the updated environment.
 
-Pushing a `v*` tag attaches all installers to a draft release. GitHub displays a SHA-256 checksum for each installer.
+Pushing a `v*` tag attaches installers and SHA-256 checksum files to a draft release.
+Release macOS builds require Apple signing credentials; pull-request builds use
+ad-hoc signatures. `bundle:macos` remains an alias for `macos-build`.
+Both macOS commands build the current Mac's native architecture, share the root
+`.env.macos-release` for signed local builds, and never upload anything. See
+[macOS release setup](../docs/macos-releases.md).
 
 ## Android requirements
 

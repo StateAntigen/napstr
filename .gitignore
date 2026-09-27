@@ -16,3 +16,5 @@ remote-protocol/target/
 website/dist/
 test-results/
 playwright-report/
+
+.env.macos-release

@@ -11,6 +11,8 @@
     "desktop": "tauri dev",
     "prebundle": "node scripts/prepare-tor-bundle.mjs",
     "bundle": "tauri build",
+    "macos-build": "node scripts/macos-release.mjs",
+    "macos-build:signed": "node scripts/macos-release.mjs --signed",
     "appimage:build": "bash scripts/build-appimage-local.sh build",
     "appimage:run": "bash scripts/build-appimage-local.sh launch",
     "appimage:test-user": "bash scripts/run-appimage-test-user.sh",
