@@ -23,6 +23,7 @@
 //! worker, which already knows which albums are worth asking about and how to be
 //! polite to the services that answer.
 
+use crate::cover::COVER_REVISION_TABLE;
 use napstr_remote_protocol::ArtRendition;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
@@ -58,9 +59,17 @@ pub struct ArtCacheStats {
 ///
 /// `used_at` is what eviction orders by, and `source` is kept so the Covers view
 /// can say where a picture came from rather than only that it exists.
+///
+/// This also owns the half of the cover revision that says "the pictures this
+/// computer can serve have moved", declared here rather than moved by callers
+/// for the same reason the rest of the schema does it with triggers: a phone
+/// re-asks for art it was told was missing when the revision moves, and a write
+/// path that forgets to move it is a phone that never sees the art. Only a
+/// different picture moves it — touching `used_at` and re-storing identical
+/// bytes are not news to anybody.
 pub fn initialise_schema(connection: &Connection) -> Result<(), String> {
     connection
-        .execute_batch(
+        .execute_batch(&format!(
             "CREATE TABLE IF NOT EXISTS art_cache (
                cover_key TEXT NOT NULL,
                rendition TEXT NOT NULL,
@@ -73,8 +82,18 @@ pub fn initialise_schema(connection: &Connection) -> Result<(), String> {
                PRIMARY KEY(cover_key, rendition)
              );
              CREATE INDEX IF NOT EXISTS art_cache_used ON art_cache(used_at);
-             CREATE INDEX IF NOT EXISTS art_cache_hash ON art_cache(hash);",
-        )
+             CREATE INDEX IF NOT EXISTS art_cache_hash ON art_cache(hash);
+             {COVER_REVISION_TABLE}
+             CREATE TRIGGER IF NOT EXISTS art_cache_cover_revision
+             AFTER INSERT ON art_cache BEGIN
+               UPDATE cover_state SET revision = revision + 1 WHERE id = 1;
+             END;
+             CREATE TRIGGER IF NOT EXISTS art_cache_cover_revision_changed
+             AFTER UPDATE OF hash ON art_cache
+             WHEN old.hash <> new.hash BEGIN
+               UPDATE cover_state SET revision = revision + 1 WHERE id = 1;
+             END;"
+        ))
         .map_err(|error| error.to_string())
 }
 
@@ -326,6 +345,7 @@ fn drop_unreferenced(connection: &Connection, root: &Path, hash: &str) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cover::cover_revision;
 
     /// A directory of its own per test, so nothing depends on the order tests
     /// run in. Removed by the test that made it.
@@ -500,6 +520,65 @@ mod tests {
             0,
             "the stale row was tidied as it was found"
         );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_new_picture_moves_the_cover_revision_and_a_touch_does_not() {
+        let root = scratch("revision");
+        let connection = database();
+        // A phone re-asks about the albums it was told had no art when this
+        // moves, so arriving bytes have to move it - otherwise the phone that
+        // asked a moment too early keeps its placeholder until something else
+        // happens to change the covers.
+        let settled = cover_revision(&connection).unwrap();
+        let fresh = jpeg(b"the first picture");
+        store(
+            &connection,
+            &root,
+            "a|album",
+            ArtRendition::Thumb,
+            &fresh,
+            "",
+        )
+        .unwrap();
+        let arrived = cover_revision(&connection).unwrap();
+        assert!(arrived > settled, "art arriving is news to a phone");
+
+        // Serving it is not a change to it, and fetching art must not set every
+        // other album's question off again.
+        touch(&connection, "a|album", ArtRendition::Thumb).unwrap();
+        assert_eq!(cover_revision(&connection).unwrap(), arrived);
+
+        // Neither is being told the same thing twice, which is what a fill pass
+        // looking at an album it already has does every time it runs.
+        store(
+            &connection,
+            &root,
+            "a|album",
+            ArtRendition::Thumb,
+            &fresh,
+            "",
+        )
+        .unwrap();
+        assert_eq!(cover_revision(&connection).unwrap(), arrived);
+
+        // A different picture for the same album and rendition is news again.
+        store(
+            &connection,
+            &root,
+            "a|album",
+            ArtRendition::Thumb,
+            &jpeg(b"a better picture"),
+            "itunes",
+        )
+        .unwrap();
+        assert!(cover_revision(&connection).unwrap() > arrived);
+
+        // The full rendition is its own question, and its own change.
+        let before_full = cover_revision(&connection).unwrap();
+        store(&connection, &root, "a|album", ArtRendition::Full, &fresh, "").unwrap();
+        assert!(cover_revision(&connection).unwrap() > before_full);
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

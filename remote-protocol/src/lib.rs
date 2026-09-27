@@ -146,9 +146,27 @@ pub struct RemoteAlbumCover {
     pub key: String,
     /// HTTPS URL of the front cover. Empty when the publisher only shared an
     /// embedded copy through an `x` tag.
+    ///
+    /// Superseded for display by [`RemoteAlbumCover::art_hash`]. A current phone
+    /// draws the picture the host holds rather than fetching from a publisher,
+    /// so it ignores this, and it is kept on the wire only so a phone built
+    /// before the art channel still finds something it can use.
     pub art: String,
     /// HTTPS URL of a smaller rendition of the same image, when published.
+    /// Superseded by [`RemoteAlbumCover::thumb_hash`], for the same reason.
     pub thumb: String,
+    /// SHA-256 of the full-size picture as this host holds it, askable for with
+    /// [`ClientRequest::FetchArt`] at [`ArtRendition::Full`].
+    ///
+    /// Empty is an ordinary state rather than a failure: this host may not have
+    /// downloaded the picture yet. A phone draws its placeholder for an empty
+    /// hash and asks again when the cover revision moves, which is exactly what
+    /// the host reports when the bytes arrive.
+    #[serde(default)]
+    pub art_hash: String,
+    /// SHA-256 of the smaller rendition, for [`ArtRendition::Thumb`].
+    #[serde(default)]
+    pub thumb_hash: String,
     pub mbid: String,
     pub year: String,
     pub genre: String,
@@ -638,6 +656,8 @@ mod tests {
                 key: "artist|album".into(),
                 art: "https://example.com/cover.jpg".into(),
                 thumb: String::new(),
+                art_hash: "c".repeat(64),
+                thumb_hash: String::new(),
                 mbid: String::new(),
                 year: "2007".into(),
                 genre: "Rock".into(),
@@ -778,6 +798,8 @@ mod tests {
                 // 2048 is the accepted maximum for `art` and `thumb`.
                 art: format!("https://example.com/{}.jpg", "x".repeat(2020)),
                 thumb: format!("https://example.com/{}.jpg", "y".repeat(2020)),
+                art_hash: format!("{index:064x}"),
+                thumb_hash: format!("{index:064x}"),
                 mbid: "0".repeat(36),
                 year: "2007".into(),
                 genre: "g".repeat(120),

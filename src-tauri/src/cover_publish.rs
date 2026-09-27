@@ -44,6 +44,7 @@
 //! name and one of the credited artist's names agree, and the picture it returns
 //! is published with `mbid` empty rather than with a guess.
 
+use crate::art_fetch::{ArtFetcher, ArtWant};
 use crate::cover::{self, ArtLookup, CoverClaimFields};
 use crate::network::NetworkService;
 use rusqlite::{params, OptionalExtension};
@@ -62,7 +63,9 @@ use tokio::sync::Notify;
 
 /// MusicBrainz requires a descriptive user agent and roughly one request a
 /// second. Napstr says what it is rather than pretending to be a browser.
-const USER_AGENT: &str = concat!(
+/// Shared with the artwork fetcher, because a picture host is owed the same
+/// answer as a metadata one.
+pub(crate) const USER_AGENT: &str = concat!(
     "Napstr/",
     env!("CARGO_PKG_VERSION"),
     " ( https://github.com/lnbits/napstr )"
@@ -233,6 +236,10 @@ pub struct CoverPublisher {
     db_path: PathBuf,
     network: Arc<NetworkService>,
     app: AppHandle,
+    /// The one place art is downloaded from. Art this computer holds for a
+    /// phone is fetched here, on this connection, rather than by the phone
+    /// asking a publisher about itself.
+    art: Arc<ArtFetcher>,
     /// Set while a pass is running, to make it stop at the next album.
     cancel: Arc<AtomicBool>,
     /// Woken by [`CoverPublisher::nudge`]; nudges coalesce.
@@ -242,7 +249,12 @@ pub struct CoverPublisher {
 }
 
 impl CoverPublisher {
-    pub fn new(db_path: PathBuf, network: Arc<NetworkService>, app: AppHandle) -> Arc<Self> {
+    pub fn new(
+        db_path: PathBuf,
+        art: Arc<ArtFetcher>,
+        network: Arc<NetworkService>,
+        app: AppHandle,
+    ) -> Arc<Self> {
         // Preferences live in the database, so a choice made in an earlier
         // session is still in force in this one. An unreadable database means
         // "off": a privacy switch is never turned on by a failure.
@@ -259,6 +271,7 @@ impl CoverPublisher {
         }
         Arc::new(Self {
             db_path,
+            art,
             network,
             app,
             cancel: Arc::new(AtomicBool::new(false)),
@@ -381,6 +394,17 @@ impl CoverPublisher {
     /// Ask a running pass to stop. It stops at the next album boundary.
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::SeqCst);
+    }
+
+    /// Fetch and hold the pictures a batch of claims names, so a paired phone
+    /// can be handed bytes rather than an address.
+    ///
+    /// Returns at once and downloads in the background, bounded and deduped by
+    /// [`ArtFetcher`]. There is no answer here about whether the bytes arrived:
+    /// the cover revision moves when they do, which is how the phone is told to
+    /// ask again — the same signal any other change to this computer's art uses.
+    pub fn ensure_art(&self, wants: &[ArtWant<'_>]) {
+        self.art.ensure_all(wants);
     }
 
     /// Write one attempt into the lookup log.

@@ -18,6 +18,7 @@ use tauri::{Emitter, Manager, State};
 use walkdir::WalkDir;
 
 mod art_cache;
+mod art_fetch;
 mod audio;
 mod cover;
 mod cover_publish;
@@ -2338,6 +2339,16 @@ pub fn run() {
                 .map_err(|error| error.to_string())?;
             let db_path = app_data.join("napstr.sqlite3");
             initialise_database(&db_path, &app_data)?;
+            // The cache directory, because art bytes are evictable by design:
+            // every one can be fetched again, and clearing them must be an
+            // ordinary action rather than a repair. A platform that will not
+            // name a cache directory gets a subdirectory of the app data
+            // instead, which still works and is still clearable.
+            let art_root = app
+                .path()
+                .app_cache_dir()
+                .map(|dir| dir.join(art_cache::ART_DIRECTORY))
+                .unwrap_or_else(|_| app_data.join(art_cache::ART_DIRECTORY));
             let tor = Arc::new(tor::TorManager::new(app_data.clone(), resource_dir));
             let transfers = Arc::new(transfer::TransferService::new(db_path.clone(), tor.clone()));
             let network =
@@ -2347,25 +2358,21 @@ pub fn run() {
             let player = Arc::new(player::NativePlayer::default());
             let playback =
                 playback_bridge::PlaybackBridge::new(player.clone(), app.handle().clone());
+            // Art a phone is shown is fetched here, once, so the phone never
+            // has to ask a publisher about itself.
+            let art = art_fetch::ArtFetcher::new(db_path.clone(), art_root.clone())?;
             // Created before the phone service, because a phone's search results
             // join the same cover queue the window fills.
             let covers = cover_publish::CoverPublisher::new(
                 db_path.clone(),
+                art,
                 network.clone(),
                 app.handle().clone(),
             );
             let mobile = mobile::MobileService::new(
                 db_path.clone(),
                 app_data.clone(),
-                // The cache directory, because art bytes are evictable by
-                // design: every one can be fetched again, and clearing them must
-                // be an ordinary action rather than a repair. A platform that
-                // will not name a cache directory gets a subdirectory of the app
-                // data instead, which still works and is still clearable.
-                app.path()
-                    .app_cache_dir()
-                    .map(|dir| dir.join(art_cache::ART_DIRECTORY))
-                    .unwrap_or_else(|_| app_data.join(art_cache::ART_DIRECTORY)),
+                art_root,
                 network.clone(),
                 covers.clone(),
                 playback.clone(),
