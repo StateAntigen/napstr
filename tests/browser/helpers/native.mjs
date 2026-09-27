@@ -10,7 +10,25 @@ export async function mockNative(page, { app = 'napstrfy', nativeLocale = 'en-GB
     window.nativeLocale = nativeLocale;
     const track = { fileId: 'a'.repeat(64), filename: 'Search.wav', title: 'Search', artist: 'Settings', album: 'User album', folder: '', path: '/music/Search.wav', format: 'WAV', mime: 'audio/wav', size: 1234567, tags: 'Rock', local: !remote, sources: [], license: '', description: '', status: 'Shared' };
     const episode = { id: 'episode', title: 'Original episode', feedTitle: 'Original podcast', audioUrl: 'https://example.com/episode.mp3', datePublished: 1700000000, duration: 100, description: '', image: '', mime: 'audio/mpeg' };
-    const status = () => ({ paired, connected: paired, desktopName: 'Music computer', streamOnly: false, endpointId: 'endpoint', libraryRevision: 1, error: '' });
+    // The computer's own key, which is what tells its playlists from public
+    // ones somebody else published. A stranger's playlist is one seeded with
+    // any other author.
+    const desktopPubkey = () => window.playlistAuthor ?? 'c'.repeat(64);
+    const status = () => ({
+      paired,
+      // A phone can be paired and still not reach the computer, which is the
+      // state a playlist has to survive: `window.desktopReachable = false` is
+      // how a spec asks for it, and every `remote_*` call answers the way the
+      // real channel would - with a failure.
+      connected: paired && window.desktopReachable !== false,
+      desktopName: 'Music computer',
+      streamOnly: false,
+      endpointId: 'endpoint',
+      libraryRevision: 1,
+      coverRevision: 0,
+      pubkey: desktopPubkey(),
+      error: ''
+    });
     const transfers = [{ id: 1, fileId: track.fileId, filename: track.filename, size: track.size, progress: 100, status: 'Verified · Complete', speed: '', destination: '/music/Search.wav' }, { id: 2, fileId: 'b'.repeat(64), filename: 'Downloading.wav', size: 100, progress: 12, status: 'Downloading', speed: '', destination: '' }];
     // The computer's player, idle until a test says otherwise.
     const idleRemote = () => ({
@@ -96,6 +114,12 @@ export async function mockNative(page, { app = 'napstrfy', nativeLocale = 'en-GB
       unregisterCallback: () => {},
       invoke: async (cmd, args = {}) => {
         window.calls.push({ cmd, args });
+        // An unreachable computer fails every request to it, exactly as the
+        // phone's own channel does - and the phone's local commands keep working,
+        // which is the whole point of the state.
+        if (window.desktopReachable === false && cmd.startsWith('remote_')) {
+          throw 'Could not reach Napstr';
+        }
         switch (cmd) {
           case 'plugin:os|locale': return window.nativeLocale;
           case 'plugin:app|version': return '0.2.2';
@@ -119,7 +143,12 @@ export async function mockNative(page, { app = 'napstrfy', nativeLocale = 'en-GB
           case 'play_audio': return { fileId: track.fileId, currentTime: 0, duration: 60, playing: true, ended: false, error: '' };
           case 'client_platform': return platform;
           case 'companion_status': return status();
-          case 'cached_library': return { ...status(), tracks: paired ? [track] : [], total: paired ? 1 : 0 };
+          case 'cached_library': {
+            // What this phone holds itself, which is what a playlist played
+            // offline is queued from.
+            const rows = window.cachedLibrary ?? (paired ? [track] : []);
+            return { ...status(), tracks: rows, total: rows.length };
+          }
           case 'remote_library': {
             // The whole library unless a page is asked for, which is what the
             // add sheet's list does as it is scrolled.
@@ -188,7 +217,12 @@ export async function mockNative(page, { app = 'napstrfy', nativeLocale = 'en-GB
           // command at a time; only the shapes differ.
           case 'remote_new_playlist_id': return window.nextPlaylistId ?? '11111111-1111-4111-8111-111111111111';
           case 'remote_playlists': {
-            const rows = playlistSummaries();
+            // `ownOnly` is the picker's question: the computer's own playlists,
+            // because a public one somebody else published is not a list to add
+            // a track to.
+            const rows = args.ownOnly
+              ? playlistSummaries().filter((row) => !row.author || row.author === desktopPubkey())
+              : playlistSummaries();
             return { playlists: rows, total: rows.length };
           }
           case 'remote_playlist': {

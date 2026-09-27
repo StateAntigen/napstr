@@ -40,6 +40,36 @@ struct SavedDesktop {
     desktop_name: String,
     #[serde(default)]
     stream_only: bool,
+    /// This computer's own public key, as it last reported it.
+    ///
+    /// Kept here rather than only in the answer that carried it: it is what
+    /// tells this phone which of its playlists are its computer's own, and being
+    /// out of reach is exactly when a playlist has to be drawn without asking
+    /// anybody. An older host - or one that has not started its own network yet -
+    /// reports nothing, which leaves whatever was learned before standing.
+    #[serde(default)]
+    pubkey: String,
+}
+
+impl SavedDesktop {
+    /// What this phone can say about the computer without hearing from it.
+    ///
+    /// `connected` is whether the last exchange succeeded; everything else is
+    /// what was saved, so an outage changes the flags and nothing about who the
+    /// computer is or which playlists are its own.
+    fn status(&self, connected: bool, error: String) -> CompanionStatus {
+        CompanionStatus {
+            stream_only: self.stream_only,
+            paired: true,
+            connected,
+            desktop_name: self.desktop_name.clone(),
+            endpoint_id: self.endpoint_id.clone(),
+            library_revision: 0,
+            cover_revision: 0,
+            pubkey: self.pubkey.clone(),
+            error,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -54,6 +84,13 @@ struct CompanionStatus {
     /// Moves when the host's art changes, so cached covers - including "the host
     /// has none" - are asked about again instead of being trusted forever.
     cover_revision: u64,
+    /// The computer's own public key, or empty while it has not said.
+    ///
+    /// A phone holds no key of its own, so this is the only thing that can tell
+    /// a playlist this computer wrote down from a public one somebody else
+    /// published - and therefore the only thing that decides what may be edited
+    /// here and what may only be read and copied.
+    pubkey: String,
     error: String,
 }
 
@@ -1336,6 +1373,9 @@ impl RemoteClient {
             endpoint_addr: ticket.endpoint_addr.clone(),
             desktop_name: ticket.desktop_name.clone(),
             stream_only: false,
+            // The computer's own key is learned from its first status answer,
+            // which is where "is this playlist mine?" is answered from.
+            pubkey: String::new(),
         };
         let endpoint = self.endpoint().await?;
         let address = decode_endpoint_addr(&desktop)?;
@@ -1438,6 +1478,7 @@ impl RemoteClient {
                 endpoint_id: String::new(),
                 library_revision: 0,
                 cover_revision: 0,
+                pubkey: String::new(),
                 error: String::new(),
             };
         }
@@ -1445,28 +1486,32 @@ impl RemoteClient {
         match tokio::time::timeout(Duration::from_secs(8), self.request(ClientRequest::Status))
             .await
         {
-            Err(_) => CompanionStatus {
-                stream_only: desktop.stream_only,
-                paired: true,
-                connected: false,
-                desktop_name: desktop.desktop_name,
-                endpoint_id: desktop.endpoint_id,
-                library_revision: 0,
-                cover_revision: 0,
-                error: "Napstr did not answer yet".into(),
-            },
+            Err(_) => desktop.status(false, "Napstr did not answer yet".into()),
             Ok(Ok(ServerResponse::Status {
                 library_revision,
                 cover_revision,
                 stream_only,
+                pubkey,
             })) => {
-                if stream_only != desktop.stream_only {
+                // An empty key is "this computer has not said", which leaves the
+                // one learned earlier standing: a host that is not on the
+                // network yet has no keys loaded, and that must not turn this
+                // computer's own playlists into somebody else's.
+                let pubkey = if pubkey.is_empty() {
+                    desktop.pubkey.clone()
+                } else {
+                    pubkey
+                };
+                if stream_only != desktop.stream_only
+                    || (!pubkey.is_empty() && pubkey != desktop.pubkey)
+                {
                     let mut saved = self.desktop.write().await;
                     if let Some(saved) = saved
                         .as_mut()
                         .filter(|saved| saved.endpoint_id == desktop.endpoint_id)
                     {
                         saved.stream_only = stream_only;
+                        saved.pubkey = pubkey.clone();
                         let _ = save_json(&self.app_data.join("paired-desktop.json"), saved);
                     }
                 }
@@ -1478,32 +1523,15 @@ impl RemoteClient {
                     endpoint_id: desktop.endpoint_id,
                     library_revision,
                     cover_revision,
+                    pubkey,
                     error: String::new(),
                 }
             }
             Ok(Err(error)) if error == "invalid Napstrfy request" => {
                 self.legacy_status(desktop).await
             }
-            Ok(Ok(other)) => CompanionStatus {
-                stream_only: desktop.stream_only,
-                paired: true,
-                connected: false,
-                desktop_name: desktop.desktop_name,
-                endpoint_id: desktop.endpoint_id,
-                library_revision: 0,
-                cover_revision: 0,
-                error: unexpected_response(&other),
-            },
-            Ok(Err(error)) => CompanionStatus {
-                stream_only: desktop.stream_only,
-                paired: true,
-                connected: false,
-                desktop_name: desktop.desktop_name,
-                endpoint_id: desktop.endpoint_id,
-                library_revision: 0,
-                cover_revision: 0,
-                error,
-            },
+            Ok(Ok(other)) => desktop.status(false, unexpected_response(&other)),
+            Ok(Err(error)) => desktop.status(false, error),
         }
     }
 
@@ -1514,42 +1542,16 @@ impl RemoteClient {
                 stream_only: desktop.stream_only,
                 paired: true,
                 connected: true,
-                desktop_name: desktop.desktop_name,
-                endpoint_id: desktop.endpoint_id,
+                desktop_name: desktop.desktop_name.clone(),
+                endpoint_id: desktop.endpoint_id.clone(),
                 library_revision: 0,
                 cover_revision: 0,
+                pubkey: desktop.pubkey.clone(),
                 error: String::new(),
             },
-            Ok(Ok(other)) => CompanionStatus {
-                stream_only: desktop.stream_only,
-                paired: true,
-                connected: false,
-                desktop_name: desktop.desktop_name,
-                endpoint_id: desktop.endpoint_id,
-                library_revision: 0,
-                cover_revision: 0,
-                error: unexpected_response(&other),
-            },
-            Ok(Err(error)) => CompanionStatus {
-                stream_only: desktop.stream_only,
-                paired: true,
-                connected: false,
-                desktop_name: desktop.desktop_name,
-                endpoint_id: desktop.endpoint_id,
-                library_revision: 0,
-                cover_revision: 0,
-                error,
-            },
-            Err(_) => CompanionStatus {
-                stream_only: desktop.stream_only,
-                paired: true,
-                connected: false,
-                desktop_name: desktop.desktop_name,
-                endpoint_id: desktop.endpoint_id,
-                library_revision: 0,
-                cover_revision: 0,
-                error: "Napstr did not answer yet".into(),
-            },
+            Ok(Ok(other)) => desktop.status(false, unexpected_response(&other)),
+            Ok(Err(error)) => desktop.status(false, error),
+            Err(_) => desktop.status(false, "Napstr did not answer yet".into()),
         }
     }
 
@@ -1828,6 +1830,7 @@ async fn remote_library(
     query: String,
     offset: usize,
     limit: usize,
+    shuffle_seed: Option<u64>,
     state: State<'_, AppState>,
 ) -> Result<LibraryPage, String> {
     match state
@@ -1836,6 +1839,7 @@ async fn remote_library(
             query,
             offset,
             limit,
+            shuffle_seed,
         })
         .await?
     {
@@ -1875,15 +1879,24 @@ async fn remote_library_by_ids(
 }
 
 /// Playlists this computer can see, newest first and without their members.
+///
+/// `own_only` asks for this computer's own playlists alone, which is what the
+/// picker beside a track wants: a public playlist somebody else published is one
+/// to play, not a list to add a track to.
 #[tauri::command]
 async fn remote_playlists(
     offset: usize,
     limit: usize,
+    own_only: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<PlaylistPage, String> {
     match state
         .remote
-        .request(ClientRequest::Playlists { offset, limit })
+        .request(ClientRequest::Playlists {
+            offset,
+            limit,
+            own_only: own_only.unwrap_or(false),
+        })
         .await?
     {
         ServerResponse::Playlists { playlists, total } => Ok(PlaylistPage { playlists, total }),
@@ -3102,6 +3115,7 @@ mod tests {
                     endpoint_addr: String::new(),
                     desktop_name: "Test Napstr".into(),
                     stream_only: true,
+                    pubkey: String::new(),
                 });
                 *remote.connection.write().await = Some(connection);
                 let media = MediaServer::start().unwrap();

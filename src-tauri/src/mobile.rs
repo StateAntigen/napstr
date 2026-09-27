@@ -14,6 +14,7 @@ use napstr_remote_protocol::{
 use qrcode::{render::svg, QrCode};
 use rusqlite::{params, OptionalExtension};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -452,6 +453,7 @@ impl MobileService {
         query: &str,
         offset: usize,
         limit: usize,
+        shuffle_seed: Option<u64>,
     ) -> Result<
         (
             Vec<RemoteTrack>,
@@ -483,7 +485,10 @@ impl MobileService {
                 (tracks, audiobook_chapter_ids)
             }
         };
-        let (page, total) = page_music_library(&tracks, query, offset, limit);
+        let (page, total) = match (query.is_empty(), shuffle_seed) {
+            (true, Some(seed)) => page_shuffled_music_library(&tracks, seed, offset, limit),
+            _ => page_music_library(&tracks, query, offset, limit),
+        };
         Ok((page, total, audiobook_chapter_ids))
     }
 
@@ -543,12 +548,17 @@ impl MobileService {
                 query,
                 offset,
                 limit,
+                shuffle_seed,
             } => {
                 if query.chars().count() > 120 {
                     return Err("Library searches are limited to 120 characters".into());
                 }
-                let (tracks, total, _) =
-                    self.music_library(&query, offset, limit.clamp(1, MAX_PAGE_SIZE))?;
+                let (tracks, total, _) = self.music_library(
+                    &query,
+                    offset,
+                    limit.clamp(1, MAX_PAGE_SIZE),
+                    shuffle_seed,
+                )?;
                 write_response(send, &ServerResponse::Library { tracks, total }).await
             }
             ClientRequest::Search { query } => {
@@ -557,7 +567,7 @@ impl MobileService {
                     return Err("Search for between 1 and 120 characters".into());
                 }
                 let (mut tracks, _, audiobook_chapter_ids) =
-                    self.music_library(query, 0, MAX_PAGE_SIZE)?;
+                    self.music_library(query, 0, MAX_PAGE_SIZE, None)?;
                 let remote = if stream_only {
                     Vec::new()
                 } else {
@@ -784,9 +794,23 @@ impl MobileService {
                     .collect();
                 write_response(send, &ServerResponse::LibraryByIds { tracks }).await
             }
-            ClientRequest::Playlists { offset, limit } => {
-                let (playlists, total) = crate::playlist::list(
-                    &open_connection(&self.db_path)?,
+            ClientRequest::Playlists {
+                offset,
+                limit,
+                own_only,
+            } => {
+                let connection = open_connection(&self.db_path)?;
+                // The picker asks for this computer's own playlists alone: a
+                // public one somebody else published is a playlist to play, not
+                // a list to add a track to.
+                let owned_by = if own_only {
+                    Some(crate::network::own_pubkey()?)
+                } else {
+                    None
+                };
+                let (playlists, total) = crate::playlist::list_owned_by(
+                    &connection,
+                    owned_by.as_deref(),
                     offset,
                     limit.clamp(1, MAX_PAGE_SIZE),
                 )?;
@@ -901,6 +925,15 @@ impl MobileService {
                         library_revision: library_revision(&self.db_path)?,
                         cover_revision: cover_revision(&self.db_path)?,
                         stream_only,
+                        // Who this computer is, which is the only way the phone
+                        // can tell its own playlists from public ones. It is a
+                        // public key: nothing secret travels, and the phone
+                        // holds no key of its own to compare against otherwise.
+                        pubkey: self
+                            .network
+                            .own_pubkey()
+                            .await
+                            .unwrap_or_default(),
                     },
                 )
                 .await
@@ -1308,6 +1341,46 @@ fn build_music_library(
     Ok((tracks, audiobook_chapter_ids))
 }
 
+/// One page of the library in the order one seed produces.
+///
+/// The order is a property of the seed and the file ids rather than of anything
+/// kept here: a file's key depends on its own id alone, so paging a hundred at a
+/// time walks one permutation from beginning to end, and the same seed asks for
+/// the same order however long ago it was minted. That is what makes a phone's
+/// browse a shuffle without the host holding a list per device, and what keeps a
+/// desktop restart from reshuffling a list the phone is halfway down.
+fn page_shuffled_music_library(
+    tracks: &[RemoteTrack],
+    seed: u64,
+    offset: usize,
+    limit: usize,
+) -> (Vec<RemoteTrack>, usize) {
+    let mut order = (0..tracks.len()).collect::<Vec<_>>();
+    order.sort_by_cached_key(|index| shuffle_key(seed, &tracks[*index].file_id));
+    let page = order
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|index| tracks[index].clone())
+        .collect::<Vec<_>>();
+    (page, tracks.len())
+}
+
+/// Where one file falls in a seeded order.
+///
+/// A hash of the seed and the file id, truncated: the file id is already a
+/// hash, so any mixing would do, and hashing the two together is the version of
+/// "any mixing" that can be checked by reading it.
+fn shuffle_key(seed: u64, file_id: &str) -> [u8; 8] {
+    let mut hasher = Sha256::new();
+    hasher.update(seed.to_le_bytes());
+    hasher.update(file_id.as_bytes());
+    let digest = hasher.finalize();
+    let mut key = [0u8; 8];
+    key.copy_from_slice(&digest[..8]);
+    key
+}
+
 fn page_music_library(
     tracks: &[RemoteTrack],
     query: &str,
@@ -1626,7 +1699,8 @@ mod tests {
             &ClientRequest::Library {
                 query: String::new(),
                 offset: 0,
-                limit: 100
+                limit: 100,
+                shuffle_seed: Some(7)
             }
         )
         .is_ok());
@@ -1812,5 +1886,73 @@ mod tests {
         assert_eq!(audiobooks[0].chapters.len(), 2);
         assert!(audiobooks[0].chapters.iter().all(|chapter| chapter.local));
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A seeded browse is one order, whatever page asks for it and whenever.
+    ///
+    /// This is what lets a phone shuffle the whole library without the host
+    /// keeping a list per device: the order is a function of the seed and the
+    /// file ids, so paging walks it, a restart of either side reproduces it, and
+    /// a library that changed keeps every file it still has in the same place.
+    #[test]
+    fn a_seeded_browse_walks_one_shuffled_order() {
+        fn track(index: usize) -> RemoteTrack {
+            RemoteTrack {
+                file_id: format!("{index:064x}"),
+                filename: format!("track-{index}.flac"),
+                title: format!("Track {index}"),
+                artist: "Someone".into(),
+                album: "Something".into(),
+                format: "FLAC".into(),
+                mime: "audio/flac".into(),
+                size: 1_000,
+                tags: String::new(),
+                local: true,
+                sources: Vec::new(),
+            }
+        }
+        let tracks = (0..40).map(track).collect::<Vec<_>>();
+        let ids = |page: &[RemoteTrack]| {
+            page.iter()
+                .map(|track| track.file_id.clone())
+                .collect::<Vec<_>>()
+        };
+        let stored = ids(&tracks);
+        let seed = 0x5eed_1234_5678_9abc;
+
+        // The whole library, seven at a time, is the library: every file once,
+        // in an order that is not the stored one.
+        let mut walked = Vec::new();
+        for offset in (0..tracks.len()).step_by(7) {
+            let (page, total) = page_shuffled_music_library(&tracks, seed, offset, 7);
+            assert_eq!(total, tracks.len());
+            assert!(page.len() <= 7);
+            walked.extend(ids(&page));
+        }
+        assert_eq!(walked.len(), stored.len());
+        let mut unique = walked.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), stored.len(), "a page repeated or lost a file");
+        assert_ne!(walked, stored, "the seeded order is the stored order");
+
+        // The same seed asks for the same order; a different one does not.
+        let (first, _) = page_shuffled_music_library(&tracks, seed, 0, 10);
+        let (again, _) = page_shuffled_music_library(&tracks, seed, 0, 10);
+        assert_eq!(ids(&first), ids(&again));
+        let (other, _) = page_shuffled_music_library(&tracks, seed.wrapping_add(1), 0, 10);
+        assert_ne!(ids(&first), ids(&other));
+
+        // Where a file falls depends on its own id, so a library that gained or
+        // lost something does not reorder the rest of itself.
+        let mut subset = tracks.clone();
+        let removed = subset.remove(3).file_id;
+        let (subset_order, _) = page_shuffled_music_library(&subset, seed, 0, subset.len());
+        let expected = walked
+            .iter()
+            .filter(|file_id| **file_id != removed)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(ids(&subset_order), expected);
     }
 }

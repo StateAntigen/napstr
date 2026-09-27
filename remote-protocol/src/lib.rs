@@ -435,6 +435,17 @@ pub enum ClientRequest {
         query: String,
         offset: usize,
         limit: usize,
+        /// A seed for a shuffled browse order, or nothing for the stored one.
+        ///
+        /// A phone mints one when it starts and sends it with every page, so the
+        /// pages it walks are one single order - and the order is derived from
+        /// the seed rather than kept anywhere, which is why a desktop restart
+        /// cannot change the order under a phone that is halfway through it, and
+        /// why two paired phones never see the same one. It applies to the
+        /// whole-library browse alone: a search that names something has an
+        /// order of its own, and the closest match is what belongs first.
+        #[serde(default)]
+        shuffle_seed: Option<u64>,
     },
     /// The catalogue records for particular file ids, in the order asked for.
     /// A handoff answer carries the host's queue as ids, so this is how a phone
@@ -463,6 +474,15 @@ pub enum ClientRequest {
     Playlists {
         offset: usize,
         limit: usize,
+        /// Answer with this computer's own playlists only.
+        ///
+        /// A phone's "add this track to a playlist" picker asks this way, because
+        /// a playlist somebody else published is not a list to add to: editing one
+        /// makes a copy of it, which is a different action from a tick in a
+        /// picker. At library scale the picker also cannot afford to page past
+        /// playlists the phone may not edit in order to reach the ones it may.
+        #[serde(default)]
+        own_only: bool,
     },
     /// One playlist, a page of its members at a time in `position` order.
     ///
@@ -665,6 +685,16 @@ pub enum ServerResponse {
         cover_revision: u64,
         #[serde(default)]
         stream_only: bool,
+        /// This computer's own public key: the author half of every playlist it
+        /// wrote down.
+        ///
+        /// A companion has no key of its own and no other way to learn this one,
+        /// and without it a playlist's `author` is just an opaque string: a phone
+        /// could not tell its computer's own playlist from a public one somebody
+        /// else published. It compares the two to decide what it may edit and
+        /// what it may only read and copy.
+        #[serde(default)]
+        pubkey: String,
     },
     Pong,
     Error {
@@ -694,7 +724,8 @@ mod tests {
             ServerResponse::Status {
                 library_revision: 1,
                 cover_revision: 0,
-                stream_only: false
+                stream_only: false,
+                pubkey: String::new()
             }
         );
         assert_eq!(
@@ -731,11 +762,38 @@ mod tests {
             library_revision: 42,
             cover_revision: 9,
             stream_only: true,
+            pubkey: "c".repeat(64),
         };
         let json = serde_json::to_string(&response).unwrap();
         assert_eq!(
             serde_json::from_str::<ServerResponse>(&json).unwrap(),
             response
+        );
+    }
+
+    /// A phone that asks for the computer's own playlists alone.
+    ///
+    /// The flag is additive: a picker that does not send it is answered with
+    /// every playlist, exactly as before it existed.
+    #[test]
+    fn the_playlist_list_may_be_asked_for_its_owners_own() {
+        assert_eq!(
+            serde_json::from_str::<ClientRequest>(r#"{"type":"playlists","offset":0,"limit":100}"#)
+                .unwrap(),
+            ClientRequest::Playlists {
+                offset: 0,
+                limit: 100,
+                own_only: false
+            }
+        );
+        let own = ClientRequest::Playlists {
+            offset: 100,
+            limit: 50,
+            own_only: true,
+        };
+        assert_eq!(
+            serde_json::from_str::<ClientRequest>(&serde_json::to_string(&own).unwrap()).unwrap(),
+            own
         );
     }
 
@@ -753,6 +811,26 @@ mod tests {
                 library_revision: 3,
                 cover_revision: 0,
                 stream_only: true,
+                pubkey: String::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_host_that_does_not_say_who_it_is_answers_with_no_key() {
+        // An older desktop sends no `pubkey`. Reading it as empty is what lets a
+        // newer phone treat every playlist as somebody else's - the safe way
+        // round, because the actions that are wrong to offer are the writes.
+        assert_eq!(
+            serde_json::from_str::<ServerResponse>(
+                r#"{"type":"status","libraryRevision":3,"streamOnly":false}"#
+            )
+            .unwrap(),
+            ServerResponse::Status {
+                library_revision: 3,
+                cover_revision: 0,
+                stream_only: false,
+                pubkey: String::new(),
             }
         );
     }
@@ -860,10 +938,11 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&ClientRequest::Playlists {
                 offset: 0,
-                limit: 100
+                limit: 100,
+                own_only: false
             })
             .unwrap(),
-            r#"{"type":"playlists","offset":0,"limit":100}"#
+            r#"{"type":"playlists","offset":0,"limit":100,"ownOnly":false}"#
         );
         assert_eq!(
             serde_json::to_string(&ClientRequest::Playlist {

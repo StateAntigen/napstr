@@ -41,6 +41,13 @@ export type CompanionStatus = {
   libraryRevision: number;
   /** Moves when the host's album art changes, so cached covers are re-asked. */
   coverRevision: number;
+  /**
+   * The computer's own public key, or empty while it has not said.
+   *
+   * A phone holds no key of its own, so this is the only thing that can tell a
+   * playlist its computer wrote down from a public one somebody else published.
+   */
+  pubkey: string;
   error: string;
 };
 

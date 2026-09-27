@@ -698,7 +698,7 @@ discriminator. Defined requests are:
 
 ```json
 {"type":"pair","token":"<token>","deviceName":"Napstrfy on Android phone"}
-{"type":"library","query":"metallica","offset":0,"limit":100}
+{"type":"library","query":"metallica","offset":0,"limit":100,"shuffleSeed":1234567890}
 {"type":"libraryByIds","fileIds":["<fileId>","<fileId>"]}
 {"type":"search","query":"enter sandman"}
 {"type":"requestDownload","fileId":"<fileId>","sourcePubkeys":["<Nostr pubkey>"],"destinationFolder":"<optional audiobook folder>"}
@@ -706,7 +706,7 @@ discriminator. Defined requests are:
 {"type":"fetchAudio","fileId":"<fileId>"}
 {"type":"available","fileIds":["<fileId>","<fileId>"]}
 {"type":"albumCovers","keys":["<artist|album>"]}
-{"type":"playlists","offset":0,"limit":100}
+{"type":"playlists","offset":0,"limit":100,"ownOnly":true}
 {"type":"playlist","playlistId":"<playlistId>","offset":0,"limit":100}
 {"type":"playback","command":{"type":"playTrack","fileId":"<fileId>","queue":["<fileId>"],"positionMs":0}}
 {"type":"playbackState"}
@@ -739,6 +739,21 @@ accepts only one sanitized path component and stores it beneath
 companion. Omitting it keeps the normal music destination at the Napstr-folder
 root.
 
+`shuffleSeed` is optional and is only meaningful on a `library` request that
+carries no `query`: it is an unsigned 32-bit number a companion mints once per
+launch and sends with every page of that browse. The desktop derives one order
+from the seed and the file ids rather than keeping a list per device, so paging
+walks one permutation from beginning to end, a desktop restart does not
+reshuffle a list a companion is halfway down, and two devices see two different
+orders. Without the field, `library` answers in the library's stored order,
+which is what a search is for. The order is a presentation and not a contract:
+a companion MUST NOT depend on where any particular track falls in it, and MUST
+cope with a desktop that ignores the field and answers in the stored order.
+
+`ownOnly` below and `shuffleSeed` above are read the same way by a desktop that
+does not know them: a request field it does not recognise is ignored rather than
+refused, so both are questions a companion may ask and a hint it may not rely on.
+
 Responses have `type` values `paired`, `library`, `libraryByIds`, `search`,
 `status`, `downloadRequested`, `transfers`, `audioReady`, `available`,
 `playlists`, `playlist`, `pong`, or `error`. Track objects contain `fileId`,
@@ -750,6 +765,15 @@ The lightweight `status` response contains `libraryRevision`, a monotonically
 increasing local-library revision. A companion MAY poll it and should reload
 library pages only when it changes. The revision check carries no catalogue
 rows and does not affect active audio streams.
+
+It also contains `pubkey`: the desktop's own Nostr public key in lowercase hex,
+which is what lets a companion tell that desktop's own playlists from public
+ones somebody else published. It is a public key, so nothing secret travels with
+it, and a companion that is not told it — an empty string, or a desktop too old
+to answer the field — MUST read every playlist that names an author as somebody
+else's, because the action that would be wrong to offer is the write. The key is
+not an authorization: a companion holds no key of its own, and it is the desktop
+that decides which coordinates it can sign.
 
 It also contains `coverRevision`, which moves whenever the album art the
 desktop would report changes: a claim that arrived from a relay, or art the
@@ -816,6 +840,18 @@ is still a member. A member the desktop no longer holds is still listed, because
 the order is part of what a playlist means. A playlist also carries the author's
 own search tags, which are what it is published to be found by; a companion shows
 them as the author's and does not add suggestions of its own to them.
+
+Every summary therefore has an `author` and a `displayName`, which is what lets a
+companion tell a desktop's own playlist from a public one somebody else published
+— the key it compares against is the one `status` reports. `ownOnly` on
+`playlists` asks the narrower question: the paired desktop's own rows, and the
+rows with no author at all, which are the ones only that desktop has ever written
+down. It exists because the list of playlists worth reading is longer than the
+list worth editing, and a picker that had to page past a shelf of strangers'
+playlists to reach the handful a person may change would be no picker. It is a
+filter rather than permission: whatever it answers, a companion MUST NOT offer a
+change to a coordinate the desktop does not hold, because only the desktop can
+sign, and it signs its own coordinates alone.
 
 A public playlist is published as a kind `30425` event whose `napstr-playlist`
 marker tag is mandatory in both directions: that kind is co-occupied by other

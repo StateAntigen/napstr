@@ -144,7 +144,7 @@
     return () => query.removeEventListener('change', listener);
   });
   const pinned = $derived(!mobile && platform !== '' && wideWindow);
-  let status = $state<CompanionStatus>({ streamOnly: false, paired: false, connected: false, desktopName: '', endpointId: '', libraryRevision: 0, coverRevision: 0, error: '' });
+  let status = $state<CompanionStatus>({ streamOnly: false, paired: false, connected: false, desktopName: '', endpointId: '', libraryRevision: 0, coverRevision: 0, pubkey: '', error: '' });
   let statusLoading = $state(true);
   let statusPending = $state(false);
   let pairingCode = $state('');
@@ -266,9 +266,9 @@
   /**
    * Playlists live on the Napstr computer: this phone lists them, opens one a
    * page of members at a time, and writes edits back through the companion
-   * channel. Nothing about a playlist is stored here except what a screen is
-   * holding, so two devices never disagree about a playlist - they both read the
-   * one the computer keeps.
+   * channel. The computer is the one that owns a playlist; what is kept here is
+   * the reading of it a screen has already been given, so a playlist can still
+   * be opened and played when the computer is out of reach.
    */
   let playlists = $state<RemotePlaylistSummary[]>([]);
   let playlistsLoading = $state(false);
@@ -1108,11 +1108,25 @@
   async function forgetDesktop() {
     if (!window.confirm('Disconnect this phone from Napstr? You will need to scan a new QR code.')) return;
     await invoke('forget_desktop');
-    status = { streamOnly: false, paired: false, connected: false, desktopName: '', endpointId: '', libraryRevision: 0, coverRevision: 0, error: '' };
+    status = { streamOnly: false, paired: false, connected: false, desktopName: '', endpointId: '', libraryRevision: 0, coverRevision: 0, pubkey: '', error: '' };
     tracks = [];
     current = null;
     audio?.pause();
   }
+
+  /**
+   * The order this launch browses the library in.
+   *
+   * Minted once when the app starts, so every launch shows a different order and
+   * every phone has one of its own - and sent with every page, so the computer
+   * derives one order for all of them rather than keeping a list per device. A
+   * search, and the sheet that adds a track to a playlist, still ask in the
+   * stored order: there the point is to find something, not to be shown
+   * everything.
+   */
+  const libraryShuffleSeed = window.crypto?.getRandomValues
+    ? window.crypto.getRandomValues(new Uint32Array(1))[0]
+    : Math.floor(Math.random() * 0xffffffff);
 
   async function loadLibrary(append = false) {
     if (!status.paired || loading || loadingMore) return;
@@ -1125,7 +1139,8 @@
       const page = await invoke<LibraryPage>('remote_library', {
         query: query.trim(),
         offset: append ? tracks.length : 0,
-        limit: 100
+        limit: 100,
+        shuffleSeed: libraryShuffleSeed
       });
       if (viewVersion !== musicViewVersion) return;
       tracks = append ? [...tracks, ...page.tracks] : page.tracks;
@@ -1151,7 +1166,7 @@
     }
     silentLibraryRefresh = true;
     try {
-      const page = await invoke<LibraryPage>('remote_library', { query: '', offset: 0, limit: 100 });
+      const page = await invoke<LibraryPage>('remote_library', { query: '', offset: 0, limit: 100, shuffleSeed: libraryShuffleSeed });
       tracks = page.tracks;
       total = page.total;
       loadedLibraryRevision = revision;
@@ -1241,6 +1256,12 @@
    * every write goes there and the answer is what this screen keeps. That keeps
    * a phone and the desktop window from ever holding two versions of one
    * playlist, which is the failure mode a second copy would introduce.
+   *
+   * A playlist somebody else published is not this phone's to edit at all. The
+   * computer's own key is what tells the two apart - the only thing that can,
+   * since a phone holds no key of its own - and an edit of somebody else's
+   * playlist is a **copy** of it: a new id, filed as this computer's own, which
+   * is the one write a read-only playlist may get.
    */
   async function showPlaylists() {
     activeTab = 'playlists';
@@ -1249,15 +1270,133 @@
     await refreshPlaylists();
   }
 
+  /**
+   * Whether a playlist is this computer's own, and therefore this phone's to
+   * change.
+   *
+   * Two things make one its own: an author that is the key the computer
+   * reported, and no author at all, which is a playlist only that computer has
+   * ever written down. An empty key is "the computer has not said who it is",
+   * and the answer to that is no: the actions that would be wrong to offer are
+   * the writes, and reading and playing a playlist needs no permission at all.
+   */
+  function playlistIsMine(author: string) {
+    if (!author) return true;
+    if (!status.pubkey) return false;
+    return author === status.pubkey;
+  }
+
+  /** This computer's own playlists, in the order the computer lists them. */
+  function playlistsMine(): RemotePlaylistSummary[] {
+    return playlists.filter((row) => playlistIsMine(row.author));
+  }
+
+  /** Everybody else's public playlists, which are read-only here. */
+  function playlistsOthers(): RemotePlaylistSummary[] {
+    return playlists.filter((row) => !playlistIsMine(row.author));
+  }
+
+  /**
+   * Where this phone keeps the playlists it has been shown.
+   *
+   * Only what a screen was already given: the names, and the members of a
+   * playlist that has been opened. Nothing is owned here - the computer keeps
+   * the playlist, and this is a reading of it that survives the computer being
+   * out of reach, which is what lets a playlist be opened and played on a train.
+   * A member this phone cannot play says so in the list, and the queue leaves it
+   * out, exactly as it does at home.
+   */
+  const playlistListKey = 'napstrfy-playlist-list';
+  const playlistMembersKey = 'napstrfy-playlist-members';
+  /** How many playlists' members are kept: one playlist may name 500 of them. */
+  const PLAYLIST_MEMBERS_CACHE_LIMIT = 12;
+
+  function readStoredPlaylistList(): RemotePlaylistSummary[] {
+    try {
+      const rows = JSON.parse(window.localStorage.getItem(playlistListKey) || '[]') as unknown;
+      if (!Array.isArray(rows)) return [];
+      return rows.filter(
+        (row): row is RemotePlaylistSummary =>
+          Boolean(row) &&
+          typeof (row as RemotePlaylistSummary).playlistId === 'string' &&
+          typeof (row as RemotePlaylistSummary).author === 'string' &&
+          typeof (row as RemotePlaylistSummary).title === 'string'
+      );
+    } catch {
+      return [];
+    }
+  }
+
+  function storePlaylistList(rows: RemotePlaylistSummary[]) {
+    try {
+      window.localStorage.setItem(playlistListKey, JSON.stringify(rows));
+    } catch {
+      // A full or unavailable store costs the offline list and nothing else.
+    }
+  }
+
+  type StoredPlaylists = Record<string, { at: number; playlist: RemotePlaylist }>;
+
+  function readStoredPlaylists(): StoredPlaylists {
+    try {
+      const stored = JSON.parse(window.localStorage.getItem(playlistMembersKey) || '{}') as unknown;
+      return stored && typeof stored === 'object' && !Array.isArray(stored)
+        ? (stored as StoredPlaylists)
+        : {};
+    } catch {
+      return {};
+    }
+  }
+
+  function readStoredPlaylist(author: string, playlistId: string): RemotePlaylist | null {
+    const stored = readStoredPlaylists()[playlistKey(author, playlistId)];
+    return stored?.playlist ?? null;
+  }
+
+  /**
+   * Keep the members of a playlist this phone has been shown.
+   *
+   * Bounded by the number of playlists rather than by their size: a playlist can
+   * name five hundred members, so what is kept is the handful that have been
+   * opened most recently, oldest first out.
+   */
+  function storePlaylist(playlist: RemotePlaylist) {
+    try {
+      const stored = readStoredPlaylists();
+      stored[playlistKey(playlist.author, playlist.playlistId)] = {
+        at: Date.now(),
+        playlist
+      };
+      const entries = Object.entries(stored).sort((left, right) => right[1].at - left[1].at);
+      window.localStorage.setItem(
+        playlistMembersKey,
+        JSON.stringify(Object.fromEntries(entries.slice(0, PLAYLIST_MEMBERS_CACHE_LIMIT)))
+      );
+    } catch {
+      // Same again: this is an accelerator, never the playlist itself.
+    }
+  }
+
   async function refreshPlaylists() {
+    // What this phone last saw is drawn at once, so a list that has been read
+    // once is still a list when the computer is asleep. An empty store is not
+    // drawn, because writing the list here is a change to the very thing the
+    // shelves read, and one of them asks for it.
+    if (playlists.length === 0) {
+      const stored = readStoredPlaylistList();
+      if (stored.length > 0) playlists = stored;
+    }
     playlistsLoading = true;
     playlistsError = '';
     try {
       const page = await invoke<PlaylistPage>('remote_playlists', { offset: 0, limit: 100 });
       playlists = page.playlists;
+      storePlaylistList(page.playlists);
       void resolvePlaylistRowArt(page.playlists);
     } catch (nextError) {
-      playlistsError = String(nextError);
+      // A list this phone already holds is an answer: only an empty screen has
+      // to say why it is empty.
+      if (playlists.length === 0) playlistsError = String(nextError);
     } finally {
       playlistsLoading = false;
     }
@@ -1283,20 +1422,34 @@
    * The host answers a page at a time, because a playlist may name 500 members
    * and one frame has to carry the answer; the editor is the one place that
    * needs the whole list, so it is the one place that pages for it.
+   *
+   * What it answers is kept, so the same playlist can be opened again with the
+   * computer out of reach - its members and their names come with it, which is
+   * what a page can draw without asking anybody.
    */
   async function loadPlaylist(author: string, playlistId: string): Promise<RemotePlaylist> {
-    const first = await invoke<RemotePlaylist>('remote_playlist', {
-      author, playlistId, offset: 0, limit: PLAYLIST_PAGE
-    });
-    const members = [...first.tracks];
-    while (members.length < first.total && members.length < MAX_PLAYLIST_MEMBERS) {
-      const next = await invoke<RemotePlaylist>('remote_playlist', {
-        author, playlistId, offset: members.length, limit: PLAYLIST_PAGE
+    try {
+      const first = await invoke<RemotePlaylist>('remote_playlist', {
+        author, playlistId, offset: 0, limit: PLAYLIST_PAGE
       });
-      if (next.tracks.length === 0) break;
-      members.push(...next.tracks);
+      const members = [...first.tracks];
+      while (members.length < first.total && members.length < MAX_PLAYLIST_MEMBERS) {
+        const next = await invoke<RemotePlaylist>('remote_playlist', {
+          author, playlistId, offset: members.length, limit: PLAYLIST_PAGE
+        });
+        if (next.tracks.length === 0) break;
+        members.push(...next.tracks);
+      }
+      const loaded = { ...first, tracks: members, total: members.length };
+      storePlaylist(loaded);
+      return loaded;
+    } catch (nextError) {
+      // The computer could not answer: this is the copy of the playlist this
+      // phone was last shown, which is a playlist it can still read and play.
+      const stored = readStoredPlaylist(author, playlistId);
+      if (stored) return stored;
+      throw nextError;
     }
-    return { ...first, tracks: members, total: members.length };
   }
 
   /**
@@ -1340,6 +1493,12 @@
         playlistSuggestTags = loaded.tags.trim() === '';
         void resolveMemberTracks();
       }
+      // Nothing about somebody else's playlist is this phone's to change: the
+      // only write it may get is a copy, which the view screen offers.
+      if (!playlistIsMine(playlistDraft.author)) {
+        playlistMode = 'view';
+        return;
+      }
       playlistMode = 'edit';
       playlistError = '';
       playlistNotice = '';
@@ -1350,6 +1509,10 @@
 
   /** The playlist's own description: what it is called, and whether it is out. */
   function openPlaylistDetails() {
+    if (playlistDraft && !playlistIsMine(playlistDraft.author)) {
+      playlistMode = 'view';
+      return;
+    }
     playlistMode = 'details';
     playlistError = '';
     playlistNotice = '';
@@ -1664,15 +1827,36 @@
   }
 
   /**
+   * The row for a playlist that has just changed, in every list holding it.
+   *
+   * A member was added or dropped, so its count and its place in the list move
+   * with the edit - and a playlist that was open at the time is out of date too.
+   */
+  function notePlaylistEdited(saved: RemotePlaylist) {
+    const fresh = (row: RemotePlaylistSummary) =>
+      row.author === saved.author && row.playlistId === saved.playlistId
+        ? { ...row, trackCount: saved.total, updatedAt: saved.updatedAt }
+        : row;
+    pickerPlaylists = pickerPlaylists.map(fresh);
+    playlists = playlists.map(fresh);
+    if (playlistDraft?.playlistId === saved.playlistId) playlistDraft = saved;
+  }
+
+  /**
    * The playlists the picker offers.
    *
-   * Today every one of them is the computer's, read back the way the Playlists
-   * page reads them. A private playlist belongs on this phone and never on the
-   * computer, so when those live here they are appended at this one point, and
-   * nothing else about the picker has to change.
+   * This computer's own, and only its own, which is why the picker asks the
+   * computer for them rather than filtering a list of everything: a public
+   * playlist somebody else published is one to play, not a list to add a track
+   * to, and at library scale a picker that had to page past a shelf of them to
+   * reach the handful a person may edit would be no picker at all. A private
+   * playlist belongs on this phone and never on the computer, so when those live
+   * here they are appended at this one point and nothing else has to change.
    */
+  let pickerPlaylists = $state<RemotePlaylistSummary[]>([]);
+
   function pickerRows(): RemotePlaylistSummary[] {
-    return playlists;
+    return pickerPlaylists;
   }
 
   /**
@@ -1690,12 +1874,13 @@
     pickerLoading = true;
     try {
       const [page, holding] = await Promise.all([
-        invoke<PlaylistPage>('remote_playlists', { offset: 0, limit: PLAYLIST_PAGE }),
+        invoke<PlaylistPage>('remote_playlists', { offset: 0, limit: PLAYLIST_PAGE, ownOnly: true }),
         invoke<RemotePlaylistCoordinate[]>('remote_playlists_containing', { fileId: track.fileId })
       ]);
-      playlists = page.playlists;
+      pickerPlaylists = page.playlists;
       pickerMembership = new Set(holding.map((held) => playlistKey(held.author, held.playlistId)));
     } catch (nextError) {
+      pickerPlaylists = [];
       pickerError = String(nextError);
     } finally {
       pickerLoading = false;
@@ -1704,6 +1889,7 @@
 
   function closePlaylistPicker() {
     pickerTrack = null;
+    pickerPlaylists = [];
     pickerMembership = new Set();
     pickerError = '';
     pickerBusy = '';
@@ -1737,15 +1923,7 @@
       if (wanted) next.add(key);
       else next.delete(key);
       pickerMembership = next;
-      // The row carries the member count, so the count moves with the edit. A
-      // member is appended, and dropping one renumbers the rest.
-      playlists = playlists.map((row) =>
-        row.author === playlist.author && row.playlistId === playlist.playlistId
-          ? { ...row, trackCount: saved.total, updatedAt: saved.updatedAt }
-          : row
-      );
-      // An open copy of this playlist is now out of date.
-      if (playlistDraft?.playlistId === playlist.playlistId) playlistDraft = saved;
+      notePlaylistEdited(saved);
     } catch (nextError) {
       pickerError = String(nextError);
     } finally {
@@ -1851,6 +2029,45 @@
   }
 
   /**
+   * Keep a copy of somebody else's playlist as this computer's own.
+   *
+   * A playlist is named by its author and its id, and this identity can only
+   * ever sign its own coordinates - so a public playlist somebody else
+   * published is read here, and the only write it may get is a copy of it. The
+   * copy is minted an id of its own and filed with no author at all, which is
+   * what tells the computer to stamp it as its own rather than to keep a
+   * revision of somebody else's coordinate.
+   */
+  async function savePlaylistCopy() {
+    if (!playlistDraft || playlistIsMine(playlistDraft.author)) return;
+    playlistSaving = true;
+    playlistError = '';
+    playlistNotice = '';
+    try {
+      const copy = await invoke<RemotePlaylist>('remote_save_playlist', {
+        playlist: {
+          ...playlistDraft,
+          playlistId: await invoke<string>('remote_new_playlist_id'),
+          author: '',
+          displayName: '',
+          published: false,
+          private: false
+        }
+      });
+      playlistDraft = copy;
+      playlistMembers = [...copy.tracks];
+      playlistSuggestTags = copy.tags.trim() === '';
+      playlistMode = 'view';
+      playlistNotice = msg("Saved as your own copy");
+      await refreshPlaylists();
+    } catch (nextError) {
+      playlistError = String(nextError);
+    } finally {
+      playlistSaving = false;
+    }
+  }
+
+  /**
    * Get rid of a playlist.
    *
    * A playlist the relays have seen is withdrawn rather than forgotten: deleting
@@ -1882,13 +2099,39 @@
    * worse than a queue that never named it.
    */
   async function playlistPlayable(): Promise<RemoteTrack[]> {
-    const playable: RemoteTrack[] = [];
     const fileIds = playlistMembers.map((member) => member.fileId);
-    for (let offset = 0; offset < fileIds.length; offset += MAX_TRACKS_BY_ID) {
-      const answered = await tracksByIds(fileIds.slice(offset, offset + MAX_TRACKS_BY_ID));
-      playable.push(...answered.filter((track) => track.local));
+    const playable: RemoteTrack[] = [];
+    try {
+      for (let offset = 0; offset < fileIds.length; offset += MAX_TRACKS_BY_ID) {
+        const answered = await tracksByIds(fileIds.slice(offset, offset + MAX_TRACKS_BY_ID));
+        playable.push(...answered.filter((track) => track.local));
+      }
+    } catch {
+      // The computer is out of reach, which is not a reason not to play: what
+      // this phone holds is still here.
     }
-    return playable;
+    if (playable.length > 0 || status.connected) return playable;
+    const held = await cachedTracksById();
+    return fileIds
+      .map((fileId) => held[fileId])
+      .filter((track): track is RemoteTrack => Boolean(track));
+  }
+
+  /**
+   * The tracks this phone holds, by file id.
+   *
+   * A playlist played with the computer out of reach is queued from these: the
+   * members this phone does not hold are left out of the queue rather than
+   * stopping it, and every one of them already says so in the list.
+   */
+  async function cachedTracksById(): Promise<Record<string, RemoteTrack>> {
+    try {
+      const offline = await invoke<LibraryPage>('cached_library');
+      return Object.fromEntries(offline.tracks.map((track) => [track.fileId, track]));
+    } catch {
+      // A damaged cache is not a queue: the list stays as the playlist has it.
+      return {};
+    }
   }
 
   /**
@@ -1977,19 +2220,30 @@
 
   /**
    * The shelves need the playlists whether or not the Playlists page has been
-   * opened, so they are asked for once the computer is there - connected, not
-   * merely paired, because the artwork on a card is resolved through the library
-   * and a question asked before the connection is up is answered with nothing.
+   * opened.
+   *
+   * They are drawn first from what this phone was last shown, so a shelf is a
+   * shelf on a train, and asked for again the moment the computer answers -
+   * which is also when the artwork on a card can be resolved through the
+   * library, so an offline shelf keeps its placeholders until then.
    */
   let playlistsAsked = false;
+  let playlistsConnected = false;
   $effect(() => {
+    // The connection is the only thing that may ask again, so the asking is
+    // untracked: reading the list here as well would make the answer to the
+    // question the reason to ask it, which is a loop rather than a screen.
     if (!status.connected) {
-      playlistsAsked = false;
+      playlistsConnected = false;
+      if (playlistsAsked) return;
+      playlistsAsked = true;
+      untrack(() => void refreshPlaylists());
       return;
     }
-    if (playlistsAsked) return;
+    if (playlistsConnected) return;
+    playlistsConnected = true;
     playlistsAsked = true;
-    void refreshPlaylists();
+    untrack(() => void refreshPlaylists());
   });
 
   /**
@@ -4760,7 +5014,14 @@
                 <div class="album-title-copy">
                   <h1>{playlistDraft.title || $t("New playlist")}</h1>
                   {#if playlistDraft.artist}<p>{playlistDraft.artist}</p>{/if}
-                  <p class="album-meta">{playlistMembers.length} {$t("Tracks")}{playlistSizeLabel()} · {playlistDraft.published ? $t("Published") : $t("Draft")}</p>
+                  <p class="album-meta">
+                    {playlistMembers.length} {$t("Tracks")}{playlistSizeLabel()}
+                    {#if playlistIsMine(playlistDraft.author)}
+                      · {playlistDraft.published ? $t("Published") : $t("Draft")}
+                    {:else}
+                      · {playlistDraft.displayName || playlistDraft.author.slice(0, 8)} · {$t("Read-only")}
+                    {/if}
+                  </p>
                 </div>
                 <button class="album-play-all" onclick={() => void playPlaylist()} disabled={playlistMembers.length === 0 || caching} aria-label={$t("Play the playlist")}>
                   {#if caching}<span class="icon-busy"></span>{:else}<span class="icon-play"></span>{/if}
@@ -4790,10 +5051,17 @@
                   <strong>{playlistDraft.title || $t("New playlist")}</strong>
                 </div>
                 <div class="playlist-tools">
-                  <button onclick={openPlaylistAdd}><span aria-hidden="true">{PLAYLIST_TOOL_GLYPH.add}</span>{$t("Add")}</button>
-                  <button onclick={() => void openPlaylistEditor(playlistDraft as RemotePlaylist)}><span aria-hidden="true">{PLAYLIST_TOOL_GLYPH.edit}</span>{$t("Edit")}</button>
-                  <button onclick={() => (showPlaylistSort = true)}><span aria-hidden="true">{PLAYLIST_TOOL_GLYPH.sort}</span>{$t("Sort")}</button>
-                  <button onclick={openPlaylistDetails}>{$t("Name & details")}</button>
+                  {#if playlistIsMine(playlistDraft.author)}
+                    <button onclick={openPlaylistAdd}><span aria-hidden="true">{PLAYLIST_TOOL_GLYPH.add}</span>{$t("Add")}</button>
+                    <button onclick={() => void openPlaylistEditor(playlistDraft as RemotePlaylist)}><span aria-hidden="true">{PLAYLIST_TOOL_GLYPH.edit}</span>{$t("Edit")}</button>
+                    <button onclick={() => (showPlaylistSort = true)}><span aria-hidden="true">{PLAYLIST_TOOL_GLYPH.sort}</span>{$t("Sort")}</button>
+                    <button onclick={openPlaylistDetails}>{$t("Name & details")}</button>
+                  {:else}
+                    <!-- Somebody else's public playlist. It plays like any other;
+                         the one write it may get is a copy of its own, because
+                         the computer can only ever sign its own coordinates. -->
+                    <button disabled={playlistSaving || !status.connected} onclick={() => void savePlaylistCopy()}>{playlistSaving ? $t("Saving…") : $t("Save a copy")}</button>
+                  {/if}
                 </div>
               </div>
 
@@ -4897,9 +5165,11 @@
               {/if}
 
               <div class="playlist-actions">
-                <button class="primary" disabled={playlistSaving || !playlistDraft.title.trim()} onclick={() => void savePlaylist()}>{playlistSaving ? $t("Saving…") : $t("Save")}</button>
-                <button disabled={playlistSaving || playlistDraft.private || !playlistDraft.title.trim() || !status.connected} onclick={() => void publishPlaylist()}>{$t("Publish")}</button>
-                <button disabled={playlistSaving} onclick={() => (showPlaylistDelete = true)}>{playlistDraft.published ? $t("Withdraw") : $t("Delete")}</button>
+                <button class="primary" disabled={playlistSaving || !playlistDraft.title.trim() || !playlistIsMine(playlistDraft.author)} onclick={() => void savePlaylist()}>{playlistSaving ? $t("Saving…") : $t("Save")}</button>
+                <button disabled={playlistSaving || playlistDraft.private || !playlistDraft.title.trim() || !status.connected || !playlistIsMine(playlistDraft.author)} onclick={() => void publishPlaylist()}>{$t("Publish")}</button>
+                {#if playlistIsMine(playlistDraft.author)}
+                  <button disabled={playlistSaving} onclick={() => (showPlaylistDelete = true)}>{playlistDraft.published ? $t("Withdraw") : $t("Delete")}</button>
+                {/if}
               </div>
             </div>
           </div>
@@ -4976,7 +5246,10 @@
             {#if playlistsError}<p class="error-card">{$t(playlistsError)}</p>{/if}
             {#if playlistsLoading}<div class="loading-list"><i></i><span>{$t("Asking Napstr…")}</span></div>{/if}
 
-            {#each playlists as playlist (playlist.author + playlist.playlistId)}
+            {#if playlistsMine().length > 0}
+              <p class="section-label"><b>{$t("Your playlists")}</b></p>
+            {/if}
+            {#each playlistsMine() as playlist (playlist.author + playlist.playlistId)}
               <div class="playlist-row">
                 <button class="playlist-open" onclick={() => void openPlaylistView(playlist)}>
                   <span class="playlist-row-art">
@@ -4991,6 +5264,31 @@
                     <small>{playlist.trackCount} {$t("Tracks")} · {playlist.published ? $t("Published") : $t("Draft")}</small>
                   </span>
                 </button>
+              </div>
+            {/each}
+
+            <!-- Everybody else's public playlists, which this phone reads and
+                 plays and does not change: a copy of one is a playlist of its
+                 own, and the tool row on it says so. -->
+            {#if playlistsOthers().length > 0}
+              <p class="section-label"><b>{$t("From everyone else")}</b></p>
+            {/if}
+            {#each playlistsOthers() as playlist (playlist.author + playlist.playlistId)}
+              <div class="playlist-row">
+                <button class="playlist-open" onclick={() => void openPlaylistView(playlist)}>
+                  <span class="playlist-row-art">
+                    {#if playlistRowTrack(playlist)}
+                      <TrackArtwork track={playlistRowTrack(playlist) as RemoteTrack} lookup />
+                    {:else}
+                      <span class="playlist-row-art-empty" aria-hidden="true">♪</span>
+                    {/if}
+                  </span>
+                  <span class="playlist-row-copy">
+                    <strong>{playlist.title}</strong>
+                    <small>{playlist.trackCount} {$t("Tracks")} · {playlist.displayName || playlist.author.slice(0, 8)}</small>
+                  </span>
+                </button>
+                <i class="playlist-badge">{$t("Read-only")}</i>
               </div>
             {/each}
 

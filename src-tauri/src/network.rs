@@ -1028,6 +1028,21 @@ impl NetworkService {
         &self.transfers
     }
 
+    /// This identity's public key, from the keys this service is already holding.
+    ///
+    /// The cached ones and only those: a companion asks for the status on a
+    /// timer, and reading the operating-system keyring on every poll would be a
+    /// keyring lookup per poll for a value that cannot change while this process
+    /// runs. No keys at all means no answer, which reads as "this computer has
+    /// not said who it is" rather than as somebody else's key.
+    pub async fn own_pubkey(&self) -> Option<String> {
+        self.keys
+            .read()
+            .await
+            .as_ref()
+            .map(|keys| keys.public_key().to_hex())
+    }
+
     pub fn preserve_interrupted_downloads(&self) -> Result<(), String> {
         queue_interrupted_downloads(&super::open_connection(&self.db_path)?)
     }

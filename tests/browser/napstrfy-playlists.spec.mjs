@@ -821,3 +821,213 @@ test('back walks out of a playlist, its screens and its sheets', async ({ page }
   expect(await pressBack(page)).toBe('handled');
   await expect(page.locator('.library-heading h1')).toHaveText('Your music');
 });
+
+/**
+ * A public playlist somebody else published.
+ *
+ * A playlist is named by its author and its id, and this identity can only ever
+ * sign its own coordinates: what arrives from the relays under another author is
+ * a list to read and play here, and the one write it may get is a copy of its
+ * own. Which of the two a row is, is what these tests hold it to.
+ */
+const STRANGER = 'd'.repeat(64);
+const COPY_ID = '44444444-4444-4444-8444-444444444444';
+
+test("the list draws this computer's playlists first, and marks the rest read-only", async ({ page }) => {
+  await mockNative(page, { platform: 'android' });
+  await page.goto('http://127.0.0.1:15174');
+  await seed(page, [
+    row({ title: 'Night drive', author: STRANGER, displayName: 'Night_Rider' }),
+    row({ playlistId: NEW_ID, title: 'Late night' })
+  ]);
+  await page.locator('.bottom-nav button').filter({ hasText: 'Playlists' }).click();
+
+  // Two tiers, ours first, and each named for what it is.
+  await expect(page.locator('.playlist-view .section-label b')).toHaveText(['Your playlists', 'From everyone else']);
+  const rows = page.locator('.playlist-row');
+  await expect(rows.locator('strong')).toHaveText(['Late night', 'Night drive']);
+  // A stranger's row says whose it is, and that it is not this phone's to change.
+  await expect(rows.first().locator('.playlist-badge')).toHaveCount(0);
+  await expect(rows.last().locator('small')).toHaveText('0 Tracks · Night_Rider');
+  await expect(rows.last().locator('.playlist-badge')).toHaveText('Read-only');
+});
+
+test("somebody else's playlist opens read-only, and the one write it gets is a copy", async ({ page }) => {
+  await openPlaylists(page);
+  await seed(page, [
+    row({
+      title: 'Night drive',
+      author: STRANGER,
+      displayName: 'Night_Rider',
+      tracks: [member(1, TRACK, 'Enter Sandman', 'Metallica'), member(2, OTHER_TRACK, 'Rooster', 'Alice In Chains')]
+    })
+  ]);
+  // Nothing here knows these files, so the size line stays out of the answer.
+  await page.evaluate(() => { window.remoteLibrary = []; });
+  // The id a copy is filed under is minted by the computer, and it is never the
+  // coordinate the original was published at.
+  await page.evaluate((id) => { window.nextPlaylistId = id; }, COPY_ID);
+  await page.locator('.bottom-nav button').filter({ hasText: 'Playlists' }).click();
+  await page.locator('.playlist-open').click();
+
+  // It reads and plays like any other playlist: the members are the members.
+  await expect(page.locator('.playlist-sheet h1')).toHaveText('Night drive');
+  await expect(page.locator('.playlist-sheet .track-copy strong')).toHaveText(['Enter Sandman', 'Rooster']);
+  await expect(page.locator('.playlist-sheet .album-meta')).toHaveText('2 Tracks · Night_Rider · Read-only');
+  // Nothing that would write to somebody else's coordinate is on offer: the one
+  // tool is the copy, and neither the editor nor the details screen can be
+  // reached from here at all.
+  await expect(page.locator('.playlist-sheet .playlist-tools button')).toHaveText(['Save a copy']);
+  await expect(page.locator('.playlist-sheet .playlist-heading')).toHaveCount(0);
+
+  await page.locator('.playlist-sheet .playlist-tools button').click();
+  const [copied] = await calls(page, 'remote_save_playlist');
+  expect(copied.playlist.playlistId).toBe(COPY_ID);
+  expect(copied.playlist.author).toBe('');
+  expect(copied.playlist.published).toBe(false);
+  expect(copied.playlist.tracks.map((track) => track.fileId)).toEqual([TRACK, OTHER_TRACK]);
+  await expect(page.locator('.playlist-notice')).toHaveText('Saved as your own copy');
+  // The copy is what the sheet is showing now, and it is this computer's: the
+  // tools a playlist of its own gets are back.
+  await expect(page.locator('.playlist-sheet .album-meta')).toHaveText('2 Tracks · Draft');
+  await expect(page.locator('.playlist-sheet .playlist-tools button')).toHaveText([
+    '+Add',
+    '☰Edit',
+    '</>Sort',
+    'Name & details'
+  ]);
+
+  // And back at the list the two are told apart: the copy is ours and a draft,
+  // the original is still somebody else's, listed under its author.
+  await page.getByLabel('Close the playlist').click();
+  const rows = page.locator('.playlist-row');
+  await expect(rows).toHaveCount(2);
+  await expect(page.locator('.playlist-view .section-label b')).toHaveText(['Your playlists', 'From everyone else']);
+  await expect(rows.first().locator('small')).toHaveText('2 Tracks · Draft');
+  await expect(rows.last().locator('small')).toHaveText('2 Tracks · Night_Rider');
+  await expect(rows.last().locator('.playlist-badge')).toHaveText('Read-only');
+});
+
+test("the picker offers this computer's playlists, and never somebody else's", async ({ page }) => {
+  await mockNative(page, { platform: 'android' });
+  await page.goto('http://127.0.0.1:15174');
+  await seed(page, [
+    row({ title: 'Driving' }),
+    row({
+      playlistId: NEW_ID,
+      title: 'Night drive',
+      author: STRANGER,
+      displayName: 'Night_Rider',
+      tracks: [member(1, TRACK, 'Enter Sandman', 'Metallica')]
+    })
+  ]);
+
+  await page.locator('.track-row .track-more').first().click();
+  await page.locator('.actions-row').filter({ hasText: 'Add to playlist' }).click();
+
+  // One row, and it is this computer's own: a public playlist somebody else
+  // published is a list to play, not a list to put a track in.
+  await expect(page.locator('.picker-row')).toHaveCount(1);
+  await expect(page.locator('.picker-row strong')).toHaveText('Driving');
+  // Which is the question the computer was asked, so a shelf of public playlists
+  // never has to be paged past to reach the handful a person may edit.
+  const asked = (await calls(page, 'remote_playlists')).at(-1);
+  expect(asked.ownOnly).toBe(true);
+  expect(await calls(page, 'remote_playlists_containing')).toHaveLength(1);
+});
+
+test('a playlist opens and plays with the computer out of reach', async ({ page }) => {
+  const seeded = [
+    row({
+      title: 'Driving',
+      tracks: [member(1, TRACK, 'Enter Sandman', 'Metallica'), member(2, OTHER_TRACK, 'Rooster', 'Alice In Chains')]
+    })
+  ];
+  // The list is read while the page starts, and the tunnel is the reload below,
+  // so both are decided before the page does anything at all.
+  await page.addInitScript((rows) => {
+    window.playlistStore = rows;
+    window.desktopReachable = window.localStorage.getItem('napstrfy-spec-offline') !== 'yes';
+  }, seeded);
+  await mockNative(page, { platform: 'android' });
+  await page.goto('http://127.0.0.1:15174');
+  await page.locator('.bottom-nav button').filter({ hasText: 'Playlists' }).click();
+
+  // Opened once with the computer there, which is what puts the playlist and its
+  // members on this phone at all.
+  await page.locator('.playlist-open').click();
+  await expect(page.locator('.playlist-sheet .track-copy strong')).toHaveText(['Enter Sandman', 'Rooster']);
+  await page.getByLabel('Close the playlist').click();
+  await expect(page.locator('.playlist-row strong')).toHaveText('Driving');
+
+  // The train goes into a tunnel: paired, and nothing can be reached.
+  await page.evaluate(() => window.localStorage.setItem('napstrfy-spec-offline', 'yes'));
+  await page.reload();
+
+  // The list is what this phone was last shown, and a list it already holds is
+  // an answer: nothing on the screen has to explain the tunnel.
+  await page.locator('.bottom-nav button').filter({ hasText: 'Playlists' }).click();
+  await expect(page.locator('.playlist-row strong')).toHaveText('Driving');
+  await expect(page.locator('.error-card')).toHaveCount(0);
+
+  // Opening it needs nobody: the members came with the copy this phone kept.
+  await page.locator('.playlist-open').click();
+  await expect(page.locator('.playlist-sheet .track-copy strong')).toHaveText(['Enter Sandman', 'Rooster']);
+
+  // And it plays from the file this phone holds. The member it does not hold
+  // stays on the list saying so, and is left out of the queue rather than
+  // stopping it.
+  await page.getByLabel('Play the playlist').click();
+  await expect(page.locator('.playlist-sheet .album-tracks li.playing')).toHaveCount(1);
+  const [cached] = await calls(page, 'cache_remote_audio');
+  expect(cached.track.fileId).toBe(TRACK);
+});
+
+test('a browse carries the one seed this launch was given, and a search does not', async ({ page }) => {
+  // A library bigger than one frame, so a browse is really paged.
+  await page.addInitScript(() => {
+    window.remoteLibrary = Array.from({ length: 120 }, (_, index) => ({
+      fileId: String(index).padStart(64, '0'),
+      filename: `Track ${index}.wav`,
+      title: `Track ${index}`,
+      artist: 'Someone',
+      album: 'Some album',
+      format: 'WAV',
+      mime: 'audio/wav',
+      size: 100,
+      tags: '',
+      local: true,
+      sources: []
+    }));
+  });
+  await mockNative(page, { platform: 'android' });
+  await page.goto('http://127.0.0.1:15174');
+
+  const browse = async () => (await calls(page, 'remote_library')).filter((call) => call.limit === 100);
+  await expect.poll(async () => (await browse()).length).toBeGreaterThan(0);
+  const seeds = (await browse()).map((call) => call.shuffleSeed);
+  // One order, seeded once per launch: a 32-bit number the computer derives the
+  // order from, rather than a list it keeps per device.
+  expect(new Set(seeds).size).toBe(1);
+  const [seed] = seeds;
+  expect(Number.isInteger(seed)).toBe(true);
+  expect(seed).toBeGreaterThanOrEqual(0);
+  expect(seed).toBeLessThanOrEqual(0xffffffff);
+
+  // The next page is the same browse - the same seed, so the same order carried
+  // on rather than a second shuffle.
+  await page.locator('.load-more').click();
+  await expect(page.locator('.track-row')).toHaveCount(120);
+  const pages = await browse();
+  expect(pages.at(-1).offset).toBe(100);
+  expect(new Set(pages.map((call) => call.shuffleSeed))).toEqual(new Set([seed]));
+
+  // A search is not a browse: there the point is to find something, so the
+  // library's own stored order is what it is asked in.
+  await page.locator('.bottom-nav button').filter({ hasText: 'Search' }).click();
+  await page.getByLabel('Search tracks').fill('Track 5');
+  await page.getByLabel('Search tracks').press('Enter');
+  await expect.poll(async () => (await calls(page, 'remote_library')).filter((call) => Boolean(call.query)).length).toBe(1);
+  const [found] = (await calls(page, 'remote_library')).filter((call) => Boolean(call.query));
+  expect(found.shuffleSeed).toBeUndefined();
+});

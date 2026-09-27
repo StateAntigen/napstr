@@ -433,10 +433,29 @@ pub fn list(
     offset: usize,
     limit: usize,
 ) -> Result<(Vec<RemotePlaylistSummary>, usize), String> {
+    list_owned_by(connection, None, offset, limit)
+}
+
+/// The same list, narrowed to one identity's own playlists.
+///
+/// `owned_by` is the author whose rows are wanted, together with the rows
+/// nobody's author owns yet because only this computer has ever written them
+/// down. A phone's picker asks this way: a public playlist somebody else
+/// published is not a list to add a track to, and paging past a library of them
+/// to find the handful a person may edit is not something a picker should do.
+pub fn list_owned_by(
+    connection: &Connection,
+    owned_by: Option<&str>,
+    offset: usize,
+    limit: usize,
+) -> Result<(Vec<RemotePlaylistSummary>, usize), String> {
     let total = connection
-        .query_row("SELECT COUNT(*) FROM playlists", [], |row| {
-            row.get::<_, i64>(0)
-        })
+        .query_row(
+            "SELECT COUNT(*) FROM playlists p
+              WHERE (?1 IS NULL OR p.author = ?1 OR p.author = '')",
+            params![owned_by],
+            |row| row.get::<_, i64>(0),
+        )
         .map_err(|error| error.to_string())?
         .max(0) as usize;
     let mut statement = connection
@@ -449,12 +468,13 @@ pub fn list(
                       WHERE t.playlist_id=p.playlist_id AND t.author=p.author
                       ORDER BY t.position LIMIT 1)
                FROM playlists p
+              WHERE (?3 IS NULL OR p.author = ?3 OR p.author = '')
               ORDER BY p.updated_at DESC, p.playlist_id, p.author
               LIMIT ?1 OFFSET ?2",
         )
         .map_err(|error| error.to_string())?;
     let playlists = statement
-        .query_map(params![limit as i64, offset as i64], |row| {
+        .query_map(params![limit as i64, offset as i64, owned_by], |row| {
             Ok(RemotePlaylistSummary {
                 playlist_id: row.get(0)?,
                 title: row.get(1)?,
@@ -1750,10 +1770,73 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    /// The picker's list is this computer's own playlists, and it says so by
+    /// coordinate rather than by id.
+    ///
+    /// A public playlist somebody else published is filed here too, now that the
+    /// relays are read: it is a playlist to open and play, not a list to add a
+    /// track to, and a picker that had to page past a library of them to reach
+    /// the handful a person may edit would not survive scale.
+    #[test]
+    fn the_owned_list_leaves_out_playlists_another_author_published() {
+        let directory =
+            std::env::temp_dir().join(format!("napstr-playlist-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let db_path = directory.join("napstr.sqlite3");
+        crate::initialise_database(&db_path, &directory).unwrap();
+        let connection = crate::open_connection(&db_path).unwrap();
+
+        let mine = "c".repeat(64);
+        // The same `d` under three authors: this identity's, nobody's yet, and
+        // somebody else's public one. Only the first two are this computer's.
+        let mut ours = playlist();
+        ours.author = mine.clone();
+        save(&connection, &ours).unwrap();
+        let mut draft = playlist();
+        draft.author = String::new();
+        save(&connection, &draft).unwrap();
+        let mut theirs = playlist();
+        theirs.author = "b".repeat(64);
+        theirs.title = "rock, by somebody else".into();
+        save(&connection, &theirs).unwrap();
+
+        let (owned, total) = list_owned_by(&connection, Some(&mine), 0, 10).unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(owned.len(), 2);
+        assert!(
+            owned
+                .iter()
+                .all(|row| row.author == mine || row.author.is_empty()),
+            "a row of somebody else's playlist answered as ours"
+        );
+        // Paging counts the same set, so a picker can walk it a page at a time.
+        let (first, _) = list_owned_by(&connection, Some(&mine), 0, 1).unwrap();
+        let (second, _) = list_owned_by(&connection, Some(&mine), 1, 1).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_ne!(first[0].author, second[0].author);
+        assert!(list_owned_by(&connection, Some(&mine), 2, 1).unwrap().0.is_empty());
+
+        // Nobody's own list is every playlist, which is what the page asks for.
+        assert_eq!(list(&connection, 0, 10).unwrap().1, 3);
+        assert_eq!(list_owned_by(&connection, None, 0, 10).unwrap().1, 3);
+        // And an identity with nothing of its own is answered with nothing
+        // rather than with somebody else's playlists.
+        assert_eq!(
+            list_owned_by(&connection, Some(&"d".repeat(64)), 0, 10)
+                .unwrap()
+                .1,
+            1,
+            "the row nobody's author owns yet is this computer's"
+        );
+
+        drop(connection);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     /// The id is chosen by the author, so it is not the identity on its own.
     #[test]
-    fn two_authors_may_use_one_playlist_id_without_replacing_each_other() {
-        let directory =
+    fn two_authors_may_use_one_playlist_id_without_replacing_each_other() {        let directory =
             std::env::temp_dir().join(format!("napstr-playlist-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&directory).unwrap();
         let db_path = directory.join("napstr.sqlite3");
