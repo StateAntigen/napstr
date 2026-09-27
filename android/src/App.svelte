@@ -194,6 +194,8 @@
   /** The sheet's full-cover URL once that image has landed, so the small
    *  rendition under it stays on screen until something better is drawn. */
   let sheetArtLoaded = $state('');
+  /** The full picture, once this phone has fetched it for what is playing. */
+  let sheetFullArt = $state('');
   /**
    * The best cover the system has been given for what is playing: the thumbnail
    * to begin with, then the full cover once that one has landed.
@@ -1639,6 +1641,7 @@
     nowArtFailed = false;
     nowCover = null;
     sheetArtLoaded = '';
+    sheetFullArt = '';
     if (!track) return;
     let alive = true;
     void coverFor(track).then((cover) => {
@@ -1659,16 +1662,23 @@
   // The lock screen starts on the thumbnail, which is already here, and moves to
   // the full cover once that has landed. For a track that was reached by playing
   // the one before it, the preload means this is a cache hit and the upgrade
-  // follows within a frame or two of the notification appearing.
+  // follows within a frame or two of the notification appearing. The drawer is
+  // given the same picture, because it is the same moment: a track becoming the
+  // one that plays is what makes its full-size art worth fetching, and a list
+  // scrolling past is not.
   $effect(() => {
     const cover = nowCover;
     lockScreenCover = cover?.thumb ?? '';
-    const full = cover?.art ?? '';
-    if (!full || full === cover?.thumb) return;
+    // There is nothing to upgrade to when the host publishes no full rendition
+    // of its own, or publishes the same picture for both renditions. The address
+    // is only known once this phone holds the bytes, so what decides this is the
+    // host's answer rather than an address being present.
+    if (!cover?.artHash || cover.artHash === cover.thumbHash) return;
     let alive = true;
     void loadFullCover(cover).then((landed) => {
       if (!alive || !landed) return;
       lockScreenCover = landed;
+      sheetFullArt = landed;
       // Not forced: nothing here is wrong-looking until the coalescer comes round.
       syncSystemMedia();
     });
@@ -1798,7 +1808,7 @@
 
   function sheetCoverUrl() {
     if (!nowCover || nowArtFailed) return '';
-    return nowCover.art || nowCover.thumb;
+    return sheetFullArt || nowCover.art || nowCover.thumb;
   }
 
   /**
@@ -2055,6 +2065,10 @@
       coverFor(album.representative).catch(() => null),
       albumsByArtist(album)
     ]);
+    // Opening the album is the engagement that makes its full-size picture worth
+    // fetching: the blurred glow behind it is drawn from the thumbnail the tile
+    // already had, and this is the one screen that draws the picture large.
+    const full = cover ? await loadFullCover(cover) : '';
     // A later open wins, so a slow response cannot overwrite a newer album.
     if (albumView?.key !== album.key) return;
     albumView = {
@@ -2062,7 +2076,7 @@
       artist: album.artist,
       album: album.album,
       year: cover?.year ?? '',
-      art: cover ? cover.art || cover.thumb : '',
+      art: full || (cover ? cover.art || cover.thumb : ''),
       thumb: cover?.thumb ?? '',
       tracks,
       more

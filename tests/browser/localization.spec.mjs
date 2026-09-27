@@ -2,6 +2,7 @@ import { test, expect } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 import { languages, direction } from '../../shared/i18n/core.js';
 import { mockNative, serveAudio, silentAudio } from './helpers/native.mjs';
+import { artHashes, heldArtUrl, serveHeldArtwork } from './helpers/artwork.mjs';
 const catalogs = Object.fromEntries(await Promise.all(languages.map(async ({ code }) => [code, JSON.parse(await readFile(new URL(`../../shared/i18n/locales/${code}.json`, import.meta.url)))])));
 
 // Ours keeps the search field on its own tab and the transport inside the
@@ -281,25 +282,34 @@ test('Napstrfy notices expire on their own and an error waits to be dismissed', 
 
 test('Napstrfy desktop pins the player as its own column with artwork, likes and playback modes', async ({ page }) => {
   await mockNative(page, { platform: 'linux' });
-  await page.addInitScript(() => {
-    // The host resolves artwork for us, so answer the way the host would.
+  // The host names the picture; the copy on this phone is what is drawn. A host
+  // that names an address and no hash is one that has not fetched the picture yet,
+  // and what a screen draws then is the thumbnail this phone already holds.
+  const coverHashes = artHashes('one picture for every album');
+  const coverUrl = heldArtUrl(coverHashes.thumb);
+  await page.addInitScript((hashes) => {
     const invoke = window.__TAURI_INTERNALS__.invoke;
     window.__TAURI_INTERNALS__.invoke = async (cmd, args = {}) => {
       if (cmd === 'remote_covers') {
         return (args.keys ?? []).map((key) => ({ key, art: '/napstr-logo-small.png', thumb: '/napstr-logo-small.png',
+          artHash: '', thumbHash: hashes.thumb,
           mbid: '', year: '', genre: '', collection: '', source: 'itunes', coverFileId: '', mime: 'image/png', author: '', seeder: false }));
+      }
+      if (cmd === 'remote_art') {
+        return { url: `${location.origin}/test-token/art/${args.hash}`, hash: args.hash };
       }
       return invoke(cmd, args);
     };
-  });
+  }, coverHashes);
+  await serveHeldArtwork(page);
   await page.route('**/fixture.wav', serveAudio);
   await page.goto('http://127.0.0.1:15174');
   await page.locator('.track-open').first().click();
   await expect.poll(() => page.locator('audio').evaluate((audio) => audio.paused)).toBe(false);
   await page.locator('.play-main').click();
   const cover = page.locator('.now-sheet-art img');
-  await expect(cover).toHaveAttribute('src', '/napstr-logo-small.png');
-  await expect(page.locator('.now-sheet-backdrop')).toHaveCSS('background-image', /napstr-logo-small\.png/);
+  await expect(cover).toHaveAttribute('src', coverUrl);
+  await expect(page.locator('.now-sheet-backdrop')).toHaveCSS('background-image', new RegExp(`/test-token/art/${coverHashes.thumb}`));
   // The art wears a blurred copy of itself behind everything, as on the phone.
   await expect(page.locator('.now-sheet-backdrop')).toHaveCSS('filter', /blur\(\d+px\)/);
   const like = page.locator('.now-mode-like');
