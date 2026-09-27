@@ -30,6 +30,8 @@
     thumb: string;
     front: boolean;
     chosen: boolean;
+    /** Why there is no art here, when that is not simply "nobody scanned it". */
+    note: string;
   };
 
   let query = '';
@@ -170,6 +172,12 @@
               {hit.types || 'unknown type'}{hit.year ? ` · ${hit.year}` : ''} · score {hit.score}
               {hit.front ? '' : ' · no front image'}
             </small>
+            {#if hit.note}
+              <!-- The record MusicBrainz knows about, with the reason the
+                   archive could not be asked about it. Dropping this row is
+                   what used to make the album look absent from the search. -->
+              <small class="art-picker-why">{hit.note}</small>
+            {/if}
             <code>{hit.mbid}</code>
           </div>
           <div class="art-picker-actions">
@@ -322,6 +330,11 @@
     display: block;
     color: #8d9ab0;
     margin: 2px 0;
+  }
+  /* Amber, not the green of the panel's own notice: this is not good news, it
+     is the reason a row that is obviously the right record has no picture. */
+  .art-picker-meta small.art-picker-why {
+    color: #e0c07a;
   }
   .art-picker-meta code {
     display: block;

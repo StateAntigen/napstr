@@ -71,6 +71,10 @@ const THROTTLE_BACKOFF_MAX: Duration = Duration::from_secs(5 * 60);
 const THROTTLE_BACKOFF_DOUBLINGS: u32 = 4;
 /// A transient failure parks the album for this long before it is offered again.
 const FAILED_LOOKUP_RETRY_SECONDS: i64 = 15 * 60;
+/// How many of a release group's releases the archive fallback walks before it
+/// gives up. A group with art has it on one of the first few, and every release
+/// walked is another request to the archive.
+const MAX_FALLBACK_RELEASES: usize = 3;
 /// The most albums the window may preview at once.
 const MAX_PREVIEW: usize = 50;
 /// A safety net rather than a cooldown: the worker is woken by real events, and
@@ -670,8 +674,15 @@ fn classify(
             Answer::Failed(format!("{host} answered {status}"))
         };
     }
-    // 503 is MusicBrainz's own back-pressure; 429 is the standard one.
-    if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+    // 503 is MusicBrainz's own back-pressure and 429 is the standard one. Any
+    // other 5xx is the server having a bad day with one record rather than a
+    // request to slow down: read as back-pressure it makes Napstr wait out an
+    // album it could have resolved, and tells the person it was throttled when
+    // it never was. The archive really does answer 500 for particular release
+    // groups while serving everything else.
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+    {
         return Answer::Throttled {
             retry_after: retry_after.and_then(parse_retry_after),
         };
@@ -736,6 +747,40 @@ struct MusicBrainzSearch {
     release_groups: Vec<MusicBrainzGroup>,
 }
 
+/// One release group asked for by id, with the releases it holds.
+#[derive(Deserialize)]
+struct MusicBrainzGroupLookup {
+    #[serde(default)]
+    releases: Vec<MusicBrainzRelease>,
+}
+
+#[derive(Deserialize)]
+struct MusicBrainzRelease {
+    #[serde(default)]
+    id: String,
+}
+
+/// One item archive.org holds, as `/metadata/<item>` describes it.
+///
+/// The two fields that matter are where it is *now*: an item is ingested onto
+/// one node and one directory, and archive.org moves it later without the
+/// Cover Art Archive's redirects knowing.
+#[derive(Deserialize)]
+struct ArchiveOrgItem {
+    #[serde(default)]
+    server: String,
+    #[serde(default)]
+    dir: String,
+    #[serde(default)]
+    files: Vec<ArchiveOrgFile>,
+}
+
+#[derive(Deserialize)]
+struct ArchiveOrgFile {
+    #[serde(default)]
+    name: String,
+}
+
 #[derive(Deserialize, Clone)]
 struct MusicBrainzGroup {
     #[serde(default)]
@@ -752,6 +797,27 @@ struct MusicBrainzGroup {
     score: u32,
     #[serde(default, rename = "secondary-types")]
     secondary_types: Vec<String>,
+    /// The names MusicBrainz credits this group to, in the order it lists them.
+    #[serde(default, rename = "artist-credit")]
+    artist_credit: Vec<MusicBrainzArtistCredit>,
+}
+
+#[derive(Deserialize, Clone)]
+struct MusicBrainzArtistCredit {
+    #[serde(default)]
+    name: String,
+}
+
+impl MusicBrainzGroup {
+    /// Whether MusicBrainz credits this group to a name that means `name`.
+    ///
+    /// A tag with no artist at all matches nothing, so every candidate ties on
+    /// this and the other keys decide.
+    fn credited_to(&self, name: &str) -> bool {
+        self.artist_credit
+            .iter()
+            .any(|credit| alike(&credit.name, name))
+    }
 }
 
 /// Pick the release group that really is this album.
@@ -759,18 +825,28 @@ struct MusicBrainzGroup {
 /// A matching title is not enough. `St. Anger` the album, the EP and the single
 /// all share one, and MusicBrainz ranks them by search score rather than by what
 /// a listener means — a single's Cover Art Archive entry is usually empty, so
-/// choosing one turns a record that has art into "no art anywhere" for a
-/// fortnight. A music library means the album, so an album group wins over
-/// anything else whose title matches.
+/// choosing one turns a record that has art into "no art at all".
+///
+/// The artist decides first, and the kind of release after it, because a music
+/// library means the album. The artist is first because the query is deliberately
+/// loose about it — any one of the names a tag lists is enough to match — so the
+/// candidate credited to the *first* name a tag gives is the one a listener
+/// means. MusicBrainz credits `Annihilation` to `KREAM` while the tag reads
+/// `KREAM / Korolova`, and a same-titled record by the other name must not win
+/// over it.
 fn best_release_group<'a>(
     groups: &'a [MusicBrainzGroup],
     album: &str,
+    artist: &str,
 ) -> Option<&'a MusicBrainzGroup> {
+    let first = artist_names(artist).into_iter().next().unwrap_or_default();
     groups
         .iter()
         .filter(|group| !group.id.is_empty() && alike(&group.title, album))
         .min_by_key(|group| {
             (
+                // The artist the tag names first: the strongest signal there is.
+                u8::from(!group.credited_to(&first)),
                 // A music library means the album, not the seven-inch single.
                 u8::from(!group.primary_type.eq_ignore_ascii_case("album")),
                 // An exact title beats one that merely contains it, so
@@ -852,7 +928,9 @@ async fn resolve(
     // Only a release group whose title really is this album is worth publishing:
     // a cover on the wrong record is worse than a blank square. Among those,
     // the album itself is the one a music library means.
-    let Some(group) = best_release_group(&found.release_groups, &candidate.album).cloned() else {
+    let Some(group) = best_release_group(&found.release_groups, &candidate.album, &candidate.artist)
+        .cloned()
+    else {
         return Ok(None);
     };
 
@@ -874,12 +952,76 @@ async fn resolve(
 ///
 /// Also where the manual art tool starts, so a person editing a search sees
 /// exactly what the automatic lookup sent rather than a blank box.
+///
+/// A tagger writes a joint credit as one string - `The Chainsmokers, Oaks` - and
+/// asking MusicBrainz for that string finds nothing at all: the release group is
+/// indexed as two credited artists, and a comma inside a quoted phrase is read as
+/// loose syntax rather than as part of a name. So each name is asked for on its
+/// own instead, and any *one* of them is enough - which matters in both
+/// directions, because a tag names exactly what it names: MusicBrainz credits
+/// `Annihilation` to `KREAM` alone while the tag reads `KREAM / Korolova`, and
+/// requiring every name finds nothing. Choosing between the candidates that
+/// leaves is [`best_release_group`]'s business, not the query's.
 pub(crate) fn default_query(artist: &str, album: &str) -> String {
-    format!(
-        "release:\"{}\" AND artist:\"{}\"",
-        escape_query(album),
-        escape_query(artist)
-    )
+    let release = format!("release:\"{}\"", escape_query(album));
+    let names = artist_names(artist);
+    match names.len() {
+        // An album with no artist tag is still worth asking about, and an empty
+        // `artist:""` clause is not a query MusicBrainz can parse.
+        0 => release,
+        // One name is the ordinary case, and its query does not change.
+        1 => format!("{release} AND artist:\"{}\"", escape_query(&names[0])),
+        _ => {
+            let credits = names
+                .iter()
+                .map(|name| format!("artist:\"{}\"", escape_query(name)))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            format!("{release} AND ({credits})")
+        }
+    }
+}
+
+/// The artists one tag claims, however a tagger joined them.
+///
+/// `A, B`, `A & B`, `A; B` and `A feat. B` all mean two credited artists, and
+/// MusicBrainz holds the credited names rather than the string a tagger wrote.
+/// A single name - the ordinary case - comes back whole and alone, so the query
+/// for it stays the plain one it has always been.
+fn artist_names(artist: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for piece in artist.split([',', ';', '&']) {
+        let mut name: Vec<&str> = Vec::new();
+        for word in piece.split_whitespace() {
+            if is_credit_connector(word) {
+                push_artist_name(&mut names, &mut name);
+                continue;
+            }
+            name.push(word);
+        }
+        push_artist_name(&mut names, &mut name);
+    }
+    names
+}
+
+/// The words and marks a tagger uses to join credited artists, none of which is
+/// part of a name: `feat.` and its spellings, and a slash written on its own.
+/// `with` and `x` are deliberately not here, because both are also names - and a
+/// slash *inside* a word is part of one too, so `AC/DC` stays one artist while
+/// `KREAM / Korolova` is two.
+fn is_credit_connector(word: &str) -> bool {
+    ["feat.", "feat", "ft.", "ft", "featuring", "/"]
+        .iter()
+        .any(|connector| word.eq_ignore_ascii_case(connector))
+}
+
+/// Close off the name being collected, if there is one, and start the next.
+fn push_artist_name(names: &mut Vec<String>, name: &mut Vec<&str>) {
+    let joined = name.join(" ");
+    name.clear();
+    if !joined.is_empty() {
+        names.push(joined);
+    }
 }
 
 /// The client every cover lookup uses: the user agent MusicBrainz asks for, and
@@ -888,6 +1030,20 @@ fn cover_http_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .user_agent(USER_AGENT)
         .timeout(HTTP_TIMEOUT)
+        .build()
+        .map_err(|error| format!("Could not prepare the cover lookup client: {error}"))
+}
+
+/// The same client, with redirects left alone so one can be read.
+///
+/// The Cover Art Archive answers every image path with a redirect into
+/// archive.org, and where that redirect points is the only place the file
+/// names, and the item they belong to, are stated.
+fn cover_http_client_stopping_at_redirects() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .timeout(HTTP_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|error| format!("Could not prepare the cover lookup client: {error}"))
 }
@@ -949,14 +1105,32 @@ fn front_image(archive: &CoverArtArchive) -> Option<(String, String, bool)> {
 }
 
 /// Ask the Cover Art Archive what art one release group has.
+///
+/// A group the archive will not answer for is not necessarily a record with no
+/// art: some answer `500` on their own endpoint while the releases inside them
+/// answer perfectly. Measured, not hypothetical
+/// (`fa59def2-1fee-4a58-8da6-079204abaf54`, "Love Is Kind" by The Chainsmokers,
+/// refuses `/release-group/…` on every request and serves its front cover from
+/// `/release/…`), and it is why a record MusicBrainz demonstrably knows about
+/// could come back as "no art anywhere". So the releases it holds are asked
+/// about instead.
 async fn archive_lookup(
     client: &reqwest::Client,
     mbid: &str,
 ) -> Result<Option<(String, String, bool)>, LookupError> {
+    match archive_image(client, &format!("release-group/{mbid}")).await {
+        Err(LookupError::Failed(_)) => archive_lookup_via_releases(client, mbid).await,
+        answer => answer,
+    }
+}
+
+/// The archive's answer for one of its own paths, as `(art, thumb, is_front)`.
+async fn archive_image(
+    client: &reqwest::Client,
+    path: &str,
+) -> Result<Option<(String, String, bool)>, LookupError> {
     let response = client
-        .get(format!(
-            "https://coverartarchive.org/release-group/{mbid}"
-        ))
+        .get(format!("https://coverartarchive.org/{path}"))
         .send()
         .await
         .map_err(|error| LookupError::Failed(format!("Cover Art Archive lookup failed: {error}")))?;
@@ -976,6 +1150,157 @@ async fn archive_lookup(
         LookupError::Failed(format!("Cover Art Archive sent something unreadable: {error}"))
     })?;
     Ok(front_image(&archive))
+}
+
+/// Look for a group's cover on the releases inside it.
+///
+/// A front image is what the caller wants, so the first release that has one
+/// wins; a release whose only image is not marked front is kept aside in case
+/// nothing better turns up, exactly as [`front_image`] treats a group.
+async fn archive_lookup_via_releases(
+    client: &reqwest::Client,
+    mbid: &str,
+) -> Result<Option<(String, String, bool)>, LookupError> {
+    // This is a second MusicBrainz request for one album, so it waits its turn:
+    // the caller paces one request per album and knows nothing about this one.
+    tokio::time::sleep(REQUEST_INTERVAL).await;
+    let mut url = reqwest::Url::parse(&format!(
+        "https://musicbrainz.org/ws/2/release-group/{mbid}"
+    ))
+    .map_err(|error| LookupError::Failed(format!("could not build the MusicBrainz query: {error}")))?;
+    url.query_pairs_mut()
+        .append_pair("inc", "releases")
+        .append_pair("fmt", "json");
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| LookupError::Failed(format!("MusicBrainz lookup failed: {error}")))?;
+    match classify(
+        response.status(),
+        retry_after_header(&response),
+        "MusicBrainz",
+        false,
+    ) {
+        Answer::Success => {}
+        Answer::NotFound => return Ok(None),
+        Answer::Throttled { retry_after } => return Err(LookupError::Throttled { retry_after }),
+        Answer::Failed(message) => return Err(LookupError::Failed(message)),
+    }
+    let group: MusicBrainzGroupLookup = response.json().await.map_err(|error| {
+        LookupError::Failed(format!("MusicBrainz sent something unreadable: {error}"))
+    })?;
+    let mut without_a_front = None;
+    for release in group
+        .releases
+        .iter()
+        .filter(|release| !release.id.is_empty())
+        .take(MAX_FALLBACK_RELEASES)
+    {
+        match archive_image(client, &format!("release/{}", release.id)).await {
+            Ok(Some(found)) if found.2 => return Ok(Some(found)),
+            Ok(Some(found)) => without_a_front = without_a_front.or(Some(found)),
+            Ok(None) => continue,
+            // The item is there - MusicBrainz reports its artwork - but the only
+            // address the Cover Art Archive gives for it answers 500 for every
+            // file in it. That is a moved item, not a record without art, and it
+            // is what made a cover that exists look like a cover nobody has.
+            Err(LookupError::Failed(_)) => {
+                if let Some(found) = archive_lookup_via_archive_org(client, &release.id).await? {
+                    return Ok(Some(found));
+                }
+            }
+            Err(refused) => return Err(refused),
+        }
+    }
+    Ok(without_a_front)
+}
+
+/// Where the picture the Cover Art Archive names actually lives now.
+///
+/// CAA answers every image path with a redirect into archive.org, and that
+/// redirect carries the node and directory the item had when it was ingested.
+/// Items move: the release this was written for (`de91dcf0-…`) sits at
+/// `ia801509.us.archive.org/2/items/…` while CAA still says
+/// `dn711003.ca.archive.org/0/items/…`, and the stale address answers 500 for
+/// every file under it - which is how a cover that exists, and that MusicBrainz
+/// itself reports as `artwork: true`, became unreachable. `archive.org/metadata`
+/// is the live answer, and it lists the files, so the rendition CAA named is
+/// asked for where it is now.
+///
+/// `/front-1200` is the request on purpose: CAA decides which image is the
+/// front one, so this can never publish a back cover as the front, and the
+/// 1200-pixel rendition is what a claim wants as its `art`.
+async fn archive_lookup_via_archive_org(
+    client: &reqwest::Client,
+    release_id: &str,
+) -> Result<Option<(String, String, bool)>, LookupError> {
+    let stopping = cover_http_client_stopping_at_redirects().map_err(LookupError::Failed)?;
+    let response = stopping
+        .get(format!(
+            "https://coverartarchive.org/release/{release_id}/front-1200"
+        ))
+        .send()
+        .await
+        .map_err(|error| LookupError::Failed(format!("Cover Art Archive lookup failed: {error}")))?;
+    let Some(location) = response
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return Ok(None);
+    };
+    let Some((item, file)) = archive_org_item_and_file(location) else {
+        return Ok(None);
+    };
+    let metadata: ArchiveOrgItem = client
+        .get(format!("https://archive.org/metadata/{item}"))
+        .send()
+        .await
+        .map_err(|error| LookupError::Failed(format!("archive.org lookup failed: {error}")))?
+        .json()
+        .await
+        .map_err(|error| {
+            LookupError::Failed(format!("archive.org sent something unreadable: {error}"))
+        })?;
+    if metadata.server.is_empty() || metadata.dir.is_empty() {
+        return Ok(None);
+    }
+    // The file has to be one the item is actually holding, or the claim would
+    // name a URL that is no better than the one that failed.
+    if !metadata.files.iter().any(|listed| listed.name == file) {
+        return Ok(None);
+    }
+    let base = format!("https://{}{}", metadata.server, metadata.dir);
+    let art = format!("{base}/{file}");
+    let smaller = archive_org_thumbnail(&file);
+    let thumb = metadata
+        .files
+        .iter()
+        .any(|listed| listed.name == smaller)
+        .then(|| format!("{base}/{smaller}"))
+        .unwrap_or_default();
+    Ok(Some((art, thumb, true)))
+}
+
+/// The item and the file one Cover Art Archive redirect points at.
+///
+/// The path is `/<node directory>/items/<item>/<file>`. The item is the segment
+/// that names a MusicBrainz id, and it is the only part that means anything once
+/// the file has moved to another node.
+fn archive_org_item_and_file(location: &str) -> Option<(String, String)> {
+    let path = location.split(['?', '#']).next()?;
+    let segments: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    let item = *segments.iter().find(|part| part.starts_with("mbid-"))?;
+    let file = *segments.last()?;
+    // `index.json` describes the images rather than being one, and a path with
+    // no file after the item is not something to build a URL from.
+    (!file.is_empty() && file != "index.json").then(|| (item.to_string(), file.to_string()))
+}
+
+/// The 250-pixel rendition of a 1200-pixel one the archive named.
+fn archive_org_thumbnail(file: &str) -> String {
+    file.replace("_thumb1200", "_thumb250")
 }
 
 /// Ask MusicBrainz for the release groups one query matches.
@@ -1049,6 +1374,10 @@ pub struct CoverSearchHit {
     pub front: bool,
     /// True for the group the automatic lookup would have picked.
     pub chosen: bool,
+    /// Why this group has no art to show, when that is not simply "nobody has
+    /// scanned it": the archive refused, or the network did. Empty when the
+    /// answer is a picture or a plain absence.
+    pub note: String,
 }
 
 /// Art a person chose for an album, replacing whatever was there before.
@@ -1097,26 +1426,39 @@ impl CoverPublisher {
         let groups = search_groups(&client, &query)
             .await
             .map_err(describe_lookup_error)?;
-        let chosen = best_release_group(&groups, album).map(|group| group.id.clone());
+        let chosen = best_release_group(&groups, album, artist).map(|group| group.id.clone());
         let mut hits = Vec::new();
+        // Once the archive starts refusing there is nothing to be gained by
+        // asking it about the rest of the page, but every group still belongs in
+        // the answer: this is the search a person runs to find out that
+        // MusicBrainz knows the record they meant. Dropping a row because the
+        // archive would not talk about it is what made an album that is plainly
+        // there look absent.
+        let mut stopped: Option<String> = None;
         for group in groups {
             if group.id.is_empty() {
                 continue;
             }
-            let (art, thumb, front) = match archive_lookup(&client, &group.id).await {
-                Ok(Some(found)) => found,
-                // A group with no art is still worth showing: it is the answer to
-                // "why does this album keep coming back empty".
-                Ok(None) => (String::new(), String::new(), false),
-                Err(error) => {
-                    // Whatever arrived before the throttle is still usable, and
-                    // better than throwing away the search just run.
-                    if hits.is_empty() {
-                        return Err(describe_lookup_error(error));
+            let mut note = stopped.clone().unwrap_or_default();
+            let mut found = (String::new(), String::new(), false);
+            if note.is_empty() {
+                match archive_lookup(&client, &group.id).await {
+                    Ok(Some(answer)) => found = answer,
+                    // A group with no art is still worth showing: it is the
+                    // answer to "why does this album keep coming back empty".
+                    Ok(None) => {}
+                    Err(error) => {
+                        // A refusal applies to the whole page; a broken record
+                        // only to itself.
+                        let refused = matches!(error, LookupError::Throttled { .. });
+                        note = describe_lookup_error(error);
+                        if refused {
+                            stopped = Some(note.clone());
+                        }
                     }
-                    break;
                 }
-            };
+            }
+            let (art, thumb, front) = found;
             let mut types = group.primary_type.clone();
             for extra in &group.secondary_types {
                 if !extra.is_empty() {
@@ -1135,6 +1477,7 @@ impl CoverPublisher {
                 art,
                 thumb,
                 front,
+                note,
             });
         }
         Ok(hits)
@@ -1487,6 +1830,241 @@ mod tests {
             classify(reqwest::StatusCode::OK, None, "MusicBrainz", false),
             Answer::Success
         ));
+        // A 500 is one record the server cannot answer for, not a request to go
+        // away and come back. The archive really does this for particular release
+        // groups; read as back-pressure it made Napstr wait out an album it could
+        // have resolved, and told the person it had been throttled.
+        match classify(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            None,
+            "Cover Art Archive",
+            true,
+        ) {
+            Answer::Failed(message) => assert!(
+                message.contains("500"),
+                "the failure has to name the status: {message}"
+            ),
+            _ => panic!("an archive 500 is a failure, not back-pressure"),
+        }
+    }
+
+    #[test]
+    fn a_release_group_lookup_reads_the_releases_it_holds() {
+        // What the archive fallback asks MusicBrainz for once a release group's
+        // own art endpoint has refused: the releases inside it, whose own
+        // endpoints answer. This is the shape measured for
+        // `fa59def2-1fee-4a58-8da6-079204abaf54` ("Love Is Kind", The Chainsmokers),
+        // which is the record that could not be looked up at all before.
+        let group: MusicBrainzGroupLookup = serde_json::from_str(
+            r#"{"id":"fa59def2-1fee-4a58-8da6-079204abaf54","title":"Love Is Kind",
+                 "releases":[{"id":"de91dcf0-edd8-4e36-b78d-63570bbe718f","title":"Love Is Kind"}]}"#,
+        )
+        .expect("the lookup MusicBrainz sends back has to parse");
+        assert_eq!(
+            group
+                .releases
+                .iter()
+                .map(|release| release.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["de91dcf0-edd8-4e36-b78d-63570bbe718f"]
+        );
+        // A group with no releases at all is an answer, not a parse failure, and
+        // it has to leave the fallback with nothing rather than an error.
+        let bare: MusicBrainzGroupLookup = serde_json::from_str(r#"{"id":"x"}"#)
+            .expect("a group the archive has no releases for still parses");
+        assert!(bare.releases.is_empty());
+    }
+
+    #[test]
+    fn a_cover_redirect_names_the_item_that_survives_moving() {
+        // Measured: this is the redirect the Cover Art Archive gives for the
+        // release that could not be looked up, and the item it names lives on a
+        // different node today than the one in the URL.
+        let (item, file) = archive_org_item_and_file(
+            "https://dn711003.ca.archive.org/0/items/mbid-de91dcf0-edd8-4e36-b78d-63570bbe718f/mbid-de91dcf0-edd8-4e36-b78d-63570bbe718f-45066579437_thumb1200.jpg",
+        )
+        .expect("a Cover Art Archive redirect names an item and a file");
+        assert_eq!(item, "mbid-de91dcf0-edd8-4e36-b78d-63570bbe718f");
+        assert_eq!(
+            file,
+            "mbid-de91dcf0-edd8-4e36-b78d-63570bbe718f-45066579437_thumb1200.jpg"
+        );
+        // The item name carries the release id, which is why a broken group has
+        // to be walked down to its releases before this route exists at all.
+        assert!(item.ends_with("de91dcf0-edd8-4e36-b78d-63570bbe718f"));
+        // A listing is not an image, and an item this code cannot name is not
+        // worth building a URL from.
+        assert!(archive_org_item_and_file(
+            "https://dn711003.ca.archive.org/0/items/mbid-de91dcf0-x/index.json"
+        )
+        .is_none());
+        assert!(archive_org_item_and_file("https://dn711003.ca.archive.org/0/items/x/y.jpg")
+            .is_none());
+        // The 250-pixel rendition of the 1200 the archive named is what a list
+        // draws, and it is the same file name with one part changed.
+        assert_eq!(
+            archive_org_thumbnail(
+                "mbid-de91dcf0-edd8-4e36-b78d-63570bbe718f-45066579437_thumb1200.jpg"
+            ),
+            "mbid-de91dcf0-edd8-4e36-b78d-63570bbe718f-45066579437_thumb250.jpg"
+        );
+        // A name that is not a 1200 at all is left alone rather than mangled.
+        assert_eq!(archive_org_thumbnail("cover.jpg"), "cover.jpg");
+    }
+
+    #[test]
+    fn archive_org_metadata_says_where_the_item_lives_now() {
+        let item: ArchiveOrgItem = serde_json::from_str(
+            r#"{"server":"ia801509.us.archive.org","dir":"/2/items/mbid-de91dcf0-edd8-4e36-b78d-63570bbe718f",
+                "files":[{"name":"mbid-de91dcf0-edd8-4e36-b78d-63570bbe718f-45066579437.jpg","size":"7095212"},
+                         {"name":"mbid-de91dcf0-edd8-4e36-b78d-63570bbe718f-45066579437_thumb1200.jpg","size":"179023"},
+                         {"name":"mbid-de91dcf0-edd8-4e36-b78d-63570bbe718f-45066579437_thumb250.jpg","size":"12265"}]}"#,
+        )
+        .expect("the metadata archive.org sends has to parse");
+        // The whole point of asking: CAA says `dn711003.ca.archive.org` with a
+        // `/0/items` directory, and the item is here instead.
+        assert_eq!(item.server, "ia801509.us.archive.org");
+        assert_eq!(item.dir, "/2/items/mbid-de91dcf0-edd8-4e36-b78d-63570bbe718f");
+        let base = format!("https://{}{}", item.server, item.dir);
+        assert_eq!(base, "https://ia801509.us.archive.org/2/items/mbid-de91dcf0-edd8-4e36-b78d-63570bbe718f");
+        assert!(item
+            .files
+            .iter()
+            .any(|file| file.name.ends_with("_thumb1200.jpg")));
+        // An answer with no server is not a place, and has to read as nothing
+        // rather than as a URL with two slashes in it.
+        let empty: ArchiveOrgItem = serde_json::from_str(r#"{"files":[]}"#).unwrap();
+        assert!(empty.server.is_empty() && empty.dir.is_empty());
+    }
+
+    #[test]
+    fn a_joint_credit_is_asked_for_one_name_at_a_time() {
+        // The tag that could not be looked up at all. MusicBrainz holds this
+        // record as two credited artists - `The Chainsmokers` and `Oaks` - and
+        // asking for the joined string finds no release group whatsoever.
+        assert_eq!(
+            default_query("The Chainsmokers, Oaks", "Love Is Kind"),
+            "release:\"Love Is Kind\" AND (artist:\"The Chainsmokers\" OR artist:\"Oaks\")"
+        );
+        // However the tagger wrote the join, it means the same two artists.
+        for joined in [
+            "A & B",
+            "A; B",
+            "A, B",
+            "A feat. B",
+            "A ft B",
+            "A FEATURING B",
+            // A slash written on its own is a join; one inside a word is not.
+            "A / B",
+        ] {
+            assert_eq!(
+                default_query(joined, "Album"),
+                "release:\"Album\" AND (artist:\"A\" OR artist:\"B\")",
+                "{joined}"
+            );
+        }
+        // The other tag that could not be looked up: a tag that names more
+        // artists than MusicBrainz credits the record to. Either name is enough,
+        // and the ranking decides which candidate that leaves.
+        assert_eq!(
+            default_query("KREAM / Korolova", "Annihilation"),
+            "release:\"Annihilation\" AND (artist:\"KREAM\" OR artist:\"Korolova\")"
+        );
+        // `AC/DC` is one artist, so a slash inside a word is left where it is.
+        assert_eq!(
+            default_query("AC/DC", "Back in Black"),
+            "release:\"Back in Black\" AND artist:\"AC/DC\""
+        );
+        // One artist is the ordinary case, and the query must not grow for it.
+        assert_eq!(
+            default_query("Rancid", "And Out Come the Wolves"),
+            "release:\"And Out Come the Wolves\" AND artist:\"Rancid\""
+        );
+        // A single crediting whose own name carries punctuation splits into its
+        // words, and that still matches: MusicBrainz indexes the credited name's
+        // tokens, so asking for them finds the same record.
+        assert_eq!(
+            default_query("Earth, Wind & Fire", "Album"),
+            "release:\"Album\" AND (artist:\"Earth\" OR artist:\"Wind\" OR artist:\"Fire\")"
+        );
+        // A tag with no artist asks about the release alone rather than sending
+        // an empty artist clause that cannot be parsed.
+        assert_eq!(default_query("", "Album"), "release:\"Album\"");
+        assert_eq!(default_query("   ", "Album"), "release:\"Album\"");
+        // And nothing a tag says can smuggle an operator into the query.
+        assert_eq!(
+            default_query("A\" OR artist:\"B", "Album"),
+            "release:\"Album\" AND artist:\"A OR artistB\""
+        );
+    }
+
+    /// The queries two tags produce, against the live MusicBrainz. Both of these
+    /// are searches that used to find nothing at all.
+    ///
+    /// Paced by hand, because MusicBrainz asks for about one request a second and
+    /// two back to back are throttled. The forms these replaced are measured
+    /// rather than asserted here - the joined credit `The Chainsmokers, Oaks`
+    /// answers with no release group, and `KREAM` AND `Korolova` with none either
+    /// - and `a_joint_credit_is_asked_for_one_name_at_a_time` is what keeps
+    /// anybody from building them again.
+    #[tokio::test]
+    #[ignore = "requires MusicBrainz"]
+    async fn the_live_query_finds_records_however_the_tag_words_the_credit() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = cover_http_client().expect("a lookup client");
+        // A joint credit, which MusicBrainz holds as two credited artists.
+        let joint = default_query("The Chainsmokers, Oaks", "Love Is Kind");
+        let groups = search_groups(&client, &joint)
+            .await
+            .expect("MusicBrainz has to answer");
+        assert!(
+            groups
+                .iter()
+                .any(|group| group.id == "fa59def2-1fee-4a58-8da6-079204abaf54"),
+            "the query has to find the record the tag means: {joint}"
+        );
+        tokio::time::sleep(REQUEST_INTERVAL * 2).await;
+        // A credit the tag overstates: MusicBrainz knows no artist called
+        // Korolova at all, and credits this record to KREAM alone.
+        let overstated = default_query("KREAM / Korolova", "Annihilation");
+        let groups = search_groups(&client, &overstated)
+            .await
+            .expect("MusicBrainz has to answer");
+        assert!(
+            groups
+                .iter()
+                .any(|group| group.id == "e8fbaa62-ca7d-4a9b-8f6f-44939b3775f5"),
+            "the query has to find the record the tag means: {overstated}"
+        );
+    }
+
+    /// The live archive, for the one record that could not be looked up at all:
+    /// its release group answers 500, its release answers 500, and the picture
+    /// sits on a node neither of those addresses names.
+    ///
+    /// Ignored because it needs the network, and run by hand whenever this route
+    /// is touched:
+    /// `cargo test --ignored live_archive -- --nocapture`
+    #[tokio::test]
+    #[ignore = "requires the Cover Art Archive and archive.org"]
+    async fn the_live_archive_recovers_a_cover_whose_item_has_moved() {
+        // reqwest is built without a TLS provider, and the app installs one on
+        // start-up; nothing in a test binary has done that yet.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = cover_http_client().expect("a lookup client");
+        let found =
+            archive_lookup_via_archive_org(&client, "de91dcf0-edd8-4e36-b78d-63570bbe718f")
+                .await
+                .expect("the archive.org route must answer rather than fail");
+        let (art, thumb, front) = found.expect("this release has a front cover");
+        assert!(front, "the front route answered, so it is the front cover");
+        assert!(art.starts_with("https://"), "{art}");
+        assert!(art.contains("mbid-de91dcf0-"), "the item name is the release id: {art}");
+        assert!(art.contains("_thumb1200"), "the 1200 rendition is what a claim wants: {art}");
+        assert!(thumb.contains("_thumb250"), "the small rendition: {thumb}");
+        // Both URLs have to be the current home of the item, not the stale one
+        // Cover Art Archive redirects are stuck on.
+        assert!(!art.contains("dn711003"), "the stale node must not be named: {art}");
     }
 
     #[test]
@@ -1696,6 +2274,9 @@ mod tests {
             primary_type: primary_type.to_string(),
             score: 100,
             secondary_types: Vec::new(),
+            artist_credit: vec![MusicBrainzArtistCredit {
+                name: "Metallica".to_string(),
+            }],
         };
         // MusicBrainz returns these in score order, and a single's Cover Art
         // Archive entry is usually empty, so taking the first title match would
@@ -1706,7 +2287,7 @@ mod tests {
             group("album", "St. Anger", "Album"),
         ];
         assert_eq!(
-            best_release_group(&groups, "St. Anger").map(|group| group.id.as_str()),
+            best_release_group(&groups, "St. Anger", "Metallica").map(|group| group.id.as_str()),
             Some("album")
         );
 
@@ -1716,7 +2297,7 @@ mod tests {
             group("first", "St. Anger", "Single"),
         ];
         assert_eq!(
-            best_release_group(&singles, "St. Anger").map(|group| group.id.as_str()),
+            best_release_group(&singles, "St. Anger", "Metallica").map(|group| group.id.as_str()),
             Some("first")
         );
 
@@ -1726,7 +2307,47 @@ mod tests {
             group("", "St. Anger", "Album"),
             group("other", "Load", "Album"),
         ];
-        assert!(best_release_group(&unusable, "St. Anger").is_none());
+        assert!(best_release_group(&unusable, "St. Anger", "Metallica").is_none());
+    }
+
+    #[test]
+    fn the_first_artist_a_tag_names_beats_a_same_titled_record_by_another() {
+        let group = |id: &str, title: &str, primary_type: &str, credits: &[&str]| {
+            MusicBrainzGroup {
+                id: id.to_string(),
+                title: title.to_string(),
+                first_release_date: String::new(),
+                primary_type: primary_type.to_string(),
+                score: 100,
+                secondary_types: Vec::new(),
+                artist_credit: credits
+                    .iter()
+                    .map(|name| MusicBrainzArtistCredit {
+                        name: name.to_string(),
+                    })
+                    .collect(),
+            }
+        };
+        // `Annihilation` is tagged `KREAM / Korolova`, and MusicBrainz credits
+        // the record to KREAM alone - it knows no artist called Korolova at all.
+        // The query asks for either name, so the ranking is what has to keep a
+        // same-titled record by the other one from winning.
+        let groups = vec![
+            group("by-the-other", "Annihilation", "Album", &["Korolova"]),
+            group("the-record", "Annihilation", "Single", &["KREAM"]),
+        ];
+        assert_eq!(
+            best_release_group(&groups, "Annihilation", "KREAM / Korolova")
+                .map(|group| group.id.as_str()),
+            Some("the-record")
+        );
+        // And with neither name credited - a tag that is simply wrong - nothing
+        // matches, so the kind of release still decides as it always did.
+        assert_eq!(
+            best_release_group(&groups, "Annihilation", "Somebody / Else")
+                .map(|group| group.id.as_str()),
+            Some("by-the-other")
+        );
     }
 
     #[test]
