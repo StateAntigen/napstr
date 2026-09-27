@@ -147,7 +147,18 @@ impl NativePlayer {
         Ok(output)
     }
 
-    fn play(&self, db_path: &Path, file_id: String, volume: f32) -> Result<PlaybackStatus, String> {
+    /// Load and start a track.
+    ///
+    /// `volume` is `None` when the caller means "keep whatever this player's
+    /// volume already is", which is what keeps a volume set from a phone from
+    /// being reset by the next track: the volume belongs to the player, not to
+    /// whoever happens to be starting something.
+    fn play(
+        &self,
+        db_path: &Path,
+        file_id: String,
+        volume: Option<f32>,
+    ) -> Result<PlaybackStatus, String> {
         let connection = open_connection(db_path)?;
         let path = playable_audio_path(&connection, &file_id)?;
         let path = validated_path(&file_id, &path)?;
@@ -174,7 +185,11 @@ impl NativePlayer {
         native.output.take();
         let output = self.open_output()?;
         let player = Player::connect_new(output.mixer());
-        player.set_volume(volume.clamp(0.0, 1.0));
+        let volume = volume
+            .filter(|volume| volume.is_finite())
+            .unwrap_or(native.volume)
+            .clamp(0.0, 1.0);
+        player.set_volume(volume);
         player.append(decoder);
         player.play();
 
@@ -182,7 +197,7 @@ impl NativePlayer {
         native.player = Some(player);
         native.file_id = Some(file_id);
         native.duration = duration;
-        native.volume = volume.clamp(0.0, 1.0);
+        native.volume = volume;
         Ok(self.status_for(&native))
     }
 
@@ -288,20 +303,18 @@ impl NativePlayer {
 #[tauri::command]
 pub async fn play_audio(
     file_id: String,
-    volume: f32,
     state: State<'_, AppState>,
 ) -> Result<PlaybackStatus, String> {
     validate_file_id(&file_id)?;
-    if !volume.is_finite() {
-        return Err("invalid playback volume".into());
-    }
     let db_path = state
         .db_path
         .lock()
         .map_err(|_| "database lock poisoned")?
         .clone();
     let player = state.player.clone();
-    tauri::async_runtime::spawn_blocking(move || player.play(&db_path, file_id, volume))
+    // No volume: the player keeps the one it has, and `set_audio_volume` is the
+    // only way to change it. A phone's volume therefore survives a track change.
+    tauri::async_runtime::spawn_blocking(move || player.play(&db_path, file_id, None))
         .await
         .map_err(|error| format!("audio worker stopped unexpectedly: {error}"))?
 }

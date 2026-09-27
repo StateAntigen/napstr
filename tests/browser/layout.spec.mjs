@@ -26,7 +26,7 @@ for (const language of ['en', 'fr', 'ar']) {
     });
     await page.goto('http://127.0.0.1:15173');
     await expect(page.locator('.search-button')).toBeEnabled();
-    const views = ['Search', 'Downloads', 'Shared', 'Profile', 'Settings', 'Trollbox', 'Napstrfy'];
+    const views = ['Search', 'Downloads', 'Shared', 'Playlists', 'Profile', 'Settings', 'Trollbox', 'Napstrfy'];
     for (const [width, height] of [[1180, 810], [851, 600], [850, 600], [651, 600], [650, 600], [560, 400]]) {
       await page.setViewportSize({ width, height });
       for (const [index, view] of views.entries()) {

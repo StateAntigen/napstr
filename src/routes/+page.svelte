@@ -21,24 +21,30 @@
   const CHAT_PAGE_SIZE = 100;
   const VISIBLE_SEEDER_LIMIT = 100;
 
-  type View = 'Search' | 'Downloads' | 'Shared' | 'Profile' | 'Settings' | 'Trollbox' | 'Napstrfy' | 'Covers';
+  type View = 'Search' | 'Downloads' | 'Shared' | 'Playlists' | 'Profile' | 'Settings' | 'Trollbox' | 'Napstrfy' | 'Covers';
   type PlayerMode = 'single' | 'folder' | 'all';
   type PlayerOrigin = 'search' | 'downloads' | 'shared' | 'audiobook' | 'direct';
   /** Repeat, as the phone offers it and this window now plays it. */
   type RemoteRepeat = 'off' | 'all' | 'one';
   /**
    * A transport instruction a phone sent, forwarded by the playback bridge.
-   * Commands the native player carries out on its own - pause, stop, seek and
-   * volume - never reach the window, so only these arrive here.
+   * Commands the native player carries out on its own - pause, seek and volume -
+   * never reach the window, so only these arrive here. `stop` does arrive, even
+   * though the player stops on its own: the window has to know that the track it
+   * was showing is no longer loaded, or its own play button would ask a player
+   * that holds nothing.
    */
   type RemotePlaybackCommand =
     | { type: 'play' }
     | { type: 'toggle' }
     | { type: 'next' }
     | { type: 'previous' }
+    | { type: 'volume'; percent: number }
     | { type: 'repeat'; mode: RemoteRepeat }
     | { type: 'shuffle'; enabled: boolean }
-    | { type: 'playTrack'; fileId: string; queue: string[] };
+    | { type: 'stop' }
+    | { type: 'handoff' }
+    | { type: 'playTrack'; fileId: string; queue: string[]; positionMs: number };
   type WindowResizeDirection = 'East' | 'North' | 'NorthEast' | 'NorthWest' | 'South' | 'SouthEast' | 'SouthWest' | 'West';
   type Result = {
     id: number;
@@ -75,6 +81,7 @@
     { label: 'Search', icon: '⌕' },
     { label: 'Downloads', icon: '⇩' },
     { label: 'Shared', icon: '▤' },
+    { label: 'Playlists', icon: '♫' },
     { label: 'Profile', icon: '☺' },
     { label: 'Settings', icon: '⚙' },
     { label: 'Trollbox', icon: '▣' },
@@ -93,7 +100,7 @@
   type CatalogueBrowseCursor = { sessionId: string };
   type CatalogueBrowsePage = { results: NetworkResult[]; cursor: CatalogueBrowseCursor | null; totalAvailable: number };
   type PlayerTrack = { fileId: string; name: string; folder: string; artist: string; mime: string };
-  type PlaybackStatus = { fileId: string; currentTime: number; duration: number; playing: boolean; ended: boolean; error: string };
+  type PlaybackStatus = { fileId: string; currentTime: number; duration: number; playing: boolean; ended: boolean; error: string; volume: number };
   type ReleaseStatus = { version: string; url: string };
   type GitHubRelease = { tag_name?: unknown; html_url?: unknown };
   type TrollboxMessage = { eventId: string; pubkey: string; npub: string; displayName: string; content: string; createdAt: number };
@@ -105,6 +112,80 @@
   type BlockConfirmation =
     | { kind: 'file'; fileId: string; label: string }
     | { kind: 'user'; pubkey: string; label: string };
+  /** A playlist as the Playlists page lists it: no members, which is what makes
+   *  browsing cheap. `author` is half the coordinate, so it travels with every
+   *  row. */
+  type PlaylistSummary = {
+    playlistId: string;
+    title: string;
+    author: string;
+    displayName: string;
+    image: string;
+    trackCount: number;
+    private: boolean;
+    published: boolean;
+    updatedAt: number;
+  };
+  /** One member, in the order the playlist puts it in. */
+  type PlaylistMember = {
+    position: number;
+    fileId: string;
+    title: string;
+    artist: string;
+    album: string;
+  };
+  /** A playlist and all of its members, which is what the editor edits. */
+  type PlaylistDetail = {
+    playlistId: string;
+    title: string;
+    author: string;
+    displayName: string;
+    artist: string;
+    mbid: string;
+    image: string;
+    tags: string;
+    private: boolean;
+    published: boolean;
+    updatedAt: number;
+    tracks: PlaylistMember[];
+    total: number;
+  };
+  /**
+   * A track the editor may add as a member.
+   *
+   * `source` says where the row was found, not what the file is. A playlist may
+   * name files its author does not hold — that is curation, and the common case
+   * is building a list of things you have not listened to yet — so the picker
+   * searches this computer and the network, and marks what is not here yet.
+   */
+  type PlaylistCandidate = {
+    fileId: string;
+    title: string;
+    artist: string;
+    album: string;
+    filename: string;
+    source: 'local' | 'network';
+  };
+  /** What one look at the relays answered, as the host reports it. */
+  type PlaylistReadReport = {
+    stored: number;
+    withdrawn: number;
+    /** This identity's own live coordinates on the relays, held here or not. */
+    own: PlaylistSummary[];
+  };
+  /** How many live seeders one member of an open playlist has right now. */
+  type PlaylistMemberAvailability = { fileId: string; seeders: number };
+  /**
+   * Where a row of the list came from, which is what its badge says.
+   *
+   * `held` is a playlist this computer holds and the relays know, `relays` one
+   * the relays know and this computer does not (so it can be restored), `local`
+   * one the relays have seen and no longer answer with (withdrawable), `draft`
+   * one nobody outside this computer has ever seen, and `theirs` somebody
+   * else's public playlist, which is read-only here.
+   */
+  type PlaylistRowState = 'held' | 'relays' | 'local' | 'draft' | 'theirs';
+  type PlaylistRow = PlaylistSummary & { state: PlaylistRowState; withdrawable: boolean };
 
   let activeView: View = 'Search';
   let results: Result[] = [];
@@ -221,9 +302,16 @@
   let playerShuffle = false;
   /** What the bridge was last told, so a change is the only thing that is sent. */
   let publishedQueueFacts = '';
-  let queueFacts: { len: number; index: number; repeat: RemoteRepeat; shuffle: boolean } = {
+  let queueFacts: {
+    len: number;
+    index: number;
+    fileIds: string[];
+    repeat: RemoteRepeat;
+    shuffle: boolean;
+  } = {
     len: 0,
     index: -1,
+    fileIds: [],
     repeat: 'off',
     shuffle: false
   };
@@ -233,6 +321,9 @@
   let playerCurrentTime = 0;
   let playerDuration = 0;
   let playerVolume = 0.85;
+  /** When this window last told the player what volume to use. */
+  let volumeSentAt = 0;
+  let pushedPlayerVolume = false;
   let playerEnded = false;
   let lastPlayerError = '';
   let transferPaneHeight = 119;
@@ -739,7 +830,7 @@
     playerDuration = 0;
     playerEnded = false;
     try {
-      applyPlaybackStatus(await invoke<PlaybackStatus>('play_audio', { fileId: track.fileId, volume: playerVolume }));
+      applyPlaybackStatus(await invoke<PlaybackStatus>('play_audio', { fileId: track.fileId }));
       if (!lastPlayerError) activityMessage = msg("Playing {p0}{p1}", { p0: track.name, p1: track.folder ? ` · ${track.folder}` : '' });
     } catch (error) {
       playerPlaying = false;
@@ -853,9 +944,11 @@
    * The list arrives as file ids in the phone's order and is used in that order.
    * Tracks this computer does not hold are dropped, exactly as they are from its
    * own search results: it can only play what it has, and a queue that stops on
-   * something unplayable is worse than a shorter one.
+   * something unplayable is worse than a shorter one. `positionMs` is where the
+   * phone had got to, so handing playback over resumes there instead of starting
+   * the track again from the beginning.
    */
-  async function playRemoteQueue(fileId: string, fileIds: string[]) {
+  async function playRemoteQueue(fileId: string, fileIds: string[], positionMs: number) {
     const order: PlayerTrack[] = [];
     for (const id of fileIds) {
       const file = sharedFiles.find((candidate) => candidate.fileId === id);
@@ -879,13 +972,29 @@
     playerQueueOrder = order;
     playerQueue = playerShuffle ? shuffledQueue(order, fileId) : order;
     await loadPlayerTrack(Math.max(0, playerQueue.findIndex((item) => item.fileId === fileId)));
+    if (positionMs > 0) await seekToPosition(positionMs / 1000);
+  }
+
+  /** Resume where a phone had got to, clamped to the length of what is loaded. */
+  async function seekToPosition(seconds: number) {
+    if (!currentTrack || !Number.isFinite(seconds) || seconds <= 0) return;
+    const target = playerDuration > 0 ? Math.min(seconds, playerDuration) : seconds;
+    try {
+      applyPlaybackStatus(await invoke<PlaybackStatus>('seek_audio', { seconds: target }));
+      playerCurrentTime = target;
+      playerEnded = false;
+    } catch (error) {
+      activityMessage = msg("Could not seek in this track: {p0}", { p0: String(error) });
+    }
   }
 
   /**
    * Carry out a transport command a phone sent.
    *
    * Only what the native player cannot manage alone arrives here, which is why
-   * there is nothing to do for pause, stop, seek or volume.
+   * there is nothing to do for pause and seek. Volume does arrive, and is only
+   * shown: the player has already been told, and this window follows it rather
+   * than telling it again.
    */
   async function handleRemoteCommand(command: RemotePlaybackCommand) {
     switch (command.type) {
@@ -901,6 +1010,9 @@
       case 'previous':
         await previousPlayerTrack();
         break;
+      case 'volume':
+        adoptPlayerVolume(command.percent / 100);
+        break;
       case 'repeat':
         playerRepeat = command.mode;
         break;
@@ -908,8 +1020,20 @@
         playerShuffle = command.enabled;
         applyPlayerQueueOrder();
         break;
+      // The audio has already stopped at the native player's end, so the only
+      // thing left is for this window to agree: a track that is no longer
+      // loaded has to be reloadable rather than playable.
+      case 'stop':
+        playerPlaying = false;
+        playerEnded = true;
+        break;
+      case 'handoff':
+        playerPlaying = false;
+        playerEnded = true;
+        activityMessage = msg("Napstrfy took playback over");
+        break;
       case 'playTrack':
-        await playRemoteQueue(command.fileId, command.queue);
+        await playRemoteQueue(command.fileId, command.queue, command.positionMs ?? 0);
         break;
     }
   }
@@ -917,14 +1041,19 @@
   /**
    * Tell the bridge what the queue looks like. It cannot see any of this, and a
    * phone shows a queue length and enables "next" from it.
+   *
+   * The file ids go too, because they are what a handoff answers with: a phone
+   * taking playback over adopts this list, and the length alone would leave it
+   * unable to say what comes next.
    */
   async function publishPlayerQueueFacts(facts: {
     len: number;
     index: number;
+    fileIds: string[];
     repeat: RemoteRepeat;
     shuffle: boolean;
   }) {
-    const key = `${facts.len}:${facts.index}:${facts.repeat}:${facts.shuffle}`;
+    const key = `${facts.len}:${facts.index}:${facts.repeat}:${facts.shuffle}:${facts.fileIds.join(',')}`;
     if (key === publishedQueueFacts) return;
     publishedQueueFacts = key;
     try {
@@ -940,10 +1069,19 @@
   $: queueFacts = {
     len: playerQueue.length,
     index: playerQueueIndex,
+    fileIds: playerQueue.map((track) => track.fileId),
     repeat: playerRepeat,
     shuffle: playerShuffle
   };
   $: if (nativeReady) void publishPlayerQueueFacts(queueFacts);
+
+  // The player starts at whatever volume it had, and remembers nothing between
+  // runs, so the stored preference is pushed once when it becomes available.
+  $: if (nativeReady && !pushedPlayerVolume) {
+    pushedPlayerVolume = true;
+    volumeSentAt = Date.now();
+    invoke<PlaybackStatus>('set_audio_volume', { volume: playerVolume }).catch(() => {});
+  }
 
   async function seekPlayer(event: Event) {
     try {
@@ -954,11 +1092,35 @@
 
   function changePlayerVolume(event: Event) {
     playerVolume = Number((event.currentTarget as HTMLInputElement).value);
-    if (currentTrack) invoke<PlaybackStatus>('set_audio_volume', { volume: playerVolume }).catch(() => {});
+    volumeSentAt = Date.now();
+    // Always told, even with nothing loaded: the player is the one that owns the
+    // volume, so a change made while it is idle is the volume the next track
+    // starts at.
+    invoke<PlaybackStatus>('set_audio_volume', { volume: playerVolume }).catch(() => {});
     window.localStorage.setItem('napstr-player-volume', String(playerVolume));
   }
 
+  /**
+   * Follow the player's volume, which is the only place one is kept.
+   *
+   * A phone changing the volume is the reason this exists: the slider has to
+   * move with it rather than disagreeing until the next poll. A change this
+   * window just sent is skipped, so that a drag cannot be yanked backwards by an
+   * answer to its own request.
+   */
+  function adoptPlayerVolume(volume: number) {
+    if (!Number.isFinite(volume)) return;
+    const value = Math.min(1, Math.max(0, volume));
+    if (Math.abs(value - playerVolume) < 0.005) return;
+    if (Date.now() - volumeSentAt < 500) return;
+    playerVolume = value;
+    window.localStorage.setItem('napstr-player-volume', String(value));
+  }
+
   function applyPlaybackStatus(status: PlaybackStatus) {
+    // Read before the track check below: a volume can change while nothing is
+    // loaded, and the slider still has to be right when something loads.
+    adoptPlayerVolume(status.volume);
     if (!currentTrack || status.fileId !== currentTrack.fileId) return;
     if (status.error) {
       playerPlaying = false;
@@ -1369,11 +1531,462 @@
     };
   }
 
+  let playlists: PlaylistSummary[] = [];
+  let playlistsLoading = false;
+  let playlistsError: string | Message = '';
+  /**
+   * This computer's own public key: the author half of every playlist it writes
+   * down. Read from the host rather than from the network status, because a
+   * playlist is edited offline too, and "is this row mine?" has to be answerable
+   * while the relays are down.
+   */
+  let playlistAuthor = '';
+  /** The playlist open in the editor, or null while the list is showing. */
+  let playlistDraft: PlaylistDetail | null = null;
+  /** The draft's members in the order the list shows them, which is the order
+   *  that gets saved: positions are written from this, never typed. */
+  let playlistMembers: PlaylistMember[] = [];
+  /** The author's answer to "suggest words from the title?". It only applies
+   *  while they have written no words of their own, and it is remembered here
+   *  because the event cannot carry the difference between "no" and "not asked". */
+  let playlistSuggestTags = true;
+  let playlistSaving = false;
+  let playlistError: string | Message = '';
+  let playlistNotice: string | Message = '';
+  let playlistCandidateQuery = '';
+  let playlistCandidates: PlaylistCandidate[] = [];
+  let playlistSearching = false;
+  /**
+   * This identity's own playlists as the relays last answered for them, or null
+   * while they have not been read successfully.
+   *
+   * Null is not an empty list, and the list is drawn differently because of it:
+   * "nobody has looked yet" must never be shown as "the relays do not have
+   * these", which is the answer that invites a withdrawal.
+   */
+  let playlistRelays: PlaylistSummary[] | null = null;
+  /** Live seeder counts for the members of the playlist open in the editor. */
+  let playlistAvailability = new Map<string, number>();
+  /** The list in its two tiers, built from the store and the relay answer. */
+  let playlistTiers: { mine: PlaylistRow[]; theirs: PlaylistRow[] } = { mine: [], theirs: [] };
+
+  /**
+   * The list in two tiers: ours first, then everybody else's.
+   *
+   * Ours are this computer's own rows plus the coordinates the relays know and
+   * it does not, which is the reconciliation: one of those can be restored, and
+   * one only here can be withdrawn. Everybody else's were read off the relays
+   * and are read-only here - a copy of one is a new playlist of this identity's,
+   * with an id of its own.
+   *
+   * The two lists are taken as arguments rather than read here, because a helper
+   * that reads this component's state itself is invisible to the change tracking
+   * that would redraw the rows.
+   */
+  function buildPlaylistTiers(
+    held: PlaylistSummary[],
+    author: string,
+    relays: PlaylistSummary[] | null
+  ) {
+    const coordinate = (row: PlaylistSummary) => `${row.author}|${row.playlistId}`;
+    const isMine = (row: PlaylistSummary) => !row.author || !author || row.author === author;
+    const answered = relays !== null;
+    const onRelays = new Set((relays ?? []).map(coordinate));
+    const mine: PlaylistRow[] = [];
+    const theirs: PlaylistRow[] = [];
+    for (const row of held) {
+      if (!isMine(row)) {
+        theirs.push({ ...row, state: 'theirs', withdrawable: false });
+        continue;
+      }
+      // A playlist this computer holds is missing from the relays only when the
+      // relays were asked and did not have it. Nothing is offered to withdraw on
+      // the strength of a look that never happened, and one that was never
+      // published is a draft rather than a playlist the relays have lost.
+      const known = onRelays.has(coordinate(row));
+      const state: PlaylistRowState = known
+        ? 'held'
+        : !row.published
+          ? 'draft'
+          : answered
+            ? 'local'
+            : 'held';
+      mine.push({ ...row, state, withdrawable: state === 'local' });
+    }
+    for (const row of relays ?? []) {
+      if (held.some((known) => coordinate(known) === coordinate(row))) continue;
+      mine.push({ ...row, state: 'relays', withdrawable: false });
+    }
+    const newestFirst = (left: PlaylistRow, right: PlaylistRow) =>
+      (right.updatedAt ?? 0) - (left.updatedAt ?? 0) || left.playlistId.localeCompare(right.playlistId);
+    mine.sort(newestFirst);
+    theirs.sort(newestFirst);
+    return { mine, theirs };
+  }
+
+  $: playlistDraftIsMine = !playlistDraft || playlistIsMine(playlistDraft.author);
+  $: playlistTiers = buildPlaylistTiers(playlists, playlistAuthor, playlistRelays);
+
+  /**
+   * Which refresh the page is waiting for.
+   *
+   * A refresh that is overtaken by a newer one must not write its answer over
+   * it. The page asks whenever it is opened and whenever Refresh is pressed, so
+   * two can be in flight at once, and an older answer landing last would label
+   * the rows from a look that has already been replaced - which is the one
+   * thing the reconciliation must never get wrong.
+   */
+  let playlistRefresh = 0;
+
+  async function refreshPlaylists() {
+    const attempt = ++playlistRefresh;
+    playlistsLoading = true;
+    playlistsError = '';
+    try {
+      if (!playlistAuthor) playlistAuthor = await invoke<string>('own_playlist_author');
+      // Looking at the relays is best effort: playlists are edited offline as
+      // often as not, and this computer's own rows are listed either way. A look
+      // that fails leaves the reconciliation exactly where it was.
+      if (networkConnected) {
+        try {
+          await invoke<PlaylistReadReport>('read_playlists');
+        } catch {
+          // The read is what tells "the relays do not have this" apart from
+          // "nobody looked"; when it cannot happen, the answer below stays null.
+        }
+      }
+      const rows = await invoke<PlaylistSummary[]>('playlists');
+      const relays = await invoke<PlaylistSummary[] | null>('playlist_reconciliation');
+      if (attempt !== playlistRefresh) return;
+      playlists = rows;
+      playlistRelays = relays;
+    } catch (error) {
+      if (attempt === playlistRefresh) playlistsError = String(error);
+    } finally {
+      if (attempt === playlistRefresh) playlistsLoading = false;
+    }
+  }
+
+  /**
+   * Bring one of your own playlists back from the relays.
+   *
+   * The relays hold the revision, so this is an import rather than a publish,
+   * and it is the author's decision: an installation that restored everything it
+   * found would be treating the relays as the truth about what this computer
+   * holds, which is the same mistake as withdrawing everything they lack.
+   */
+  async function restorePlaylist(row: PlaylistRow) {
+    playlistSaving = true;
+    playlistsError = '';
+    try {
+      await invoke('restore_playlist', { playlistId: row.playlistId });
+      await refreshPlaylists();
+    } catch (error) {
+      playlistsError = String(error);
+    } finally {
+      playlistSaving = false;
+    }
+  }
+
+  /**
+   * How many live seeders each member of an open playlist has.
+   *
+   * A playlist asserts nothing about who holds its members, so this comes from
+   * the ordinary kind 30422 heartbeats, from any author. It is decoration: a
+   * member nobody seeds is still drawn, because its position is part of what the
+   * playlist means - so a relay that cannot answer costs the badges and nothing
+   * else.
+   */
+  async function loadPlaylistAvailability(detail: PlaylistDetail) {
+    playlistAvailability = new Map();
+    if (!networkConnected || detail.tracks.length === 0) return;
+    try {
+      const rows = await invoke<PlaylistMemberAvailability[]>('playlist_member_availability', {
+        fileIds: detail.tracks.map((member) => member.fileId)
+      });
+      playlistAvailability = new Map(rows.map((row) => [row.fileId, row.seeders]));
+    } catch {
+      // The members are shown from the playlist's own description instead.
+    }
+  }
+
+  /**
+   * What a member row says about who holds the file right now, or an empty
+   * string while nothing is known about it.
+   *
+   * A playlist is curation: it need not be held by its author, by this computer,
+   * or by anybody at all, so a member row answers with what is actually out
+   * there rather than with what the playlist claims. An unavailable member is
+   * drawn like every other member - its position is part of what the playlist
+   * means - which is why this says so instead of dropping the row.
+   */
+  function memberAvailability(fileId: string, counts: Map<string, number>, local: Set<string>) {
+    if (local.has(fileId)) return $t("This computer");
+    if (!counts.has(fileId)) return '';
+    const seeders = counts.get(fileId) ?? 0;
+    if (seeders === 0) return $t("Unavailable");
+    return `${seeders} ${$t(seeders === 1 ? "seeder" : "seeders")}`;
+  }
+
+  /**
+   * Whether a row is this computer's own playlist.
+   *
+   * Two things make a row this identity's: an author it holds the key for, and
+   * an empty author, which is a playlist only this computer has ever written
+   * down. A row that arrived from a relay with somebody else's author is theirs,
+   * and everything this page does with one of those is read-only - saving it
+   * makes a copy under an id of its own rather than a revision of their
+   * coordinate. Refusing to edit a playlist because the identity could not be
+   * read would be worse than the mistake it guards against.
+   */
+  function playlistIsMine(author: string) {
+    return !author || !playlistAuthor || author === playlistAuthor;
+  }
+
+  /** A playlist that has not been written down yet, with an id to write it under. */
+  async function newPlaylist() {
+    playlistsError = '';
+    try {
+      playlistDraft = {
+        playlistId: await invoke<string>('new_playlist_id'),
+        title: '',
+        author: playlistAuthor,
+        displayName,
+        artist: '',
+        mbid: '',
+        image: '',
+        tags: '',
+        private: false,
+        published: false,
+        updatedAt: 0,
+        tracks: [],
+        total: 0
+      };
+      playlistMembers = [];
+      playlistCandidates = [];
+      playlistCandidateQuery = '';
+      playlistSuggestTags = true;
+      playlistError = '';
+      playlistNotice = '';
+    } catch (error) {
+      playlistsError = String(error);
+    }
+  }
+
+  async function openPlaylist(summary: PlaylistSummary) {
+    playlistsError = '';
+    try {
+      const loaded = await invoke<PlaylistDetail | null>('playlist', {
+        author: summary.author,
+        playlistId: summary.playlistId
+      });
+      if (!loaded) {
+        playlistsError = msg("That playlist is not on this computer");
+        return;
+      }
+      playlistDraft = loaded;
+      playlistMembers = [...loaded.tracks];
+      playlistCandidates = [];
+      playlistCandidateQuery = '';
+      // A playlist that already carries words of its own has already answered
+      // the suggestion question, and re-asking would put our words back.
+      playlistSuggestTags = loaded.tags.trim() === '';
+      playlistError = '';
+      playlistNotice = '';
+      void loadPlaylistAvailability(loaded);
+    } catch (error) {
+      playlistsError = String(error);
+    }
+  }
+
+  function closePlaylistEditor() {
+    playlistDraft = null;
+    playlistMembers = [];
+    playlistCandidates = [];
+    playlistCandidateQuery = '';
+    playlistAvailability = new Map();
+    playlistError = '';
+    playlistNotice = '';
+  }
+
+  function addPlaylistMember(candidate: PlaylistCandidate) {
+    if (playlistMembers.some((member) => member.fileId === candidate.fileId)) return;
+    playlistMembers = [
+      ...playlistMembers,
+      {
+        position: playlistMembers.length + 1,
+        fileId: candidate.fileId,
+        // The playlist's own description of the track, which is all there is to
+        // go on when the file is not here: a hint, always, and one a catalogue
+        // entry overrides the moment there is one.
+        title: candidate.title || candidate.filename,
+        artist: candidate.artist,
+        album: candidate.album
+      }
+    ];
+  }
+
+  /** Forget the picture a playlist names. The file itself is not touched. */
+  function clearPlaylistImage() {
+    if (playlistDraft) playlistDraft = { ...playlistDraft, image: '' };
+  }
+
+  function removePlaylistMember(index: number) {
+    playlistMembers = playlistMembers.filter((_, position) => position !== index);
+  }
+
+  function movePlaylistMember(index: number, delta: number) {
+    const target = index + delta;
+    if (target < 0 || target >= playlistMembers.length) return;
+    const moved = [...playlistMembers];
+    const [member] = moved.splice(index, 1);
+    moved.splice(target, 0, member);
+    playlistMembers = moved;
+  }
+
+  /** The draft as the host stores it: positions are the order on screen. */
+  function playlistForHost(): PlaylistDetail {
+    const tracks = playlistMembers.map((member, index) => ({ ...member, position: index + 1 }));
+    return { ...(playlistDraft as PlaylistDetail), tracks, total: tracks.length };
+  }
+
+  /**
+   * Find tracks to add: here first, then on the network.
+   *
+   * Searching only this computer would make the ordinary case impossible — a
+   * person listing music they have not listened to here yet — so a network row
+   * is offered the same way a local one is, and marked, because adding it means
+   * the playlist names a file before this computer holds it. That is allowed,
+   * and the member reads from the playlist's own description until it arrives.
+   */
+  async function searchPlaylistTracks() {
+    playlistSearching = true;
+    playlistError = '';
+    const query = playlistCandidateQuery.trim();
+    try {
+      const here = await invoke<NativeFile[]>('search_catalog', { query });
+      const found: PlaylistCandidate[] = here.map((file) => ({
+        fileId: file.fileId,
+        title: file.title,
+        artist: file.artist,
+        album: file.album,
+        filename: file.filename,
+        source: 'local' as const
+      }));
+      if (networkConnected) {
+        try {
+          const remote = await invoke<NetworkResult[]>('network_search', { query });
+          for (const result of remote) {
+            if (found.some((candidate) => candidate.fileId === result.fileId)) continue;
+            found.push({
+              fileId: result.fileId,
+              title: result.title,
+              artist: result.artist,
+              album: result.album,
+              filename: result.filename,
+              source: 'network' as const
+            });
+          }
+        } catch {
+          // A playlist is edited offline as often as not. A network that cannot
+          // answer is not a failure of the search: it leaves the local rows.
+        }
+      }
+      playlistCandidates = found;
+    } catch (error) {
+      playlistError = String(error);
+    } finally {
+      playlistSearching = false;
+    }
+  }
+
+  /** Write the draft down here. Editing is local until the author publishes. */
+  async function savePlaylist() {
+    if (!playlistDraft) return false;
+    playlistSaving = true;
+    playlistError = '';
+    playlistNotice = '';
+    try {
+      // A playlist somebody else wrote is filed as a copy with an id of its
+      // own, which is what comes back here - so the editor carries on with the
+      // copy rather than with their coordinate.
+      const copied = !playlistIsMine(playlistDraft.author);
+      playlistDraft = await invoke<PlaylistDetail>('save_playlist', { playlist: playlistForHost() });
+      playlistMembers = [...playlistDraft.tracks];
+      playlistNotice = msg("Saved on this computer");
+      await refreshPlaylists();
+      if (copied) await loadPlaylistAvailability(playlistDraft);
+      return true;
+    } catch (error) {
+      playlistError = String(error);
+      return false;
+    } finally {
+      playlistSaving = false;
+    }
+  }
+
+  async function publishPlaylist() {
+    if (!playlistDraft) return;
+    if (!(await savePlaylist())) return;
+    playlistSaving = true;
+    playlistError = '';
+    try {
+      playlistDraft = await invoke<PlaylistDetail>('publish_playlist', {
+        playlist: playlistForHost(),
+        suggestTags: playlistSuggestTags
+      });
+      playlistMembers = [...playlistDraft.tracks];
+      playlistNotice = msg("Published to the relays");
+      await refreshPlaylists();
+    } catch (error) {
+      playlistError = String(error);
+    } finally {
+      playlistSaving = false;
+    }
+  }
+
+  /**
+   * Get rid of a playlist.
+   *
+   * A playlist the relays have seen is withdrawn rather than forgotten: deleting
+   * it here alone would leave the published revision standing, and the next
+   * client to look would find a playlist its author believes they threw away.
+   * A row this computer does not own is nobody's to delete here - the host
+   * refuses to withdraw a coordinate it does not hold, and a playlist that
+   * arrived from a relay would simply come back on the next look.
+   */
+  async function deletePlaylist(playlist: PlaylistDetail | PlaylistSummary | null) {
+    if (!playlist) return;
+    // Withdrawing is not like forgetting: the relays are told, and the playlist
+    // is gone for everyone who reads it. It is the author's decision, so it is
+    // asked for rather than assumed - which is the whole point of keeping the
+    // reconciliation away from anything automatic.
+    if (
+      playlist.published &&
+      !window.confirm($t("This is published, so it will be withdrawn from the relays as well."))
+    ) {
+      return;
+    }
+    playlistSaving = true;
+    playlistError = '';
+    try {
+      if (playlist.published) await invoke('withdraw_playlist', { playlistId: playlist.playlistId });
+      else await invoke('delete_playlist', { author: playlist.author, playlistId: playlist.playlistId });
+      if (playlistDraft && playlistDraft.playlistId === playlist.playlistId) closePlaylistEditor();
+      await refreshPlaylists();
+    } catch (error) {
+      playlistError = String(error);
+    } finally {
+      playlistSaving = false;
+    }
+  }
+
   function activateView(view: View) {
     activeView = view;
     if (view === 'Trollbox') void refreshTrollbox();
     if (view === 'Napstrfy') void openMobileConnect();
     if (view === 'Covers') void refreshCovers();
+    if (view === 'Playlists') void refreshPlaylists();
   }
 
   async function openMobileConnect() {
@@ -3013,6 +3626,162 @@
             <input bind:value={trollboxDraft} maxlength="500" autocomplete="off" placeholder={networkConnected ? $t("Type a public message…") : $t("Connect to Nostr to chat")} disabled={!networkConnected || trollboxSending} aria-label={$t("Trollbox message")} onkeydown={(event) => { if (event.key === 'Enter') { event.preventDefault(); void sendTrollboxMessage(); } }} />
             <button class="classic-button primary" type="button" disabled={!networkConnected || trollboxSending || !trollboxDraft.trim()} onclick={() => void sendTrollboxMessage()}>{trollboxSending ? $t("Sending…") : $t("Send")}</button>
           </div>
+        </section>
+      {:else if activeView === 'Playlists'}
+        <section class="full-panel playlist-view">
+          <div class="panel-title playlist-title">
+            <span></span><b>{playlistDraft ? $t("Playlist") : $t("Playlists")}</b><span></span>
+            <button class="classic-button" title={$t("Refresh")} onclick={() => void refreshPlaylists()}>⟳</button>
+            {#if playlistDraft}
+              <button class="classic-button" title={$t("Back to playlists")} onclick={closePlaylistEditor}>← {$t("Playlists")}</button>
+            {:else}
+              <button class="classic-button primary" title={$t("New playlist")} onclick={() => void newPlaylist()}>+ {$t("New playlist")}</button>
+            {/if}
+          </div>
+
+          {#if playlistsError}<div class="trollbox-error">{$t(playlistsError)}</div>{/if}
+
+          {#if playlistDraft}
+            <div class="playlist-editor">
+              <div class="playlist-fields">
+                <label>{$t("Title")}
+                  <input bind:value={playlistDraft.title} maxlength="256" disabled={!playlistDraftIsMine} />
+                </label>
+                <label>{$t("Album artist")}
+                  <input bind:value={playlistDraft.artist} maxlength="256" disabled={!playlistDraftIsMine} />
+                </label>
+                <label>{$t("Release group MBID")}
+                  <input bind:value={playlistDraft.mbid} maxlength="36" disabled={!playlistDraftIsMine} />
+                </label>
+                <label>{$t("Search words")}
+                  <input bind:value={playlistDraft.tags} maxlength="500" placeholder={$t("Tags")} disabled={!playlistDraftIsMine} />
+                </label>
+                <p class="playlist-id">{$t("Playlist id")} <code>{playlistDraft.playlistId}</code></p>
+                {#if playlistDraft.image}
+                  <p class="playlist-id">{$t("Artwork")} <code>{playlistDraft.image}</code>
+                    <button class="classic-button" title={$t("Remove")} disabled={!playlistDraftIsMine} onclick={clearPlaylistImage}>×</button>
+                  </p>
+                {/if}
+                <label class="playlist-toggle">
+                  <input type="checkbox" bind:checked={playlistSuggestTags} disabled={!playlistDraftIsMine || playlistDraft.tags.trim() !== ''} />
+                  <span>{$t("Suggest words from the title")}</span>
+                </label>
+                {#if playlistDraft.tags.trim() === ''}
+                  <p class="privacy-note wide"><span>i</span> {$t("With no words of your own, this playlist is found by its name and its members alone.")}</p>
+                {/if}
+              </div>
+
+              <div class="playlist-members">
+                <div class="playlist-members-head"><b>{$t("Tracks")}</b><span>{playlistMembers.length}</span></div>
+                {#each playlistMembers as member, index (member.fileId)}
+                  <div class="playlist-member">
+                    <span class="playlist-member-position">{index + 1}</span>
+                    <div class="playlist-member-copy">
+                      <b>{member.title || member.fileId.slice(0, 12)}</b>
+                      <small>{member.artist}{member.album ? ` · ${member.album}` : ''}</small>
+                    </div>
+                    <span class="playlist-badges">
+                      {#if !localFileIds.has(member.fileId)}
+                        <i class="playlist-badge" title={$t("From the playlist")}>{$t("From the playlist")}</i>
+                      {/if}
+                      {#if memberAvailability(member.fileId, playlistAvailability, localFileIds)}
+                        <i class="playlist-badge" class:amber={!localFileIds.has(member.fileId) && playlistAvailability.get(member.fileId) === 0}>{memberAvailability(member.fileId, playlistAvailability, localFileIds)}</i>
+                      {/if}
+                    </span>
+                    <button class="classic-button" title={$t("Move up")} disabled={!playlistDraftIsMine || index === 0} onclick={() => movePlaylistMember(index, -1)}>↑</button>
+                    <button class="classic-button" title={$t("Move down")} disabled={!playlistDraftIsMine || index === playlistMembers.length - 1} onclick={() => movePlaylistMember(index, 1)}>↓</button>
+                    <button class="classic-button" title={$t("Remove")} disabled={!playlistDraftIsMine} onclick={() => removePlaylistMember(index)}>×</button>
+                  </div>
+                {/each}
+                {#if playlistMembers.length === 0}
+                  <p class="empty-state compact">{$t("No tracks yet")}</p>
+                {/if}
+              </div>
+
+              <div class="playlist-add">
+                <div class="playlist-members-head"><b>{$t("Add a track")}</b><span></span></div>
+                <form class="playlist-track-search" onsubmit={(event) => { event.preventDefault(); void searchPlaylistTracks(); }}>
+                  <input bind:value={playlistCandidateQuery} placeholder={$t("Search")} aria-label={$t("Search")} disabled={!playlistDraftIsMine} />
+                  <button class="classic-button" type="submit" disabled={!playlistDraftIsMine || playlistSearching}>{$t("Search")}</button>
+                </form>
+                <div class="playlist-candidates">
+                  {#each playlistCandidates as candidate (candidate.fileId)}
+                    <div class="playlist-candidate">
+                      <div class="playlist-member-copy">
+                        <b>{candidate.title || candidate.filename}</b>
+                        <small>{candidate.artist}{candidate.album ? ` · ${candidate.album}` : ''}</small>
+                      </div>
+                      {#if candidate.source === 'network'}
+                        <i class="playlist-badge" title={$t("Not on this computer")}>{$t("Not on this computer")}</i>
+                      {/if}
+                      <button class="classic-button" disabled={!playlistDraftIsMine || playlistMembers.some((member) => member.fileId === candidate.fileId)} onclick={() => addPlaylistMember(candidate)}>{$t("Add")}</button>
+                    </div>
+                  {/each}
+                </div>
+              </div>
+
+              <div class="playlist-actions">
+                <button class="classic-button primary" disabled={playlistSaving || !playlistDraft.title.trim()} onclick={() => void savePlaylist()}>{playlistSaving ? $t("Saving…") : playlistDraftIsMine ? $t("Save") : $t("Save a copy")}</button>
+                {#if playlistDraftIsMine}
+                  <button class="classic-button" title={$t("Publish")} disabled={playlistSaving || !playlistDraft.title.trim()} onclick={() => void publishPlaylist()}>{$t("Publish")}</button>
+                  <button class="classic-button" title={$t("Delete")} disabled={playlistSaving} onclick={() => void deletePlaylist(playlistDraft)}>× {$t("Delete")}</button>
+                {/if}
+                {#if playlistNotice}<span class="playlist-notice">{$t(playlistNotice)}</span>{/if}
+                {#if playlistError}<span class="playlist-error">{$t(playlistError)}</span>{/if}
+              </div>
+            </div>
+          {:else}
+            <div class="playlist-list">
+              {#if playlistTiers.mine.length > 0}
+                <p class="playlist-group">{$t("Your playlists")}</p>
+              {/if}
+              {#each playlistTiers.mine as row (row.author + " " + row.playlistId)}
+                <div class="playlist-row">
+                  <button class="playlist-open" title={$t("Open")} onclick={() => void openPlaylist(row)}>
+                    <b>{row.title}</b>
+                    <small>{row.trackCount} {$t("Tracks")} · {row.displayName || row.author.slice(0, 12)}</small>
+                  </button>
+                  <span class="playlist-badges">
+                    {#if row.state === 'relays'}
+                      <i class="playlist-badge">{$t("On the relays only")}</i>
+                    {:else if row.state === 'local'}
+                      <i class="playlist-badge" title={$t("This is published, so it will be withdrawn from the relays as well.")}>{$t("Only on this computer")}</i>
+                    {:else if row.state === 'draft'}
+                      <i class="playlist-badge">{$t("Draft")}</i>
+                    {:else}
+                      <i class="playlist-badge">{$t("Held locally")}</i>
+                      <i class="playlist-badge">{row.published ? $t("Published") : $t("Draft")}</i>
+                    {/if}
+                  </span>
+                  {#if row.state === 'relays'}
+                    <button class="classic-button" disabled={playlistSaving} onclick={() => void restorePlaylist(row)}>{$t("Restore")}</button>
+                  {:else}
+                    <button class="classic-button" title={row.withdrawable ? $t("Withdraw") : $t("Delete")} disabled={playlistSaving} onclick={() => void deletePlaylist(row)}>×</button>
+                  {/if}
+                </div>
+              {/each}
+
+              {#if playlistTiers.theirs.length > 0}
+                <p class="playlist-group">{$t("From everyone else")}</p>
+              {/if}
+              {#each playlistTiers.theirs as row (row.author + " " + row.playlistId)}
+                <div class="playlist-row">
+                  <button class="playlist-open" title={$t("Open")} onclick={() => void openPlaylist(row)}>
+                    <b>{row.title}</b>
+                    <small>{row.trackCount} {$t("Tracks")} · {row.displayName || row.author.slice(0, 12)}</small>
+                  </button>
+                  <span class="playlist-badges"><i class="playlist-badge">{$t("Read-only")}</i></span>
+                  <span></span>
+                </div>
+              {/each}
+
+              {#if playlistsLoading}
+                <p class="empty-state compact">···</p>
+              {:else if playlistTiers.mine.length === 0 && playlistTiers.theirs.length === 0}
+                <p class="empty-state compact">{$t("No playlists yet")}</p>
+              {/if}
+            </div>
+          {/if}
         </section>
       {:else if activeView === 'Covers'}
         <section class="full-panel cover-scan-view">

@@ -23,6 +23,7 @@ mod cover_publish;
 mod mobile;
 mod network;
 mod playback_bridge;
+mod playlist;
 mod player;
 mod protocol;
 mod tor;
@@ -268,6 +269,7 @@ fn initialise_database(path: &Path, app_data: &Path) -> Result<(), String> {
         )
         .map_err(|error| error.to_string())?;
     network::initialise_network_schema(&connection)?;
+    playlist::initialise_schema(&connection)?;
     connection
         .execute_batch(
             "DELETE FROM download_sources WHERE request_id IN (
@@ -2169,6 +2171,176 @@ fn publish_playback_state(snapshot: playback_bridge::QueueSnapshot, state: State
     state.playback.publish_queue(snapshot);
 }
 
+/// Sign and publish a public playlist, and keep it here so this computer offers
+/// it without waiting for a relay to echo it back.
+///
+/// A private playlist is refused rather than published: it stays on this
+/// computer and the phones paired with it, because a relay would see a
+/// coordinate, a size and an edit timestamp even with the body encrypted.
+///
+/// `suggest_tags` asks for search words derived from the title, and only matters
+/// while the playlist has none of its own: the author's words are the whole
+/// answer whenever there are any.
+#[tauri::command]
+async fn publish_playlist(
+    playlist: napstr_remote_protocol::RemotePlaylist,
+    suggest_tags: bool,
+    state: State<'_, AppState>,
+) -> Result<napstr_remote_protocol::RemotePlaylist, String> {
+    state.network.publish_playlist(&playlist, suggest_tags).await
+}
+
+/// Withdraw a playlist this computer published, on the relays and here.
+#[tauri::command]
+async fn withdraw_playlist(playlist_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    state.network.withdraw_playlist(&playlist_id).await
+}
+
+/// An id for a playlist that has not been published yet.
+///
+/// A playlist's identity is its name and role for its author, not its contents,
+/// so it cannot be derived from anything: it is minted here and then persisted
+/// by whoever asked, which is what lets a later edit replace the same playlist
+/// rather than making a second one.
+#[tauri::command]
+fn new_playlist_id() -> String {
+    playlist::new_playlist_id()
+}
+
+/// This computer's own public key, which is the author half of every playlist it
+/// writes down.
+///
+/// Reading it never touches a relay, which matters because playlists are edited
+/// offline: the page has to be able to say "this row is mine, I may edit it"
+/// while the network is down, and it can only do that if the answer is available
+/// then.
+#[tauri::command]
+fn own_playlist_author() -> Result<String, String> {
+    network::own_pubkey()
+}
+
+/// Every playlist this computer holds, newest first, without their members.
+///
+/// Two kinds of row sit in the one list and are told apart by what they carry:
+/// what this identity published, and what it has only written down. A member
+/// list is what makes a row expensive, so browsing never carries the members of
+/// playlists nobody opened.
+#[tauri::command]
+fn playlists(state: State<'_, AppState>) -> Result<Vec<napstr_remote_protocol::RemotePlaylistSummary>, String> {
+    playlist::list(&open_db(&state)?, 0, playlist::PLAYLIST_LIST_LIMIT)
+        .map(|(playlists, _)| playlists)
+}
+
+/// One playlist with its members, or nothing when this computer holds no
+/// playlist at that coordinate.
+///
+/// An empty `author` asks about the id alone, which is answered only while
+/// exactly one author's row answers to it.
+#[tauri::command]
+fn playlist(
+    author: String,
+    playlist_id: String,
+    state: State<'_, AppState>,
+) -> Result<Option<napstr_remote_protocol::RemotePlaylist>, String> {
+    playlist::page(
+        &open_db(&state)?,
+        &author,
+        &playlist_id,
+        0,
+        playlist::PLAYLIST_MEMBER_LIMIT,
+    )
+}
+
+/// Write a playlist down on this computer without publishing it.
+///
+/// Editing is local until the author says publish, so a half-written playlist
+/// survives a restart without a relay ever having seen it, and a private one is
+/// never anything but local. The author and the edit time are stamped here
+/// rather than taken from the caller: the coordinate has to be the one a later
+/// publication will use, or publishing a draft would leave two rows behind under
+/// one id, only one of which is the author's.
+///
+/// A revision of somebody else's playlist is filed as a copy under an id of its
+/// own, which is what `playlist::file_revision` is for. A window in front of a
+/// public playlist may press Save, but nothing here ever signs for a coordinate
+/// this identity does not own.
+#[tauri::command]
+fn save_playlist(
+    playlist: napstr_remote_protocol::RemotePlaylist,
+    state: State<'_, AppState>,
+) -> Result<napstr_remote_protocol::RemotePlaylist, String> {
+    playlist::file_revision(
+        &open_db(&state)?,
+        playlist,
+        &network::own_pubkey()?,
+        Utc::now().timestamp(),
+    )
+}
+
+/// Forget a playlist this computer holds and has never published.
+///
+/// A published one is withdrawn instead, which is what a relay has to be told.
+#[tauri::command]
+fn delete_playlist(
+    author: String,
+    playlist_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    playlist::remove(&open_db(&state)?, &author, &playlist_id)
+}
+
+/// Read the public playlists the relays answer with, and file other authors'.
+///
+/// Best effort: a network that cannot answer is reported to the page, which
+/// keeps showing whatever this computer holds - and keeps quiet about which of
+/// its own playlists the relays do or do not have, because that question was
+/// not answered.
+#[tauri::command]
+async fn read_playlists(
+    state: State<'_, AppState>,
+) -> Result<network::PlaylistReadReport, String> {
+    state.network.read_public_playlists().await
+}
+
+/// This identity's own playlists as the relays last answered for them, or
+/// nothing at all while the relays have not been read.
+///
+/// The difference matters and is why this is not a plain list: "we never looked"
+/// and "the relays do not have any of your playlists" would otherwise be the
+/// same answer, and the second one is what invites a withdrawal.
+#[tauri::command]
+async fn playlist_reconciliation(
+    state: State<'_, AppState>,
+) -> Result<Option<Vec<napstr_remote_protocol::RemotePlaylistSummary>>, String> {
+    Ok(state.network.playlist_reconciliation().await)
+}
+
+/// Import one of this identity's own playlists from the relays.
+///
+/// The user-confirmed half of the reconciliation the NIP describes: a
+/// coordinate that exists on a relay and not here can be brought back, and
+/// nothing does this by itself.
+#[tauri::command]
+async fn restore_playlist(
+    playlist_id: String,
+    state: State<'_, AppState>,
+) -> Result<napstr_remote_protocol::RemotePlaylist, String> {
+    state.network.restore_playlist(&playlist_id).await
+}
+
+/// How many live seeders each member of an open playlist has right now.
+///
+/// A playlist asserts nothing about who holds its members, so this is the
+/// ordinary kind `30422` availability answer for a bounded set of file ids; the
+/// page draws it beside the members it is already showing.
+#[tauri::command]
+async fn playlist_member_availability(
+    file_ids: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<network::PlaylistMemberAvailability>, String> {
+    state.network.playlist_member_availability(file_ids).await
+}
+
 /// The albums the cover worker would act on next, for the Covers tab.
 #[tauri::command]
 fn cover_candidates(
@@ -2430,6 +2602,18 @@ pub fn run() {
             player::set_audio_volume,
             player::audio_status,
             publish_playback_state,
+            publish_playlist,
+            withdraw_playlist,
+            new_playlist_id,
+            own_playlist_author,
+            playlists,
+            playlist,
+            save_playlist,
+            delete_playlist,
+            read_playlists,
+            playlist_reconciliation,
+            restore_playlist,
+            playlist_member_availability,
             cover_candidates,
             cover_status,
             set_cover_preferences,
