@@ -93,31 +93,35 @@ test('Napstrfy asks about the artwork of the track next in the queue while the o
   const rows = page.locator('.track-row');
   await expect(rows).toHaveCount(40);
   await rows.first().locator('.track-open').click();
-  // The playlist looks its own artwork up for the first twelve rows only, and the
-  // library rows that far down have never been scrolled into view, so the album
-  // twenty-one tracks along has never been asked about by anything on screen.
+  // Every row of the playlist looks its own album up as it comes into view, as
+  // the library's rows do, so what a row shows is a fact about whether it has
+  // been on screen rather than about where it sits in the list.
   await page.getByRole('button', { name: 'Open the playlist' }).click();
   const asked = async () => (await asks(page)).flat().join('\n');
-  // The rows on screen have asked for their own albums by now, and the ones below
-  // the fold have not, so this is a real absence rather than a race not yet lost.
   await expect.poll(asked).toContain('album 5');
-  // The playlist draws its own artwork for the first twelve rows and no further,
-  // so the tiles past them stay on the placeholder. This is the same fact as the
-  // album twenty-one tracks along not having been asked about, and unlike the
-  // asks it cannot be confounded by a shelf card for that same album, which is
-  // why it is asserted here: the batch is whatever had laid out by the flush.
+  // The rows on screen have asked for their own albums by now and drawn them; the
+  // ones below the fold have not been looked at by anything, so this is a real
+  // absence rather than a race not yet lost.
   const queueRows = page.locator('.queue-row');
   await expect(queueRows.nth(11).locator('.artwork img:not(.fallback)')).toHaveCount(1);
   await expect(queueRows.nth(20).locator('.artwork img:not(.fallback)')).toHaveCount(0);
-  await page.locator('.queue-row').nth(20).locator('.queue-open').click();
+  // The full rendition is what the preload fetches and nothing else does: a tile
+  // only ever draws the thumbnail, so album twenty-one's is untouched until the
+  // track before it is played.
+  expect(fetched).not.toContain('/cover-21.png');
+  await queueRows.nth(20).locator('.queue-open').click();
   // Playing it is what asks on behalf of the track that will follow it, and what
   // fetches both of its renditions: the thumbnail so the player has a cover at
   // once, and the full one so the drawer and the lock screen have nothing left to
-  // wait for. The playlist's own rows never draw that far down - its twelfth row
-  // is where the tiles stop - so this is the preload's doing.
+  // wait for. Row twenty-one's own tile would have asked about the album anyway
+  // once it scrolled into view, so the full rendition is what says the preload
+  // did this.
   await expect.poll(asked).toContain('album 21');
   await expect.poll(() => fetched).toContain('/cover-21-thumb.png');
   await expect.poll(() => fetched).toContain('/cover-21.png');
+  // The row the click scrolled to has drawn its album for itself, which is the
+  // thing the cap used to stop happening past the twelfth row.
+  await expect(queueRows.nth(20).locator('.artwork img:not(.fallback)')).toHaveCount(1);
 });
 
 test('Napstrfy artwork recovers from a transient host failure while the screen stays open', async ({ page }) => {

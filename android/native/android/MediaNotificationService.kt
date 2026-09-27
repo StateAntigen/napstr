@@ -83,6 +83,38 @@ class MediaNotificationService : Service() {
   private var artwork: Bitmap? = null
   private var artworkRequest = 0
   private val mainHandler = Handler(Looper.getMainLooper())
+  /**
+   * False while this webview is hidden behind the lock screen. The page cannot
+   * keep an eye on the computer's player from there - a hidden webview has its
+   * timers throttled, and with the computer as the source there is no audio
+   * playing here for the system to make an exception for - so the native side
+   * does the asking instead, and stops again the moment the page is back.
+   */
+  private var pageVisible = true
+  /**
+   * Nudges the page to look at the computer again. It is deliberately a native
+   * timer rather than a page one: throttling is a property of the page, and this
+   * is what keeps the lock screen moving while the phone is locked.
+   */
+  private val pollTicker = object : Runnable {
+    override fun run() {
+      if (!remote || pageVisible) {
+        pollTickerRunning = false
+        return
+      }
+      MediaControlBridge.poll()
+      mainHandler.postDelayed(this, REMOTE_POLL_INTERVAL)
+    }
+  }
+  /**
+   * Whether [pollTicker] is already waiting.
+   *
+   * The page publishes its state about once a second, and every publish lands in
+   * [updatePollTicker]. Re-posting the tick each time would push it back a second
+   * at a time for as long as the page kept talking, which is forever - so a tick
+   * that is already scheduled is left alone.
+   */
+  private var pollTickerRunning = false
   private val artworkLoader = Executors.newSingleThreadExecutor { runnable ->
     Thread(runnable, "napstrfy-artwork").apply { isDaemon = true }
   }
@@ -167,9 +199,30 @@ class MediaNotificationService : Service() {
     liked = intent.getBooleanExtra(EXTRA_LIKED, false)
     looping = intent.getBooleanExtra(EXTRA_LOOPING, false)
     remote = intent.getBooleanExtra(EXTRA_REMOTE, false)
+    pageVisible = intent.getBooleanExtra(EXTRA_VISIBLE, true)
     volumeLevel = intent.getIntExtra(EXTRA_VOLUME, 0).coerceIn(0, 100)
     updateArtwork(intent.getStringExtra(EXTRA_ARTWORK).orEmpty())
     updateScreenWakeLock()
+    updatePollTicker()
+  }
+
+  /**
+   * Run the nudge loop exactly while it is the only thing that can run: the
+   * computer is the source and the page that would otherwise poll it is hidden.
+   * Stopping it again matters as much as starting it - a tick every few seconds
+   * for the whole time a track plays on the computer would be a wake-up the
+   * phone does not need while its own page is awake and polling already.
+   */
+  private fun updatePollTicker() {
+    if (remote && !pageVisible) {
+      if (!pollTickerRunning) {
+        pollTickerRunning = true
+        mainHandler.postDelayed(pollTicker, REMOTE_POLL_INTERVAL)
+      }
+      return
+    }
+    pollTickerRunning = false
+    mainHandler.removeCallbacks(pollTicker)
   }
 
   /**
@@ -373,6 +426,8 @@ class MediaNotificationService : Service() {
 
   override fun onDestroy() {
     artworkLoader.shutdownNow()
+    pollTickerRunning = false
+    mainHandler.removeCallbacks(pollTicker)
     releaseScreenWakeLock()
     mediaSession.isActive = false
     mediaSession.release()
@@ -405,6 +460,10 @@ class MediaNotificationService : Service() {
     const val EXTRA_LOOPING = "looping"
     const val EXTRA_REMOTE = "remote"
     const val EXTRA_VOLUME = "volume"
+    /** Whether the page that sent this is actually on screen. */
+    const val EXTRA_VISIBLE = "visible"
+    /** How often a hidden page is nudged to look at the computer again. */
+    private const val REMOTE_POLL_INTERVAL = 3000L
     private const val CHANNEL_ID = "napstrfy_playback"
     private const val NOTIFICATION_ID = 7302
   }

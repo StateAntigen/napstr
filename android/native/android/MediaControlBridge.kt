@@ -34,6 +34,9 @@ class MediaControlBridge(private val activity: MainActivity) {
       // volume is a percentage of the computer's volume.
       putExtra(MediaNotificationService.EXTRA_REMOTE, state.optBoolean("remote"))
       putExtra(MediaNotificationService.EXTRA_VOLUME, state.optInt("volume", 0))
+      // Whether the page is on screen decides who polls the computer: the page
+      // itself while it is visible, this service while it is not.
+      putExtra(MediaNotificationService.EXTRA_VISIBLE, state.optBoolean("visible", true))
       // Labels are translated by the webview, which owns the chosen language.
       val labels = state.optJSONObject("labels")
       for (key in listOf(
@@ -66,6 +69,22 @@ class MediaControlBridge(private val activity: MainActivity) {
 
     fun detach() {
       webView.clear()
+    }
+
+    /**
+     * Ask the page to look at the computer's player again.
+     *
+     * Reached only while the page is hidden, where its own timers are at the
+     * webview's mercy: `evaluateJavascript` is not a page timer, so it runs
+     * whatever the throttling would have done to one.
+     */
+    fun poll() {
+      webView.get()?.post {
+        webView.get()?.evaluateJavascript(
+          "window.dispatchEvent(new Event('napstrfy-poll'))",
+          null
+        )
+      }
     }
 
     fun dispatch(action: String) {

@@ -2632,7 +2632,11 @@
   function publishSystemMetadata(metadata: SystemMediaState) {
     const bridge = androidMediaBridge();
     if (bridge) {
-      bridge.update(JSON.stringify(metadata));
+      // `visible` says whether this page can still do its own polling. Behind the
+      // lock screen a webview has its timers throttled, so the service starts
+      // asking the computer on this page's behalf, and stops again once the page
+      // is back in front.
+      bridge.update(JSON.stringify({ ...metadata, visible: !document.hidden }));
       return;
     }
     const session = webMediaSession();
@@ -4546,13 +4550,18 @@
     }, 15000);
     // While the computer is the source, the bar is showing its track and its
     // position, so it has to be asked what it is doing often enough to look live.
+    // This keeps running while the app is in the background, and that is the
+    // point of it: the lock screen is drawing the computer's track, and it is the
+    // only place the change would otherwise be noticed. There is no local audio
+    // playing here to keep the page's timers alive, so the native service nudges
+    // this page as well whenever it is hidden.
     const remoteTimer = window.setInterval(() => {
-      if (!document.hidden && playbackTarget === 'desktop') void refreshRemote();
+      if (playbackTarget === 'desktop') void refreshRemote();
     }, 2500);
     // Between those answers the bar moves rather than stepping, and a track that
     // has run out is noticed here instead of waiting for the next poll.
     const remoteTickTimer = window.setInterval(() => {
-      if (document.hidden || playbackTarget !== 'desktop') return;
+      if (playbackTarget !== 'desktop') return;
       remoteTick = Date.now();
       noteRemotePlaybackTick();
       // The lock screen's progress has no audio events to ride on out here.
@@ -4575,7 +4584,12 @@
       sleepClock = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
     }, 1000);
     const foreground = () => {
-      if (document.hidden) return;
+      if (document.hidden) {
+        // Going behind the lock screen is what hands the computer's player to the
+        // service's own timer, and it has to be told rather than guessed at.
+        syncSystemMedia(true);
+        return;
+      }
       void refreshStatus();
       void refreshTransfers();
       void refreshPodcastDownloads();
@@ -4588,6 +4602,15 @@
       syncSystemMedia(true);
     };
     document.addEventListener('visibilitychange', foreground);
+    // The service's nudge, while this page is hidden. It is not a page timer, so
+    // the webview's throttling cannot postpone it.
+    const systemPoll = () => {
+      if (playbackTarget !== 'desktop') return;
+      remoteTick = Date.now();
+      noteRemotePlaybackTick();
+      void refreshRemote();
+    };
+    window.addEventListener('napstrfy-poll', systemPoll);
     window.addEventListener('napstrfy-media-action', handleSystemMediaAction);
     window.addEventListener('napstrfy-back', handleSystemBack);
     window.addEventListener('keydown', handleKeyboard);
@@ -4600,6 +4623,7 @@
       window.clearInterval(sleepTimer);
       window.clearInterval(pendingHandoffTimer);
       document.removeEventListener('visibilitychange', foreground);
+      window.removeEventListener('napstrfy-poll', systemPoll);
       window.removeEventListener('napstrfy-media-action', handleSystemMediaAction);
       window.removeEventListener('napstrfy-back', handleSystemBack);
       window.removeEventListener('keydown', handleKeyboard);
@@ -5552,7 +5576,7 @@
         <div class:playing={index === shownQueueIndex} class:liked={isTrackLiked(track)} class="queue-row">
           <button class="queue-open" onclick={() => void playQueueRow(index)}>
             <span class="queue-index">{index === shownQueueIndex ? '▶' : index + 1}</span>
-            <TrackArtwork track={track} lookup={index < 12} />
+            <TrackArtwork track={track} lookup />
             <span class="queue-copy"><strong>{title(track)}</strong><small>{artist(track)}</small></span>
           </button>
           <!-- Where the track is held, as on the library rows: the menu is the
