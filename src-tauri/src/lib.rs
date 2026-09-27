@@ -2209,6 +2209,42 @@ fn nudge_cover_worker(state: State<'_, AppState>) {
     state.covers.nudge();
 }
 
+/// The domains this computer will take album art from, as the Covers tab edits
+/// it.
+///
+/// Stored normalised — one lowercase domain per line — so the box reads back the
+/// list that is actually in force. An empty list accepts any HTTPS host, which
+/// is how Napstr behaved before the list existed.
+#[tauri::command]
+fn set_allowed_art_hosts(
+    hosts: String,
+    state: State<'_, AppState>,
+) -> Result<cover_publish::CoverStatus, String> {
+    state.covers.set_allowed_art_hosts(&hosts)
+}
+
+/// The newest cover lookup attempts, newest first, for the Covers tab's log.
+///
+/// This exists because a failed lookup used to leave nothing behind but a count:
+/// the reason — a DNS failure, a refusal, an album nobody has art for — was
+/// written nowhere, so an outage and a blank square looked identical.
+#[tauri::command]
+fn cover_lookup_log(
+    limit: usize,
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::cover::CoverLookupLogRow>, String> {
+    state.covers.lookup_log(limit)
+}
+
+/// Every album this computer holds that no cover answers, failures first.
+#[tauri::command]
+fn cover_missing(
+    limit: usize,
+    state: State<'_, AppState>,
+) -> Result<Vec<cover_publish::CoverGap>, String> {
+    state.covers.missing_albums(limit)
+}
+
 /// Albums the results pane is showing, reported as it draws them.
 ///
 /// This is how "albums seen in search results" reaches the cover worker: the
@@ -2439,6 +2475,9 @@ pub fn run() {
             cover_default_query,
             cover_search_candidates,
             cover_apply_pick,
+            set_allowed_art_hosts,
+            cover_lookup_log,
+            cover_missing,
             report_cover,
             set_downloads_paused,
             clear_all_transfers,

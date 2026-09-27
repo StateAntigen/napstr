@@ -33,10 +33,20 @@
 //! What the worker will not do is invent art. A release group is only used when
 //! its title really matches the album, and a claim is only published when no
 //! other author already has a winning one.
+//!
+//! Two art sources, in order. MusicBrainz plus the Cover Art Archive come first,
+//! because they are open, they carry a stable identifier, and their licence is
+//! the one a claim can be published under. Apple's catalogue is asked only when
+//! the archive comes back empty, which is the ordinary case for a record nobody
+//! has scanned and a commercial one for a record Apple sells: `Annihilation` by
+//! KREAM & Korolova is `404` at the archive and a cover at Apple. That source
+//! has no identifier to match on, so it is only ever accepted when the album
+//! name and one of the credited artist's names agree, and the picture it returns
+//! is published with `mbid` empty rather than with a guess.
 
 use crate::cover::{self, ArtLookup, CoverClaimFields};
 use crate::network::NetworkService;
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
@@ -63,6 +73,23 @@ const USER_AGENT: &str = concat!(
 /// *publishing*, which a relay will take as fast as it arrives.
 const REQUEST_INTERVAL: Duration = Duration::from_millis(1200);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(12);
+/// How long MusicBrainz is given, which is not the same question as how long the
+/// archive is given.
+///
+/// The public web service queues rather than refuses when it is busy, and the
+/// queue is long: measured from one connection, minutes apart and all `200`, the
+/// same search answered in 0.59s, 15.3s, 19.5s and 25.0s, with two requests that
+/// never answered at all while the TCP connect stayed a steady 0.19s. A network
+/// timeout shorter than that is not a round-trip guard, it is a coin toss that
+/// throws away answers already on their way — which is exactly what turned a
+/// busy service into thirty "failed" albums.
+const MUSICBRAINZ_TIMEOUT: Duration = Duration::from_secs(45);
+/// How many refusals or unanswered requests in a row end a pass.
+///
+/// The waits grow to minutes each, so this is a bound on an evening spent
+/// waiting for a service that has stopped answering rather than on politeness:
+/// the albums stay pending, and the next pass picks up where this one stopped.
+const MAX_CONSECUTIVE_HOLDS: u32 = 6;
 /// The first wait after a 503 or 429. Doubles with each consecutive refusal, so
 /// a MusicBrainz outage costs a handful of requests rather than one per album.
 const THROTTLE_BACKOFF_BASE: Duration = Duration::from_secs(30);
@@ -75,6 +102,29 @@ const FAILED_LOOKUP_RETRY_SECONDS: i64 = 15 * 60;
 /// gives up. A group with art has it on one of the first few, and every release
 /// walked is another request to the archive.
 const MAX_FALLBACK_RELEASES: usize = 3;
+/// The iTunes catalogue, asked only once the archive has come back empty.
+///
+/// It exists for the records a volunteer archive simply never scanned: measured,
+/// `Annihilation` by KREAM & Korolova is a release group MusicBrainz knows and
+/// the Cover Art Archive answers `404` for, while Apple has the sleeve. Nothing
+/// about that is a lookup bug, and no amount of query work on the metadata
+/// sources finds a picture that is not there.
+const ITUNES_SEARCH_ENDPOINT: &str = "https://itunes.apple.com/search";
+/// How many results one iTunes query may consider. Apple's own relevance order
+/// has this record first; the extra rows are what makes a wrong match visible
+/// rather than silently accepted.
+const ITUNES_RESULT_LIMIT: usize = 25;
+/// iTunes publishes no rate limit. This is politeness, not compliance: a library
+/// of thousands is thousands of requests in one pass, and being throttled by a
+/// service Napstr has no documented agreement with is worse than being slow.
+const ITUNES_INTERVAL: Duration = Duration::from_millis(400);
+/// The rendition to ask Apple for. Its artwork URLs end in a size, and the whole
+/// picture is the same file path at a different one, so a cover that would
+/// otherwise be a 100-pixel thumbnail is asked for at 1200.
+const ITUNES_FULL_RENDITION: &str = "1200x1200bb.jpg";
+const ITUNES_THUMB_RENDITION: &str = "200x200bb.jpg";
+/// The most albums the missing-cover list will answer with.
+const MAX_MISSING_LIST: usize = 2_000;
 /// The most albums the window may preview at once.
 const MAX_PREVIEW: usize = 50;
 /// A safety net rather than a cooldown: the worker is woken by real events, and
@@ -86,6 +136,10 @@ const IDLE_RECHECK: Duration = Duration::from_secs(15 * 60);
 const REPORT_INTERVAL: Duration = Duration::from_millis(150);
 const SETTING_LOOKUP_EXTERNAL: &str = "cover_lookup_external";
 const SETTING_PUBLISH_CLAIMS: &str = "cover_publish_claims";
+/// Set once the first start with a second art source has cleared the answers
+/// that were reached without one. See
+/// [`forget_answers_from_before_the_second_source`].
+const SETTING_SECOND_SOURCE_STARTED: &str = "cover_second_source_started";
 /// Emitted on every meaningful step, so the window shows the worker live.
 pub const COVER_STATUS_EVENT: &str = "napstr-cover-status";
 
@@ -163,6 +217,11 @@ pub struct CoverStatus {
     pub backed_off: usize,
     /// True when a pass ended early because the switches were turned off.
     pub stopped: bool,
+    /// The domains this computer will take art from, one per line. Empty means
+    /// no restriction, which is what every library had before the setting
+    /// existed. Carried in the status so the Covers tab can edit it without a
+    /// second round trip.
+    pub allowed_art_hosts: String,
     pub message: String,
 }
 
@@ -188,6 +247,16 @@ impl CoverPublisher {
         // session is still in force in this one. An unreadable database means
         // "off": a privacy switch is never turned on by a failure.
         let preferences = read_preferences(&db_path).unwrap_or_default();
+        let allowed_art_hosts = read_allowed_art_hosts(&db_path).unwrap_or_default();
+        // A "nobody has art for this" answer is trusted for a fortnight, and
+        // every one of them written before there was a second source is a
+        // verdict on half a search: it would keep an album Apple sells looking
+        // empty for the rest of the fortnight, which is exactly the report that
+        // started this. Cleared once. A failure here is not worth refusing to
+        // start over — the worker simply keeps its old answers.
+        if let Ok(connection) = crate::open_connection(&db_path) {
+            let _ = forget_answers_from_before_the_second_source(&connection);
+        }
         Arc::new(Self {
             db_path,
             network,
@@ -198,6 +267,7 @@ impl CoverPublisher {
             status: Mutex::new(CoverStatus {
                 lookup_external: preferences.lookup_external,
                 publish_claims: preferences.publish_claims,
+                allowed_art_hosts,
                 message: preferences.describe(),
                 ..CoverStatus::default()
             }),
@@ -281,9 +351,70 @@ impl CoverPublisher {
         Ok(self.report())
     }
 
+    /// Record which hosts art may come from, then make the window re-ask.
+    ///
+    /// Stored normalised — one domain per line, lowercase, no `*.` — so the box
+    /// reads back the list that is actually in force rather than the string a
+    /// person typed, and so the same list cannot look different twice.
+    pub fn set_allowed_art_hosts(&self, hosts: &str) -> Result<CoverStatus, String> {
+        let normalised = cover::parse_art_hosts(hosts).join("\n");
+        {
+            let connection = crate::open_connection(&self.db_path)?;
+            connection
+                .execute(
+                    "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+                    params![cover::SETTING_ALLOWED_ART_HOSTS, normalised],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        if let Ok(mut status) = self.status.lock() {
+            status.allowed_art_hosts = normalised.clone();
+            status.message = match cover::parse_art_hosts(&normalised).len() {
+                0 => "Art from any HTTPS host is accepted".into(),
+                1 => "Art is accepted only from 1 host".into(),
+                count => format!("Art is accepted only from {count} hosts"),
+            };
+        }
+        Ok(self.report())
+    }
+
     /// Ask a running pass to stop. It stops at the next album boundary.
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::SeqCst);
+    }
+
+    /// Write one attempt into the lookup log.
+    ///
+    /// Logging is diagnostics: a database that cannot be written must not stop
+    /// an album being resolved, so the result is dropped on purpose.
+    fn log(&self, candidate: &CoverCandidate, outcome: &str, source: &str, message: &str) {
+        if let Ok(connection) = crate::open_connection(&self.db_path) {
+            let _ = cover::record_lookup_log(
+                &connection,
+                cover::LookupLogEntry {
+                    key: &candidate.key,
+                    artist: &candidate.artist,
+                    album: &candidate.album,
+                    outcome,
+                    source,
+                    message,
+                },
+            );
+        }
+    }
+
+    /// The newest lookup attempts, for the Covers tab.
+    pub fn lookup_log(&self, limit: usize) -> Result<Vec<cover::CoverLookupLogRow>, String> {
+        let connection = crate::open_connection(&self.db_path)?;
+        cover::recent_lookup_log(&connection, limit)
+    }
+
+    /// Every album this computer holds that no cover answers, worst first.
+    ///
+    /// See [`missing_albums`] for what "worst" means.
+    pub fn missing_albums(&self, limit: usize) -> Result<Vec<CoverGap>, String> {
+        let connection = crate::open_connection(&self.db_path)?;
+        missing_albums(&connection, limit)
     }
 
     /// What the worker would act on right now, capped for display.
@@ -382,6 +513,8 @@ impl CoverPublisher {
         };
 
         let mut throttle_streak = 0u32;
+        // Why this pass ended early, when it did. Empty means it finished.
+        let mut stop = String::new();
         for candidate in &candidates {
             // The switches may have been turned off, or a stop asked for, while
             // this pass was running.
@@ -411,21 +544,36 @@ impl CoverPublisher {
                         Considered::NoArt => self.tally(|status| status.no_art += 1),
                     }
                 }
-                Err(LookupError::Throttled { retry_after }) => {
+                // A refusal and an unanswered request are the same message from
+                // the service — slow down — so they get the same answer: wait,
+                // and do not write the album off. Only the words differ, and the
+                // words matter when a person is reading them.
+                Err(error @ (LookupError::Throttled { .. } | LookupError::Unanswered { .. })) => {
+                    let retry_after = match &error {
+                        LookupError::Throttled { retry_after } => *retry_after,
+                        _ => None,
+                    };
                     throttle_streak += 1;
-                    let delay = throttle_delay(throttle_streak, retry_after);
+                    let (delay, given_up) = hold_decision(throttle_streak, retry_after);
                     // Remember the pause, so a later pass does not walk straight
                     // back into the same refusal.
                     self.park(&candidate.key, delay);
                     if let Ok(mut status) = self.status.lock() {
                         status.backed_off += 1;
-                        status.message = format!(
-                            "MusicBrainz asked Napstr to slow down; waiting {}s",
-                            delay.as_secs()
-                        );
+                        status.message =
+                            format!("{}; waiting {}s", describe_lookup_error(error), delay.as_secs());
                     }
                     self.report();
                     tokio::time::sleep(delay).await;
+                    // Waiting is polite; waiting all evening is not. The albums
+                    // left stay pending, so the next pass resumes rather than
+                    // restarts, and nothing is written off.
+                    if given_up {
+                        stop = format!(
+                            "MusicBrainz has not answered {throttle_streak} times in a row; stopping this pass. Everything left is still waiting."
+                        );
+                        break;
+                    }
                 }
                 Err(LookupError::Failed(message)) => {
                     // A transient fault is not worth retrying immediately, so
@@ -442,7 +590,7 @@ impl CoverPublisher {
             }
             self.tick();
         }
-        self.finish(String::new());
+        self.finish(stop);
     }
 
     /// End a pass: state what happened, and say plainly when nothing was ready.
@@ -513,24 +661,62 @@ impl CoverPublisher {
                 {
                     return Ok(Considered::AlreadyCovered);
                 }
-                match resolve(client, candidate).await? {
-                    Some(resolution) => {
+                match resolve(client, candidate).await {
+                    Ok(Some(resolution)) => {
+                        self.log(candidate, "found", &resolution.source, "");
                         self.record(&candidate.key, Some(&resolution))?;
                         resolution
                     }
                     // MusicBrainz has nothing today. If this computer already
                     // holds art for the album, keep it: one unhelpful answer is
                     // no reason to throw away a working picture.
-                    None => match self.stored_art(&candidate.key)? {
-                        Some(previous) => {
-                            self.record(&candidate.key, Some(&previous))?;
-                            previous
+                    Ok(None) => {
+                        self.log(candidate, "none", "", "no art in any source");
+                        match self.stored_art(&candidate.key)? {
+                            Some(previous) => {
+                                self.record(&candidate.key, Some(&previous))?;
+                                previous
+                            }
+                            None => {
+                                self.record(&candidate.key, None)?;
+                                return Ok(Considered::NoArt);
+                            }
                         }
-                        None => {
-                            self.record(&candidate.key, None)?;
-                            return Ok(Considered::NoArt);
-                        }
-                    },
+                    }
+                    // The reason is written down here, once, because this is the
+                    // only moment it exists: the cache keeps the verdict and the
+                    // parking, and nothing else keeps the cause.
+                    Err(LookupError::Throttled { retry_after }) => {
+                        self.log(
+                            candidate,
+                            "throttled",
+                            "",
+                            &match retry_after {
+                                Some(delay) => format!("asked to wait {}s", delay.as_secs()),
+                                None => "asked to wait".into(),
+                            },
+                        );
+                        return Err(LookupError::Throttled { retry_after });
+                    }
+                    // Logged as its own outcome, because "the service is busy"
+                    // and "this album is wrong" are different things to see in a
+                    // list, and only one of them is the album's problem.
+                    Err(error @ LookupError::Unanswered { waited }) => {
+                        self.log(
+                            candidate,
+                            "slow",
+                            "",
+                            &format!("no answer within {}s", waited.as_secs()),
+                        );
+                        return Err(error);
+                    }
+                    Err(LookupError::Failed(message)) => {
+                        // Parking is the pass loop's business: it happens once,
+                        // for every failure including the ones this function
+                        // never sees.
+                        self.log(candidate, "failed", "", &message);
+                        return Err(LookupError::Failed(message));
+                    }
                 }
             }
         };
@@ -624,6 +810,94 @@ impl CoverPublisher {
     }
 }
 
+/// An album this computer holds that no cover answers, and what is known about
+/// why.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoverGap {
+    pub key: String,
+    pub artist: String,
+    pub album: String,
+    pub tracks: usize,
+    /// `failed`, `not_looked_up`, `no_art` or `resolved_here`.
+    pub state: String,
+    /// Where the album came from: `library` for one this computer holds.
+    pub source: String,
+    /// The most recent reason recorded for it, when there is one.
+    pub note: String,
+}
+
+/// Every album this computer holds that no `30427` answers, worst first.
+///
+/// "Worst" is `failed`, then never asked, then a considered "nobody has this",
+/// then one this computer resolved for itself and nobody has signed. A failure
+/// comes first because it is the state that hides work: an album parked after a
+/// transport error looks exactly like an album nobody has art for, and the order
+/// is the only thing that tells them apart in a list.
+///
+/// A claim from anybody takes an album off the list, including another author's:
+/// the question is which albums have no kind `30427`, not which ones this
+/// computer signed.
+fn missing_albums(connection: &rusqlite::Connection, limit: usize) -> Result<Vec<CoverGap>, String> {
+    let claimed = stored_cover_keys(connection)?;
+    let outcomes = cover::lookup_outcomes(connection)?;
+    let messages = cover::last_lookup_messages(connection)?;
+    let mut gaps = Vec::new();
+    for (key, artist, album, tracks, source) in library_albums(connection)? {
+        if claimed.contains(&key) {
+            continue;
+        }
+        let outcome = outcomes.get(&key).map(String::as_str).unwrap_or("");
+        let state = match outcome {
+            "error" => "failed",
+            "none" => "no_art",
+            // This computer holds a picture for it and nobody has signed a
+            // claim: the album is not missing art, it is missing a `30427`, and
+            // that is a publishing decision rather than a lookup to make.
+            "found" => "resolved_here",
+            // Never asked.
+            _ => "not_looked_up",
+        };
+        gaps.push(CoverGap {
+            note: messages.get(&key).cloned().unwrap_or_default(),
+            key,
+            artist,
+            album,
+            tracks,
+            state: state.into(),
+            source: source.to_string(),
+        });
+    }
+    gaps.sort_by(|left, right| {
+        (
+            rank_of_state(&left.state),
+            left.artist.to_lowercase(),
+            left.album.to_lowercase(),
+        )
+            .cmp(&(
+                rank_of_state(&right.state),
+                right.artist.to_lowercase(),
+                right.album.to_lowercase(),
+            ))
+    });
+    gaps.truncate(limit.clamp(1, MAX_MISSING_LIST));
+    Ok(gaps)
+}
+
+/// How badly an album wants looking at, for sorting.
+///
+/// A failure first, because it is the state that hides work. "Already resolved
+/// here" last, because it is the one state where the reader is looking at a
+/// publishing decision rather than missing art.
+fn rank_of_state(state: &str) -> u8 {
+    match state {
+        "failed" => 0,
+        "not_looked_up" => 1,
+        "no_art" => 2,
+        _ => 3,
+    }
+}
+
 /// What one album produced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Considered {
@@ -642,8 +916,61 @@ enum Considered {
 enum LookupError {
     /// MusicBrainz or the archive asked this client to slow down.
     Throttled { retry_after: Option<Duration> },
+    /// The request was sent and no answer came back in time.
+    ///
+    /// A separate case from failure because it is not an answer about the album:
+    /// a service that queues behind a busy queue is telling the client the same
+    /// thing a 503 is, and the client's response — wait, do not write the album
+    /// off — is the same too. Only the words are different, and the words matter
+    /// when a person is reading them.
+    Unanswered { waited: Duration },
     /// Anything else that stopped this album being resolved.
     Failed(String),
+}
+
+/// A transport failure, with the cause reqwest keeps inside it.
+///
+/// `reqwest::Error`'s own Display is `error sending request for url (…)` and
+/// nothing else. That is what a person was shown a screenful of while
+/// MusicBrainz was unreachable: the URL they already knew, and no reason. The
+/// reason is in the source chain — a DNS failure, a TLS failure, a connection
+/// reset, a timeout — and it is the only part worth reading, so it is appended
+/// rather than replaced.
+fn request_error(what: &str, error: &reqwest::Error) -> LookupError {
+    LookupError::Failed(format!("{what}: {}", describe_causes(error)))
+}
+
+/// Every cause in an error's chain, outermost first, without duplicates.
+fn describe_causes(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut current = Some(error);
+    while let Some(step) = current {
+        let text = step.to_string();
+        // A cause that repeats its parent says nothing new.
+        if !text.trim().is_empty() && parts.last() != Some(&text) {
+            parts.push(text);
+        }
+        current = step.source();
+    }
+    parts.join(" \u{2192} ")
+}
+
+/// A MusicBrainz request that failed, with a timeout read as back-pressure.
+///
+/// A request that was sent and never answered is not an answer about the album.
+/// MusicBrainz queues behind its own load, so the honest reading of a timeout is
+/// "the service is busy", and the honest response is to wait rather than to
+/// write the album off — see [`MUSICBRAINZ_TIMEOUT`] for what was measured.
+fn musicbrainz_error(error: &reqwest::Error) -> LookupError {
+    if error.is_timeout() {
+        return LookupError::Unanswered {
+            waited: MUSICBRAINZ_TIMEOUT,
+        };
+    }
+    LookupError::Failed(format!(
+        "MusicBrainz lookup failed: {}",
+        describe_causes(error)
+    ))
 }
 
 /// How an HTTP status should be read.
@@ -688,6 +1015,44 @@ fn classify(
         };
     }
     Answer::Failed(format!("{host} answered {status}"))
+}
+
+/// What to do about one album that could not be looked up, and whether it ends
+/// the pass.
+///
+/// Separate from the pass loop so the policy is testable without a publisher, a
+/// database or a network: the waits grow to minutes, and a pass that grinds
+/// through an evening of them is worse than one that stops and says why.
+fn hold_decision(streak: u32, retry_after: Option<Duration>) -> (Duration, bool) {
+    (
+        throttle_delay(streak, retry_after),
+        streak >= MAX_CONSECUTIVE_HOLDS,
+    )
+}
+
+/// Reserve the next MusicBrainz slot and wait for it.
+///
+/// The pace lives here rather than at each call site because three of them make
+/// MusicBrainz requests — the automatic search, the release-group fallback and
+/// the manual tool — and callers that each wait their own turn still collide
+/// with each other. A collision is precisely the burst a queue-based limiter
+/// punishes, and the punishment is the delay this exists to avoid.
+///
+/// The reservation is taken under the lock and the sleeping happens outside it,
+/// so concurrent callers come out one interval apart rather than all at once.
+static MUSICBRAINZ_PACE: std::sync::OnceLock<tokio::sync::Mutex<Option<Instant>>> =
+    std::sync::OnceLock::new();
+
+async fn pace_musicbrainz() {
+    let pace = MUSICBRAINZ_PACE.get_or_init(|| tokio::sync::Mutex::new(None));
+    let now = Instant::now();
+    let slot = {
+        let mut next = pace.lock().await;
+        let slot = next.map_or(now, |allowed| allowed.max(now));
+        *next = Some(slot + REQUEST_INTERVAL);
+        slot
+    };
+    tokio::time::sleep(slot.saturating_duration_since(Instant::now())).await;
 }
 
 /// `Retry-After` is either delta-seconds or an HTTP date. Only the numeric form
@@ -883,15 +1248,94 @@ struct CoverArtThumbnails {
 }
 
 /// Ask MusicBrainz for the release group, then the Cover Art Archive for its
-/// front image. `Ok(None)` is a considered answer: this album has no art there.
+/// front image, then Apple's catalogue when the archive comes back empty.
+/// `Ok(None)` is a considered answer: nobody this computer can reach has art.
 ///
 /// A 503 or 429 comes back as [`LookupError::Throttled`] rather than a plain
 /// failure, because the caller's correct response is to wait, not to give up or
 /// to try the next album immediately.
+///
+/// The identifier is MusicBrainz's wherever there is one, even when the picture
+/// comes from Apple: the release group is what was identified, and a claim that
+/// names it is one a reader can follow. Where MusicBrainz has no matching group
+/// at all, the claim is published with `mbid` empty rather than with a guess.
 async fn resolve(
     client: &reqwest::Client,
     candidate: &CoverCandidate,
 ) -> Result<Option<ArtLookup>, LookupError> {
+    let mut lookup = ArtLookup {
+        key: candidate.key.clone(),
+        source: "musicbrainz".into(),
+        ..ArtLookup::default()
+    };
+    // Only a release group whose title really is this album is worth publishing:
+    // a cover on the wrong record is worse than a blank square. Among those,
+    // the album itself is the one a music library means.
+    //
+    // A MusicBrainz that cannot be reached is not an answer about this album. It
+    // used to end the lookup, which turned a flaky connection into "no art" —
+    // the second source is a different service and may well be reachable, so a
+    // transport failure is carried past this step rather than returned from it.
+    // A refusal to be asked at all (429/503) is honoured, because that is a
+    // request to stop asking.
+    let mut unreachable = String::new();
+    let identified = match resolve_release_group(client, candidate).await {
+        Ok(group) => group,
+        Err(LookupError::Failed(message)) => {
+            unreachable = message;
+            None
+        }
+        Err(refused) => return Err(refused),
+    };
+    if let Some(group) = identified {
+        lookup.mbid = group.id.clone();
+        lookup.year = group.first_release_date.chars().take(4).collect();
+        lookup.collection = group.title.clone();
+        if let Some((art, thumb, _)) = archive_lookup(client, &group.id).await? {
+            lookup.art = art;
+            lookup.thumb = thumb;
+            return Ok(Some(lookup));
+        }
+    }
+    // The archive has nothing for this record — the ordinary case for a record
+    // nobody has scanned, and the case a volunteer archive can never fix by
+    // being asked differently. Apple sells a great many of them, so it is asked
+    // before this computer decides the album has no art at all.
+    let cover = itunes_lookup(client, &candidate.artist, &candidate.album).await;
+    // Nothing from Apple *and* nothing from MusicBrainz is not a considered
+    // answer: one of the two was never really asked. Reported as a failure, so
+    // the album is retried in a quarter of an hour rather than written off for a
+    // fortnight.
+    let Some(cover) = (match cover {
+        Ok(found) => found,
+        Err(LookupError::Failed(_)) if !unreachable.is_empty() => None,
+        Err(error) => return Err(error),
+    }) else {
+        return if unreachable.is_empty() {
+            Ok(None)
+        } else {
+            Err(LookupError::Failed(unreachable))
+        };
+    };
+    lookup.art = cover.art;
+    lookup.thumb = cover.thumb;
+    lookup.source = "itunes".into();
+    // Apple's own name and year are only used where MusicBrainz had neither:
+    // seeded from a real release group, that group's title is the better answer.
+    if lookup.collection.is_empty() {
+        lookup.collection = cover.title;
+    }
+    if lookup.year.is_empty() {
+        lookup.year = cover.year;
+    }
+    Ok(Some(lookup))
+}
+
+/// The release group MusicBrainz holds for this album, if it holds one.
+async fn resolve_release_group(
+    client: &reqwest::Client,
+    candidate: &CoverCandidate,
+) -> Result<Option<MusicBrainzGroup>, LookupError> {
     let query = default_query(&candidate.artist, &candidate.album);
     // Encoded through `Url` rather than `RequestBuilder::query`, which reqwest
     // 0.13 puts behind its `query` feature. This needs no extra dependency and
@@ -903,11 +1347,13 @@ async fn resolve(
         .append_pair("query", &query)
         .append_pair("fmt", "json")
         .append_pair("limit", "10");
+    pace_musicbrainz().await;
     let search = client
         .get(search_url)
+        .timeout(MUSICBRAINZ_TIMEOUT)
         .send()
         .await
-        .map_err(|error| LookupError::Failed(format!("MusicBrainz lookup failed: {error}")))?;
+        .map_err(|error| musicbrainz_error(&error))?;
     match classify(
         search.status(),
         retry_after_header(&search),
@@ -925,27 +1371,7 @@ async fn resolve(
         .json()
         .await
         .map_err(|error| LookupError::Failed(format!("MusicBrainz sent something unreadable: {error}")))?;
-    // Only a release group whose title really is this album is worth publishing:
-    // a cover on the wrong record is worse than a blank square. Among those,
-    // the album itself is the one a music library means.
-    let Some(group) = best_release_group(&found.release_groups, &candidate.album, &candidate.artist)
-        .cloned()
-    else {
-        return Ok(None);
-    };
-
-    let Some((art, thumb, _)) = archive_lookup(client, &group.id).await? else {
-        return Ok(None);
-    };
-    Ok(Some(ArtLookup {
-        key: candidate.key.clone(),
-        art,
-        thumb,
-        mbid: group.id,
-        year: group.first_release_date.chars().take(4).collect(),
-        collection: group.title,
-        source: "musicbrainz".into(),
-    }))
+    Ok(best_release_group(&found.release_groups, &candidate.album, &candidate.artist).cloned())
 }
 
 /// The MusicBrainz query Napstr asks for an album.
@@ -1133,7 +1559,7 @@ async fn archive_image(
         .get(format!("https://coverartarchive.org/{path}"))
         .send()
         .await
-        .map_err(|error| LookupError::Failed(format!("Cover Art Archive lookup failed: {error}")))?;
+        .map_err(|error| request_error("Cover Art Archive lookup failed", &error))?;
     match classify(
         response.status(),
         retry_after_header(&response),
@@ -1161,9 +1587,9 @@ async fn archive_lookup_via_releases(
     client: &reqwest::Client,
     mbid: &str,
 ) -> Result<Option<(String, String, bool)>, LookupError> {
-    // This is a second MusicBrainz request for one album, so it waits its turn:
-    // the caller paces one request per album and knows nothing about this one.
-    tokio::time::sleep(REQUEST_INTERVAL).await;
+    // This is a second MusicBrainz request for one album, so it waits its turn —
+    // [`pace_musicbrainz`] is what makes that true, and it is why there is no
+    // sleep here: two sleeps would pace this call twice and nothing else once.
     let mut url = reqwest::Url::parse(&format!(
         "https://musicbrainz.org/ws/2/release-group/{mbid}"
     ))
@@ -1171,11 +1597,13 @@ async fn archive_lookup_via_releases(
     url.query_pairs_mut()
         .append_pair("inc", "releases")
         .append_pair("fmt", "json");
+    pace_musicbrainz().await;
     let response = client
         .get(url)
+        .timeout(MUSICBRAINZ_TIMEOUT)
         .send()
         .await
-        .map_err(|error| LookupError::Failed(format!("MusicBrainz lookup failed: {error}")))?;
+        .map_err(|error| musicbrainz_error(&error))?;
     match classify(
         response.status(),
         retry_after_header(&response),
@@ -1242,7 +1670,7 @@ async fn archive_lookup_via_archive_org(
         ))
         .send()
         .await
-        .map_err(|error| LookupError::Failed(format!("Cover Art Archive lookup failed: {error}")))?;
+        .map_err(|error| request_error("Cover Art Archive lookup failed", &error))?;
     let Some(location) = response
         .headers()
         .get(reqwest::header::LOCATION)
@@ -1257,7 +1685,7 @@ async fn archive_lookup_via_archive_org(
         .get(format!("https://archive.org/metadata/{item}"))
         .send()
         .await
-        .map_err(|error| LookupError::Failed(format!("archive.org lookup failed: {error}")))?
+        .map_err(|error| request_error("archive.org lookup failed", &error))?
         .json()
         .await
         .map_err(|error| {
@@ -1281,6 +1709,196 @@ async fn archive_lookup_via_archive_org(
         .then(|| format!("{base}/{smaller}"))
         .unwrap_or_default();
     Ok(Some((art, thumb, true)))
+}
+
+// ---------------------------------------------------------------------------
+// The second source: Apple's catalogue
+// ---------------------------------------------------------------------------
+
+/// A front cover from the iTunes catalogue, with the name it was filed under.
+#[derive(Debug, Clone, Default)]
+struct ItunesCover {
+    /// The 1200-pixel rendition, or whatever Apple named if it is not the
+    /// usual shape.
+    art: String,
+    thumb: String,
+    /// The album's own name, with Apple's `- Single` marker removed.
+    title: String,
+    /// The year Apple files it under.
+    year: String,
+    /// Apple's collection id, so a person can be shown where the art came from.
+    collection_id: String,
+}
+
+impl ItunesCover {
+    /// The id this hit is keyed by in the picker, and never a MusicBrainz id:
+    /// publishing Apple's collection id as an MBID would be a lie a reader
+    /// could follow somewhere real.
+    fn id(&self) -> String {
+        format!("itunes:{}", self.collection_id)
+    }
+}
+
+#[derive(Deserialize)]
+struct ItunesSearch {
+    #[serde(default)]
+    results: Vec<ItunesResult>,
+}
+
+#[derive(Deserialize, Clone, Default)]
+struct ItunesResult {
+    #[serde(default, rename = "collectionId")]
+    collection_id: i64,
+    #[serde(default, rename = "collectionName")]
+    collection_name: String,
+    #[serde(default, rename = "artistName")]
+    artist_name: String,
+    #[serde(default, rename = "artworkUrl100")]
+    artwork_url: String,
+    #[serde(default, rename = "releaseDate")]
+    release_date: String,
+}
+
+impl ItunesResult {
+    /// The album's own name, without the marker Apple appends to a single.
+    ///
+    /// Apple files a one-track release as `Annihilation - Single`, and a
+    /// comparison against a tag reading `Annihilation` fails on that suffix
+    /// alone. `collectionType` does not help: it is `Album` for a single too.
+    fn title(&self) -> String {
+        let name = self.collection_name.trim();
+        for suffix in [" - Single", " - EP"] {
+            if name.len() > suffix.len()
+                && name.to_ascii_lowercase().ends_with(&suffix.to_ascii_lowercase())
+            {
+                return name[..name.len() - suffix.len()].trim().to_string();
+            }
+        }
+        name.to_string()
+    }
+
+    fn cover(&self) -> ItunesCover {
+        ItunesCover {
+            art: itunes_rendition(&self.artwork_url, ITUNES_FULL_RENDITION),
+            thumb: itunes_rendition(&self.artwork_url, ITUNES_THUMB_RENDITION),
+            title: self.title(),
+            year: self.release_date.chars().take(4).collect(),
+            collection_id: self.collection_id.to_string(),
+        }
+    }
+}
+
+/// Apple's artwork URL at the size a cover wants.
+///
+/// Every artwork URL ends in the rendition, `…/827568018151.jpg/100x100bb.jpg`,
+/// and the file path above it is the same one whatever size is asked for. Only
+/// that shape is rewritten: an address Apple formats some other way is left
+/// exactly as it was rather than mangled into something that does not resolve.
+fn itunes_rendition(artwork_url: &str, rendition: &str) -> String {
+    let trimmed = artwork_url.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    // Apple's samples are all `https://`, but a claim may only carry HTTPS, so
+    // a `http://` one is repaired rather than discarded.
+    let upgraded = match trimmed.strip_prefix("http://") {
+        Some(rest) => format!("https://{rest}"),
+        None if trimmed.starts_with("https://") => trimmed.to_string(),
+        None => return String::new(),
+    };
+    let Some(cut) = upgraded.rfind('/') else {
+        return upgraded;
+    };
+    let last = &upgraded[cut + 1..];
+    if !last.ends_with("bb.jpg") {
+        return upgraded;
+    }
+    format!("{}/{rendition}", &upgraded[..cut])
+}
+
+/// The result a music library means, among what Apple offered.
+///
+/// There is no identifier to match on, so both halves of the name have to agree:
+/// a title that is this album's, and an artist credit naming somebody the tag
+/// names. `Annihilation` has namesakes, and returning the wrong one puts a
+/// stranger's sleeve on a record, which is worse than returning nothing.
+fn best_itunes_result<'a>(
+    results: &'a [ItunesResult],
+    album: &str,
+    artist: &str,
+) -> Option<&'a ItunesResult> {
+    let wanted = artist_names(artist);
+    results
+        .iter()
+        .filter(|result| !result.artwork_url.trim().is_empty() && alike(&result.title(), album))
+        .enumerate()
+        .min_by_key(|(position, result)| {
+            let credited = artist_names(&result.artist_name);
+            (
+                // The tag names the artist; a result credited to somebody else
+                // is a different record that happens to share the name.
+                u8::from(
+                    !wanted
+                        .iter()
+                        .any(|name| credited.iter().any(|credit| alike(credit, name))),
+                ),
+                // An exact title beats Apple's longer edition names, so
+                // `Annihilation` wins over `Annihilation (Remixes)`.
+                u8::from(fold_title(&result.title()) != fold_title(album)),
+                // Anything still tied keeps Apple's own relevance order.
+                *position,
+            )
+        })
+        .map(|(_, result)| result)
+}
+
+/// Ask the iTunes catalogue for this album's art.
+///
+/// `Ok(None)` is a considered answer — Apple does not sell this record, or what
+/// it offered named a different artist — and the caller treats it exactly like
+/// the archive's own "nobody has scanned this".
+async fn itunes_lookup(
+    client: &reqwest::Client,
+    artist: &str,
+    album: &str,
+) -> Result<Option<ItunesCover>, LookupError> {
+    // Paced on its own interval, which does not count against MusicBrainz's: the
+    // archive has already been asked by the time this runs.
+    tokio::time::sleep(ITUNES_INTERVAL).await;
+    let mut url = reqwest::Url::parse(ITUNES_SEARCH_ENDPOINT)
+        .map_err(|error| LookupError::Failed(format!("could not build the iTunes query: {error}")))?;
+    // The name, not a Lucene query: Apple's search is a plain text match, so the
+    // album and the artist are simply offered to it together.
+    let term = format!("{} {}", album.trim(), artist.trim());
+    url.query_pairs_mut()
+        .append_pair("term", term.trim())
+        .append_pair("entity", "album")
+        .append_pair("limit", &ITUNES_RESULT_LIMIT.to_string());
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| request_error("iTunes lookup failed", &error))?;
+    match classify(
+        response.status(),
+        retry_after_header(&response),
+        "iTunes",
+        // A 404 from a search endpoint means it moved, not that this album has
+        // no art, so it must not be remembered as a considered answer.
+        false,
+    ) {
+        Answer::Success => {}
+        Answer::NotFound => return Ok(None),
+        Answer::Throttled { retry_after } => return Err(LookupError::Throttled { retry_after }),
+        Answer::Failed(message) => return Err(LookupError::Failed(message)),
+    }
+    let found: ItunesSearch = response
+        .json()
+        .await
+        .map_err(|error| LookupError::Failed(format!("iTunes sent something unreadable: {error}")))?;
+    Ok(best_itunes_result(&found.results, album, artist)
+        .map(ItunesResult::cover)
+        .filter(|cover| !cover.art.is_empty()))
 }
 
 /// The item and the file one Cover Art Archive redirect points at.
@@ -1314,11 +1932,13 @@ async fn search_groups(
         .append_pair("query", query)
         .append_pair("fmt", "json")
         .append_pair("limit", "10");
+    pace_musicbrainz().await;
     let response = client
         .get(url)
+        .timeout(MUSICBRAINZ_TIMEOUT)
         .send()
         .await
-        .map_err(|error| LookupError::Failed(format!("MusicBrainz lookup failed: {error}")))?;
+        .map_err(|error| musicbrainz_error(&error))?;
     match classify(
         response.status(),
         retry_after_header(&response),
@@ -1340,6 +1960,10 @@ async fn search_groups(
 fn describe_lookup_error(error: LookupError) -> String {
     match error {
         LookupError::Failed(message) => message,
+        LookupError::Unanswered { waited } => format!(
+            "MusicBrainz did not answer within {}s \u{2014} the service is busy, so this album is still waiting",
+            waited.as_secs()
+        ),
         LookupError::Throttled { retry_after } => match retry_after {
             Some(delay) => format!(
                 "MusicBrainz asked Napstr to slow down \u{2014} try again in about {} seconds",
@@ -1354,7 +1978,7 @@ fn describe_lookup_error(error: LookupError) -> String {
 // Choosing art by hand
 // ---------------------------------------------------------------------------
 
-/// One release group MusicBrainz offered, with the art the archive holds for it.
+/// One candidate for this album's art, from either of the two sources.
 ///
 /// The automatic choice ranks by primary type and an exact title, which is right
 /// far more often than not but cannot know that a person meant a different
@@ -1362,7 +1986,14 @@ fn describe_lookup_error(error: LookupError) -> String {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CoverSearchHit {
+    /// What the row is keyed by in the window. It is *not* always an MBID: an
+    /// iTunes row is keyed by Apple's collection id, because there is no
+    /// MusicBrainz release group for it and inventing one would be a lie.
+    pub id: String,
+    /// The release-group MBID, empty when the art is not from MusicBrainz.
     pub mbid: String,
+    /// `musicbrainz` or `itunes`.
+    pub source: String,
     pub title: String,
     /// The primary type, with any `Live`/`Compilation` markers after it.
     pub types: String,
@@ -1392,6 +2023,15 @@ pub struct CoverManualPick {
     /// The release group title, published as `collection`.
     pub title: String,
     pub year: String,
+    /// `hit` for a row this computer offered, `url` for a link a person typed.
+    /// A typed link is the one case where the art domain list is enforced, so a
+    /// window that omits this field is treated as a hit rather than as a link.
+    #[serde(default = "default_pick_source")]
+    pub source: String,
+}
+
+fn default_pick_source() -> String {
+    "hit".into()
 }
 
 /// What applying a pick did.
@@ -1467,7 +2107,9 @@ impl CoverPublisher {
             }
             hits.push(CoverSearchHit {
                 chosen: chosen.as_deref() == Some(group.id.as_str()),
+                id: group.id.clone(),
                 mbid: group.id,
+                source: "musicbrainz".into(),
                 title: group.title,
                 types: types
                     .trim_matches(|character: char| character == ' ' || character == '\u{b7}')
@@ -1480,6 +2122,47 @@ impl CoverPublisher {
                 note,
             });
         }
+        // The second source, always asked, because the question this tool
+        // answers is "what art exists for this album" and not "what does
+        // MusicBrainz think". Apple's answer is matched on the album and artist
+        // names alone, so it is offered with no MBID and is never marked as the
+        // automatic choice: the automatic lookup only falls back to it when the
+        // archive is empty, which is not something this list can know.
+        match itunes_lookup(&client, artist, album).await {
+            Ok(Some(cover)) => hits.push(CoverSearchHit {
+                chosen: false,
+                id: cover.id(),
+                mbid: String::new(),
+                source: "itunes".into(),
+                title: cover.title,
+                types: "matched by name".into(),
+                year: cover.year,
+                score: 0,
+                art: cover.art,
+                thumb: cover.thumb,
+                front: true,
+                note: String::new(),
+            }),
+            Ok(None) => {}
+            // The second source failing is worth a row of its own rather than a
+            // silently shorter list: "Apple was not reachable" and "Apple does
+            // not sell this" look identical in a list that only shows what
+            // worked, and the first one is worth pressing Fire again for.
+            Err(error) => hits.push(CoverSearchHit {
+                chosen: false,
+                id: "itunes:unavailable".into(),
+                mbid: String::new(),
+                source: "itunes".into(),
+                title: album.trim().to_string(),
+                types: "not reachable".into(),
+                year: String::new(),
+                score: 0,
+                art: String::new(),
+                thumb: String::new(),
+                front: false,
+                note: describe_lookup_error(error),
+            }),
+        }
         Ok(hits)
     }
 
@@ -1488,12 +2171,29 @@ impl CoverPublisher {
     /// The key is computed from display metadata exactly as the automatic lookup
     /// computes it, so the `d` tag matches what a lookup would have produced and
     /// the claim is found again by anybody filtering on that key.
+    ///
+    /// A link a person typed is the one path where art arrives from an address
+    /// nobody vouched for, so it is also the one path the art domain list gates.
+    /// The list is a filter, not a boundary — the person configuring it is the
+    /// person it protects — and it deliberately does not apply to art this
+    /// computer looked up itself, which would break a list that omits the
+    /// sources Napstr uses on purpose.
     pub async fn apply_pick(&self, pick: CoverManualPick) -> Result<CoverPickResult, String> {
         let key = cover::cover_key(&pick.artist, &pick.album)
             .ok_or("this album has no addressable cover key")?;
         let art = pick.art.trim().to_string();
         if !art.starts_with("https://") {
             return Err("a cover needs an HTTPS image URL".into());
+        }
+        if pick.source.eq_ignore_ascii_case("url") {
+            let connection = crate::open_connection(&self.db_path)?;
+            let hosts = cover::allowed_art_hosts(&connection);
+            if !cover::art_host_allowed(&hosts, &art) {
+                let host = cover::art_url_host(&art).unwrap_or_else(|| art.clone());
+                return Err(format!(
+                    "{host} is not on the list of art domains this computer accepts. Add it in the Covers tab first."
+                ));
+            }
         }
         let lookup = ArtLookup {
             key: key.clone(),
@@ -1595,6 +2295,58 @@ fn read_preferences(db_path: &Path) -> Result<CoverPreferences, String> {
         lookup_external: read_flag(&connection, SETTING_LOOKUP_EXTERNAL),
         publish_claims: read_flag(&connection, SETTING_PUBLISH_CLAIMS),
     })
+}
+
+/// Forget "nobody has art for this" answers given before a second source
+/// existed.
+///
+/// `none` means "everything this computer asks was asked, and nothing came
+/// back", and it is trusted for [`cover::ART_NONE_LIFETIME_SECONDS`]. That is
+/// the right answer to keep — asking MusicBrainz the same question twice a day
+/// is rude and pointless — but only while "everything this computer asks" means
+/// the same thing. Once Apple's catalogue is part of the search, an older
+/// verdict was reached without it, and leaving those rows alone is what would
+/// make an album Napstr can now cover keep drawing a blank square until the
+/// fortnight ran out.
+///
+/// Guarded by its own marker rather than by a schema version, so it happens
+/// exactly once per database and rows written after it keep their full life. A
+/// parked failure is deliberately left alone: it is a fifteen-minute retry, not
+/// a verdict, and it expires on its own.
+fn forget_answers_from_before_the_second_source(
+    connection: &rusqlite::Connection,
+) -> Result<usize, String> {
+    if read_flag(connection, SETTING_SECOND_SOURCE_STARTED) {
+        return Ok(0);
+    }
+    let cleared = connection
+        .execute("DELETE FROM album_art_lookups WHERE outcome='none'", [])
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, '1')",
+            params![SETTING_SECOND_SOURCE_STARTED],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(cleared)
+}
+
+/// The art domain list exactly as it is stored, for showing back in the box.
+///
+/// Read as text rather than normalized: the stored value is already normalized
+/// by [`CoverPublisher::set_allowed_art_hosts`], and a row written by an older
+/// build should look like what it is.
+fn read_allowed_art_hosts(db_path: &Path) -> Result<String, String> {
+    let connection = crate::open_connection(db_path)?;
+    let stored = connection
+        .query_row(
+            "SELECT value FROM settings WHERE key=?1",
+            [cover::SETTING_ALLOWED_ART_HOSTS],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    Ok(stored.unwrap_or_default().trim().to_string())
 }
 
 fn read_flag(connection: &rusqlite::Connection, key: &str) -> bool {
@@ -2038,6 +2790,416 @@ mod tests {
         );
     }
 
+    #[test]
+    fn apple_names_a_cover_the_archive_has_none_for() {
+        // Measured, not imagined: this release group answers 404 at the Cover
+        // Art Archive and Apple sells the sleeve. It is why a second source
+        // exists at all.
+        let result: ItunesResult = serde_json::from_str(
+            r#"{"collectionId":1895931386,"collectionName":"Annihilation - Single",
+                "artistName":"KREAM & Korolova","trackCount":1,
+                "releaseDate":"2026-05-22T07:00:00Z","collectionType":"Album",
+                "artworkUrl100":"https://is1-ssl.mzstatic.com/image/thumb/Music211/v4/7b/3e/00/7b3e00e6-bec7-e8cf-b86a-064eed9f87d6/827568018151.jpg/100x100bb.jpg"}"#,
+        )
+        .unwrap();
+        // Apple's `- Single` marker is not part of the album's name, and a
+        // comparison against a tag reading `Annihilation` fails on it alone.
+        assert_eq!(result.title(), "Annihilation");
+        let cover = result.cover();
+        assert_eq!(cover.title, "Annihilation");
+        assert_eq!(cover.year, "2026");
+        // The whole picture, not the 100-pixel thumbnail Apple's search returns.
+        assert!(
+            cover.art.ends_with("/1200x1200bb.jpg"),
+            "the full rendition is what a claim wants: {}",
+            cover.art
+        );
+        assert!(cover.thumb.ends_with("/200x200bb.jpg"), "{}", cover.thumb);
+        assert!(cover.art.starts_with("https://"), "{}", cover.art);
+        // The id is Apple's, and it must never be mistaken for an MBID.
+        assert_eq!(cover.id(), "itunes:1895931386");
+    }
+
+    #[test]
+    fn an_apple_url_of_another_shape_is_left_alone() {
+        // Apple's artwork URLs end in the rendition, and only that shape is
+        // rewritten. Anything else is returned as it arrived rather than
+        // mangled into an address that does not resolve.
+        assert_eq!(
+            itunes_rendition("https://example.org/cover.jpg", ITUNES_FULL_RENDITION),
+            "https://example.org/cover.jpg"
+        );
+        // A `http://` one is repaired, because a claim may only carry HTTPS.
+        assert_eq!(
+            itunes_rendition(
+                "http://is1-ssl.mzstatic.com/a/b/1.jpg/100x100bb.jpg",
+                ITUNES_FULL_RENDITION
+            ),
+            "https://is1-ssl.mzstatic.com/a/b/1.jpg/1200x1200bb.jpg"
+        );
+        // Nothing usable is empty, not a half-built URL.
+        assert_eq!(itunes_rendition("", ITUNES_FULL_RENDITION), "");
+        assert_eq!(itunes_rendition("ftp://host/a.jpg", ITUNES_FULL_RENDITION), "");
+    }
+
+    #[test]
+    fn the_apple_result_has_to_name_this_album_and_one_of_its_artists() {
+        let result = |collection: &str, artist: &str| ItunesResult {
+            collection_id: 1,
+            collection_name: collection.to_string(),
+            artist_name: artist.to_string(),
+            artwork_url: "https://is1-ssl.mzstatic.com/x/1.jpg/100x100bb.jpg".to_string(),
+            release_date: "2026-05-22T07:00:00Z".to_string(),
+        };
+        // A namesake by another artist is a different record, and putting its
+        // sleeve on this one is worse than leaving the square blank.
+        let offered = vec![
+            result("Annihilation", "Some Tribute Band"),
+            result("Annihilation", "KREAM & Korolova"),
+            result("Annihilation (Remixes)", "KREAM & Korolova"),
+        ];
+        let picked = best_itunes_result(&offered, "Annihilation", "KREAM / Korolova")
+            .expect("the record the tag means is in there");
+        assert_eq!(picked.artist_name, "KREAM & Korolova");
+        assert_eq!(picked.title(), "Annihilation");
+
+        // A tag that joins its artists differently still matches: the words of
+        // the credited names are what agree, not the punctuation.
+        assert!(best_itunes_result(&offered, "Annihilation", "KREAM, Korolova").is_some());
+        // A result with no artwork is no use whatever it is named.
+        let mut artless = result("Annihilation", "KREAM");
+        artless.artwork_url = String::new();
+        assert!(best_itunes_result(&[artless], "Annihilation", "KREAM").is_none());
+        // And nothing that is not this album is accepted, however Apple ranks it.
+        assert!(best_itunes_result(&offered, "Elation", "KREAM").is_none());
+    }
+
+    #[test]
+    fn a_pasted_link_is_refused_unless_its_host_is_listed() {
+        // The setting is a text box, so a list arrives however a person wrote
+        // it: commas, newlines, capitals, or a wildcard they expect to work.
+        assert_eq!(
+            cover::parse_art_hosts(" CoverArtArchive.org ,\n*.MzStatic.com \n\n archive.org"),
+            vec!["coverartarchive.org", "mzstatic.com", "archive.org"]
+        );
+        // An empty list accepts any host, which is what every library had before
+        // the setting existed.
+        assert!(cover::art_host_allowed(&[], "https://anything.example/a.jpg"));
+        let hosts = cover::parse_art_hosts("archive.org\ncoverartarchive.org");
+        // A listed domain covers its subdomains, which is where the files
+        // actually live.
+        assert!(cover::art_host_allowed(
+            &hosts,
+            "https://ia801509.us.archive.org/2/items/x/a.jpg"
+        ));
+        assert!(cover::art_host_allowed(
+            &hosts,
+            "https://coverartarchive.org/release/x/front"
+        ));
+        // A domain that merely ends in a listed one is not that domain.
+        assert!(!cover::art_host_allowed(&hosts, "https://notarchive.org/a.jpg"));
+        assert!(!cover::art_host_allowed(
+            &hosts,
+            "https://archive.org.evil.example/a.jpg"
+        ));
+        // A link that is not an absolute HTTP address has nothing to check.
+        assert!(!cover::art_host_allowed(&hosts, "/a.jpg"));
+        assert!(!cover::art_host_allowed(&hosts, "data:image/png;base64,AAAA"));
+        // A port and userinfo are not part of the host.
+        assert!(cover::art_host_allowed(
+            &hosts,
+            "https://user@archive.org:8080/a.jpg"
+        ));
+    }
+
+    #[test]
+    fn the_art_host_setting_round_trips_through_the_database() {
+        let connection = cover_database();
+        assert_eq!(cover::allowed_art_hosts(&connection), Vec::<String>::new());
+        connection
+            .execute(
+                "INSERT OR REPLACE INTO settings (key,value) VALUES (?1,?2)",
+                params![cover::SETTING_ALLOWED_ART_HOSTS, "archive.org\nmzstatic.com"],
+            )
+            .unwrap();
+        assert_eq!(
+            cover::allowed_art_hosts(&connection),
+            vec!["archive.org".to_string(), "mzstatic.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_stale_no_art_verdict_is_forgotten_once_there_is_a_second_source() {
+        let connection = cover_database();
+        let found = art_lookup("covered|record", "https://archive.org/front.jpg");
+        // Three answers, and only one of them is a verdict reached without
+        // asking Apple.
+        cover::record_art_lookup(&connection, "quiet|record", cover::ArtLookupOutcome::NoArt)
+            .unwrap();
+        cover::record_art_lookup(
+            &connection,
+            "covered|record",
+            cover::ArtLookupOutcome::Found(&found),
+        )
+        .unwrap();
+        cover::record_art_lookup(
+            &connection,
+            "broken|record",
+            cover::ArtLookupOutcome::Failed {
+                retry_after_seconds: FAILED_LOOKUP_RETRY_SECONDS,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            forget_answers_from_before_the_second_source(&connection).unwrap(),
+            1,
+            "only the verdict reached without the second source is discarded"
+        );
+        // The covered album keeps its art, and the failure keeps its own
+        // fifteen-minute retry rather than being promoted to a verdict.
+        let mut statement = connection
+            .prepare("SELECT cover_key || ':' || outcome FROM album_art_lookups ORDER BY cover_key")
+            .unwrap();
+        let outcomes: Vec<String> = statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(outcomes, vec!["broken|record:error", "covered|record:found"]);
+
+        // It happens once: a "no art" answer recorded after the upgrade is a
+        // verdict on the whole search, and keeps its fortnight.
+        cover::record_art_lookup(&connection, "quiet|record", cover::ArtLookupOutcome::NoArt)
+            .unwrap();
+        assert_eq!(
+            forget_answers_from_before_the_second_source(&connection).unwrap(),
+            0
+        );
+        let suppressed =
+            cover::suppressed_art_keys(&connection, &["quiet|record".to_string()]).unwrap();
+        assert_eq!(suppressed.len(), 1, "the new answer is still in force");
+    }
+
+    #[test]
+    fn the_log_keeps_the_reason_and_explains_the_missing_list() {
+        let connection = cover_database();
+        insert_library_track(&connection, "aa", "Blue Foundation", "Blood Moon");
+        insert_library_track(&connection, "bb", "KREAM", "Annihilation");
+        insert_library_track(&connection, "cc", "Somebody", "Covered");
+        insert_library_track(&connection, "dd", "Nobody", "Scanned");
+        insert_library_track(&connection, "ee", "Quiet", "Held");
+        // One album has a claim from somebody else, so it is not missing a
+        // `30427` and belongs nowhere near this list.
+        connection
+            .execute(
+                "INSERT INTO album_covers(cover_key,source_pubkey,art,thumb,mbid,year,genre,collection,source,cover_file_id,mime,event_id,created_at,deleted,seeder,seen_at)
+                 VALUES('somebody|covered','aa','https://example.com/a.jpg','','','','','','musicbrainz','','','bb',1,0,0,'now')",
+                [],
+            )
+            .unwrap();
+        // One was asked about and has none, one was asked about and this
+        // computer holds the picture, and a lookup fell over on another.
+        cover::record_art_lookup(&connection, "nobody|scanned", cover::ArtLookupOutcome::NoArt)
+            .unwrap();
+        cover::record_art_lookup(
+            &connection,
+            "quiet|held",
+            cover::ArtLookupOutcome::Found(&art_lookup("quiet|held", "https://archive.org/a.jpg")),
+        )
+        .unwrap();
+        cover::record_art_lookup(
+            &connection,
+            "kream|annihilation",
+            cover::ArtLookupOutcome::Failed {
+                retry_after_seconds: FAILED_LOOKUP_RETRY_SECONDS,
+            },
+        )
+        .unwrap();
+        cover::record_lookup_log(
+            &connection,
+            cover::LookupLogEntry {
+                key: "kream|annihilation",
+                artist: "KREAM",
+                album: "Annihilation",
+                outcome: "failed",
+                source: "",
+                message: "MusicBrainz lookup failed: error sending request \u{2192} dns error",
+            },
+        )
+        .unwrap();
+        cover::record_lookup_log(
+            &connection,
+            cover::LookupLogEntry {
+                key: "blue foundation|blood moon",
+                artist: "Blue Foundation",
+                album: "Blood Moon",
+                outcome: "found",
+                source: "itunes",
+                message: "",
+            },
+        )
+        .unwrap();
+
+        let log = cover::recent_lookup_log(&connection, 10).unwrap();
+        assert_eq!(log.len(), 2);
+        // Newest first, with the source that answered kept.
+        assert_eq!(log[0].album, "Blood Moon");
+        assert_eq!(log[0].outcome, "found");
+        assert_eq!(log[0].source, "itunes");
+        assert!(log[1].message.contains("dns error"), "{}", log[1].message);
+
+        let gaps = missing_albums(&connection, 50).unwrap();
+        assert_eq!(
+            gaps.iter().map(|gap| gap.state.as_str()).collect::<Vec<_>>(),
+            // The failure first, then the albums in the order a person cares
+            // about them: work to do, written off, art nobody has signed.
+            vec!["failed", "not_looked_up", "no_art", "resolved_here"]
+        );
+        assert_eq!(gaps[0].album, "Annihilation");
+        assert!(
+            gaps[0].note.contains("dns error"),
+            "the list carries the last reason: {}",
+            gaps[0].note
+        );
+        assert_eq!(gaps[1].artist, "Blue Foundation");
+        assert_eq!(gaps[1].tracks, 1);
+        assert_eq!(gaps[3].album, "Held");
+        // The claimed album is absent, not merely last.
+        assert!(!gaps.iter().any(|gap| gap.album == "Covered"));
+
+        // The reason survives a restart because it is read back from the log, and
+        // the log stays bounded: a pass over a library may not grow it forever.
+        for index in 0..(cover::LOOKUP_LOG_LIMIT + 20) {
+            cover::record_lookup_log(
+                &connection,
+                cover::LookupLogEntry {
+                    key: "blue foundation|blood moon",
+                    artist: "Blue Foundation",
+                    album: "Blood Moon",
+                    outcome: "none",
+                    source: "",
+                    message: &format!("attempt {index}"),
+                },
+            )
+            .unwrap();
+        }
+        let kept: i64 = connection
+            .query_row("SELECT COUNT(*) FROM cover_lookup_log", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(kept, cover::LOOKUP_LOG_LIMIT);
+    }
+
+    /// A transport failure has to say *why*. reqwest's own message is the URL the
+    /// reader already had, and a screenful of those is what sent somebody looking
+    /// for a log page in the first place.
+    #[tokio::test]
+    async fn a_transport_failure_carries_the_cause_that_reqwest_hides() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        // A client that will not wait, against a port nothing listens on: the
+        // failure is a transport one, and nothing here leaves the machine, so
+        // this is not one of the live tests.
+        let client = reqwest::Client::builder()
+            .user_agent(USER_AGENT)
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("a client");
+        let error = client
+            .get("http://127.0.0.1:1/")
+            .send()
+            .await
+            .expect_err("nothing listens on port 1");
+        let LookupError::Failed(message) = request_error("MusicBrainz lookup failed", &error) else {
+            panic!("a transport failure is a failure, not a refusal");
+        };
+        assert!(message.starts_with("MusicBrainz lookup failed: "), "{message}");
+        assert!(
+            message.contains('\u{2192}'),
+            "the cause has to be appended, not left inside the error: {message}"
+        );
+        assert!(
+            message.len() > error.to_string().len(),
+            "reqwest's own message is what was already being shown: {message}"
+        );
+    }
+
+    /// The whole route for the album that started all of this: a release group
+    /// MusicBrainz knows, an archive that has no picture of it, and a sleeve on
+    /// sale at Apple.
+    ///
+    /// Ignored because it needs all three services:
+    /// `cargo test --ignored live_lookup_falls_through -- --nocapture`
+    #[tokio::test]
+    #[ignore = "requires MusicBrainz, the Cover Art Archive and iTunes"]
+    async fn the_live_lookup_falls_through_to_the_second_source() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = cover_http_client().expect("a lookup client");
+        let candidate = CoverCandidate {
+            key: "kream|annihilation".to_string(),
+            artist: "KREAM / Korolova".to_string(),
+            album: "Annihilation".to_string(),
+            track_count: 1,
+            source: "library".to_string(),
+        };
+        let found = resolve(&client, &candidate)
+            .await
+            .expect("the lookup has to answer rather than fail")
+            .expect("Apple sells this single, so the album has a cover");
+        assert_eq!(found.source, "itunes", "the picture came from the second source");
+        // The identifier is still MusicBrainz's: the release group was
+        // identified there, and a reader can follow an MBID and nothing else.
+        assert_eq!(found.mbid, "e8fbaa62-ca7d-4a9b-8f6f-44939b3775f5");
+        assert_eq!(found.collection, "Annihilation");
+        assert_eq!(found.year, "2026");
+        assert!(found.art.contains("mzstatic.com"), "{}", found.art);
+        assert!(found.art.ends_with("/1200x1200bb.jpg"), "{}", found.art);
+        assert_eq!(found.key, candidate.key);
+    }
+
+    /// The live second source against the live iTunes catalogue, for the record the
+    /// archive has no picture of at all.
+    ///
+    /// Ignored because it needs the network:
+    /// `cargo test --ignored live_second_source -- --nocapture`
+    #[tokio::test]
+    #[ignore = "requires the iTunes catalogue"]
+    async fn the_live_second_source_covers_what_the_archive_never_scanned() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = cover_http_client().expect("a lookup client");
+        // The release group MusicBrainz knows and whose Cover Art Archive entry
+        // answers 404: `coverartarchive.org/release-group/e8fbaa62-…` says no
+        // cover art was found, and Apple sells the sleeve.
+        let found = itunes_lookup(&client, "KREAM / Korolova", "Annihilation")
+            .await
+            .expect("iTunes has to answer");
+        let cover = found.expect("Apple sells this single, so it has a sleeve");
+        assert_eq!(cover.title, "Annihilation");
+        assert!(cover.art.ends_with("/1200x1200bb.jpg"), "{}", cover.art);
+        // The rendition has to actually resolve. A URL that answers 404 is worse
+        // than no cover at all: it is a claim that points at nothing.
+        let response = client
+            .get(&cover.art)
+            .send()
+            .await
+            .expect("the artwork has to be fetched");
+        assert!(
+            response.status().is_success(),
+            "{} answered {}",
+            cover.art,
+            response.status()
+        );
+        assert!(
+            response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .starts_with("image/"),
+            "the URL has to be a picture: {}",
+            cover.art
+        );
+    }
+
     /// The live archive, for the one record that could not be looked up at all:
     /// its release group answers 500, its release answers 500, and the picture
     /// sits on a node neither of those addresses names.
@@ -2065,6 +3227,52 @@ mod tests {
         // Both URLs have to be the current home of the item, not the stale one
         // Cover Art Archive redirects are stuck on.
         assert!(!art.contains("dn711003"), "the stale node must not be named: {art}");
+    }
+
+    #[test]
+    fn a_service_that_stops_answering_ends_the_pass_rather_than_grinding() {
+        // The waits grow exactly as they do for a refusal, because it is the
+        // same message from the service.
+        assert_eq!(hold_decision(1, None), (Duration::from_secs(30), false));
+        assert_eq!(hold_decision(3, None), (Duration::from_secs(120), false));
+        // A server that names its own interval is honoured on the first hold.
+        assert_eq!(
+            hold_decision(1, Some(Duration::from_secs(120))),
+            (Duration::from_secs(120), false)
+        );
+        // And then the pass ends: waiting an evening for a service that has
+        // stopped answering is not patience, and the albums left stay pending.
+        let (wait, given_up) = hold_decision(MAX_CONSECUTIVE_HOLDS, None);
+        assert_eq!(wait, THROTTLE_BACKOFF_MAX);
+        assert!(given_up);
+        assert!(!hold_decision(MAX_CONSECUTIVE_HOLDS - 1, None).1);
+    }
+
+    #[test]
+    fn an_unanswered_request_reads_as_a_busy_service() {
+        let said = describe_lookup_error(LookupError::Unanswered {
+            waited: MUSICBRAINZ_TIMEOUT,
+        });
+        // The wait it actually gave the service, named.
+        assert!(said.contains(&MUSICBRAINZ_TIMEOUT.as_secs().to_string()), "{said}");
+        assert!(said.contains("busy"), "{said}");
+        // And it must not read like a verdict on the album: that is the mistake
+        // this whole path was making.
+        assert!(!said.contains("no art"), "{said}");
+    }
+
+    /// The pace is shared, so no caller can slip in behind another's back. The
+    /// search, the release-group fallback and the manual tool all come through
+    /// here, and callers that each pace themselves still collide.
+    #[tokio::test]
+    async fn two_musicbrainz_callers_come_out_one_interval_apart() {
+        let started = Instant::now();
+        tokio::join!(pace_musicbrainz(), pace_musicbrainz());
+        assert!(
+            started.elapsed() >= REQUEST_INTERVAL,
+            "two callers were let through together: {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

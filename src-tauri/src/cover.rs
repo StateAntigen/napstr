@@ -642,7 +642,26 @@ pub(crate) fn initialise_cover_schema(connection: &Connection) -> Result<(), Str
                album TEXT NOT NULL,
                noted_at TEXT NOT NULL
              );
-             CREATE INDEX IF NOT EXISTS cover_watch_noted_at ON cover_watch(noted_at);",
+             CREATE INDEX IF NOT EXISTS cover_watch_noted_at ON cover_watch(noted_at);
+             -- One line per external lookup attempt, newest last, pruned to the
+             -- last few hundred. This is the only place the *reason* a lookup
+             -- failed is written down: `album_art_lookups` remembers the verdict
+             -- and when it may be asked again, and a verdict with no reason is
+             -- what made an outage look like an album with no art. Deliberately
+             -- without a cover-revision trigger: it is a record of what was
+             -- tried, not a change to what art exists.
+             CREATE TABLE IF NOT EXISTS cover_lookup_log (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               at TEXT NOT NULL,
+               cover_key TEXT NOT NULL DEFAULT '',
+               artist TEXT NOT NULL DEFAULT '',
+               album TEXT NOT NULL DEFAULT '',
+               outcome TEXT NOT NULL,
+               source TEXT NOT NULL DEFAULT '',
+               message TEXT NOT NULL DEFAULT ''
+             );
+             CREATE INDEX IF NOT EXISTS cover_lookup_log_cover_key
+               ON cover_lookup_log(cover_key, id DESC);",
         )
         .map_err(|error| error.to_string())?;
     // Art this computer resolved for itself is half of what it would report, so
@@ -1139,6 +1158,254 @@ pub(crate) fn cover_from_art_lookup(lookup: &ArtLookup) -> AlbumCover {
         created_at: 0,
         seeder: false,
     }
+}
+
+// ---------------------------------------------------------------------------
+// What the lookups actually did
+// ---------------------------------------------------------------------------
+
+/// How many attempts the log keeps. Enough to cover a long pass over a library,
+/// short enough that the table stays a log rather than a database.
+pub(crate) const LOOKUP_LOG_LIMIT: i64 = 400;
+
+/// How much of a failure message is worth keeping. A reqwest error can carry a
+/// URL and a cause; a stack of them is not a log line.
+const LOOKUP_MESSAGE_LIMIT: usize = 400;
+
+/// One attempt to write into the log.
+pub(crate) struct LookupLogEntry<'a> {
+    pub key: &'a str,
+    pub artist: &'a str,
+    pub album: &'a str,
+    /// `found`, `none`, `failed` or `throttled`.
+    pub outcome: &'a str,
+    /// Which source answered, when one did.
+    pub source: &'a str,
+    /// Why, when the answer was not a picture or a plain absence.
+    pub message: &'a str,
+}
+
+/// One line of the lookup log, as the Covers tab shows it.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoverLookupLogRow {
+    /// When, as an RFC 3339 stamp. The window formats it for the reader.
+    pub at: String,
+    pub key: String,
+    pub artist: String,
+    pub album: String,
+    pub outcome: String,
+    pub source: String,
+    pub message: String,
+}
+
+/// Write one attempt, then drop whatever has fallen off the end.
+///
+/// Failing to log must never fail a lookup, so every caller ignores the result.
+/// The pruning is by id rather than by time, because the log is a fixed-size
+/// ring and not a retention policy.
+pub(crate) fn record_lookup_log(
+    connection: &Connection,
+    entry: LookupLogEntry<'_>,
+) -> Result<(), String> {
+    connection
+        .execute(
+            "INSERT INTO cover_lookup_log(at,cover_key,artist,album,outcome,source,message)
+             VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                Utc::now().to_rfc3339(),
+                entry.key,
+                entry.artist,
+                entry.album,
+                entry.outcome,
+                entry.source,
+                truncate(entry.message, LOOKUP_MESSAGE_LIMIT),
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute(
+            "DELETE FROM cover_lookup_log
+             WHERE id <= (SELECT MAX(id) FROM cover_lookup_log) - ?1",
+            params![LOOKUP_LOG_LIMIT],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// The newest `limit` attempts, newest first.
+pub(crate) fn recent_lookup_log(
+    connection: &Connection,
+    limit: usize,
+) -> Result<Vec<CoverLookupLogRow>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT at,cover_key,artist,album,outcome,source,message
+             FROM cover_lookup_log ORDER BY id DESC LIMIT ?1",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map(params![limit.clamp(1, 1_000) as i64], |row| {
+            Ok(CoverLookupLogRow {
+                at: row.get(0)?,
+                key: row.get(1)?,
+                artist: row.get(2)?,
+                album: row.get(3)?,
+                outcome: row.get(4)?,
+                source: row.get(5)?,
+                message: row.get(6)?,
+            })
+        })
+        .map_err(|error| error.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+/// The most recent reason recorded for each album, in one pass.
+///
+/// Used to explain a list of albums that have no cover: the verdict lives in
+/// `album_art_lookups`, and the reason it was reached lives here.
+pub(crate) fn last_lookup_messages(
+    connection: &Connection,
+) -> Result<HashMap<String, String>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT cover_key,message FROM cover_lookup_log
+             WHERE id IN (SELECT MAX(id) FROM cover_lookup_log
+                          WHERE cover_key <> '' GROUP BY cover_key)",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| error.to_string())?;
+    let mut messages = HashMap::new();
+    for row in rows {
+        let (key, message) = row.map_err(|error| error.to_string())?;
+        messages.insert(key, message);
+    }
+    Ok(messages)
+}
+
+/// The verdict held for every album this computer has asked about.
+///
+/// One pass, like [`suppressed_art_keys`], because a library-sized list is
+/// answered from this: `found`, `none` or `error`.
+pub(crate) fn lookup_outcomes(connection: &Connection) -> Result<HashMap<String, String>, String> {
+    let mut statement = connection
+        .prepare("SELECT cover_key,outcome FROM album_art_lookups")
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| error.to_string())?;
+    let mut outcomes = HashMap::new();
+    for row in rows {
+        let (key, outcome) = row.map_err(|error| error.to_string())?;
+        outcomes.insert(key, outcome);
+    }
+    Ok(outcomes)
+}
+
+/// Cut a message down to a log line, on a character boundary.
+fn truncate(value: &str, limit: usize) -> String {
+    let trimmed = value.trim();
+    if trimmed.chars().count() <= limit {
+        return trimmed.to_string();
+    }
+    let mut kept: String = trimmed.chars().take(limit).collect();
+    kept.push('\u{2026}');
+    kept
+}
+
+// ---------------------------------------------------------------------------
+// Which hosts art may come from
+// ---------------------------------------------------------------------------
+
+/// The setting holding the domains this computer will take cover art from.
+///
+/// Stored as the user typed it, one domain per line, and deliberately *not* a
+/// privacy switch: it is a spam and shock filter, and it is the interim answer
+/// to art arriving from an address nobody vouched for. The real answer is the
+/// trust model the NIP is heading for, where a claim's author is what counts.
+pub(crate) const SETTING_ALLOWED_ART_HOSTS: &str = "cover_allowed_art_hosts";
+
+/// The domains the user listed, lowercased and without a leading `.` or `*.`.
+///
+/// An unreadable database or an absent row reads as an empty list, which means
+/// "no restriction". That is what Napstr did before the setting existed, and a
+/// filter that nobody configured must not blank a library: this is a
+/// convenience, not a boundary, and it is documented that way in the Covers tab.
+pub(crate) fn allowed_art_hosts(connection: &Connection) -> Vec<String> {
+    let stored = connection
+        .query_row(
+            "SELECT value FROM settings WHERE key=?1",
+            [SETTING_ALLOWED_ART_HOSTS],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .unwrap_or(None);
+    parse_art_hosts(stored.as_deref().unwrap_or(""))
+}
+
+/// One setting's worth of domains, however a person typed them.
+///
+/// Commas, semicolons and whitespace all separate, because the setting is a
+/// text box and a person will paste a list rather than type one domain.
+pub(crate) fn parse_art_hosts(value: &str) -> Vec<String> {
+    value
+        .split([',', ';', '\n', '\r', '\t', ' '])
+        .map(|host| {
+            host.trim()
+                .trim_start_matches("*.")
+                .trim_start_matches('.')
+                .to_ascii_lowercase()
+        })
+        .filter(|host| !host.is_empty())
+        .collect()
+}
+
+/// The host of an image URL, lowercased, without userinfo or a port.
+///
+/// Kept separate from [`allowed_art_hosts`] so both the accepting side (a
+/// pasted link) and the displaying side (somebody else's claim) ask the same
+/// question of the same string.
+pub(crate) fn art_url_host(url: &str) -> Option<String> {
+    let trimmed = url.trim();
+    let rest = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let host = authority
+        .rsplit('@')
+        .next()?
+        .split(':')
+        .next()?
+        .trim()
+        .to_ascii_lowercase();
+    (!host.is_empty()).then_some(host)
+}
+
+/// Whether `url` may be used as art when `hosts` is the configured list.
+///
+/// An empty list allows any host, because that is the behaviour every existing
+/// library was built with. A listed domain covers its subdomains, so
+/// `mzstatic.com` admits `is1-ssl.mzstatic.com`, which is where Apple actually
+/// serves artwork from. A URL with no host at all — or one that is not an
+/// absolute HTTP address — is refused once a list exists, because there is
+/// nothing to check it against.
+pub(crate) fn art_host_allowed(hosts: &[String], url: &str) -> bool {
+    if hosts.is_empty() {
+        return true;
+    }
+    let Some(host) = art_url_host(url) else {
+        return false;
+    };
+    hosts
+        .iter()
+        .any(|allowed| host == *allowed || host.ends_with(&format!(".{allowed}")))
 }
 
 /// How many times what this computer would answer about album art has changed.

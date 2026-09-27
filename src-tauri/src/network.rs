@@ -2732,6 +2732,20 @@ impl NetworkService {
     pub async fn best_known_covers(&self, keys: Vec<String>) -> Result<Vec<AlbumCover>, String> {
         let covers = self.album_covers(keys.clone()).await?;
         let requested = cover::normalised_request(&keys, COVER_KEY_LIMIT);
+        let connection = super::open_connection(&self.db_path)?;
+        // This is the one place a claim and a local resolution both become a
+        // picture, so it is where "which hosts will this computer take art
+        // from" is asked. Art on a host the list does not name is not drawn,
+        // and the album then falls back to whatever *is* acceptable for it —
+        // including nothing. An empty list accepts every host, which is what
+        // every library that never opened the setting has.
+        let hosts = cover::allowed_art_hosts(&connection);
+        let usable = |cover: &AlbumCover| {
+            [&cover.art, &cover.thumb]
+                .into_iter()
+                .all(|url| url.is_empty() || cover::art_host_allowed(&hosts, url))
+        };
+        let mut covers = covers.into_iter().filter(usable).collect::<Vec<_>>();
         let claimed = covers
             .iter()
             .map(|cover| cover.key.clone())
@@ -2743,9 +2757,11 @@ impl NetworkService {
         if missing.is_empty() {
             return Ok(covers);
         }
-        let connection = super::open_connection(&self.db_path)?;
-        let mut covers = covers;
-        covers.extend(cover::resolved_covers(&connection, &missing)?);
+        covers.extend(
+            cover::resolved_covers(&connection, &missing)?
+                .into_iter()
+                .filter(usable),
+        );
         Ok(covers)
     }
 
