@@ -157,6 +157,11 @@ megabytes — so a link to the original makes every consumer on the network pay 
 detail no screen will draw. Where the source offers renditions, ask for one: the
 Cover Art Archive serves 250, 500 and 1200 pixel versions of every image, and the
 1200 is what `art` wants. Note that its `large` alias means 500, so ask by number.
+The iTunes catalogue offers the same thing in a less obvious form: its artwork
+URLs name a rendition in the last path segment (`…/827568018151.jpg/100x100bb.jpg`)
+and the file above it is the same one at any size, so the 100-pixel thumbnail it
+returns from a search must be rewritten to `1200x1200bb.jpg` before it is published
+as `art`.
 
 `thumb` is the counterpart for dense grids: 250 pixels on the long edge fills a
 shelf tile, a list row, or a blurred backdrop, and it is the rendition a client
