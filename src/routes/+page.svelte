@@ -1177,6 +1177,28 @@
   // backend's worker acts on them by itself: there is no button to press for a
   // pass to happen, and leaving one on means it resumes after a restart.
   type CoverCandidate = { key: string; artist: string; album: string; trackCount: number; source: string };
+  /** An album this computer holds that no cover answers. */
+  type CoverGap = {
+    key: string;
+    artist: string;
+    album: string;
+    tracks: number;
+    /** `failed`, `not_looked_up` or `no_art`. */
+    state: string;
+    source: string;
+    /** The most recent reason recorded for it, when there is one. */
+    note: string;
+  };
+  /** One attempt, the way the log kept it. */
+  type CoverLogRow = {
+    at: string;
+    key: string;
+    artist: string;
+    album: string;
+    outcome: string;
+    source: string;
+    message: string;
+  };
   type CoverStatus = {
     lookupExternal: boolean;
     publishClaims: boolean;
@@ -1191,10 +1213,15 @@
     failed: number;
     backedOff: number;
     stopped: boolean;
+    /** One domain per line. Empty means any HTTPS host. */
+    allowedArtHosts: string;
     message: string;
   };
   /** How many albums the Covers tab previews. The worker itself is unbounded. */
   const COVER_QUEUE_PREVIEW = 25;
+  /** How many albums the missing-cover list shows, and how many log lines. */
+  const COVER_GAP_PREVIEW = 400;
+  const COVER_LOG_PREVIEW = 120;
   // Deliberately plain `let`s, like every other variable in this file. A single
   // rune anywhere in the component compiles the whole thing in runes mode, which
   // silently makes every plain `let` here non-reactive - including the
@@ -1205,6 +1232,22 @@
   let coverStatus: CoverStatus | null = null;
   let coverLoading = false;
   let coverError = '';
+  /** Albums no cover answers, worst first, and what each lookup actually did. */
+  let coverMissing: CoverGap[] = [];
+  let coverLog: CoverLogRow[] = [];
+  // The art domain list is edited in a text box, so the box holds the draft and
+  // `allowedArtHostsSaved` holds what the host actually has. A background status
+  // refresh must not overwrite what somebody is halfway through typing, so the
+  // stored value is only adopted while the two still agree.
+  let allowedArtHosts = '';
+  let allowedArtHostsSaved = '';
+  /**
+   * The hosts Napstr itself reads art from, and the list to offer somebody who
+   * wants the filter on without having to work out the domains by hand. Apple
+   * is named at `mzstatic.com` because that is where its artwork redirects to:
+   * `itunes.apple.com` answers the search, not the picture.
+   */
+  const RECOMMENDED_ART_HOSTS = ['coverartarchive.org', 'archive.org', 'mzstatic.com'];
   // Bumped when the worker produces art, which is what makes the tiles ask
   // again. A long pass would otherwise leave every square blank until it ended.
   let coverRevision = 0;
@@ -1257,11 +1300,55 @@
     coverError = '';
     try {
       coverStatus = await invoke<CoverStatus>('cover_status');
+      if (allowedArtHosts === allowedArtHostsSaved) {
+        allowedArtHosts = coverStatus.allowedArtHosts;
+        allowedArtHostsSaved = allowedArtHosts;
+      }
       coverQueue = await invoke<CoverCandidate[]>('cover_candidates', { limit: COVER_QUEUE_PREVIEW });
+      // The two diagnostic lists are read with the same call that refreshes the
+      // tab: an album that just failed is the thing a person came here to see.
+      coverMissing = await invoke<CoverGap[]>('cover_missing', { limit: COVER_GAP_PREVIEW });
+      coverLog = await invoke<CoverLogRow[]>('cover_lookup_log', { limit: COVER_LOG_PREVIEW });
     } catch (error) {
       coverError = String(error);
     } finally {
       coverLoading = false;
+    }
+  }
+
+  /** When a log line happened, in the reader's own clock. */
+  function coverLogTime(at: string) {
+    const stamp = new Date(at);
+    return Number.isNaN(stamp.getTime()) ? at : stamp.toLocaleTimeString();
+  }
+
+  /** How a missing album's state reads to a person. */
+  function coverGapState(state: string) {
+    if (state === 'failed') return 'lookup failed';
+    if (state === 'no_art') return 'no art anywhere';
+    if (state === 'resolved_here') return 'art here, no claim';
+    return 'not looked up yet';
+  }
+
+  /**
+   * Save the art domain list.
+   *
+   * The host normalizes it — lowercase, one per line — and the box is refilled
+   * from what it stored, so the list on screen is the list in force rather than
+   * the string that was typed. Every cached square is then dropped, because a
+   * host that has just been removed from the list must stop being drawn at once
+   * rather than at the next restart.
+   */
+  async function saveAllowedArtHosts(hosts: string) {
+    coverError = '';
+    try {
+      coverStatus = await invoke<CoverStatus>('set_allowed_art_hosts', { hosts });
+      allowedArtHosts = coverStatus.allowedArtHosts;
+      allowedArtHostsSaved = allowedArtHosts;
+      lastCoverRevisionAt = 0;
+      refreshCoverArtwork();
+    } catch (error) {
+      coverError = String(error);
     }
   }
 
@@ -3022,7 +3109,7 @@
           <div class="cover-scan-controls">
             <label class="cover-scan-toggle">
               <input type="checkbox" checked={coverStatus?.lookupExternal ?? false} onchange={(event) => void setCoverPreferences(event.currentTarget.checked, coverStatus?.publishClaims ?? false)} />
-              <span>{$t("Look up art automatically")}<small>{$t("Asks MusicBrainz and the Cover Art Archive about every album without a cover: the ones on this computer, and the albums the results pane has shown you")}</small></span>
+              <span>{$t("Look up art automatically")}<small>{$t("Asks MusicBrainz and the Cover Art Archive about every album without a cover: the ones on this computer, and the albums the results pane has shown you")}{' '}{'When those have nothing, the iTunes catalogue is asked for the same album, matched on the album and artist names.'}</small></span>
             </label>
             <label class="cover-scan-toggle">
               <input type="checkbox" checked={coverStatus?.publishClaims ?? false} onchange={(event) => void setCoverPreferences(coverStatus?.lookupExternal ?? false, event.currentTarget.checked)} />
@@ -3034,6 +3121,38 @@
               <button class="classic-button" onclick={() => void lookForCoversNow()} disabled={!coverOptIn(coverStatus)}>{$t("Look now")}</button>
             {/if}
             <button class="classic-button" onclick={() => void refreshCovers()} disabled={coverLoading}>{$t("Refresh")}</button>
+          </div>
+
+          <!--
+            Which hosts art may come from. This is the interim answer to art
+            arriving from an address nobody vouched for — a stranger's claim, or
+            a link somebody pastes — until the cover NIP's own trust model
+            carries it. Empty is the honest default: it is how Napstr behaved
+            before the list existed, so nobody's library loses its covers to a
+            filter they never asked for.
+          -->
+          <div class="cover-art-hosts">
+            <div class="cover-art-hosts-head">
+              <label for="cover-art-hosts">{'Art domains to accept'}</label>
+              <span>{'One per line. A domain covers its subdomains: mzstatic.com admits is1-ssl.mzstatic.com.'}</span>
+            </div>
+            <textarea
+              id="cover-art-hosts"
+              rows="3"
+              spellcheck="false"
+              placeholder={'coverartarchive.org\narchive.org\nmzstatic.com'}
+              bind:value={allowedArtHosts}
+            ></textarea>
+            <div class="cover-art-hosts-actions">
+              <button
+                class="classic-button primary"
+                disabled={allowedArtHosts === allowedArtHostsSaved}
+                onclick={() => void saveAllowedArtHosts(allowedArtHosts)}
+              >{'Save list'}</button>
+              <button class="classic-button" onclick={() => void saveAllowedArtHosts(RECOMMENDED_ART_HOSTS.join('\n'))}>{'Use the recommended list'}</button>
+              <button class="classic-button" onclick={() => void saveAllowedArtHosts('')}>{'Accept any host'}</button>
+            </div>
+            <p class="privacy-note wide"><span>i</span> {"Empty means any HTTPS host, which is what every library had before this list existed. With a list, art is drawn only when it is served from one of these domains or a subdomain of one — somebody else's published claim, art this computer looked up, and a link you paste here, which is refused outright if its host is not listed. It is a filter, not a boundary: the person who sets it is the person it protects, and the real answer is the trust model the cover NIP is heading for."}</p>
           </div>
 
           {#if coverError}<div class="trollbox-error">{coverError}</div>{/if}
@@ -3065,6 +3184,60 @@
             {#if !coverLoading && coverQueue.length === 0}
               <p class="empty-state compact">{coverOptIn(coverStatus) ? 'Nothing is waiting. New music and new browsing wake Napstr by themselves.' : 'Switch one of these on and Napstr starts on its own.'}</p>
             {/if}
+          </div>
+
+          <!--
+            What the queue above cannot say: the queue is the next 25 albums the
+            worker would touch, and this is every album this computer holds with
+            no cover at all — failures first, because a lookup that fell over is
+            the one state that looks exactly like an album nobody has art for.
+          -->
+          <div class="cover-gap-panel">
+            <div class="cover-art-hosts-head">
+              <label for="cover-gap-list">{'Albums without a cover claim'}</label>
+              <span>{coverMissing.length} {coverMissing.length === 1 ? 'album' : 'albums'}{" of this computer's own music, worst first. A failure comes first because a lookup that fell over looks identical to an album nobody has art for."}</span>
+            </div>
+            <div id="cover-gap-list" class="cover-gap-list">
+              {#each coverMissing as gap (gap.key)}
+                <div class="cover-gap">
+                  <div><b>{gap.album}</b><small>{gap.artist}</small></div>
+                  <span class:cover-gap-failed={gap.state === 'failed'} class="cover-gap-state">{coverGapState(gap.state)}</span>
+                  <span>{gap.tracks} {gap.tracks === 1 ? 'track' : 'tracks'}</span>
+                  <button class="classic-button" onclick={() => void openCoverPicker(gap.artist, gap.album)}>{$t("Find art…")}</button>
+                  {#if gap.note}<small class="cover-gap-note" title={gap.note}>{gap.note}</small>{/if}
+                </div>
+              {/each}
+              {#if !coverLoading && coverMissing.length === 0}
+                <p class="empty-state compact">{'Every album this computer holds has a cover claim, or has not been scanned yet.'}</p>
+              {/if}
+            </div>
+          </div>
+
+          <!--
+            The log. Nothing else in Napstr keeps the reason a lookup failed:
+            `album_art_lookups` keeps the verdict and when it may be asked again,
+            so before this table an outage and an album with no art produced the
+            same blank square and the same count.
+          -->
+          <div class="cover-log-panel">
+            <div class="cover-art-hosts-head">
+              <label for="cover-log-list">{'Lookup log'}</label>
+              <span>{'Newest first, last '}{COVER_LOG_PREVIEW}{' attempts, kept across restarts.'}</span>
+            </div>
+            <div id="cover-log-list" class="cover-log-list">
+              {#each coverLog as line (line.at + line.key + line.outcome)}
+                <div class="cover-log-line">
+                  <time>{coverLogTime(line.at)}</time>
+                  <span class:cover-gap-failed={line.outcome === 'failed'} class:cover-log-throttled={line.outcome === 'throttled' || line.outcome === 'slow'} class="cover-log-outcome">{line.outcome}</span>
+                  <span class="cover-log-album">{line.album}{line.artist ? ` — ${line.artist}` : ''}</span>
+                  {#if line.source}<span class="cover-log-source">{line.source}</span>{/if}
+                  {#if line.message}<small class="cover-gap-note" title={line.message}>{line.message}</small>{/if}
+                </div>
+              {/each}
+              {#if !coverLoading && coverLog.length === 0}
+                <p class="empty-state compact">{'No lookups have run yet.'}</p>
+              {/if}
+            </div>
           </div>
         </section>
       {:else if activeView === 'Napstrfy'}

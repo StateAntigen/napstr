@@ -21,7 +21,12 @@
   export let onApplied: () => void = () => {};
 
   type Hit = {
+    /** What the row is keyed by. Not always an MBID: an iTunes row is keyed by
+     *  Apple's collection id, because there is no MusicBrainz group for it. */
+    id: string;
     mbid: string;
+    /** `musicbrainz` or `itunes`. */
+    source: string;
     title: string;
     types: string;
     year: string;
@@ -35,6 +40,7 @@
   };
 
   let query = '';
+  let imageUrl = '';
   let hits: Hit[] = [];
   let busy = false;
   let error = '';
@@ -42,7 +48,7 @@
   /** True once a search has actually run, so the empty list can be explained. */
   let searched = false;
   /** The candidate whose art was just applied, to mark the row. */
-  let appliedMbid = '';
+  let appliedId = '';
 
   async function loadDefaultQuery() {
     try {
@@ -56,7 +62,7 @@
     busy = true;
     error = '';
     note = '';
-    appliedMbid = '';
+    appliedId = '';
     try {
       hits = await invoke<Hit[]>('cover_search_candidates', {
         artist,
@@ -64,7 +70,7 @@
         query: query.trim() ? query : null
       });
       searched = true;
-      if (hits.length === 0) note = 'MusicBrainz returned nothing for that search.';
+      if (hits.length === 0) note = 'Neither MusicBrainz nor iTunes returned anything for that album.';
     } catch (failure) {
       error = String(failure);
       hits = [];
@@ -74,6 +80,15 @@
     }
   }
 
+  /**
+   * File a candidate from the list.
+   *
+   * `source: 'hit'` is what tells the host this art came from a row it offered
+   * itself, so the art domain list is not applied to it: that list exists to
+   * guard links a person types and art other people publish, and a list that
+   * omitted the sources Napstr uses on purpose would break the feature it sits
+   * beside.
+   */
   async function use(hit: Hit) {
     busy = true;
     error = '';
@@ -89,11 +104,50 @@
             art: hit.art,
             thumb: hit.thumb,
             title: hit.title,
-            year: hit.year
+            year: hit.year,
+            source: 'hit'
           }
         }
       );
-      appliedMbid = hit.mbid;
+      appliedId = hit.id;
+      note = result.note ? `${result.note} Key: ${result.key}` : `Saved under ${result.key}`;
+      onApplied();
+    } catch (failure) {
+      error = String(failure);
+    } finally {
+      busy = false;
+    }
+  }
+
+  /**
+   * File art from a link a person pasted.
+   *
+   * This is art from an address nobody vouched for, so it is the case the art
+   * domain list in the Covers tab applies to, and the host is what refuses it —
+   * the window cannot be the only thing checking.
+   */
+  async function useUrl() {
+    busy = true;
+    error = '';
+    note = '';
+    appliedId = '';
+    try {
+      const result = await invoke<{ key: string; published: boolean; eventId: string; note: string }>(
+        'cover_apply_pick',
+        {
+          pick: {
+            artist,
+            album,
+            mbid: '',
+            art: imageUrl.trim(),
+            thumb: '',
+            title: '',
+            year: '',
+            source: 'url'
+          }
+        }
+      );
+      appliedId = 'pasted';
       note = result.note ? `${result.note} Key: ${result.key}` : `Saved under ${result.key}`;
       onApplied();
     } catch (failure) {
@@ -146,8 +200,42 @@
     <p class="art-picker-hint">
       Lucene syntax: <code>release:</code>, <code>artist:</code>, <code>AND</code>, <code>OR</code>.
       Swap in a different spelling, add <code>country:US</code>, or search for a release group by name —
-      the automatic lookup could not guess that.
+      the automatic lookup could not guess that. iTunes is always asked as well, by album and artist
+      name rather than by this query.
     </p>
+
+    <!--
+      The last resort, and the only path where art arrives from an address
+      nobody vouched for. It is deliberately plain: paste a link, see the
+      picture, decide. What that link is allowed to be is the host's business,
+      and the list it checks is in the Covers tab.
+    -->
+    <div class="art-picker-query">
+      <label for="art-picker-url">Paste a link</label>
+      <input
+        id="art-picker-url"
+        bind:value={imageUrl}
+        spellcheck="false"
+        placeholder="https://example.org/cover.jpg"
+        onkeydown={(event) => {
+          if (event.key === 'Enter') {
+            event.preventDefault();
+            void useUrl();
+          }
+        }}
+      />
+      <button
+        class="classic-button"
+        onclick={() => void useUrl()}
+        disabled={busy || !imageUrl.trim().startsWith('https://')}
+      >Use this URL</button>
+    </div>
+    {#if imageUrl.trim().startsWith('https://')}
+      <div class="art-picker-preview">
+        <img src={imageUrl.trim()} alt="" />
+        <small>What that link holds, if the host will serve it.</small>
+      </div>
+    {/if}
 
     {#if currentArt}
       <p class="art-picker-hint">The art shown now is the small square on the left of each row below; pick the one that matches.</p>
@@ -157,8 +245,8 @@
     {#if note}<div class="art-picker-note">{note}</div>{/if}
 
     <div class="art-picker-results">
-      {#each hits as hit (hit.mbid)}
-        <div class:applied={appliedMbid === hit.mbid} class="art-picker-hit">
+      {#each hits as hit (hit.id)}
+        <div class:applied={appliedId === hit.id} class="art-picker-hit">
           <span class="art-picker-art">
             {#if hit.thumb || hit.art}
               <img src={hit.thumb || hit.art} alt="" loading="lazy" decoding="async" />
@@ -169,16 +257,22 @@
           <div class="art-picker-meta">
             <b>{hit.title}</b>
             <small>
-              {hit.types || 'unknown type'}{hit.year ? ` · ${hit.year}` : ''} · score {hit.score}
+              {hit.source === 'itunes' ? 'iTunes' : 'MusicBrainz'}{hit.types ? ` · ${hit.types}` : ''}{hit.year ? ` · ${hit.year}` : ''}{hit.score ? ` · score ${hit.score}` : ''}
               {hit.front ? '' : ' · no front image'}
             </small>
             {#if hit.note}
-              <!-- The record MusicBrainz knows about, with the reason the
-                   archive could not be asked about it. Dropping this row is
-                   what used to make the album look absent from the search. -->
+              <!-- The record the source knows about, with the reason no picture
+                   could be fetched for it. Dropping this row is what used to
+                   make the album look absent from the search. -->
               <small class="art-picker-why">{hit.note}</small>
             {/if}
-            <code>{hit.mbid}</code>
+            <!-- The identifier, where there is one worth showing: a release-group
+                 MBID for a MusicBrainz row, Apple's collection for a candidate
+                 whose only name is that. A row that is merely "the second
+                 source could not be reached" has neither. -->
+            {#if hit.mbid || hit.art}
+              <code title={hit.mbid ? 'MusicBrainz release group' : 'Apple collection, which is not an MBID'}>{hit.id}</code>
+            {/if}
           </div>
           <div class="art-picker-actions">
             {#if hit.chosen}<span class="art-picker-chosen" title="What the automatic lookup would pick">automatic</span>{/if}
@@ -240,6 +334,7 @@
     grid-template-columns: auto 1fr auto;
     align-items: center;
     gap: 10px;
+    margin-top: 10px;
   }
   .art-picker-query label {
     color: #8d9ab0;
@@ -279,6 +374,26 @@
     background: rgba(60, 130, 90, 0.14);
     border: 1px solid rgba(60, 130, 90, 0.45);
     color: #b6e0c6;
+  }
+  /* The pasted link, shown before it is filed: a person pasting a URL is
+     judging a picture, and judging it from a filename is not judging it. */
+  .art-picker-preview {
+    margin-top: 10px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .art-picker-preview img {
+    width: 96px;
+    height: 96px;
+    object-fit: cover;
+    border-radius: 6px;
+    border: 1px solid #222b3a;
+    background: #06090d;
+  }
+  .art-picker-preview small {
+    color: #8d9ab0;
+    font-size: 12px;
   }
   .art-picker-results {
     margin-top: 12px;
