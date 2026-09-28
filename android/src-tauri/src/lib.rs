@@ -9,8 +9,8 @@ use napstr_remote_protocol::{
     RemoteAudiobook, RemoteAudiobookSummary, RemoteDiscussionActivity, RemoteDiscussionMessage,
     RemotePlaybackState, RemotePlaylist, RemotePlaylistCoordinate, RemotePlaylistSummary,
     RemoteTrack, RemoteTransfer, ServerResponse, ALPN, MAX_ART_KEY_CHARS, MAX_CONTROL_FRAME_BYTES,
-    MAX_COVER_KEYS, MAX_PLAYLIST_MEMBERS, MAX_PLAYLIST_PAGE, MAX_PLAY_QUEUE, MAX_QR_SVG_BYTES,
-    MAX_REPORT_NOTE_CHARS, MAX_TRACKS_BY_ID, REPORT_REASONS,
+    MAX_COVER_KEYS, MAX_PAGE_SIZE, MAX_PLAYLIST_MEMBERS, MAX_PLAYLIST_PAGE, MAX_PLAY_QUEUE,
+    MAX_QR_SVG_BYTES, MAX_REPORT_NOTE_CHARS, MAX_TRACKS_BY_ID, REPORT_REASONS, shuffle_key,
 };
 use quick_xml::{events::Event, Reader};
 use qrcode::{render::svg, QrCode};
@@ -1462,7 +1462,133 @@ struct RemoteClient {
         tokio::sync::RwLock<std::collections::HashMap<String, iroh::endpoint::Connection>>,
     /// Every computer this phone may talk to, in the order they were paired.
     hosts: tokio::sync::RwLock<Vec<SavedHost>>,
+    /// The rows of the shuffled mix collected so far, for the seed they belong
+    /// to. Empty until a shuffle is asked for.
+    mixed: tokio::sync::RwLock<Option<MixedLibrary>>,
     start_lock: tokio::sync::Mutex<()>,
+}
+
+/// What one computer has given of the mix so far.
+struct MixedHost {
+    endpoint_id: String,
+    /// The rows it has sent, in the order its own seed produced them.
+    rows: Vec<RemoteTrack>,
+    /// How many rows it says it holds, once it has said. A computer that has not
+    /// answered has not said it holds nothing.
+    total: Option<usize>,
+    /// It could not be reached, so this mix has what it gave and no more.
+    failed: bool,
+}
+
+/// The mix of everything this phone may read, collected a page at a time.
+///
+/// Nothing here decides an order: a shuffle is a property of the seed, and the
+/// order is the shared key over every row that arrives. What is kept is rows
+/// already fetched, because a page deep into a mix needs every computer's rows
+/// down to that depth, and collecting them again on each step of a scroll would
+/// transfer the same rows over and over.
+///
+/// It stands for as long as the seed does. A phone mints a seed for a shuffle and
+/// drops it when the person turns the shuffle off or asks for another, so a mix
+/// kept here is stale exactly when the seed is replaced.
+struct MixedLibrary {
+    seed: u64,
+    /// The computers it was collected from, so pairing or forgetting one starts
+    /// the mix again rather than mixing in rows from a computer that has gone.
+    endpoints: Vec<String>,
+    hosts: Vec<MixedHost>,
+}
+
+/// The computers this phone may read music from, in the order it asks them: the
+/// one it acts through first, then the others as it holds them - or why none can
+/// be asked.
+///
+/// That order is the whole of the weighting. A file two computers both hold is
+/// one file, and taking it from the first of them keeps the phone's own copy -
+/// the row that knows a bitrate and where the file is - rather than a friend's.
+fn readable_hosts(hosts: &[SavedHost]) -> Result<Vec<SavedHost>, String> {
+    if hosts.is_empty() {
+        return Err("Pair Napstrfy with Napstr first".into());
+    }
+    let primary = primary_host(hosts).map(|host| host.endpoint_id);
+    let mut readable = hosts
+        .iter()
+        .filter(|host| host.grant().browse)
+        .cloned()
+        .collect::<Vec<_>>();
+    if readable.is_empty() {
+        return Err("This phone may not read these computers' libraries".into());
+    }
+    // Stable, so the computers after the first keep the order they were paired in.
+    readable.sort_by_key(|host| primary.as_deref() != Some(host.endpoint_id.as_str()));
+    Ok(readable)
+}
+
+/// What several computers answered to one search, one row per file.
+///
+/// A file id is a hash of the file's own bytes, so the same recording found on
+/// two computers is one row: the first answer wins, and because the phone's own
+/// computer is asked first, that is its row.
+fn merge_search_results(answers: Vec<Vec<RemoteTrack>>) -> Vec<RemoteTrack> {
+    let mut merged: Vec<RemoteTrack> = Vec::new();
+    let mut seen = HashSet::new();
+    for tracks in answers {
+        for track in tracks {
+            if seen.insert(track.file_id.clone()) {
+                merged.push(track);
+            }
+        }
+    }
+    merged
+}
+
+/// One page of a mix, out of the rows collected so far.
+///
+/// Every computer's rows are tried for a place, each file once, and the places
+/// are the ones the seed gives: the same key the computers sorted their own
+/// libraries by, computed here over rows from all of them at once.
+fn mixed_page(hosts: &[MixedHost], seed: u64, offset: usize, limit: usize) -> (Vec<RemoteTrack>, usize) {
+    let mut seen = HashSet::new();
+    let mut order = Vec::new();
+    for host in hosts {
+        for track in &host.rows {
+            if seen.insert(track.file_id.as_str()) {
+                order.push(track);
+            }
+        }
+    }
+    order.sort_by_cached_key(|track| shuffle_key(seed, &track.file_id));
+    let page = order
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .cloned()
+        .collect::<Vec<_>>();
+    // What the computers together say they hold. A file they both hold is
+    // counted twice here, so this is an upper bound - and an exact number when
+    // there is one computer, which is every phone that has paired with one.
+    let total = hosts
+        .iter()
+        .map(|host| host.total.unwrap_or(host.rows.len()))
+        .sum();
+    (page, total)
+}
+
+/// What to ask one computer for next, or nothing when it has given all it has.
+///
+/// `held` is how many rows of its mix are here, `need` how deep the page being
+/// built goes. Answers are capped by the protocol, so a page deeper than that cap
+/// arrives as several requests rather than one larger one.
+fn next_mix_request(held: usize, total: Option<usize>, need: usize) -> Option<(usize, usize)> {
+    if held >= need {
+        return None;
+    }
+    let remaining = match total {
+        Some(total) if held >= total => return None,
+        Some(total) => total - held,
+        None => need - held,
+    };
+    Some((held, (need - held).min(MAX_PAGE_SIZE).min(remaining)))
 }
 
 impl RemoteClient {
@@ -1488,6 +1614,7 @@ impl RemoteClient {
             endpoint: tokio::sync::RwLock::new(None),
             connections: tokio::sync::RwLock::new(std::collections::HashMap::new()),
             hosts: tokio::sync::RwLock::new(hosts),
+            mixed: tokio::sync::RwLock::new(None),
             start_lock: tokio::sync::Mutex::new(()),
         })
     }
@@ -1646,6 +1773,9 @@ impl RemoteClient {
     /// `None` is the computer this phone acts through, which is what every
     /// caller meant before there could be more than one - so a screen that has
     /// not learned about sources keeps asking exactly whom it asked before.
+    ///
+    /// A question worth asking every computer - a search, a shuffled page - fans
+    /// out before it reaches here, so what arrives here is always one computer.
     async fn request_from(
         &self,
         source: Option<&str>,
@@ -1679,6 +1809,172 @@ impl RemoteClient {
             .find(|host| host.endpoint_id == endpoint_id)
             .cloned()
             .ok_or_else(|| "That computer is not paired with this phone".into())
+    }
+
+    /// What one computer answers, or why it could not.
+    ///
+    /// A refusal arrives as a message rather than as a transport failure, which
+    /// is how `request_from` reports one too: both are things a person may be
+    /// told about a particular computer.
+    async fn try_request(
+        &self,
+        host: &SavedHost,
+        request: ClientRequest,
+    ) -> Result<ServerResponse, String> {
+        match self.exchange_with(host, request).await {
+            Ok((ServerResponse::Error { message }, _)) => Err(message),
+            Ok((response, _)) => Ok(response),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// A search answered by every computer this phone may read from.
+    ///
+    /// They are asked at once. A computer that has gone is only known to have
+    /// gone by waiting for it, and asking them one after another would put every
+    /// vanished friend's wait in front of the answer.
+    ///
+    /// The computer this phone acts through is the exception to tolerating a
+    /// failure: it is the one that speaks for the phone, so a person whose own
+    /// computer cannot be reached is told that, rather than being shown a
+    /// friend's matches as though all were well. A friend who cannot be reached
+    /// contributes nothing and is not an error - a library that is not there is a
+    /// library with nothing in it, and the rest of the answer is still worth
+    /// having.
+    async fn search_everywhere(&self, query: &str) -> Result<Vec<RemoteTrack>, String> {
+        let hosts = readable_hosts(&self.hosts().await)?;
+        let primary = primary_host(&hosts).map(|host| host.endpoint_id);
+        let answers = futures_util::future::join_all(hosts.iter().map(|host| {
+            let request = ClientRequest::Search {
+                query: query.to_string(),
+            };
+            async move {
+                (
+                    host.endpoint_id.clone(),
+                    self.try_request(host, request).await,
+                )
+            }
+        }))
+        .await;
+        let asks_the_primary = |endpoint_id: &str| primary.as_deref() == Some(endpoint_id);
+        let mut merged = Vec::new();
+        for (endpoint_id, answer) in answers {
+            match answer {
+                Ok(ServerResponse::Search { tracks }) => merged.push(tracks),
+                Ok(response) => {
+                    if asks_the_primary(&endpoint_id) {
+                        return Err(unexpected_response(&response));
+                    }
+                }
+                Err(error) => {
+                    if asks_the_primary(&endpoint_id) {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        Ok(merge_search_results(merged))
+    }
+
+    /// One page of the mix of everything this phone may read.
+    ///
+    /// The seed is this phone's, and it goes to every computer: each answers with
+    /// its own library in that seed's order. The order shown is the same key
+    /// again, computed here over the rows that arrive, so no computer has to know
+    /// that any other exists - and a friend's music falls among the phone's own by
+    /// the rule each of them sorted by.
+    async fn mixed_library(
+        &self,
+        seed: u64,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(Vec<RemoteTrack>, usize), String> {
+        let hosts = readable_hosts(&self.hosts().await)?;
+        let endpoints = hosts
+            .iter()
+            .map(|host| host.endpoint_id.clone())
+            .collect::<Vec<_>>();
+        let need = offset + limit;
+        let primary = primary_host(&hosts).map(|host| host.endpoint_id);
+        let asks_the_primary = |endpoint_id: &str| primary.as_deref() == Some(endpoint_id);
+
+        // Held while the rows below are collected: the rows kept here are the
+        // answer to a question about an ordering, so two pages asked for at once
+        // would each collect the same rows into it. Nothing else takes this lock,
+        // so a page being built never holds up the host list or a connection.
+        let mut mixed = self.mixed.write().await;
+        let stale = match mixed.as_ref() {
+            Some(held) => held.seed != seed || held.endpoints != endpoints,
+            None => true,
+        };
+        if stale {
+            *mixed = Some(MixedLibrary {
+                seed,
+                endpoints: endpoints.clone(),
+                hosts: endpoints
+                    .iter()
+                    .map(|endpoint_id| MixedHost {
+                        endpoint_id: endpoint_id.clone(),
+                        rows: Vec::new(),
+                        total: None,
+                        failed: false,
+                    })
+                    .collect(),
+            });
+        }
+        let mix = mixed.as_mut().expect("a mix was just built");
+
+        for index in 0..mix.hosts.len() {
+            loop {
+                let (held, total) = {
+                    let host = &mix.hosts[index];
+                    if host.failed {
+                        break;
+                    }
+                    (host.rows.len(), host.total)
+                };
+                let Some((at, take)) = next_mix_request(held, total, need) else {
+                    break;
+                };
+                let request = ClientRequest::Library {
+                    query: String::new(),
+                    offset: at,
+                    limit: take,
+                    shuffle_seed: Some(seed),
+                };
+                let endpoint_id = mix.hosts[index].endpoint_id.clone();
+                match self.try_request(&hosts[index], request).await {
+                    Ok(ServerResponse::Library { tracks, total }) => {
+                        let host = &mut mix.hosts[index];
+                        host.total = Some(total);
+                        if tracks.is_empty() {
+                            break;
+                        }
+                        host.rows.extend(tracks);
+                    }
+                    Ok(response) => {
+                        if asks_the_primary(&endpoint_id) {
+                            return Err(unexpected_response(&response));
+                        }
+                        mix.hosts[index].failed = true;
+                        break;
+                    }
+                    Err(error) => {
+                        if asks_the_primary(&endpoint_id) {
+                            return Err(error);
+                        }
+                        // A friend who cannot be reached is left out of this mix
+                        // rather than waited for on every step of the scroll: the
+                        // mix is as complete as it could be when it was built, and
+                        // a new shuffle asks again.
+                        mix.hosts[index].failed = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(mixed_page(&mix.hosts, seed, offset, limit))
     }
 
     /// One request to one computer, retried once on a fresh tunnel.
@@ -2165,6 +2461,16 @@ async fn remote_library(
     source: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<LibraryPage, String> {
+    // A shuffle with no computer named is every computer this phone may read,
+    // mixed: that is what "shuffle their music in" is. Naming a computer asks
+    // that one, and a query is a question about one library rather than a mix of
+    // them, so both take the plain path below.
+    if source.is_none() && query.is_empty() {
+        if let Some(seed) = shuffle_seed {
+            let (tracks, total) = state.remote.mixed_library(seed, offset, limit).await?;
+            return Ok(LibraryPage { tracks, total });
+        }
+    }
     match state
         .remote
         .request_from(
@@ -2795,6 +3101,12 @@ async fn remote_search(
     source: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Vec<RemoteTrack>, String> {
+    // No computer named is everyone: a search is a question worth asking every
+    // computer this phone may read from, which is how a friend's library turns up
+    // in results. Naming one asks that one alone.
+    if source.is_none() {
+        return state.remote.search_everywhere(&query).await;
+    }
     match state
         .remote
         .request_from(source.as_deref(), ClientRequest::Search { query })
@@ -3424,6 +3736,57 @@ mod tests {
         }
     }
 
+    /// One library row, of the shape a computer sends.
+    ///
+    /// Only the parts a mix looks at are interesting here: the file id a row is
+    /// placed by, and who answered, which is how two rows for one file are told
+    /// apart.
+    fn library_row(file_id: &str, local: bool) -> RemoteTrack {
+        RemoteTrack {
+            file_id: file_id.into(),
+            filename: format!("{}.mp3", &file_id[..8]),
+            title: "A track".into(),
+            artist: if local { "Mine".into() } else { "Theirs".into() },
+            album: "An album".into(),
+            format: "MP3".into(),
+            mime: "audio/mpeg".into(),
+            size: 4_000_000,
+            tags: String::new(),
+            local,
+            sources: Vec::new(),
+            bitrate_kbps: 320,
+            sample_rate_hz: 44_100,
+            channels: 2,
+            lossless: false,
+            duration_ms: 200_000,
+        }
+    }
+
+    /// Rows for whole files, named by one character each so a library can be
+    /// written down as a short string.
+    fn library_rows(ids: &[char]) -> Vec<RemoteTrack> {
+        ids.iter()
+            .map(|id| library_row(&id.to_string().repeat(64), true))
+            .collect()
+    }
+
+    /// The order a page came back in, as those characters.
+    fn places(tracks: &[RemoteTrack]) -> String {
+        tracks
+            .iter()
+            .map(|track| track.file_id.chars().next().unwrap())
+            .collect()
+    }
+
+    fn mixed_from(endpoint_id: &str, rows: Vec<RemoteTrack>, total: usize) -> MixedHost {
+        MixedHost {
+            endpoint_id: endpoint_id.into(),
+            rows,
+            total: Some(total),
+            failed: false,
+        }
+    }
+
     /// A file written before this phone could hold more than one computer is one
     /// computer, not a list of none.
     ///
@@ -3502,6 +3865,105 @@ mod tests {
         saved.stream_only = true;
         assert_eq!(saved.grant(), DeviceRights::read_only());
         assert!(saved.grant().is_read_only());
+    }
+
+    /// Only the computers this phone may read are asked, and it asks its own
+    /// first whatever order they were paired in.
+    #[test]
+    fn the_computers_this_phone_may_read_are_asked_own_first() {
+        let friend = host("friend", DeviceRights::read_only(), "Ada's Napstr");
+        let own = host("own", DeviceRights::full(), "My Napstr");
+        let nothing = host("none", DeviceRights::default(), "A Laptop");
+
+        let asked = readable_hosts(&[friend.clone(), nothing.clone(), own.clone()]).unwrap();
+        assert_eq!(
+            asked
+                .iter()
+                .map(|host| host.endpoint_id.as_str())
+                .collect::<Vec<_>>(),
+            ["own", "friend"]
+        );
+        // A computer that allows nothing is not a library to read, and a phone
+        // with no computer at all is told which of the two it is looking at.
+        assert!(readable_hosts(&[nothing]).is_err());
+        assert_eq!(
+            readable_hosts(&[]).unwrap_err(),
+            "Pair Napstrfy with Napstr first"
+        );
+    }
+
+    /// A file two computers hold is one row, and it is the row of the computer
+    /// that was asked first.
+    #[test]
+    fn a_file_two_computers_hold_is_one_row_from_the_first_of_them() {
+        let merged = merge_search_results(vec![
+            vec![library_row(&"b".repeat(64), true)],
+            vec![
+                library_row(&"b".repeat(64), false),
+                library_row(&"d".repeat(64), false),
+            ],
+        ]);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(places(&merged), "bd");
+        // The phone's own computer answered first, so its row is the one kept.
+        assert_eq!(merged[0].artist, "Mine");
+        assert!(merged[0].local);
+    }
+
+    /// A mix is one order over every computer's rows, and the order is the shared
+    /// key: the same files come back in the same places however the rows were
+    /// shared out, so a scroll through a shuffle keeps going rather than
+    /// repeating.
+    ///
+    /// The orders here are worked out away from this code, from the formula both
+    /// applications use.
+    #[test]
+    fn a_mix_is_one_order_over_every_computers_rows() {
+        let hosts = vec![
+            mixed_from("own", library_rows(&['a', 'b']), 2),
+            mixed_from("friend", library_rows(&['b', 'c']), 2),
+        ];
+
+        let (page, total) = mixed_page(&hosts, 7, 0, 10);
+        // Each file once: the one both computers hold is one row.
+        assert_eq!(page.len(), 3);
+        assert_eq!(places(&page), "cba");
+
+        // A page at a time continues where the last left off rather than
+        // repeating what has already gone by.
+        let (first, _) = mixed_page(&hosts, 7, 0, 1);
+        let (second, _) = mixed_page(&hosts, 7, 1, 2);
+        assert_eq!(places(&first), "c");
+        assert_eq!(places(&second), "ba");
+
+        // Another seed is another order.
+        let (other, _) = mixed_page(&hosts, 9, 0, 10);
+        assert_eq!(places(&other), "acb");
+
+        // What the computers together say they hold, which counts the file they
+        // both hold twice: an upper bound, and exactly right with one computer.
+        assert_eq!(total, 4);
+    }
+
+    /// A page deeper than one answer can carry is asked for in parts, and a
+    /// computer that has given everything it holds is asked no more.
+    #[test]
+    fn a_deep_page_is_asked_for_in_parts_and_stops_when_asked_out() {
+        // The first part of anything is at most one answer.
+        assert_eq!(next_mix_request(0, None, 100), Some((0, 100)));
+        assert_eq!(
+            next_mix_request(0, None, MAX_PAGE_SIZE + 50),
+            Some((0, MAX_PAGE_SIZE))
+        );
+        assert_eq!(
+            next_mix_request(MAX_PAGE_SIZE, Some(400), MAX_PAGE_SIZE + 50),
+            Some((MAX_PAGE_SIZE, 50))
+        );
+        // Holding what the page needs is nothing to ask for, and neither is a
+        // computer that has given all it has.
+        assert_eq!(next_mix_request(200, Some(400), 100), None);
+        assert_eq!(next_mix_request(30, Some(30), 100), None);
+        assert_eq!(next_mix_request(30, Some(40), 100), Some((30, 10)));
     }
 
     /// A playlist is edited on a phone by sending the whole of it, so the one

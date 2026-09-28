@@ -12,12 +12,11 @@ use napstr_remote_protocol::{
     RemoteAudiobook, RemoteAudiobookSummary, RemoteDiscussionActivity, RemoteDiscussionMessage,
     RemoteDiscussionReply, RemoteSource, RemoteTrack, RemoteTransfer, ServerResponse, ALPN,
     MAX_ART_KEY_CHARS, MAX_CONTROL_FRAME_BYTES, MAX_COVER_KEYS, MAX_PAGE_SIZE, MAX_PLAYLIST_PAGE,
-    MAX_PLAY_QUEUE, MAX_POSITION_MS, MAX_TRACKS_BY_ID, PROTOCOL_VERSION,
+    MAX_PLAY_QUEUE, MAX_POSITION_MS, MAX_TRACKS_BY_ID, PROTOCOL_VERSION, shuffle_key,
 };
 use qrcode::{render::svg, QrCode};
 use rusqlite::{params, OptionalExtension};
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -1772,21 +1771,6 @@ fn page_shuffled_music_library(
         .map(|index| tracks[index].clone())
         .collect::<Vec<_>>();
     (page, tracks.len())
-}
-
-/// Where one file falls in a seeded order.
-///
-/// A hash of the seed and the file id, truncated: the file id is already a
-/// hash, so any mixing would do, and hashing the two together is the version of
-/// "any mixing" that can be checked by reading it.
-fn shuffle_key(seed: u64, file_id: &str) -> [u8; 8] {
-    let mut hasher = Sha256::new();
-    hasher.update(seed.to_le_bytes());
-    hasher.update(file_id.as_bytes());
-    let digest = hasher.finalize();
-    let mut key = [0u8; 8];
-    key.copy_from_slice(&digest[..8]);
-    key
 }
 
 fn page_music_library(

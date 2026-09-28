@@ -1,5 +1,6 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 pub const ALPN: &[u8] = b"/napstr/mobile/1";
 pub const PROTOCOL_VERSION: u16 = 1;
@@ -12,6 +13,32 @@ pub const MAX_COVER_KEYS: usize = 40;
 /// 300 characters, so anything longer is not a key this host ever stored and is
 /// refused rather than searched for.
 pub const MAX_ART_KEY_CHARS: usize = 300;
+
+/// Where one file falls in a seeded order.
+///
+/// A hash of the seed and the file id, truncated: the file id is already a hash,
+/// so any mixing would do, and hashing the two together is the version of "any
+/// mixing" that can be checked by reading it.
+///
+/// Both sides compute this, and that is the point of it being here rather than
+/// wherever it is first used. A computer sorting its own library by this key and
+/// a phone laying several computers' libraries alongside each other agree on one
+/// order because the key depends on nothing but the seed and the file id - so a
+/// friend's music can be shuffled in without any computer knowing that the
+/// others exist, and without the phone holding anybody's whole list.
+///
+/// The order is stable for a seed however long ago it was minted, which is what
+/// lets a phone page through it a hundred files at a time, and what keeps a
+/// computer restart from reshuffling a list the phone is halfway down.
+pub fn shuffle_key(seed: u64, file_id: &str) -> [u8; 8] {
+    let mut hasher = Sha256::new();
+    hasher.update(seed.to_le_bytes());
+    hasher.update(file_id.as_bytes());
+    let digest = hasher.finalize();
+    let mut key = [0u8; 8];
+    key.copy_from_slice(&digest[..8]);
+    key
+}
 
 /// Which of an album's two renditions a phone is asking for.
 ///
@@ -1297,6 +1324,27 @@ mod tests {
         assert!(!DeviceRights::read_only().is_full());
         assert!(DeviceRights::full().is_full());
         assert!(!DeviceRights::default().is_full());
+    }
+
+    /// One order, two sides: the key a computer sorts its own library by is the
+    /// key a phone lays several computers' libraries out by.
+    ///
+    /// The numbers are SHA-256 of the seed as eight little-endian bytes followed
+    /// by the file id, first eight bytes, worked out away from this code - so
+    /// this pins the formula rather than restating it. Both applications build
+    /// from this crate, which is what keeps them agreeing.
+    #[test]
+    fn the_shuffle_key_is_the_seed_and_the_file_together() {
+        let file = "a".repeat(64);
+        assert_eq!(shuffle_key(7, &file), [0xda, 0x37, 0x1c, 0x80, 0xe9, 0x63, 0x3a, 0xd7]);
+        assert_eq!(shuffle_key(9, &file), [0x04, 0x62, 0x33, 0x9c, 0xf3, 0x99, 0x59, 0xbb]);
+        // A different seed puts the same file somewhere else, and a different file
+        // puts something else at the same seed: neither alone decides.
+        assert_ne!(shuffle_key(7, &file), shuffle_key(9, &file));
+        assert_ne!(shuffle_key(7, &file), shuffle_key(7, &"b".repeat(64)));
+        // And the same question always gets the same answer, which is what makes
+        // a page of a shuffle a page of one order.
+        assert_eq!(shuffle_key(7, &file), shuffle_key(7, &file));
     }
 
     /// A phone that asks for the computer's own playlists alone.
