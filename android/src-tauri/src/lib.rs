@@ -6,11 +6,11 @@ use futures_util::StreamExt;
 use iroh::{endpoint::presets, Endpoint, EndpointAddr, EndpointId, SecretKey};
 use napstr_remote_protocol::{
     ArtRendition, ClientRequest, PairingTicket, PlaybackCommand, RemoteAlbumCover, RemoteAudiobook,
-    RemoteAudiobookSummary, RemotePlaybackState, RemotePlaylist, RemotePlaylistCoordinate,
-    RemotePlaylistSummary, RemoteTrack, RemoteTransfer, ServerResponse, ALPN, MAX_ART_KEY_CHARS,
-    MAX_CONTROL_FRAME_BYTES, MAX_COVER_KEYS, MAX_PLAYLIST_MEMBERS, MAX_PLAYLIST_PAGE, MAX_PLAY_QUEUE,
-    MAX_QR_SVG_BYTES, MAX_REPORT_NOTE_CHARS, MAX_TRACKS_BY_ID,
-    REPORT_REASONS,
+    RemoteAudiobookSummary, RemoteDiscussionActivity, RemoteDiscussionMessage, RemotePlaybackState,
+    RemotePlaylist, RemotePlaylistCoordinate, RemotePlaylistSummary, RemoteTrack, RemoteTransfer,
+    ServerResponse, ALPN, MAX_ART_KEY_CHARS, MAX_CONTROL_FRAME_BYTES, MAX_COVER_KEYS,
+    MAX_PLAYLIST_MEMBERS, MAX_PLAYLIST_PAGE, MAX_PLAY_QUEUE, MAX_QR_SVG_BYTES,
+    MAX_REPORT_NOTE_CHARS, MAX_TRACKS_BY_ID, REPORT_REASONS,
 };
 use quick_xml::{events::Event, Reader};
 use qrcode::{render::svg, QrCode};
@@ -2340,6 +2340,79 @@ fn normalise_cover_key(value: &str) -> Option<String> {
 ///
 /// A read-only pairing may ask this too: seeing what the computer is doing is
 /// not a way of changing it.
+/// The conversation around one track, a page at a time.
+///
+/// Reading costs the phone nothing but a request, and reading is all a lent phone
+/// may do: the messages are public, and the computer is the one fetching them.
+#[tauri::command]
+async fn remote_track_discussion(
+    file_id: String,
+    before: Option<u64>,
+    state: State<'_, AppState>,
+) -> Result<Vec<RemoteDiscussionMessage>, String> {
+    match state
+        .remote
+        .request(ClientRequest::TrackDiscussion {
+            file_id: file_id.clone(),
+            before,
+        })
+        .await
+    {
+        Ok(ServerResponse::TrackDiscussion { messages }) => Ok(messages),
+        Ok(response) => Err(unexpected_response(&response)),
+        Err(error) => Err(friendly_if_missing(error, DISCUSSION_UNAVAILABLE)),
+    }
+}
+
+/// Say something in that conversation.
+///
+/// The computer signs it with the user's own key and publishes it under their
+/// name, so a read-only pairing is refused there rather than here - and this
+/// still refuses to offer the box in the first place, because a phone that can
+/// only fail should not invite the attempt.
+#[tauri::command]
+async fn remote_send_track_discussion(
+    file_id: String,
+    content: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    match state
+        .remote
+        .request(ClientRequest::SendTrackDiscussion {
+            file_id: file_id.clone(),
+            content,
+        })
+        .await
+    {
+        Ok(ServerResponse::TrackDiscussionSent { event_id }) => Ok(event_id),
+        Ok(response) => Err(unexpected_response(&response)),
+        Err(error) => Err(friendly_if_missing(error, DISCUSSION_UNAVAILABLE)),
+    }
+}
+
+/// How many people have commented on each of these files, for the marks on rows.
+///
+/// The host answers about the files it is willing to name to a relay, so a file
+/// this computer holds without having published is simply absent from the answer.
+#[tauri::command]
+async fn remote_track_discussion_activity(
+    file_ids: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<RemoteDiscussionActivity>, String> {
+    match state
+        .remote
+        .request(ClientRequest::TrackDiscussionActivity { file_ids })
+        .await
+    {
+        Ok(ServerResponse::TrackDiscussionActivity { activity }) => Ok(activity),
+        Ok(response) => Err(unexpected_response(&response)),
+        // A mark is a courtesy: an older computer that does not know the question
+        // leaves the rows quiet rather than reporting an error for something
+        // nobody asked for.
+        Err(_) => Ok(Vec::new()),
+    }
+}
+
 #[tauri::command]
 async fn remote_playback_state(
     state: State<'_, AppState>,
@@ -2888,6 +2961,8 @@ const READ_ONLY_CODE_UNAVAILABLE: &str =
     "This Napstr cannot create read-only codes yet. Update Napstr on your computer.";
 const REPORT_UNAVAILABLE: &str =
     "This Napstr cannot publish reports yet. Update Napstr on your computer.";
+const DISCUSSION_UNAVAILABLE: &str =
+    "This Napstr cannot show track discussions yet. Update Napstr on your computer.";
 
 /// A host that does not know a request answers with a parse error, which says
 /// nothing useful to the person holding the phone.
@@ -3090,6 +3165,9 @@ pub fn run() {
             cached_library,
             remote_covers,
             remote_art,
+            remote_track_discussion,
+            remote_send_track_discussion,
+            remote_track_discussion_activity,
             remote_playback_state,
             remote_playback,
             remote_read_only_ticket,

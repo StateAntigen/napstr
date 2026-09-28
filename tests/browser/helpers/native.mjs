@@ -22,7 +22,7 @@ export async function mockNative(page, { app = 'napstrfy', nativeLocale = 'en-GB
       // real channel would - with a failure.
       connected: paired && window.desktopReachable !== false,
       desktopName: 'Music computer',
-      streamOnly: false,
+      streamOnly: Boolean(window.streamOnly),
       endpointId: 'endpoint',
       libraryRevision: 1,
       coverRevision: 0,
@@ -165,6 +165,19 @@ export async function mockNative(page, { app = 'napstrfy', nativeLocale = 'en-GB
             return { tracks: rows.slice(offset, offset + limit), total: rows.length };
           }
           case 'remote_search': if (window.searchError) throw window.searchError; return window.networkSearchResults ?? [track];
+          // The conversation around a track: a test seeds what has been said, and
+          // a send appends to the same list, so the page asks again and finds it.
+          case 'remote_track_discussion': return args.before ? [] : window.discussionMessages ?? [];
+          case 'remote_send_track_discussion': {
+            const said = window.discussionMessages ?? [];
+            const sent = { eventId: `sent-${said.length}`, pubkey: 'c'.repeat(64), npub: 'npub1me', displayName: 'Me', content: args.content, createdAt: 1_800_000_100 };
+            window.discussionMessages = [...said, sent];
+            return sent.eventId;
+          }
+          case 'remote_track_discussion_activity': {
+            const known = window.discussionActivity ?? {};
+            return args.fileIds.map((fileId) => known[fileId]).filter(Boolean);
+          }
           case 'remote_transfers': return [{ ...transfers[1], fileId: track.fileId }];
           case 'reconcile_audio_cache': return true;
           // The native side draws the track code, so answer the way it does.

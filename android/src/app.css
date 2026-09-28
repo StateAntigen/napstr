@@ -505,6 +505,31 @@ svg .filled { fill: currentColor; stroke: none; }
 .quality-chip.on { color: #0b0b0f; background: #c9c2ff; border-color: #c9c2ff; }
 .quality-hint { margin: 10px 0 2px; color: #85858f; font-size: 11px; line-height: 1.45; }
 
+/* A track's conversation: public messages fetched by the computer, in the same
+   shape the desktop's own chat panel draws them. */
+.discussion-view { position: fixed; z-index: 36; inset: 0; display: flex; flex-direction: column; overflow: hidden; background: #0b0b0e; animation: queue-in .22s ease-out; }
+.discussion-view .view-head { position: static; padding: calc(env(safe-area-inset-top) + 12px) 14px 10px 18px; display: flex; align-items: center; gap: 12px; border-bottom: 1px solid #1c1c22; }
+.discussion-view .view-head h1 { margin: 0; font-size: 21px; letter-spacing: -.02em; }
+.discussion-scroll { min-height: 0; flex: 1 1 auto; overflow-y: auto; overscroll-behavior-y: contain; padding: 14px 16px calc(20px + env(safe-area-inset-bottom)); }
+.discussion-about { margin-bottom: 14px; }
+.discussion-about strong, .discussion-about small { display: block; }
+.discussion-about strong { font-size: 15px; }
+.discussion-about small { margin-top: 3px; color: #8a8a95; font-size: 12px; }
+.discussion-message { margin: 0 0 12px; padding: 10px 13px; background: #131318; border: 1px solid #1f1f27; border-radius: 12px; }
+/* What this identity said is marked, which is what `status.pubkey` is for. */
+.discussion-message.mine { background: #191733; border-color: #34305c; }
+.discussion-message header { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 5px; }
+.discussion-message header b { color: #cbc4ff; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.discussion-message header time { flex: 0 0 auto; color: #6f6f7a; font-size: 11px; }
+.discussion-message p { margin: 0; color: #ececf1; font-size: 14px; line-height: 1.45; overflow-wrap: anywhere; }
+.discussion-error { margin: 0 0 12px; padding: 10px 12px; color: #ffb3bd; background: #2a1a1f; border: 1px solid #4a2b33; border-radius: 10px; font-size: 12px; }
+.discussion-older { width: 100%; min-height: 36px; margin-bottom: 12px; color: #b9b9c4; background: #16161c; border: 1px solid #26262e; border-radius: 10px; font-size: 12px; font-weight: 700; }
+.discussion-compose { display: flex; gap: 8px; padding: 10px 16px calc(12px + env(safe-area-inset-bottom)); border-top: 1px solid #1c1c22; background: #0e0e12; }
+.discussion-compose input { min-width: 0; flex: 1 1 auto; min-height: 42px; padding: 0 14px; color: #ececf1; background: #16161c; border: 1px solid #26262e; border-radius: 21px; font-size: 14px; }
+.discussion-compose button { flex: 0 0 auto; min-width: 74px; min-height: 42px; padding: 0 16px; color: #0b0b0f; background: #c9c2ff; border: 0; border-radius: 21px; font-size: 13px; font-weight: 700; }
+.discussion-compose button:disabled { opacity: .5; }
+
+
 /* Temporary cover-art diagnostics, reached from Settings. Delete with
    CoverDebug.svelte. */
 .cover-debug-open { min-height: 30px; padding: 5px 11px; display: flex; align-items: center; gap: 10px; color: #d9d5ff; background: rgba(30,27,51,.94); border: 1px solid #514b78; border-radius: 15px; font-size: 12px; font-weight: 700; }

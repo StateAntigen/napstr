@@ -247,6 +247,22 @@ pub struct PublicChatCursor {
     event_id: EventId,
 }
 
+impl PublicChatCursor {
+    /// A cursor for everything written before this second.
+    ///
+    /// The desktop pages by `(second, event id)` because two messages can share a
+    /// second. A phone pages by the second alone - that is all its wire carries -
+    /// so the boundary is the oldest message it already has, and the zero id keeps
+    /// the comparison inclusive: a message written in that same second has already
+    /// been delivered rather than being skipped.
+    pub fn written_before(created_at: u64) -> Self {
+        Self {
+            created_at,
+            event_id: EventId::all_zeros(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CatalogueContent {

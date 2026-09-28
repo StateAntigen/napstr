@@ -1,16 +1,17 @@
 use crate::{
     build_local_audiobooks, build_local_audiobooks_from_files, cover_publish::CoverAlbumNote,
-    cover_publish::CoverPublisher, load_files, load_files_by_id, load_transfers, open_connection,
-    search_matches, SharedFile,
+    cover_publish::CoverPublisher, load_files, load_files_by_id, load_transfers, network,
+    open_connection, search_matches, SharedFile,
 };
 use chrono::Utc;
 use iroh::{endpoint::presets, Endpoint, SecretKey};
 use crate::art_fetch::ArtWant;
 use napstr_remote_protocol::{
     ArtRendition, ClientRequest, CoverReportResult, PairingTicket, PlaybackCommand, RemoteAlbumCover,
-    RemoteAudiobook, RemoteAudiobookSummary, RemoteSource, RemoteTrack, RemoteTransfer,
-    ServerResponse, ALPN, MAX_ART_KEY_CHARS, MAX_CONTROL_FRAME_BYTES, MAX_COVER_KEYS, MAX_PAGE_SIZE,
-    MAX_PLAYLIST_PAGE, MAX_PLAY_QUEUE, MAX_POSITION_MS, MAX_TRACKS_BY_ID, PROTOCOL_VERSION,
+    RemoteAudiobook, RemoteAudiobookSummary, RemoteDiscussionActivity, RemoteDiscussionMessage,
+    RemoteSource, RemoteTrack, RemoteTransfer, ServerResponse, ALPN, MAX_ART_KEY_CHARS,
+    MAX_CONTROL_FRAME_BYTES, MAX_COVER_KEYS, MAX_PAGE_SIZE, MAX_PLAYLIST_PAGE, MAX_PLAY_QUEUE,
+    MAX_POSITION_MS, MAX_TRACKS_BY_ID, PROTOCOL_VERSION,
 };
 use qrcode::{render::svg, QrCode};
 use rusqlite::{params, OptionalExtension};
@@ -25,6 +26,12 @@ use std::{
 use tokio::io::AsyncReadExt;
 
 const PAIRING_LIFETIME_SECONDS: i64 = 5 * 60;
+/// What a comment may be: the same ceiling the desktop's own composer enforces,
+/// because both write the same kind of event into the same conversation.
+const MAX_DISCUSSION_CHARS: usize = 500;
+/// Files one row-mark question may name. The host caps it again in the network
+/// layer; this is the wire's own limit, refused before any work is done.
+const MAX_DISCUSSION_ACTIVITY_IDS: usize = 200;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -986,6 +993,61 @@ impl MobileService {
                 );
                 write_response(send, &ServerResponse::AlbumCovers { covers: answer }).await
             }
+            ClientRequest::TrackDiscussion { file_id, before } => {
+                if !is_sha256_file_id(&file_id.trim()) {
+                    return Err("That track has no valid file ID".into());
+                }
+                // A cursor rather than an offset, because a conversation grows at
+                // the end: the oldest message of the last page is what the phone
+                // asks from, and the boundary stays inclusive so a message written
+                // in that same second is not skipped.
+                let cursor = before.map(network::PublicChatCursor::written_before);
+                let messages = self
+                    .network
+                    .track_discussion_messages(file_id.trim().to_string(), false, cursor)
+                    .await?
+                    .into_iter()
+                    .map(remote_discussion_message)
+                    .collect();
+                write_response(send, &ServerResponse::TrackDiscussion { messages }).await
+            }
+            ClientRequest::SendTrackDiscussion { file_id, content } => {
+                if !is_sha256_file_id(&file_id.trim()) {
+                    return Err("That track has no valid file ID".into());
+                }
+                if content.trim().is_empty() || content.chars().count() > MAX_DISCUSSION_CHARS {
+                    return Err(format!(
+                        "Comments are between 1 and {MAX_DISCUSSION_CHARS} characters"
+                    ));
+                }
+                // Signed and published by the computer's identity, so this speaks
+                // in the user's own name on a public relay. The network service
+                // announces the result itself, so the desktop's own chat view
+                // hears about a comment sent from a phone.
+                let event_id = self
+                    .network
+                    .send_track_discussion_message(file_id.trim().to_string(), content)
+                    .await?;
+                write_response(send, &ServerResponse::TrackDiscussionSent { event_id }).await
+            }
+            ClientRequest::TrackDiscussionActivity { file_ids } => {
+                if file_ids.len() > MAX_DISCUSSION_ACTIVITY_IDS {
+                    return Err("Too many files were asked about at once".into());
+                }
+                let activity = self
+                    .network
+                    .track_discussion_activity(file_ids)
+                    .await?
+                    .into_iter()
+                    .map(|row| RemoteDiscussionActivity {
+                        file_id: row.file_id,
+                        authors: row.authors.min(u32::MAX as usize) as u32,
+                        messages: row.messages.min(u32::MAX as usize) as u32,
+                        last_at: row.last_at,
+                    })
+                    .collect();
+                write_response(send, &ServerResponse::TrackDiscussionActivity { activity }).await
+            }
             ClientRequest::FetchArt { key, rendition } => {
                 if key.is_empty() || key.chars().count() > MAX_ART_KEY_CHARS {
                     return Err("Invalid art request".into());
@@ -1246,6 +1308,10 @@ fn check_request_permission(stream_only: bool, request: &ClientRequest) -> Resul
         // Which playlists hold a file is one more way of reading a playlist.
         | ClientRequest::PlaylistsContaining { .. }
         | ClientRequest::AlbumCovers { .. }
+        // A conversation is public and reading it is a read. Posting is not: it
+        // is published in the user's own name, which is why it is not here.
+        | ClientRequest::TrackDiscussion { .. }
+        | ClientRequest::TrackDiscussionActivity { .. }
         // Art is a read, and a phone lent read-only access should see covers:
         // the bytes come from this computer, so this reveals nothing the phone
         // could not already ask for by key.
@@ -1273,6 +1339,12 @@ fn check_request_permission(stream_only: bool, request: &ClientRequest) -> Resul
         ),
         ClientRequest::ReportCover { .. } => Err(
             "This phone has read-only access, so it cannot publish reports.".into(),
+        ),
+        // A comment is signed with the user's own key and published to public
+        // relays, under their name. That is an act rather than a read, and it is
+        // the same line read-only access already draws for reports and playlists.
+        ClientRequest::SendTrackDiscussion { .. } => Err(
+            "This phone has read-only access, so it cannot post comments.".into(),
         ),
         _ => Err("This phone has read-only access. Downloads on the Napstr host are not permitted.".into()),
     }
@@ -1338,6 +1410,24 @@ fn cached_art_hashes(
 
 /// Trim the host's bookkeeping (event ids, timestamps) from a resolved cover
 /// before it crosses the wire.
+/// A public message as the phone draws it.
+///
+/// The name and the npub come resolved rather than empty: a phone holds no Nostr
+/// identity, so it cannot ask a relay for a profile, and the host already keeps
+/// the names it has seen for the conversation it is rendering.
+fn remote_discussion_message(
+    message: crate::network::TrollboxMessage,
+) -> RemoteDiscussionMessage {
+    RemoteDiscussionMessage {
+        event_id: message.event_id,
+        pubkey: message.pubkey,
+        npub: message.npub,
+        display_name: message.display_name,
+        content: message.content,
+        created_at: message.created_at,
+    }
+}
+
 fn remote_album_cover(cover: crate::network::AlbumCover) -> RemoteAlbumCover {
     RemoteAlbumCover {
         key: cover.key,
@@ -1875,6 +1965,34 @@ mod tests {
             }
         )
         .is_ok());
+    }
+
+    #[test]
+    fn a_read_only_phone_may_read_a_conversation_but_not_speak_in_one() {
+        let file_id = "a".repeat(64);
+        // Reading is reading: the messages are public and the computer is only
+        // fetching them, so a lent phone may show a conversation and the marks on
+        // rows that say which ones are worth showing.
+        for request in [
+            ClientRequest::TrackDiscussion {
+                file_id: file_id.clone(),
+                before: Some(1_800_000_000),
+            },
+            ClientRequest::TrackDiscussionActivity {
+                file_ids: vec![file_id.clone()],
+            },
+        ] {
+            assert!(check_request_permission(true, &request).is_ok());
+        }
+        // Posting is signed with the user's own key and published under their
+        // name, which is the same line read-only access already draws for reports
+        // and for playlists.
+        let comment = ClientRequest::SendTrackDiscussion {
+            file_id,
+            content: "Nice track".into(),
+        };
+        assert!(check_request_permission(true, &comment).is_err());
+        assert!(check_request_permission(false, &comment).is_ok());
     }
 
     #[test]

@@ -173,6 +173,37 @@ pub struct RemoteAudiobookSummary {
     pub total_size: u64,
     pub chapter_count: usize,
 }
+
+/// One public message about one file, as a phone draws it.
+///
+/// The name and the npub come resolved, because the phone holds no Nostr
+/// identity of its own: it cannot ask a relay for a profile, and the host already
+/// keeps the names it has seen.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteDiscussionMessage {
+    pub event_id: String,
+    pub pubkey: String,
+    pub npub: String,
+    pub display_name: String,
+    pub content: String,
+    /// The event's own timestamp, in seconds since the epoch.
+    pub created_at: u64,
+}
+
+/// How much conversation a file has attracted, as a row's mark reads it.
+///
+/// `authors` is the number of distinct people, which is not the number of
+/// messages: one author talking to themselves is one author.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteDiscussionActivity {
+    pub file_id: String,
+    pub authors: u32,
+    pub messages: u32,
+    /// The newest comment, in seconds since the epoch.
+    pub last_at: u64,
+}
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteAlbumCover {
@@ -635,6 +666,37 @@ pub enum ClientRequest {
     AlbumCovers {
         keys: Vec<String>,
     },
+    /// The conversation around one file, a page at a time, oldest of the page
+    /// last.
+    ///
+    /// Reading is reading: a read-only pairing may ask, because these messages
+    /// are public and the host is only fetching them. Posting is a different
+    /// message, and a different permission.
+    TrackDiscussion {
+        file_id: String,
+        /// Only messages written before this second. The oldest message of the
+        /// last page is the cursor, so nothing is repeated - and a message written
+        /// in the same second as the cursor is not skipped, because the host keeps
+        /// the boundary inclusive rather than guessing.
+        #[serde(default)]
+        before: Option<u64>,
+    },
+    /// Say something in that conversation.
+    ///
+    /// Signed by the computer's identity, so it is published under the user's own
+    /// name: a public act rather than a read, and one a read-only pairing is
+    /// refused.
+    SendTrackDiscussion {
+        file_id: String,
+        content: String,
+    },
+    /// How much conversation a page of files has attracted, for the marks on rows.
+    /// The host answers about the files it is willing to name to a relay; a file
+    /// it holds without having published is left out of the answer as well as out
+    /// of the question.
+    TrackDiscussionActivity {
+        file_ids: Vec<String>,
+    },
     /// A write-capable phone driving the host's own player.
     Playback {
         command: PlaybackCommand,
@@ -722,6 +784,15 @@ pub enum ServerResponse {
     },
     AlbumCovers {
         covers: Vec<RemoteAlbumCover>,
+    },
+    TrackDiscussion {
+        messages: Vec<RemoteDiscussionMessage>,
+    },
+    TrackDiscussionSent {
+        event_id: String,
+    },
+    TrackDiscussionActivity {
+        activity: Vec<RemoteDiscussionActivity>,
     },
     /// The header an art transfer begins with: the bytes follow it in chunks,
     /// exactly as audio does. `hash` is what the phone stores them under, so two
@@ -895,6 +966,83 @@ mod tests {
         assert_eq!(read.format, "FLAC");
         assert_eq!(read.bitrate_kbps, 0, "a host that says nothing is not a 0 kb/s file");
         assert!(!read.lossless, "and it says nothing about losslessness either");
+    }
+
+    /// A phone reads a conversation, asks which rows are worth reading, and - if it
+    /// was not lent read-only - says something in one.
+    ///
+    /// The wire names are the contract, so they are asserted rather than assumed,
+    /// and so is the biggest answer this can produce: a page of the longest
+    /// comments a host may carry, which has to fit in one control frame.
+    #[test]
+    fn discussion_messages_round_trip_and_a_page_of_them_fits_one_control_frame() {
+        let file_id = "a".repeat(64);
+        assert_eq!(
+            serde_json::to_value(ClientRequest::TrackDiscussion {
+                file_id: file_id.clone(),
+                before: Some(1_800_000_000),
+            })
+            .unwrap(),
+            serde_json::json!({
+                "type": "trackDiscussion",
+                "fileId": file_id,
+                "before": 1_800_000_000u64,
+            })
+        );
+        // An older phone sends no cursor at all, and asking for the newest page is
+        // exactly what that means.
+        let newest: ClientRequest = serde_json::from_str(&format!(
+            r#"{{"type":"trackDiscussion","fileId":"{file_id}"}}"#
+        ))
+        .unwrap();
+        assert_eq!(
+            newest,
+            ClientRequest::TrackDiscussion {
+                file_id: file_id.clone(),
+                before: None
+            }
+        );
+
+        let messages = (0..100)
+            .map(|index| RemoteDiscussionMessage {
+                event_id: format!("{index:064x}"),
+                pubkey: "b".repeat(64),
+                npub: format!("npub1{}", "c".repeat(58)),
+                display_name: "d".repeat(64),
+                content: "e".repeat(500),
+                created_at: 1_800_000_000,
+            })
+            .collect::<Vec<_>>();
+        let payload = serde_json::to_vec(&ServerResponse::TrackDiscussion {
+            messages: messages.clone(),
+        })
+        .unwrap();
+        assert!(
+            payload.len() <= MAX_CONTROL_FRAME_BYTES,
+            "a page of comments is {} bytes, over the {MAX_CONTROL_FRAME_BYTES} byte frame limit",
+            payload.len()
+        );
+        assert_eq!(
+            serde_json::from_slice::<ServerResponse>(&payload).unwrap(),
+            ServerResponse::TrackDiscussion { messages }
+        );
+
+        // The marks on rows travel as counts rather than as conversations.
+        assert_eq!(
+            serde_json::to_value(ServerResponse::TrackDiscussionActivity {
+                activity: vec![RemoteDiscussionActivity {
+                    file_id: file_id.clone(),
+                    authors: 3,
+                    messages: 7,
+                    last_at: 1_800_000_000,
+                }]
+            })
+            .unwrap(),
+            serde_json::json!({
+                "type": "trackDiscussionActivity",
+                "activity": [{ "fileId": file_id, "authors": 3, "messages": 7, "lastAt": 1_800_000_000u64 }],
+            })
+        );
     }
 
     #[test]

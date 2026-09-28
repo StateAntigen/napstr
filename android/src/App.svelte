@@ -24,7 +24,7 @@
   import appIcon from '../src-tauri/icons/icon.png';
   import { artworkHue, coverFor, coverKey, invalidateCoverNegatives, loadFullCover, preloadArtwork, type AlbumCover } from './lib/artwork';
   import { reportReasons } from './lib/types';
-  import type { AudiobookLibraryPage, CachedAudio, CompanionStatus, CoverReport, LibraryPage, PlaybackCommand, PlaylistPage, PodcastDownload, PodcastEpisode, PodcastFeed, ReadOnlyTicketOffer, RemoteAudiobook, RemoteAudiobookSummary, RemotePlaybackState, RemotePlaylist, RemotePlaylistCoordinate, RemotePlaylistSummary, RemotePlaylistTrack, RemoteRepeat, RemoteTrack, RemoteTransfer, ReportReason } from './lib/types';
+  import type { AudiobookLibraryPage, CachedAudio, CompanionStatus, CoverReport, LibraryPage, PlaybackCommand, PlaylistPage, PodcastDownload, PodcastEpisode, PodcastFeed, ReadOnlyTicketOffer, RemoteAudiobook, RemoteAudiobookSummary, RemoteDiscussionMessage, RemotePlaybackState, RemotePlaylist, RemotePlaylistCoordinate, RemotePlaylistSummary, RemotePlaylistTrack, RemoteRepeat, RemoteTrack, RemoteTransfer, ReportReason } from './lib/types';
 
   const musicChips = ['Rock', 'Soundtrack', 'Punk', 'Folk', 'Upbeat'];
   const musicHistoryKey = 'napstrfy-played-albums';
@@ -45,6 +45,8 @@
   const COVER_DEBUG = true;
   /** The host caps a library page at 200, so one album always fits. */
   const MAX_ALBUM_TRACKS = 200;
+  /** How many comments a page of a track's conversation holds. */
+  const DISCUSSION_PAGE = 100;
   /** Fraction of the screen a right swipe on the liked page must cover to leave it. */
   const LIKED_SWIPE_DISMISS_RATIO = 0.25;
   /** Albums grouped out of the tracks this phone has loaded. */
@@ -250,6 +252,22 @@
   let showQueue = $state(false);
   /** The track menu, opened from the drawer or from any album track. */
   let showActions = $state(false);
+  /**
+   * The conversation open on screen, and what it holds.
+   *
+   * Reading is all a lent phone can do, so the composer is the pairing's business
+   * rather than this state's; anything that arrives here is public text the
+   * computer fetched, and is drawn as text.
+   */
+  let discussionTrack = $state<RemoteTrack | null>(null);
+  let discussionMessages = $state<RemoteDiscussionMessage[]>([]);
+  let discussionDraft = $state('');
+  let discussionLoading = $state(false);
+  let discussionSending = $state(false);
+  let discussionError: string | Message = $state('');
+  let discussionHasMore = $state(true);
+  /** The list itself, so a new comment can be brought into view. */
+  let discussionScroller = $state<HTMLDivElement | undefined>(undefined);
   let showSleepOptions = $state(false);
   let actionTrack = $state<RemoteTrack | null>(null);
   let sleepValue = $state('');
@@ -4030,6 +4048,93 @@
     return mode === 'off' ? 'Off' : mode === 'all' ? 'All' : 'One track';
   }
 
+  /**
+   * Opens a track's conversation and reads its newest page.
+   *
+   * The conversation lives on public relays and is fetched by the computer, so a
+   * phone lent read-only access can read one: nothing here is a secret, and the
+   * messages are the same ones anyone could fetch.
+   */
+  async function openDiscussion(track: RemoteTrack) {
+    closeActions();
+    discussionTrack = track;
+    discussionMessages = [];
+    discussionDraft = '';
+    discussionError = '';
+    discussionHasMore = true;
+    await refreshDiscussion();
+  }
+
+  function closeDiscussion() {
+    discussionTrack = null;
+    discussionMessages = [];
+    discussionDraft = '';
+    discussionError = '';
+  }
+
+  /**
+   * Reads a page of the conversation: the newest, or the one before the oldest
+   * message already held.
+   *
+   * The cursor is a second rather than an offset, because a conversation grows at
+   * the end: asking from the oldest message that is here cannot skip one that
+   * arrived in the meantime.
+   */
+  async function refreshDiscussion(older = false) {
+    const track = discussionTrack;
+    if (!track || discussionLoading || (older && !discussionHasMore)) return;
+    discussionLoading = true;
+    if (!older) discussionError = '';
+    try {
+      const before = older ? discussionMessages[0]?.createdAt : undefined;
+      const messages = await invoke<RemoteDiscussionMessage[]>('remote_track_discussion', {
+        fileId: track.fileId,
+        before
+      });
+      if (discussionTrack?.fileId !== track.fileId) return;
+      if (older) discussionHasMore = messages.length > 0 && messages.length >= DISCUSSION_PAGE;
+      discussionMessages = older
+        ? [...messages, ...discussionMessages.filter((held) => !messages.some((next) => next.eventId === held.eventId))]
+        : messages;
+      // A conversation opens on its newest page, which belongs at the bottom:
+      // history being read above it is left where the reader put it.
+      if (!older) {
+        await tick();
+        discussionScroller?.scrollTo({ top: discussionScroller.scrollHeight });
+      }
+    } catch (nextError) {
+      discussionError = String(nextError);
+    } finally {
+      discussionLoading = false;
+    }
+  }
+
+  /** Posts a comment: the computer signs it and publishes it under the user's name. */
+  async function sendDiscussion() {
+    const track = discussionTrack;
+    const content = discussionDraft.trim();
+    if (!track || !content || discussionSending || status.streamOnly) return;
+    discussionSending = true;
+    discussionError = '';
+    try {
+      await invoke<string>('remote_send_track_discussion', { fileId: track.fileId, content });
+      discussionDraft = '';
+      await refreshDiscussion();
+    } catch (nextError) {
+      discussionError = String(nextError);
+    } finally {
+      discussionSending = false;
+    }
+  }
+
+  /** When a message was written, in the reader's own clock. */
+  function discussionStamp(seconds: number) {
+    const at = new Date(seconds * 1000);
+    return Number.isNaN(at.getTime())
+      ? ''
+      : at.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+  }
+
   function openActions(track: RemoteTrack | null) {
     actionTrack = track;
     showSleepOptions = false;
@@ -6164,6 +6269,54 @@
   </div>
 {/if}
 
+{#if discussionTrack}
+  <div class="discussion-view" class:desktop={desktopShell} role="dialog" aria-modal="true" aria-label={$t("Track discussion")}>
+    <header class="view-head">
+      <button class="view-icon" onclick={closeDiscussion} aria-label={$t("Close the discussion")}>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14.5 5 8 12l6.5 7" /></svg>
+      </button>
+      <h1>{$t("Track discussion")}</h1>
+    </header>
+    <div
+      class="discussion-scroll"
+      bind:this={discussionScroller}
+      aria-busy={discussionLoading}
+      onscroll={(event) => { if (event.currentTarget.scrollTop < 40) void refreshDiscussion(true); }}
+    >
+      <div class="discussion-about">
+        <strong>{title(discussionTrack)}</strong>
+        <small>{artist(discussionTrack)}</small>
+      </div>
+      {#if discussionLoading && discussionMessages.length === 0}<p class="quality-hint">{$t("Loading…")}</p>{/if}
+      {#if !discussionLoading && discussionMessages.length === 0 && !discussionError}<p class="quality-hint">{$t("No comments yet.")}</p>{/if}
+      {#if discussionHasMore && discussionMessages.length > 0 && !discussionLoading}
+        <button class="discussion-older" onclick={() => void refreshDiscussion(true)}>{$t("Load more")}</button>
+      {/if}
+      {#each discussionMessages as message (message.eventId)}
+        <article class="discussion-message" class:mine={message.pubkey === status.pubkey}>
+          <header><b>{message.displayName || message.npub}</b><time>{discussionStamp(message.createdAt)}</time></header>
+          <p>{message.content}</p>
+        </article>
+      {/each}
+      {#if discussionError}<p class="discussion-error">{discussionError}</p>{/if}
+    </div>
+    {#if status.streamOnly}
+      <p class="settings-note">{$t("This pairing is read only: it can browse and play, but cannot ask Napstr to download or publish.")}</p>
+    {:else}
+      <form class="discussion-compose" onsubmit={(event) => { event.preventDefault(); void sendDiscussion(); }}>
+        <input
+          bind:value={discussionDraft}
+          maxlength="500"
+          autocomplete="off"
+          aria-label={$t("Track discussion comment")}
+          placeholder={$t("Comment on this track…")}
+        />
+        <button disabled={!discussionDraft.trim() || discussionSending} aria-busy={discussionSending}>{discussionSending ? '…' : $t("Send")}</button>
+      </form>
+    {/if}
+  </div>
+{/if}
+
 {#if showActions && menuTrack}
   <div class="actions-view" role="dialog" aria-modal="true" aria-label={$t("Track options")}>
     <button class="actions-scrim" onclick={closeActions} aria-label={$t("Close the track options")}></button>
@@ -6209,6 +6362,11 @@
         <button class="actions-row" onclick={() => void shareTrack(menuTrack)}>
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4" /><path d="M8 7.5 12 3.5l4 4" /><path d="M5 14v6h14v-6" /></svg>
           <span>{$t("Share")}</span><small>{trackUri(menuTrack)}</small>
+        </button>
+        <button class="actions-row" disabled={!remoteAvailable()} onclick={() => void openDiscussion(menuTrack as RemoteTrack)}>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4.2 5.4h15.6v9.8H9.6L5.2 19v-3.8H4.2z" /></svg>
+          <span>{$t("Track discussion")}</span>
+          {#if !remoteAvailable()}<small>{$t("Needs a connection")}</small>{/if}
         </button>
         <button class="actions-row" onclick={() => void openTrackCode(menuTrack)}>
           <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.6" y="3.6" width="6.4" height="6.4" rx="1.2" /><rect x="14" y="3.6" width="6.4" height="6.4" rx="1.2" /><rect x="3.6" y="14" width="6.4" height="6.4" rx="1.2" /><path d="M14 14h2.6v2.6H14z" /><path d="M17.8 18.4h2.6v2H17.8z" /><path d="M14 20.4h1.6" /><path d="M20.4 14v2.6" /></svg>

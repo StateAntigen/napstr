@@ -1,5 +1,35 @@
 export type RemoteSource = { pubkey: string; displayName: string };
 
+/**
+ * One public message about one track.
+ *
+ * The name and the npub arrive resolved, because this phone holds no Nostr
+ * identity: it cannot ask a relay for a profile, so the computer sends the names
+ * it has already seen.
+ */
+export type RemoteDiscussionMessage = {
+  eventId: string;
+  pubkey: string;
+  npub: string;
+  displayName: string;
+  content: string;
+  /** The event's own timestamp, in seconds since the epoch. */
+  createdAt: number;
+};
+
+/**
+ * How much conversation a track has attracted.
+ *
+ * `authors` is what a mark shows: distinct people, not messages, because one
+ * person can post as many messages as they like.
+ */
+export type RemoteDiscussionActivity = {
+  fileId: string;
+  authors: number;
+  messages: number;
+  lastAt: number;
+};
+
 export type RemoteTrack = {
   fileId: string;
   filename: string;
