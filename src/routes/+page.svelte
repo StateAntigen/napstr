@@ -1420,6 +1420,20 @@
   // again. A long pass would otherwise leave every square blank until it ended.
   let coverRevision = 0;
   let lastCoverRevisionAt = 0;
+  /**
+   * Which of the Covers tab's panels is open.
+   *
+   * One at a time, because the tab used to stack six panels with a paragraph
+   * under each: what a person comes here for is in the summary line above them,
+   * and the long explanations are in the titles of the things they explain.
+   * Deliberately not stored - a fresh look at the tab should start on what is
+   * waiting, which is the only panel with something to do in it.
+   */
+  let coverPanel: 'waiting' | 'found' | 'activity' | 'settings' = 'waiting';
+
+  function setCoverPanel(panel: 'waiting' | 'found' | 'activity' | 'settings') {
+    coverPanel = panel;
+  }
 
   // ---- Results presentation ------------------------------------------------
   //
@@ -3926,166 +3940,180 @@
         </section>
       {:else if activeView === 'Covers'}
         <section class="full-panel cover-scan-view">
-          <div class="panel-title"><span></span><b>{$t("Album covers")}</b><span></span></div>
-          <p class="privacy-note wide"><span>i</span> {$t("Napstr finds album art in two steps. Reading the kind")} <code>30427</code> {$t("claims other people published needs nothing switched on: it is an ordinary relay query, and it happens by itself as results appear. The two switches below are the steps that leave Napstr. Napstr acts on them on its own — there is nothing else to press — and they are stored, so leaving one on means it carries on after a restart.")}</p>
+          <div class="panel-title" title={$t("Napstr finds album art in two steps. Reading the kind") + ' 30427 ' + $t("claims other people published needs nothing switched on: it is an ordinary relay query, and it happens by itself as results appear. The two switches below are the steps that leave Napstr. Napstr acts on them on its own — there is nothing else to press — and they are stored, so leaving one on means it carries on after a restart.")}><span></span><b>{$t("Album covers")}</b><span></span></div>
 
-          <div class="cover-scan-controls">
-            <label class="cover-scan-toggle">
-              <input type="checkbox" checked={coverStatus?.lookupExternal ?? false} onchange={(event) => void setCoverPreferences(event.currentTarget.checked, coverStatus?.publishClaims ?? false)} />
-              <span>{$t("Look up art automatically")}<small>{$t("Asks MusicBrainz and the Cover Art Archive about every album without a cover: the ones on this computer, and the albums the results pane has shown you")}{' '}{'When those have nothing, the iTunes catalogue is asked for the same album, matched on the album and artist names.'}</small></span>
-            </label>
-            <label class="cover-scan-toggle">
-              <input type="checkbox" checked={coverStatus?.publishClaims ?? false} onchange={(event) => void setCoverPreferences(coverStatus?.lookupExternal ?? false, event.currentTarget.checked)} />
-              <span>{$t("Sign and publish the covers I resolve")}<small>{$t("A kind")} <code>30427</code> {$t("claim signed with your own identity and sent to your relays, as fast as they can be signed")}</small></span>
-            </label>
-            {#if coverStatus?.running}
-              <button class="classic-button" onclick={() => void stopCoverPass()}>{$t("Stop")}</button>
-            {:else}
-              <button class="classic-button" onclick={() => void lookForCoversNow()} disabled={!coverOptIn(coverStatus)}>{$t("Look now")}</button>
+          <!--
+            Everything a person comes here for, in one line: what is held, how
+            much disk it takes, and what is left to fetch. The panels below it are
+            one at a time, because six panels stacked with a paragraph under each
+            is a wall rather than a page.
+          -->
+          <div
+            class="cover-summary"
+            title={'Albums the worker is dealing with, pictures this computer holds for your phones and what they take on disk, albums whose pictures it has not fetched yet, and albums of your own music with no cover claim. Everything long-winded about this tab is in a tooltip on the thing it is about.'}
+          >
+            <span>{#if coverStatus?.running}<b>{(coverStatus?.remaining ?? 0).toLocaleString()}</b>{' of '}{(coverStatus?.pending ?? 0).toLocaleString()}{' this pass'}{:else}<b>{(coverStatus?.pending ?? 0).toLocaleString()}</b>{' in the last pass'}{/if}</span>
+            <span><b>{(coverStatus?.artCached ?? 0).toLocaleString()}</b>{' '}{(coverStatus?.artCached ?? 0) === 1 ? 'picture' : 'pictures'}</span>
+            <span>{readableBytes(coverStatus?.artBytes ?? 0)}</span>
+            <span><b>{(coverStatus?.artPending ?? 0).toLocaleString()}</b>{' '}{(coverStatus?.artPending ?? 0) === 1 ? 'album' : 'albums'}{' to fetch'}</span>
+            <span><b>{coverMissing.length.toLocaleString()}</b>{' '}{coverMissing.length === 1 ? 'album' : 'albums'}{' without a claim'}</span>
+            {#if coverStatus?.current}<span class="cover-summary-current" title={$t("Working on")}>{coverStatus.current}</span>{/if}
+            <button class="cover-summary-refresh" onclick={() => void refreshCovers()} disabled={coverLoading} title={$t("Refresh")}>{coverLoading ? '…' : '⟳'}</button>
+          </div>
+
+          <div class="cover-subtabs">
+            <button class="cover-subtab" class:active={coverPanel === 'waiting'} title={'The albums the worker would touch next'} onclick={() => setCoverPanel('waiting')}>{'Waiting'}</button>
+            <button class="cover-subtab" class:active={coverPanel === 'found'} title={'Every album of your own music with no cover claim, worst first. A failure comes first because a lookup that fell over looks identical to an album nobody has art for.'} onclick={() => setCoverPanel('found')}>{'Covers found'}</button>
+            <button class="cover-subtab" class:active={coverPanel === 'activity'} title={'What the last pass did, and the reason for every lookup that did not work. Nothing else in Napstr keeps that reason.'} onclick={() => setCoverPanel('activity')}>{'Activity'}</button>
+            <button class="cover-subtab" class:active={coverPanel === 'settings'} title={'What this computer is allowed to do about your album art, and what it is holding.'} onclick={() => setCoverPanel('settings')}>{'Settings'}</button>
+          </div>
+
+          <div class="cover-panel-body">
+            {#if coverPanel === 'settings'}
+              <div class="cover-panel-head">
+                <b>{'Where art may come from'}</b>
+                <span>{'Two switches, both off by default. Everything above happens without them.'}</span>
+              </div>
+              <div class="cover-scan-controls">
+                <label class="cover-scan-toggle">
+                  <input type="checkbox" checked={coverStatus?.lookupExternal ?? false} onchange={(event) => void setCoverPreferences(event.currentTarget.checked, coverStatus?.publishClaims ?? false)} />
+                  <span>{$t("Look up art automatically")}<small>{$t("Asks MusicBrainz and the Cover Art Archive about every album without a cover: the ones on this computer, and the albums the results pane has shown you")}{' '}{'When those have nothing, the iTunes catalogue is asked for the same album, matched on the album and artist names.'}</small></span>
+                </label>
+                <label class="cover-scan-toggle">
+                  <input type="checkbox" checked={coverStatus?.publishClaims ?? false} onchange={(event) => void setCoverPreferences(coverStatus?.lookupExternal ?? false, event.currentTarget.checked)} />
+                  <span>{$t("Sign and publish the covers I resolve")}<small>{$t("A kind")} <code>30427</code> {$t("claim signed with your own identity and sent to your relays, as fast as they can be signed")}</small></span>
+                </label>
+              </div>
+
+              <!--
+                Which hosts art may come from. This is the interim answer to art
+                arriving from an address nobody vouched for — a stranger's claim, or
+                a link somebody pastes — until the cover NIP's own trust model
+                carries it. Empty is the honest default: it is how Napstr behaved
+                before the list existed, so nobody's library loses its covers to a
+                filter they never asked for. The reasoning lives in the label's
+                title rather than in a paragraph under the box.
+              -->
+              <div class="cover-art-hosts">
+                <div class="cover-panel-head">
+                  <label for="cover-art-hosts" title={"Empty means any HTTPS host, which is what every library had before this list existed. With a list, art is drawn only when it is served from one of these domains or a subdomain of one — somebody else's published claim, art this computer looked up, and a link you paste here, which is refused outright if its host is not listed. It is a filter, not a boundary: the person who sets it is the person it protects, and the real answer is the trust model the cover NIP is heading for."}>{'Art domains to accept'}</label>
+                  <span>{'One per line. A domain covers its subdomains: mzstatic.com admits is1-ssl.mzstatic.com.'}</span>
+                </div>
+                <textarea
+                  id="cover-art-hosts"
+                  rows="3"
+                  spellcheck="false"
+                  placeholder={'coverartarchive.org\narchive.org\nmzstatic.com'}
+                  bind:value={allowedArtHosts}
+                ></textarea>
+                <div class="cover-art-hosts-actions">
+                  <button
+                    class="classic-button primary"
+                    disabled={allowedArtHosts === allowedArtHostsSaved}
+                    onclick={() => void saveAllowedArtHosts(allowedArtHosts)}
+                  >{'Save list'}</button>
+                  <button class="classic-button" onclick={() => void saveAllowedArtHosts(RECOMMENDED_ART_HOSTS.join('\n'))}>{'Use the recommended list'}</button>
+                  <button class="classic-button" onclick={() => void saveAllowedArtHosts('')}>{'Accept any host'}</button>
+                </div>
+              </div>
+
+              <div class="cover-art-hosts">
+                <div class="cover-panel-head">
+                  <b title={"Fetching happens on a schedule of its own, two downloads at a time, and stops with the lookups switch above — a picture means contacting whichever host the claim names. Nothing here is the only copy: every picture can be fetched again from art this computer has already resolved, so clearing them costs time rather than anything that was found. Oldest-used pictures are dropped first when the cache reaches half a gigabyte, so art for albums you actually look at outlives art for albums you only scrolled past."}>{'Artwork held for phones'}</b>
+                  <span>{'Sent over the pairing, so a phone never asks a publisher about itself.'}</span>
+                </div>
+                <div id="cover-art-cache" class="cover-art-hosts-actions">
+                  <button class="classic-button" onclick={() => void setArtPaused(!coverStatus?.artPaused)}>
+                    {coverStatus?.artPaused ? 'Resume fetching' : 'Pause fetching'}
+                  </button>
+                  <button class="classic-button" disabled={(coverStatus?.artCached ?? 0) === 0} onclick={() => void clearArtCache()}>{'Clear the held pictures'}</button>
+                </div>
+              </div>
             {/if}
-            <button class="classic-button" onclick={() => void refreshCovers()} disabled={coverLoading}>{$t("Refresh")}</button>
-          </div>
 
-          <!--
-            Which hosts art may come from. This is the interim answer to art
-            arriving from an address nobody vouched for — a stranger's claim, or
-            a link somebody pastes — until the cover NIP's own trust model
-            carries it. Empty is the honest default: it is how Napstr behaved
-            before the list existed, so nobody's library loses its covers to a
-            filter they never asked for.
-          -->
-          <div class="cover-art-hosts">
-            <div class="cover-art-hosts-head">
-              <label for="cover-art-hosts">{'Art domains to accept'}</label>
-              <span>{'One per line. A domain covers its subdomains: mzstatic.com admits is1-ssl.mzstatic.com.'}</span>
-            </div>
-            <textarea
-              id="cover-art-hosts"
-              rows="3"
-              spellcheck="false"
-              placeholder={'coverartarchive.org\narchive.org\nmzstatic.com'}
-              bind:value={allowedArtHosts}
-            ></textarea>
-            <div class="cover-art-hosts-actions">
-              <button
-                class="classic-button primary"
-                disabled={allowedArtHosts === allowedArtHostsSaved}
-                onclick={() => void saveAllowedArtHosts(allowedArtHosts)}
-              >{'Save list'}</button>
-              <button class="classic-button" onclick={() => void saveAllowedArtHosts(RECOMMENDED_ART_HOSTS.join('\n'))}>{'Use the recommended list'}</button>
-              <button class="classic-button" onclick={() => void saveAllowedArtHosts('')}>{'Accept any host'}</button>
-            </div>
-            <p class="privacy-note wide"><span>i</span> {"Empty means any HTTPS host, which is what every library had before this list existed. With a list, art is drawn only when it is served from one of these domains or a subdomain of one — somebody else's published claim, art this computer looked up, and a link you paste here, which is refused outright if its host is not listed. It is a filter, not a boundary: the person who sets it is the person it protects, and the real answer is the trust model the cover NIP is heading for."}</p>
-          </div>
+            {#if coverPanel === 'waiting'}
+              <div class="cover-panel-head">
+                <b>{'Waiting'}</b>
+                <span>{coverQueue.length} {coverQueue.length === 1 ? 'album' : 'albums'}{' the worker would touch next. This is a window onto the queue, not the queue itself.'}</span>
+              </div>
+              <div class="cover-candidate-list">
+                {#each coverQueue as candidate (candidate.key)}
+                  <div class="cover-candidate">
+                    <div><b>{candidate.album}</b><small>{candidate.artist}</small></div>
+                    <span>{candidate.trackCount} {candidate.trackCount === 1 ? 'track' : 'tracks'} · {candidate.source}</span>
+                    <code title={candidate.key}>{candidate.key}</code>
+                    <button class="classic-button" onclick={() => void openCoverPicker(candidate.artist, candidate.album)}>{$t("Find art…")}</button>
+                    <button class="classic-button" title={$t("Report the cover published for this album")} onclick={() => openCoverReport(candidate.artist, candidate.album)}>{$t("Report")}</button>
+                  </div>
+                {/each}
+                {#if !coverLoading && coverQueue.length === 0}
+                  <p class="empty-state compact">{coverOptIn(coverStatus) ? 'Nothing is waiting. New music and new browsing wake Napstr by themselves.' : 'Switch one of these on and Napstr starts on its own.'}</p>
+                {/if}
+              </div>
+              <div class="cover-art-hosts-actions">
+                {#if coverStatus?.running}
+                  <button class="classic-button" onclick={() => void stopCoverPass()}>{$t("Stop")}</button>
+                {:else}
+                  <button class="classic-button" onclick={() => void lookForCoversNow()} disabled={!coverOptIn(coverStatus)}>{$t("Look now")}</button>
+                {/if}
+              </div>
+            {/if}
 
-          <!--
-            The pictures themselves: how many, how much disk, and how many albums
-            are still waiting for theirs. This is the half of the feature a phone
-            sees, and until now it had no window onto it at all - a cache filling
-            in the background, and no way to tell whether it was working or how
-            much it had cost. The numbers are the host's, read at most every few
-            seconds.
-          -->
-          {#if coverStatus}
-            <div class="cover-art-cache">
-              <div class="cover-art-hosts-head">
-                <label for="cover-art-cache">{'Artwork this computer holds'}</label>
-                <span>{coverStatus.artCached} {coverStatus.artCached === 1 ? 'picture' : 'pictures'}{", "}{readableBytes(coverStatus.artBytes)}{", for "}{coverStatus.artPending} {coverStatus.artPending === 1 ? 'album' : 'albums'}{" still to fetch. Paired phones are sent these bytes over the pairing, so they never ask a publisher about themselves."}</span>
+            {#if coverPanel === 'found'}
+              <div class="cover-panel-head">
+                <b title={"A failure comes first because a lookup that fell over looks identical to an album nobody has art for."}>{'Covers found'}</b>
+                <span>{coverMissing.length} {coverMissing.length === 1 ? 'album' : 'albums'}{" of this computer's own music, worst first."}</span>
               </div>
-              <div id="cover-art-cache" class="cover-art-hosts-actions">
-                <button class="classic-button" onclick={() => void setArtPaused(!coverStatus?.artPaused)}>
-                  {coverStatus.artPaused ? 'Resume fetching' : 'Pause fetching'}
-                </button>
-                <button class="classic-button" disabled={coverStatus.artCached === 0} onclick={() => void clearArtCache()}>{'Clear the held pictures'}</button>
+              <div id="cover-gap-list" class="cover-gap-list">
+                {#each coverMissing as gap (gap.key)}
+                  <div class="cover-gap">
+                    <div><b>{gap.album}</b><small>{gap.artist}</small></div>
+                    <span class:cover-gap-failed={gap.state === 'failed'} class="cover-gap-state">{coverGapState(gap.state)}</span>
+                    <span>{gap.tracks} {gap.tracks === 1 ? 'track' : 'tracks'}</span>
+                    <button class="classic-button" onclick={() => void openCoverPicker(gap.artist, gap.album)}>{$t("Find art…")}</button>
+                    {#if gap.note}<small class="cover-gap-note" title={gap.note}>{gap.note}</small>{/if}
+                  </div>
+                {/each}
+                {#if !coverLoading && coverMissing.length === 0}
+                  <p class="empty-state compact">{'Every album this computer holds has a cover claim, or has not been scanned yet.'}</p>
+                {/if}
               </div>
-              <p class="privacy-note wide"><span>i</span> {"Fetching happens on a schedule of its own, two downloads at a time, and stops with the lookups switch above — a picture means contacting whichever host the claim names. Nothing here is the only copy: every picture can be fetched again from art this computer has already resolved, so clearing them costs time rather than anything that was found. Oldest-used pictures are dropped first when the cache reaches half a gigabyte, so art for albums you actually look at outlives art for albums you only scrolled past."}</p>
-            </div>
-          {/if}
+            {/if}
+
+            {#if coverPanel === 'activity'}
+              {#if coverStatus}
+                <div class="cover-scan-status">
+                  <span><b>{coverStatus.published}</b> {$t("published")}</span>
+                  <span><b>{coverStatus.resolved}</b> {$t("resolved, not signed")}</span>
+                  <span><b>{coverStatus.alreadyCovered}</b> {$t("covered by others")}</span>
+                  <span><b>{coverStatus.noArt}</b> {$t("no art anywhere")}</span>
+                  {#if coverStatus.failed}<span><b>{coverStatus.failed}</b> {$t("failed")}</span>{/if}
+                  {#if coverStatus.backedOff}<span><b>{coverStatus.backedOff}</b> {$t("throttled waits")}</span>{/if}
+                </div>
+                {#if coverStatus.message}<p class="cover-scan-message">{coverStatus.message}</p>{/if}
+              {/if}
+              <div class="cover-panel-head">
+                <b>{'Lookup log'}</b>
+                <span>{'Newest first, last '}{COVER_LOG_PREVIEW}{' attempts, kept across restarts.'}</span>
+              </div>
+              <div id="cover-log-list" class="cover-log-list">
+                {#each coverLog as line (line.at + line.key + line.outcome)}
+                  <div class="cover-log-line">
+                    <time>{coverLogTime(line.at)}</time>
+                    <span class:cover-gap-failed={line.outcome === 'failed'} class:cover-log-throttled={line.outcome === 'throttled' || line.outcome === 'slow'} class="cover-log-outcome">{line.outcome}</span>
+                    <span class="cover-log-album">{line.album}{line.artist ? ` — ${line.artist}` : ''}</span>
+                    {#if line.source}<span class="cover-log-source">{line.source}</span>{/if}
+                    {#if line.message}<small class="cover-gap-note" title={line.message}>{line.message}</small>{/if}
+                  </div>
+                {/each}
+                {#if !coverLoading && coverLog.length === 0}
+                  <p class="empty-state compact">{'No lookups have run yet.'}</p>
+                {/if}
+              </div>
+            {/if}
+          </div>
 
           {#if coverError}<div class="trollbox-error">{coverError}</div>{/if}
-
-          {#if coverStatus}
-            <div class="cover-scan-status">
-              <span><b>{coverStatus.running ? coverStatus.remaining : coverStatus.pending}</b> {coverStatus.running ? 'left in this pass' : 'in the last pass'}</span>
-              <span><b>{coverStatus.published}</b> {$t("published")}</span>
-              <span><b>{coverStatus.resolved}</b> {$t("resolved, not signed")}</span>
-              <span><b>{coverStatus.alreadyCovered}</b> {$t("covered by others")}</span>
-              <span><b>{coverStatus.noArt}</b> {$t("no art anywhere")}</span>
-              {#if coverStatus.failed}<span><b>{coverStatus.failed}</b> {$t("failed")}</span>{/if}
-              {#if coverStatus.backedOff}<span><b>{coverStatus.backedOff}</b> {$t("throttled waits")}</span>{/if}
-            </div>
-            {#if coverStatus.current}<p class="cover-scan-current">{$t("Working on")} {coverStatus.current}</p>{/if}
-            {#if coverStatus.message}<p class="cover-scan-message">{coverStatus.message}</p>{/if}
-          {/if}
-
-          <div class="cover-candidate-list">
-            {#each coverQueue as candidate (candidate.key)}
-              <div class="cover-candidate">
-                <div><b>{candidate.album}</b><small>{candidate.artist}</small></div>
-                <span>{candidate.trackCount} {candidate.trackCount === 1 ? 'track' : 'tracks'} · {candidate.source}</span>
-                <code title={candidate.key}>{candidate.key}</code>
-                <button class="classic-button" onclick={() => void openCoverPicker(candidate.artist, candidate.album)}>{$t("Find art…")}</button>
-                <button class="classic-button" title={$t("Report the cover published for this album")} onclick={() => openCoverReport(candidate.artist, candidate.album)}>{$t("Report")}</button>
-              </div>
-            {/each}
-            {#if !coverLoading && coverQueue.length === 0}
-              <p class="empty-state compact">{coverOptIn(coverStatus) ? 'Nothing is waiting. New music and new browsing wake Napstr by themselves.' : 'Switch one of these on and Napstr starts on its own.'}</p>
-            {/if}
-          </div>
-
-          <!--
-            What the queue above cannot say: the queue is the next 25 albums the
-            worker would touch, and this is every album this computer holds with
-            no cover at all — failures first, because a lookup that fell over is
-            the one state that looks exactly like an album nobody has art for.
-          -->
-          <div class="cover-gap-panel">
-            <div class="cover-art-hosts-head">
-              <label for="cover-gap-list">{'Albums without a cover claim'}</label>
-              <span>{coverMissing.length} {coverMissing.length === 1 ? 'album' : 'albums'}{" of this computer's own music, worst first. A failure comes first because a lookup that fell over looks identical to an album nobody has art for."}</span>
-            </div>
-            <div id="cover-gap-list" class="cover-gap-list">
-              {#each coverMissing as gap (gap.key)}
-                <div class="cover-gap">
-                  <div><b>{gap.album}</b><small>{gap.artist}</small></div>
-                  <span class:cover-gap-failed={gap.state === 'failed'} class="cover-gap-state">{coverGapState(gap.state)}</span>
-                  <span>{gap.tracks} {gap.tracks === 1 ? 'track' : 'tracks'}</span>
-                  <button class="classic-button" onclick={() => void openCoverPicker(gap.artist, gap.album)}>{$t("Find art…")}</button>
-                  {#if gap.note}<small class="cover-gap-note" title={gap.note}>{gap.note}</small>{/if}
-                </div>
-              {/each}
-              {#if !coverLoading && coverMissing.length === 0}
-                <p class="empty-state compact">{'Every album this computer holds has a cover claim, or has not been scanned yet.'}</p>
-              {/if}
-            </div>
-          </div>
-
-          <!--
-            The log. Nothing else in Napstr keeps the reason a lookup failed:
-            `album_art_lookups` keeps the verdict and when it may be asked again,
-            so before this table an outage and an album with no art produced the
-            same blank square and the same count.
-          -->
-          <div class="cover-log-panel">
-            <div class="cover-art-hosts-head">
-              <label for="cover-log-list">{'Lookup log'}</label>
-              <span>{'Newest first, last '}{COVER_LOG_PREVIEW}{' attempts, kept across restarts.'}</span>
-            </div>
-            <div id="cover-log-list" class="cover-log-list">
-              {#each coverLog as line (line.at + line.key + line.outcome)}
-                <div class="cover-log-line">
-                  <time>{coverLogTime(line.at)}</time>
-                  <span class:cover-gap-failed={line.outcome === 'failed'} class:cover-log-throttled={line.outcome === 'throttled' || line.outcome === 'slow'} class="cover-log-outcome">{line.outcome}</span>
-                  <span class="cover-log-album">{line.album}{line.artist ? ` — ${line.artist}` : ''}</span>
-                  {#if line.source}<span class="cover-log-source">{line.source}</span>{/if}
-                  {#if line.message}<small class="cover-gap-note" title={line.message}>{line.message}</small>{/if}
-                </div>
-              {/each}
-              {#if !coverLoading && coverLog.length === 0}
-                <p class="empty-state compact">{'No lookups have run yet.'}</p>
-              {/if}
-            </div>
-          </div>
         </section>
       {:else if activeView === 'Napstrfy'}
         <section class="full-panel mobile-connect-view">
