@@ -35,7 +35,7 @@ use tokio::{
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct SavedDesktop {
+struct SavedHost {
     endpoint_id: String,
     endpoint_addr: String,
     desktop_name: String,
@@ -59,7 +59,7 @@ struct SavedDesktop {
     pubkey: String,
 }
 
-impl SavedDesktop {
+impl SavedHost {
     /// What this computer allows.
     fn grant(&self) -> DeviceRights {
         self.rights.unwrap_or_else(|| legacy_grant(self.stream_only))
@@ -83,6 +83,66 @@ impl SavedDesktop {
             error,
         }
     }
+}
+
+/// Where the computers this phone may talk to are kept.
+///
+/// A new file rather than the old one's name in a new shape: the old file is
+/// still read once below, and leaving it alone is what lets a phone that has not
+/// paired since keep its pairing.
+const PAIRED_HOSTS_FILE: &str = "paired-hosts.json";
+const LEGACY_PAIRED_FILE: &str = "paired-desktop.json";
+
+/// The computers this phone may talk to.
+///
+/// A bare list rather than an object wrapping one, because serde ignores fields
+/// it does not know: the old file - one computer, written flat - would parse as
+/// a wrapper with an empty list, and the pairing would vanish quietly.
+fn load_hosts(path: &Path, legacy: &Path) -> Vec<SavedHost> {
+    if let Ok(bytes) = fs::read(path) {
+        if let Ok(hosts) = serde_json::from_slice::<Vec<SavedHost>>(&bytes) {
+            return hosts;
+        }
+    }
+    let Ok(bytes) = fs::read(legacy) else {
+        return Vec::new();
+    };
+    serde_json::from_slice::<SavedHost>(&bytes)
+        .map(|host| vec![host])
+        .unwrap_or_default()
+}
+
+fn save_hosts(path: &Path, hosts: &[SavedHost]) -> Result<(), String> {
+    save_json(path, &hosts)
+}
+
+/// Add a computer, or replace what is known about one that is already here.
+///
+/// Pairing a computer this phone knows is how its grant is changed by scanning a
+/// code, so it must not leave a second copy of the same machine behind.
+fn upsert_host(hosts: &mut Vec<SavedHost>, host: SavedHost) {
+    match hosts
+        .iter_mut()
+        .find(|saved| saved.endpoint_id == host.endpoint_id)
+    {
+        Some(saved) => *saved = host,
+        None => hosts.push(host),
+    }
+}
+
+/// The computer this phone acts through.
+///
+/// The one that lets it act as its owner, when any of them do: that pairing is
+/// what this phone signs with, and it is the computer whose library and status
+/// the rest of the app is drawn from. With none of them privileged - a phone
+/// lent browse-and-play, or one paired only with a friend - it is the first it
+/// was paired with, which is the single computer it has ever had.
+fn primary_host(hosts: &[SavedHost]) -> Option<SavedHost> {
+    hosts
+        .iter()
+        .find(|host| host.grant().privileged)
+        .or_else(|| hosts.first())
+        .cloned()
 }
 
 /// What the old boolean meant, for a host that only speaks it.
@@ -1392,27 +1452,42 @@ fn podcast_media_track(episode: &PodcastEpisode, size: u64) -> Result<RemoteTrac
 struct RemoteClient {
     app_data: PathBuf,
     endpoint: tokio::sync::RwLock<Option<Endpoint>>,
-    connection: tokio::sync::RwLock<Option<iroh::endpoint::Connection>>,
-    desktop: tokio::sync::RwLock<Option<SavedDesktop>>,
+    /// One connection per computer.
+    ///
+    /// A map rather than a slot, because these fail one at a time: a friend's
+    /// computer being asleep must not cost this phone the tunnel it acts
+    /// through, and a track that came from one computer has to stay playable
+    /// while another is out of reach.
+    connections:
+        tokio::sync::RwLock<std::collections::HashMap<String, iroh::endpoint::Connection>>,
+    /// Every computer this phone may talk to, in the order they were paired.
+    hosts: tokio::sync::RwLock<Vec<SavedHost>>,
     start_lock: tokio::sync::Mutex<()>,
 }
 
 impl RemoteClient {
+    async fn close_connection(&self, endpoint_id: &str) {
+        if let Some(connection) = self.connections.write().await.remove(endpoint_id) {
+            connection.close(0u32.into(), b"pairing changed");
+        }
+    }
+
     async fn disconnect(&self) {
-        if let Some(connection) = self.connection.write().await.take() {
+        for (_, connection) in self.connections.write().await.drain() {
             connection.close(0u32.into(), b"pairing changed");
         }
     }
 
     fn new(app_data: PathBuf) -> Arc<Self> {
-        let desktop = fs::read(app_data.join("paired-desktop.json"))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+        let hosts = load_hosts(
+            &app_data.join(PAIRED_HOSTS_FILE),
+            &app_data.join(LEGACY_PAIRED_FILE),
+        );
         Arc::new(Self {
             app_data,
             endpoint: tokio::sync::RwLock::new(None),
-            connection: tokio::sync::RwLock::new(None),
-            desktop: tokio::sync::RwLock::new(desktop),
+            connections: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            hosts: tokio::sync::RwLock::new(hosts),
             start_lock: tokio::sync::Mutex::new(()),
         })
     }
@@ -1435,17 +1510,24 @@ impl RemoteClient {
         Ok(endpoint)
     }
 
-    async fn connect(&self) -> Result<iroh::endpoint::Connection, String> {
-        if let Some(connection) = self.connection.read().await.clone() {
+    /// The computer this phone acts through.
+    async fn primary(&self) -> Result<SavedHost, String> {
+        let hosts = self.hosts.read().await;
+        primary_host(&hosts).ok_or_else(|| "Pair Napstrfy with Napstr first".into())
+    }
+
+    /// Every computer this phone may talk to, for a screen that offers more than
+    /// one.
+    async fn hosts(&self) -> Vec<SavedHost> {
+        self.hosts.read().await.clone()
+    }
+
+    /// A tunnel to one computer, opened if it is not already.
+    async fn connection(&self, host: &SavedHost) -> Result<iroh::endpoint::Connection, String> {
+        if let Some(connection) = self.connections.read().await.get(&host.endpoint_id).cloned() {
             return Ok(connection);
         }
-        let desktop = self
-            .desktop
-            .read()
-            .await
-            .clone()
-            .ok_or("Pair Napstrfy with Napstr first")?;
-        let address = decode_endpoint_addr(&desktop)?;
+        let address = decode_endpoint_addr(host)?;
         let connection = tokio::time::timeout(
             Duration::from_secs(25),
             self.endpoint().await?.connect(address, ALPN),
@@ -1453,7 +1535,10 @@ impl RemoteClient {
         .await
         .map_err(|_| "Napstr did not answer over Iroh")?
         .map_err(|error| format!("Could not reach Napstr: {error}"))?;
-        *self.connection.write().await = Some(connection.clone());
+        self.connections
+            .write()
+            .await
+            .insert(host.endpoint_id.clone(), connection.clone());
         Ok(connection)
     }
 
@@ -1462,7 +1547,7 @@ impl RemoteClient {
         if ticket.expires_at < chrono_timestamp() {
             return Err("This pairing code has expired. Create another in Napstr.".into());
         }
-        let desktop = SavedDesktop {
+        let host = SavedHost {
             endpoint_id: ticket.endpoint_id.clone(),
             endpoint_addr: ticket.endpoint_addr.clone(),
             desktop_name: ticket.desktop_name.clone(),
@@ -1475,7 +1560,7 @@ impl RemoteClient {
             pubkey: String::new(),
         };
         let endpoint = self.endpoint().await?;
-        let address = decode_endpoint_addr(&desktop)?;
+        let address = decode_endpoint_addr(&host)?;
         let connection =
             tokio::time::timeout(Duration::from_secs(25), endpoint.connect(address, ALPN))
                 .await
@@ -1505,25 +1590,39 @@ impl RemoteClient {
             ),
             other => return Err(unexpected_response(&other)),
         };
-        let mut saved = desktop;
+        let mut saved = host;
         saved.desktop_name = desktop_name.clone();
         saved.stream_only = grant.is_read_only();
         saved.rights = Some(grant);
-        save_json(&self.app_data.join("paired-desktop.json"), &saved)?;
-        self.disconnect().await;
-        *self.desktop.write().await = Some(saved);
-        *self.connection.write().await = Some(connection);
+        // The connection this pairing was made on is the one to keep for this
+        // computer, and every other computer's tunnel is left as it was: a
+        // second code for a friend is not a reason to drop the first.
+        {
+            let mut hosts = self.hosts.write().await;
+            upsert_host(&mut hosts, saved.clone());
+            save_hosts(&self.app_data.join(PAIRED_HOSTS_FILE), &hosts)?;
+        }
+        self.close_connection(&saved.endpoint_id).await;
+        self.connections
+            .write()
+            .await
+            .insert(saved.endpoint_id.clone(), connection);
         Ok(desktop_name)
     }
 
     async fn forget(&self) -> Result<(), String> {
         self.disconnect().await;
-        *self.desktop.write().await = None;
-        match fs::remove_file(self.app_data.join("paired-desktop.json")) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.to_string()),
+        self.hosts.write().await.clear();
+        // Both files. Forgetting and then reading the file the older build wrote
+        // is how a pairing comes back from the dead.
+        for name in [PAIRED_HOSTS_FILE, LEGACY_PAIRED_FILE] {
+            match fs::remove_file(self.app_data.join(name)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.to_string()),
+            }
         }
+        Ok(())
     }
 
     async fn request(&self, request: ClientRequest) -> Result<ServerResponse, String> {
@@ -1538,9 +1637,19 @@ impl RemoteClient {
         &self,
         request: ClientRequest,
     ) -> Result<(ServerResponse, iroh::endpoint::RecvStream), String> {
+        let host = self.primary().await?;
+        self.exchange_with(&host, request).await
+    }
+
+    /// One request to one computer, retried once on a fresh tunnel.
+    async fn exchange_with(
+        &self,
+        host: &SavedHost,
+        request: ClientRequest,
+    ) -> Result<(ServerResponse, iroh::endpoint::RecvStream), String> {
         let mut last_error = "Napstr is unavailable".to_string();
         for _ in 0..2 {
-            match self.connect().await {
+            match self.connection(host).await {
                 Ok(connection) => match tokio::time::timeout(
                     Duration::from_secs(30),
                     exchange_on(&connection, request.clone()),
@@ -1553,7 +1662,7 @@ impl RemoteClient {
                 },
                 Err(error) => last_error = error,
             }
-            *self.connection.write().await = None;
+            self.close_connection(&host.endpoint_id).await;
         }
         Err(last_error)
     }
@@ -1607,20 +1716,17 @@ impl RemoteClient {
         Ok(Some(FetchedArt { hash, bytes }))
     }
 
-    /// True when this pairing may only browse and play, which is what keeps the
-    /// phone from offering controls the host would refuse anyway.
+    /// True when the computer this phone acts through may only browse and play,
+    /// which is what keeps the phone from offering controls it would refuse.
     async fn stream_only(&self) -> bool {
-        self.desktop
-            .read()
+        self.primary()
             .await
-            .as_ref()
-            .map(|desktop| desktop.grant().is_read_only())
+            .map(|host| host.grant().is_read_only())
             .unwrap_or(false)
     }
 
     async fn status(&self) -> CompanionStatus {
-        let desktop = self.desktop.read().await.clone();
-        if desktop.is_none() {
+        let Ok(host) = self.primary().await else {
             return CompanionStatus {
                 stream_only: false,
                 paired: false,
@@ -1632,12 +1738,11 @@ impl RemoteClient {
                 pubkey: String::new(),
                 error: String::new(),
             };
-        }
-        let desktop = desktop.unwrap();
+        };
         match tokio::time::timeout(Duration::from_secs(8), self.request(ClientRequest::Status))
             .await
         {
-            Err(_) => desktop.status(false, "Napstr did not answer yet".into()),
+            Err(_) => host.status(false, "Napstr did not answer yet".into()),
             Ok(Ok(ServerResponse::Status {
                 library_revision,
                 cover_revision,
@@ -1651,61 +1756,57 @@ impl RemoteClient {
                 // network yet has no keys loaded, and that must not turn this
                 // computer's own playlists into somebody else's.
                 let pubkey = if pubkey.is_empty() {
-                    desktop.pubkey.clone()
+                    host.pubkey.clone()
                 } else {
                     pubkey
                 };
-                if grant != desktop.grant()
-                    || (!pubkey.is_empty() && pubkey != desktop.pubkey)
-                {
-                    let mut saved = self.desktop.write().await;
-                    if let Some(saved) = saved
-                        .as_mut()
-                        .filter(|saved| saved.endpoint_id == desktop.endpoint_id)
+                if grant != host.grant() || (!pubkey.is_empty() && pubkey != host.pubkey) {
+                    let mut hosts = self.hosts.write().await;
+                    if let Some(saved) = hosts
+                        .iter_mut()
+                        .find(|saved| saved.endpoint_id == host.endpoint_id)
                     {
                         saved.stream_only = grant.is_read_only();
                         saved.rights = Some(grant);
                         saved.pubkey = pubkey.clone();
-                        let _ = save_json(&self.app_data.join("paired-desktop.json"), saved);
+                        let _ = save_hosts(&self.app_data.join(PAIRED_HOSTS_FILE), &hosts);
                     }
                 }
                 CompanionStatus {
                     stream_only: grant.is_read_only(),
                     paired: true,
                     connected: true,
-                    desktop_name: desktop.desktop_name,
-                    endpoint_id: desktop.endpoint_id,
+                    desktop_name: host.desktop_name,
+                    endpoint_id: host.endpoint_id,
                     library_revision,
                     cover_revision,
                     pubkey,
                     error: String::new(),
                 }
             }
-            Ok(Err(error)) if error == "invalid Napstrfy request" => {
-                self.legacy_status(desktop).await
-            }
-            Ok(Ok(other)) => desktop.status(false, unexpected_response(&other)),
-            Ok(Err(error)) => desktop.status(false, error),
+            Ok(Err(error)) if error == "invalid Napstrfy request" => self.legacy_status(host).await,
+            Ok(Ok(other)) => host.status(false, unexpected_response(&other)),
+            Ok(Err(error)) => host.status(false, error),
         }
     }
 
-    async fn legacy_status(&self, desktop: SavedDesktop) -> CompanionStatus {
+    async fn legacy_status(&self, host: SavedHost) -> CompanionStatus {
         match tokio::time::timeout(Duration::from_secs(8), self.request(ClientRequest::Ping)).await
         {
             Ok(Ok(ServerResponse::Pong)) => CompanionStatus {
-                stream_only: desktop.grant().is_read_only(),
+                stream_only: host.grant().is_read_only(),
                 paired: true,
                 connected: true,
-                desktop_name: desktop.desktop_name.clone(),
-                endpoint_id: desktop.endpoint_id.clone(),
+                desktop_name: host.desktop_name.clone(),
+                endpoint_id: host.endpoint_id.clone(),
                 library_revision: 0,
                 cover_revision: 0,
-                pubkey: desktop.pubkey.clone(),
+                pubkey: host.pubkey.clone(),
                 error: String::new(),
             },
-            Ok(Ok(other)) => desktop.status(false, unexpected_response(&other)),
-            Ok(Err(error)) => desktop.status(false, error),
-            Err(_) => desktop.status(false, "Napstr did not answer yet".into()),
+            Ok(Ok(other)) => host.status(false, unexpected_response(&other)),
+            Ok(Err(error)) => host.status(false, error),
+            Err(_) => host.status(false, "Napstr did not answer yet".into()),
         }
     }
 
@@ -1840,18 +1941,18 @@ impl RemoteClient {
 
     async fn offline_library(&self) -> Result<OfflineLibrary, String> {
         let cached = self.cached_entries().await?;
-        let desktop = self.desktop.read().await.clone();
+        let host = self.primary().await.ok();
         let tracks = cached
             .into_iter()
             .filter(|item| item.library_visible)
             .map(|item| item.track)
             .collect::<Vec<_>>();
         Ok(OfflineLibrary {
-            stream_only: desktop.as_ref().is_some_and(|desktop| desktop.grant().is_read_only()),
+            stream_only: host.as_ref().is_some_and(|host| host.grant().is_read_only()),
             total: tracks.len(),
             tracks,
-            paired: desktop.is_some(),
-            desktop_name: desktop.map(|item| item.desktop_name).unwrap_or_default(),
+            paired: host.is_some(),
+            desktop_name: host.map(|item| item.desktop_name).unwrap_or_default(),
         })
     }
 
@@ -1980,6 +2081,39 @@ async fn pair_desktop(
 #[tauri::command]
 async fn forget_desktop(state: State<'_, AppState>) -> Result<(), String> {
     state.remote.forget().await
+}
+
+/// One computer this phone may talk to, for a screen that offers more than one.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteHost {
+    endpoint_id: String,
+    desktop_name: String,
+    rights: DeviceRights,
+    /// The computer this phone acts through: the one whose library and status
+    /// the rest of the app is drawn from.
+    primary: bool,
+}
+
+#[tauri::command]
+async fn remote_hosts(state: State<'_, AppState>) -> Result<Vec<RemoteHost>, String> {
+    let hosts = state.remote.hosts().await;
+    let primary = primary_host(&hosts).map(|host| host.endpoint_id);
+    Ok(hosts
+        .into_iter()
+        .map(|host| {
+            // Read before the fields are moved out: `grant` borrows the whole
+            // host, which is not available once one of its fields has gone.
+            let grant = host.grant();
+            let is_primary = primary.as_deref() == Some(host.endpoint_id.as_str());
+            RemoteHost {
+                primary: is_primary,
+                endpoint_id: host.endpoint_id,
+                desktop_name: host.desktop_name,
+                rights: grant,
+            }
+        })
+        .collect())
 }
 
 #[tauri::command]
@@ -2855,11 +2989,10 @@ async fn read_response(receive: &mut iroh::endpoint::RecvStream) -> Result<Serve
     serde_json::from_slice(&payload).map_err(|_| "Napstr returned an invalid response".into())
 }
 
-fn decode_endpoint_addr(desktop: &SavedDesktop) -> Result<EndpointAddr, String> {
-    serde_json::from_str(&desktop.endpoint_addr)
+fn decode_endpoint_addr(host: &SavedHost) -> Result<EndpointAddr, String> {
+    serde_json::from_str(&host.endpoint_addr)
         .or_else(|_| {
-            desktop
-                .endpoint_id
+            host.endpoint_id
                 .parse::<EndpointId>()
                 .map(EndpointAddr::new)
                 .map_err(|_| serde_json::Error::io(std::io::Error::other("invalid endpoint ID")))
@@ -3186,6 +3319,7 @@ pub fn run() {
             companion_status,
             pair_desktop,
             forget_desktop,
+            remote_hosts,
             remote_library,
             remote_library_by_ids,
             remote_playlists,
@@ -3229,6 +3363,97 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn host(endpoint: &str, rights: DeviceRights, name: &str) -> SavedHost {
+        SavedHost {
+            endpoint_id: endpoint.into(),
+            endpoint_addr: format!("{{\"id\":\"{endpoint}\",\"addrs\":[]}}"),
+            desktop_name: name.into(),
+            stream_only: rights.is_read_only(),
+            rights: Some(rights),
+            pubkey: String::new(),
+        }
+    }
+
+    /// A file written before this phone could hold more than one computer is one
+    /// computer, not a list of none.
+    ///
+    /// This is why the list is a bare array: serde ignores fields it does not
+    /// know, so a wrapper object would have read the old flat shape as a valid
+    /// wrapper with no computers in it, and the pairing would vanish quietly.
+    #[test]
+    fn the_single_computer_file_is_read_as_the_only_computer() {
+        let directory = std::env::temp_dir().join(format!("napstr-hosts-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let legacy = directory.join(LEGACY_PAIRED_FILE);
+        let list = directory.join(PAIRED_HOSTS_FILE);
+
+        let old = host("legacy", DeviceRights::full(), "Old Napstr");
+        fs::write(&legacy, serde_json::to_vec(&old).unwrap()).unwrap();
+        let hosts = load_hosts(&list, &legacy);
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].desktop_name, "Old Napstr");
+        assert_eq!(hosts[0].grant(), DeviceRights::full());
+
+        // Once the list is there it is what is read, even with the old file still
+        // lying about - which is also why forgetting removes both.
+        save_hosts(&list, &[]).unwrap();
+        assert!(load_hosts(&list, &legacy).is_empty());
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// A second code for a computer this phone knows changes what it may do
+    /// rather than adding it twice, which is what makes a fresh code a way to
+    /// widen a friend's access without unpairing anything.
+    #[test]
+    fn pairing_a_known_computer_replaces_what_was_known_about_it() {
+        let mut hosts = vec![host("a", DeviceRights::read_only(), "Ada's Napstr")];
+        upsert_host(&mut hosts, host("a", DeviceRights::full(), "Ada's Napstr"));
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].grant(), DeviceRights::full());
+
+        upsert_host(&mut hosts, host("b", DeviceRights::read_only(), "Bob's Napstr"));
+        assert_eq!(hosts.len(), 2);
+        assert_eq!(hosts[1].grant(), DeviceRights::read_only());
+    }
+
+    /// The phone acts through the computer that lets it act as its owner,
+    /// whatever order they were paired in - and through the first it has when
+    /// none of them do, which is the single computer a lent phone has ever had.
+    #[test]
+    fn the_phone_acts_through_the_computer_that_lets_it_own() {
+        let friend = host("friend", DeviceRights::read_only(), "Ada's Napstr");
+        let own = host("own", DeviceRights::full(), "My Napstr");
+
+        assert_eq!(
+            primary_host(&[friend.clone(), own.clone()]).unwrap().endpoint_id,
+            "own"
+        );
+        assert_eq!(
+            primary_host(&[own, friend.clone()]).unwrap().endpoint_id,
+            "own"
+        );
+        assert_eq!(primary_host(&[friend]).unwrap().endpoint_id, "friend");
+        assert!(primary_host(&[]).is_none());
+    }
+
+    /// A computer that has never named its grant is taken at the word of the old
+    /// boolean, which is what that boolean has always meant.
+    #[test]
+    fn a_computer_that_never_said_keeps_the_meaning_of_the_boolean() {
+        let mut saved = host("legacy", DeviceRights::full(), "Old Napstr");
+        saved.rights = None;
+        saved.stream_only = false;
+        assert_eq!(saved.grant(), DeviceRights::full());
+        assert!(!saved.grant().is_read_only());
+
+        // And read-only stays read-only, so every gate on this phone decides
+        // what it decided before grants existed.
+        saved.stream_only = true;
+        assert_eq!(saved.grant(), DeviceRights::read_only());
+        assert!(saved.grant().is_read_only());
+    }
 
     /// A playlist is edited on a phone by sending the whole of it, so the one
     /// size the phone can get wrong is its own: an edit too large to travel in a
@@ -3418,15 +3643,18 @@ mod tests {
                     .await
                     .unwrap();
                 let remote = RemoteClient::new(root.clone());
-                *remote.desktop.write().await = Some(SavedDesktop {
-                    endpoint_id: desktop_endpoint.id().to_string(),
-                    endpoint_addr: String::new(),
-                    desktop_name: "Test Napstr".into(),
-                    stream_only: true,
-                    rights: Some(DeviceRights::read_only()),
-                    pubkey: String::new(),
-                });
-                *remote.connection.write().await = Some(connection);
+                {
+                    let endpoint_id = desktop_endpoint.id().to_string();
+                    remote.hosts.write().await.push(SavedHost {
+                        endpoint_id: endpoint_id.clone(),
+                        endpoint_addr: String::new(),
+                        desktop_name: "Test Napstr".into(),
+                        stream_only: true,
+                        rights: Some(DeviceRights::read_only()),
+                        pubkey: String::new(),
+                    });
+                    remote.connections.write().await.insert(endpoint_id, connection);
+                }
                 let media = MediaServer::start(root.join(art_store::ART_DIRECTORY)).unwrap();
                 let playback = remote
                     .cache_audio(track.clone(), media.clone(), true)
