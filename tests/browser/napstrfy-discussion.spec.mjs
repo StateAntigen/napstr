@@ -49,6 +49,15 @@ async function openApp(page, { messages = [], streamOnly = false } = {}) {
     window.remoteLibrary = [song];
     window.discussionMessages = messages;
     window.streamOnly = streamOnly;
+    // The hardware back button, the way Android drives it: the page is handed a
+    // press only while it advertises a destination, and a press it is not given
+    // leaves the app. The bridge is not in the browser, so it is recorded instead.
+    window.backAvailable = null;
+    window.appExits = 0;
+    window.NapstrfyBack = {
+      setBackAvailable: (available) => { window.backAvailable = available; },
+      setDrawerOpen: (open) => { window.backAvailable = open; }
+    };
   }, { song, messages, streamOnly });
   await page.goto('http://127.0.0.1:15174');
   await expect(page.locator('.track-row strong')).toHaveText(['Song']);
@@ -62,6 +71,22 @@ async function openDiscussion(page) {
 }
 
 const callsTo = (page, cmd) => page.evaluate((name) => window.calls.filter((call) => call.cmd === name).length, cmd);
+
+/**
+ * Presses the hardware back button the way Android does, and reports which of the
+ * two things happened: the page took the press, or it was never offered it.
+ */
+async function pressBack(page) {
+  return page.evaluate(() => {
+    if (!window.backAvailable) {
+      window.appExits += 1;
+      return 'exit';
+    }
+    window.backAvailable = false;
+    window.dispatchEvent(new CustomEvent('napstrfy-back'));
+    return 'handled';
+  });
+}
 
 test('Napstrfy shows a track conversation and marks what this identity said', async ({ page }) => {
   await openApp(page, { messages: [themFirst, mineLast] });
@@ -201,4 +226,30 @@ test('Napstrfy draws the line a reply answers', async ({ page }) => {
   await expect(quote).toContainText('This rip is clean.');
   // Only the reply carries one: a message that answers nothing stays plain.
   await expect(page.locator('.discussion-message').first().locator('.discussion-quote')).toHaveCount(0);
+});
+
+test('a back press closes the conversation instead of leaving the app', async ({ page }) => {
+  await openApp(page, { messages: [themFirst] });
+  await openDiscussion(page);
+  // The sheet has to tell Android there is somewhere to go back to. Without this
+  // the press is never offered to the page, and Android leaves the app.
+  await expect.poll(() => page.evaluate(() => window.backAvailable)).toBe(true);
+
+  expect(await pressBack(page)).toBe('handled');
+  await expect(page.locator('.discussion-view')).toHaveCount(0);
+  expect(await page.evaluate(() => window.appExits)).toBe(0);
+});
+
+test('a back press out of the card\u2019s thread leaves the player sheet standing', async ({ page }) => {
+  await openApp(page, { messages: [themFirst] });
+  await openPlayer(page);
+  await page.locator('.sheet-card').click();
+  await expect(page.locator('.discussion-view')).toBeVisible();
+  await expect.poll(() => page.evaluate(() => window.backAvailable)).toBe(true);
+
+  // The thread is drawn over the sheet that opened it, so it is the first thing
+  // back takes: the press closes the conversation, not the player underneath it.
+  expect(await pressBack(page)).toBe('handled');
+  await expect(page.locator('.discussion-view')).toHaveCount(0);
+  await expect(page.locator('.now-sheet')).toBeVisible();
 });

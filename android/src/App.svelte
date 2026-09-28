@@ -281,6 +281,31 @@
   /** The box, so starting a reply can put the cursor in it. */
   let discussionInput = $state<HTMLInputElement | undefined>(undefined);
   /**
+   * The art behind the sheet, so its bar sits over a picture rather than over
+   * flat black - which is also what makes the round back button read as glass.
+   *
+   * Keyed on the album, the way the playlist sheet is: a cover belongs to the
+   * record, so two tracks off one album share the one fetch.
+   */
+  let discussionThumb = $state('');
+  let discussionArtKey = '';
+
+  $effect(() => {
+    const track = discussionTrack;
+    const key = track ? `${track.artist}|${track.album}` : '';
+    if (key === discussionArtKey) return;
+    discussionArtKey = key;
+    discussionThumb = '';
+    if (!track || !key) return;
+    void coverFor(track)
+      .then((cover) => {
+        if (discussionArtKey === key) discussionThumb = cover?.thumb ?? '';
+      })
+      .catch(() => {
+        if (discussionArtKey === key) discussionThumb = '';
+      });
+  });
+  /**
    * The newest page for the track the player sheet is showing.
    *
    * Held apart from what the thread holds, because the card is read before the
@@ -764,6 +789,12 @@
     }
     if (showQueue) {
       showQueue = false;
+      return;
+    }
+    // The conversation is drawn over whatever opened it - the track menu, an
+    // album, or the player's own card - so it is the first of those to go.
+    if (discussionTrack) {
+      closeDiscussion();
       return;
     }
     if (showNowPlaying) {
@@ -3123,6 +3154,7 @@
       showActions ||
       showAlbumView ||
       showQueue ||
+      !!discussionTrack ||
       (showNowPlaying && !sheetClosing) ||
       showingLikedMusic ||
       !!playlistDraft ||
@@ -6388,12 +6420,24 @@
 {/if}
 
 {#if discussionTrack}
-  <div class="discussion-view" class:desktop={desktopShell} role="dialog" aria-modal="true" aria-label={$t("Track discussion")}>
+  <div
+    class="discussion-view"
+    class:desktop={desktopShell}
+    style={`--cover-hue:${artworkHue(discussionTrack.fileId)}`}
+    role="dialog"
+    aria-modal="true"
+    aria-label={$t("Track discussion")}
+  >
+    <div class="discussion-glow" style={discussionThumb ? `background-image:url(${discussionThumb})` : ''}></div>
+    <div class="discussion-glow-scrim"></div>
     <header class="view-head">
       <button class="view-icon" onclick={closeDiscussion} aria-label={$t("Close the discussion")}>
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14.5 5 8 12l6.5 7" /></svg>
       </button>
-      <h1>{$t("Track discussion")}</h1>
+      <span class="discussion-title">
+        <strong>{title(discussionTrack)}</strong>
+        <small>{artist(discussionTrack)}</small>
+      </span>
     </header>
     <div
       class="discussion-scroll"
@@ -6401,10 +6445,6 @@
       aria-busy={discussionLoading}
       onscroll={(event) => { if (event.currentTarget.scrollTop < 40) void refreshDiscussion(true); }}
     >
-      <div class="discussion-about">
-        <strong>{title(discussionTrack)}</strong>
-        <small>{artist(discussionTrack)}</small>
-      </div>
       {#if discussionLoading && discussionMessages.length === 0}<p class="quality-hint">{$t("Loading…")}</p>{/if}
       {#if !discussionLoading && discussionMessages.length === 0 && !discussionError}<p class="quality-hint">{$t("No comments yet.")}</p>{/if}
       {#if discussionHasMore && discussionMessages.length > 0 && !discussionLoading}

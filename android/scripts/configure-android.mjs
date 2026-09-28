@@ -59,6 +59,16 @@ if (!manifest.includes('android:name=".MediaNotificationService"')) {
         <provider`,
   );
 }
+// The keyboard: left to itself Android pans the whole window up to reveal the
+// focused box, which walks the title bar and its back button off the top of the
+// screen. Resizing the window instead lets the column take the space out of the
+// scroller, so the bar stays where it is.
+if (!manifest.includes('android:windowSoftInputMode=')) {
+  manifest = manifest.replace(
+    '            android:name=".MainActivity"',
+    '            android:name=".MainActivity"\n            android:windowSoftInputMode="adjustResize"',
+  );
+}
 await writeFile(manifestPath, manifest);
 
 const javaDirectory = resolve(main, 'java/net/napstr/nostrfy');
