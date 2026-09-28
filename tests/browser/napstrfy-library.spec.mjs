@@ -184,6 +184,8 @@ test('Napstrfy draws the player bar and the cover stretched behind it from the t
   const bar = await page.locator('.now-playing').getAttribute('style');
   expect(bar).toContain(coverThumb);
   expect(bar).not.toContain(coverFull);
+  // Awaited: the page must not be closing while this call is in flight, which is
+  // how this test failed the first time it ran beside the playlists line.
   await releaseFullCover();
 });
 
