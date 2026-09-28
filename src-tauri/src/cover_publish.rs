@@ -47,6 +47,7 @@
 use crate::art_fetch::{ArtFetcher, ArtWant};
 use crate::cover::{self, ArtLookup, CoverClaimFields};
 use crate::network::NetworkService;
+use napstr_remote_protocol::ArtRendition;
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -254,6 +255,43 @@ pub struct CoverStatus {
     /// second round trip.
     pub allowed_art_hosts: String,
     pub message: String,
+}
+
+/// What asking for one rendition means as a fetch: that rendition, and only it.
+///
+/// Separated from the asking so the rule can be read and tested on its own, since
+/// it is the whole policy in one line: a thumbnail is what every row that comes on
+/// screen draws, and the full picture is what somebody engaged with draws, so an
+/// ask for one must never quietly become a download of both. `None` means the
+/// claim names nothing for that rendition, which is not a failure.
+fn want_for_rendition<'a>(
+    key: &'a str,
+    art: &'a str,
+    thumb: &'a str,
+    source: &'a str,
+    rendition: ArtRendition,
+) -> Option<ArtWant<'a>> {
+    let wanted = match rendition {
+        ArtRendition::Full => art,
+        ArtRendition::Thumb => thumb,
+    };
+    if wanted.is_empty() {
+        return None;
+    }
+    Some(match rendition {
+        ArtRendition::Full => ArtWant {
+            key,
+            art,
+            thumb: "",
+            source,
+        },
+        ArtRendition::Thumb => ArtWant {
+            key,
+            art: "",
+            thumb,
+            source,
+        },
+    })
 }
 
 /// The background worker that keeps covers moving.
@@ -622,6 +660,48 @@ impl CoverPublisher {
     /// ask again — the same signal any other change to this computer's art uses.
     pub fn ensure_art(&self, wants: &[ArtWant<'_>]) {
         self.art.ensure_all(wants);
+    }
+
+    /// Fetch and hold one rendition of one album, because a phone asked for it.
+    ///
+    /// The phone is the only thing that knows which rendition a screen wants, and
+    /// it says so by asking: a row drew a thumbnail, or somebody opened the drawer
+    /// on a track and wanted the full picture. This turns that ask into a
+    /// download, from whichever address this computer would show for the album —
+    /// the same answer the phone was given, so the same list of domains decides
+    /// it.
+    pub async fn ensure_rendition(&self, key: &str, rendition: ArtRendition) {
+        let covers = match self.network.best_known_covers(vec![key.to_string()]).await {
+            Ok(covers) => covers,
+            Err(error) => {
+                self.log_line(
+                    key,
+                    "",
+                    "",
+                    "failed",
+                    "",
+                    &format!("could not look up the album a phone asked about: {error}"),
+                );
+                return;
+            }
+        };
+        let Some(cover) = covers.into_iter().next() else {
+            return;
+        };
+        match want_for_rendition(
+            key,
+            &cover.art,
+            &cover.thumb,
+            &cover.source,
+            rendition,
+        ) {
+            Some(want) => self.art.ensure_all(&[want]),
+            // A claim that names nothing for that rendition is an ordinary
+            // answer: the archive publishes no thumbnail of its own, and a phone
+            // asking for one is asking for the full picture, which it does for
+            // itself.
+            None => {}
+        }
     }
 
     /// Write one attempt into the lookup log.
@@ -2796,6 +2876,30 @@ mod tests {
             collection: "City of Echoes".to_string(),
             source: "musicbrainz".to_string(),
         }
+    }
+
+    #[test]
+    fn an_ask_for_one_rendition_never_becomes_a_download_of_both() {
+        let art = "https://archive.org/full.jpg";
+        let thumb = "https://is1-ssl.mzstatic.com/thumb.jpg";
+        // A drawer opening on a track wants the picture it draws, and the
+        // thumbnail it already has is not it: asking for the full one must not
+        // queue the thumbnail again, and the other way round.
+        let full = want_for_rendition("a|b", art, thumb, "itunes", ArtRendition::Full).unwrap();
+        assert_eq!(full.art, art);
+        assert_eq!(full.thumb, "", "the thumbnail is not part of this ask");
+        let small = want_for_rendition("a|b", art, thumb, "itunes", ArtRendition::Thumb).unwrap();
+        assert_eq!(small.thumb, thumb);
+        assert_eq!(small.art, "", "the full picture is not part of this ask");
+
+        // The archive publishes no thumbnail of its own, so an ask for one is not
+        // a failure and not a reason to download anything: the phone asks for the
+        // full picture in that case, for itself.
+        assert!(want_for_rendition("a|b", art, "", "musicbrainz", ArtRendition::Thumb).is_none());
+        assert!(
+            want_for_rendition("a|b", "", thumb, "itunes", ArtRendition::Full).is_none(),
+            "a claim that names no full picture cannot be asked for one"
+        );
     }
 
     #[test]

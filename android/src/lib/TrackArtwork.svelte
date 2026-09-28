@@ -65,6 +65,11 @@
         // views that show a cover big - the album header, the drawer - draw the
         // full one themselves, over the small one they start from.
         image = cover.thumb || cover.art;
+        // A cover with nothing to draw yet is the same waiting state as no cover
+        // at all: the host is fetching the picture this row asked for, and it is
+        // worth asking again rather than leaving a placeholder until something
+        // else happens to re-render this row.
+        if (!image) retryLater();
       });
     }
     return () => { alive = false; clearTimeout(retryTimer); };

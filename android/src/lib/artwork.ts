@@ -306,10 +306,11 @@ export function coverFor(track: RemoteTrack): Promise<AlbumCover | null> {
 /**
  * One rendition this phone has confirmed is on disk, by ask.
  *
- * Keyed by album and rendition rather than by address, because the answer is not
- * an address until it has been asked for: a screen drawn twice must not ask
- * twice, and the first ask is what tells this phone whether a picture is already
- * here.
+ * Keyed by album, rendition and hash rather than by address, because the answer
+ * is not an address until it has been asked for: a screen drawn twice must not ask
+ * twice, the first ask is what tells this phone whether a picture is already here,
+ * and a hash is part of the key because a picture that changed is a different ask
+ * rather than the same one answered from a memo.
  */
 const artAsks = new Map<string, Promise<string>>();
 
@@ -344,12 +345,21 @@ function askForRendition(
   rendition: 'thumb' | 'full',
   hash: string
 ): Promise<string> {
-  const token = `${key}|${rendition}`;
+  const token = `${key}|${rendition}|${hash}`;
   const asked = artAsks.get(token);
   if (asked) return asked;
   const promise = invoke<AlbumArtwork>('remote_art', { key, rendition, hash })
     .then((artwork) => {
-      if (!artwork.url || !artwork.hash) return '';
+      if (!artwork.url || !artwork.hash) {
+        // The host has nothing to serve yet, which is an answer and not an error -
+        // but not one worth remembering. The host fetches what it is asked for,
+        // and what moves when it lands is the cover revision, which brings this
+        // ask back here. Remembering the empty answer would mean the phone held a
+        // placeholder for a picture that had arrived, and the host waiting for a
+        // question it had already answered "no" to.
+        artAsks.delete(token);
+        return '';
+      }
       rememberHeld(key, rendition, artwork.hash);
       return artwork.url;
     })
@@ -425,25 +435,31 @@ function loadRendition(url: string): Promise<string> {
 }
 
 /**
- * Fetch both renditions of a track's cover now, rather than when the screens that
- * show them appear. This is for the track coming next.
+ * Warm the artwork of the track coming next, so the player is not waiting for a
+ * cover when it starts.
  *
- * By the time it plays, its cover has been asked about, its thumbnail is in the
- * image cache - so the player is a cover from its first frame - and its full
- * cover has landed, so the drawer fades it in without waiting and the lock screen
- * is able to move on to it at once.
+ * The thumbnail is always fetched: every row, tile and bar draws one, and it is
+ * what the player puts on screen in its first frame. The full-size picture is
+ * fetched only when something that draws one is open, which is what `full` says.
  *
- * Fetching the full rendition is a deliberate cost, and one worth revisiting on a
- * metered connection: every track that becomes the next one has its full cover
- * downloaded whether or not anything gets to draw it. Dropping the second call
- * below would leave everything else as it is, with the lock screen upgrading when
- * its own fetch lands rather than before the track is even played.
+ * Why the second half is conditional: a tile never draws the full picture, so
+ * with nothing open the only thing that could draw it is the player - and the
+ * player is not playing this track yet. Asking for it anyway downloads a picture
+ * for a screen nobody is looking at, and on a metered connection that is somebody
+ * else's money. With a sheet open it is about to be drawn, which is what makes it
+ * worth fetching early at all.
+ *
+ * What the gate costs: with nothing open, the lock screen's upgrade to the full
+ * cover waits until the track actually starts rather than being ready before it.
+ * It still arrives - the track becoming the one that plays is its own trigger -
+ * so the cost is a frame or two of the thumbnail, on a surface that is usually
+ * in somebody's pocket at the time.
  */
-export function preloadArtwork(track: RemoteTrack) {
+export function preloadArtwork(track: RemoteTrack, { full = false }: { full?: boolean } = {}) {
   void coverFor(track).then((cover) => {
     if (!cover) return;
     void loadRendition(cover.thumb);
-    void loadFullCover(cover);
+    if (full) void loadFullCover(cover);
   });
 }
 

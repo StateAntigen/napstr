@@ -2410,8 +2410,12 @@
         });
       }
       // The same track's artwork is asked about and fetched now, so the player
-      // has a cover the moment it starts instead of after a round trip.
-      if (next) preloadArtwork(next);
+      // has a cover the moment it starts instead of after a round trip. Its
+      // full-size picture is fetched as well only when something that draws one
+      // is open: a tile never does, so with everything closed the download would
+      // be for a screen nobody is looking at, and the player fetches what it
+      // needs when the track starts anyway.
+      if (next) preloadArtwork(next, { full: showNowPlaying || showQueue || showAlbumView });
     } catch (nextError) {
       playing = false;
       error = `Could not play ${title(track)}: ${String(nextError)}`;

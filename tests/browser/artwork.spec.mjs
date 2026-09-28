@@ -163,6 +163,29 @@ test('Napstrfy fetches the artwork of the track next in the queue while the one 
   await expect(queueRows.nth(target).locator('.artwork img:not(.fallback)')).toHaveCount(1);
 });
 
+test('Napstrfy warms the next track’s thumbnail only, while nothing that draws a full cover is open', async ({ page }) => {
+  await mockNative(page);
+  await seedLibrary(page, 5);
+  const far = await refusePublisherArtwork(page, ['**/publisher-*']);
+  await serveHeldArtwork(page);
+  await page.route('**/fixture.wav', serveAudio);
+  await page.goto('http://127.0.0.1:15174');
+  const rows = page.locator('.track-row');
+  await expect(rows).toHaveCount(5);
+  // Playing a row from the library leaves nothing open, so the track that follows
+  // has its thumbnail warmed and nothing more: its full-size picture would be
+  // downloaded for a screen that does not exist yet. A tile never draws one.
+  await rows.first().locator('.track-open').click();
+  const fetched = async () =>
+    (await artAsks(page)).map((ask) => `${ask.key} ${ask.rendition}`).join('\n');
+  await expect.poll(fetched).toContain('rancid|album 1 thumb');
+  expect(await fetched()).not.toContain('rancid|album 1 full');
+  // What is playing is a different question: the lock screen draws its full-size
+  // picture whether or not anything in this app is open, so that one is fetched.
+  await expect.poll(fetched).toContain('rancid|album 0 full');
+  expect(far).toEqual([]);
+});
+
 test('Napstrfy keeps the art it already holds while the host is still fetching its own copy', async ({ page }) => {
   await mockNative(page);
   // The host knows of a picture for this album and has not fetched it, so it

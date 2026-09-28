@@ -950,7 +950,7 @@ impl MobileService {
                         thumb
                     };
                     // ...and, having just been asked about exactly these
-                    // albums, this is the moment to go and get the pictures that
+                    // albums, this is the moment to go and get the thumbnails that
                     // are missing. It is bounded and deduped by the fetcher, so a
                     // phone opening a screen is a small number of downloads
                     // rather than a small number of requests per album, and the
@@ -962,7 +962,12 @@ impl MobileService {
                         .iter()
                         .map(|cover| ArtWant {
                             key: &cover.key,
-                            art: &cover.art,
+                            // Thumbnails only. Every tile and row on a phone draws
+                            // one, and nothing on a screen of albums draws the
+                            // full picture: a full one is asked for by the screen
+                            // that draws it, per rendition, which is the only
+                            // thing that knows whether it wants it.
+                            art: "",
                             thumb: &cover.thumb,
                             source: &cover.source,
                         })
@@ -982,6 +987,20 @@ impl MobileService {
                     // album this computer has not fetched art for yet, and the
                     // right thing for it to do is paint its placeholder and ask
                     // again when the cover revision moves.
+                    //
+                    // Asking is also how this computer learns which rendition a
+                    // screen wants, which is the one thing a phone knows and a
+                    // host cannot: a thumbnail is drawn by every row that comes
+                    // on screen, and the full picture only by an album somebody
+                    // engaged with. So the ask is taken as the request it is - in
+                    // the background, because the phone is waiting for an answer
+                    // and not for a download - and the bytes landing are what move
+                    // that revision.
+                    let covers = self.covers.clone();
+                    let wanted = key.clone();
+                    tauri::async_runtime::spawn(async move {
+                        covers.ensure_rendition(&wanted, rendition).await;
+                    });
                     return write_response(send, &ServerResponse::ArtMissing { key }).await;
                 };
                 // Handing them out is what "used" means, and it is what eviction
