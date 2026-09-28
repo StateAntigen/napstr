@@ -5,11 +5,11 @@ use public_http::{podcast_http_client, safe_public_https_url};
 use futures_util::StreamExt;
 use iroh::{endpoint::presets, Endpoint, EndpointAddr, EndpointId, SecretKey};
 use napstr_remote_protocol::{
-    ArtRendition, ClientRequest, PairingTicket, PlaybackCommand, RemoteAlbumCover, RemoteAudiobook,
-    RemoteAudiobookSummary, RemoteDiscussionActivity, RemoteDiscussionMessage, RemotePlaybackState,
-    RemotePlaylist, RemotePlaylistCoordinate, RemotePlaylistSummary, RemoteTrack, RemoteTransfer,
-    ServerResponse, ALPN, MAX_ART_KEY_CHARS, MAX_CONTROL_FRAME_BYTES, MAX_COVER_KEYS,
-    MAX_PLAYLIST_MEMBERS, MAX_PLAYLIST_PAGE, MAX_PLAY_QUEUE, MAX_QR_SVG_BYTES,
+    ArtRendition, ClientRequest, DeviceRights, PairingTicket, PlaybackCommand, RemoteAlbumCover,
+    RemoteAudiobook, RemoteAudiobookSummary, RemoteDiscussionActivity, RemoteDiscussionMessage,
+    RemotePlaybackState, RemotePlaylist, RemotePlaylistCoordinate, RemotePlaylistSummary,
+    RemoteTrack, RemoteTransfer, ServerResponse, ALPN, MAX_ART_KEY_CHARS, MAX_CONTROL_FRAME_BYTES,
+    MAX_COVER_KEYS, MAX_PLAYLIST_MEMBERS, MAX_PLAYLIST_PAGE, MAX_PLAY_QUEUE, MAX_QR_SVG_BYTES,
     MAX_REPORT_NOTE_CHARS, MAX_TRACKS_BY_ID, REPORT_REASONS,
 };
 use quick_xml::{events::Event, Reader};
@@ -41,6 +41,13 @@ struct SavedDesktop {
     desktop_name: String,
     #[serde(default)]
     stream_only: bool,
+    /// What this computer allows, as it last said.
+    ///
+    /// A host that has never said - an older one, or a file written before
+    /// grants existed - leaves this empty, and then the boolean above is taken
+    /// at its word, which is what it has always meant.
+    #[serde(default)]
+    rights: Option<DeviceRights>,
     /// This computer's own public key, as it last reported it.
     ///
     /// Kept here rather than only in the answer that carried it: it is what
@@ -53,6 +60,11 @@ struct SavedDesktop {
 }
 
 impl SavedDesktop {
+    /// What this computer allows.
+    fn grant(&self) -> DeviceRights {
+        self.rights.unwrap_or_else(|| legacy_grant(self.stream_only))
+    }
+
     /// What this phone can say about the computer without hearing from it.
     ///
     /// `connected` is whether the last exchange succeeded; everything else is
@@ -60,7 +72,7 @@ impl SavedDesktop {
     /// computer is or which playlists are its own.
     fn status(&self, connected: bool, error: String) -> CompanionStatus {
         CompanionStatus {
-            stream_only: self.stream_only,
+            stream_only: self.grant().is_read_only(),
             paired: true,
             connected,
             desktop_name: self.desktop_name.clone(),
@@ -70,6 +82,15 @@ impl SavedDesktop {
             pubkey: self.pubkey.clone(),
             error,
         }
+    }
+}
+
+/// What the old boolean meant, for a host that only speaks it.
+fn legacy_grant(stream_only: bool) -> DeviceRights {
+    if stream_only {
+        DeviceRights::read_only()
+    } else {
+        DeviceRights::full()
     }
 }
 
@@ -1446,6 +1467,9 @@ impl RemoteClient {
             endpoint_addr: ticket.endpoint_addr.clone(),
             desktop_name: ticket.desktop_name.clone(),
             stream_only: false,
+            // What this computer allows arrives in the answer to the code that
+            // was scanned, so nothing is assumed before it does.
+            rights: None,
             // The computer's own key is learned from its first status answer,
             // which is where "is this playlist mine?" is answered from.
             pubkey: String::new(),
@@ -1470,16 +1494,21 @@ impl RemoteClient {
         .await
         .map_err(|_| "Napstr did not complete pairing in time")??
         .0;
-        let (desktop_name, stream_only) = match response {
+        let (desktop_name, grant) = match response {
             ServerResponse::Paired {
                 desktop_name,
                 stream_only,
-            } => (desktop_name, stream_only),
+                rights,
+            } => (
+                desktop_name,
+                rights.unwrap_or_else(|| legacy_grant(stream_only)),
+            ),
             other => return Err(unexpected_response(&other)),
         };
         let mut saved = desktop;
         saved.desktop_name = desktop_name.clone();
-        saved.stream_only = stream_only;
+        saved.stream_only = grant.is_read_only();
+        saved.rights = Some(grant);
         save_json(&self.app_data.join("paired-desktop.json"), &saved)?;
         self.disconnect().await;
         *self.desktop.write().await = Some(saved);
@@ -1585,7 +1614,7 @@ impl RemoteClient {
             .read()
             .await
             .as_ref()
-            .map(|desktop| desktop.stream_only)
+            .map(|desktop| desktop.grant().is_read_only())
             .unwrap_or(false)
     }
 
@@ -1613,8 +1642,10 @@ impl RemoteClient {
                 library_revision,
                 cover_revision,
                 stream_only,
+                rights,
                 pubkey,
             })) => {
+                let grant = rights.unwrap_or_else(|| legacy_grant(stream_only));
                 // An empty key is "this computer has not said", which leaves the
                 // one learned earlier standing: a host that is not on the
                 // network yet has no keys loaded, and that must not turn this
@@ -1624,7 +1655,7 @@ impl RemoteClient {
                 } else {
                     pubkey
                 };
-                if stream_only != desktop.stream_only
+                if grant != desktop.grant()
                     || (!pubkey.is_empty() && pubkey != desktop.pubkey)
                 {
                     let mut saved = self.desktop.write().await;
@@ -1632,13 +1663,14 @@ impl RemoteClient {
                         .as_mut()
                         .filter(|saved| saved.endpoint_id == desktop.endpoint_id)
                     {
-                        saved.stream_only = stream_only;
+                        saved.stream_only = grant.is_read_only();
+                        saved.rights = Some(grant);
                         saved.pubkey = pubkey.clone();
                         let _ = save_json(&self.app_data.join("paired-desktop.json"), saved);
                     }
                 }
                 CompanionStatus {
-                    stream_only,
+                    stream_only: grant.is_read_only(),
                     paired: true,
                     connected: true,
                     desktop_name: desktop.desktop_name,
@@ -1661,7 +1693,7 @@ impl RemoteClient {
         match tokio::time::timeout(Duration::from_secs(8), self.request(ClientRequest::Ping)).await
         {
             Ok(Ok(ServerResponse::Pong)) => CompanionStatus {
-                stream_only: desktop.stream_only,
+                stream_only: desktop.grant().is_read_only(),
                 paired: true,
                 connected: true,
                 desktop_name: desktop.desktop_name.clone(),
@@ -1815,7 +1847,7 @@ impl RemoteClient {
             .map(|item| item.track)
             .collect::<Vec<_>>();
         Ok(OfflineLibrary {
-            stream_only: desktop.as_ref().is_some_and(|desktop| desktop.stream_only),
+            stream_only: desktop.as_ref().is_some_and(|desktop| desktop.grant().is_read_only()),
             total: tracks.len(),
             tracks,
             paired: desktop.is_some(),
@@ -3391,6 +3423,7 @@ mod tests {
                     endpoint_addr: String::new(),
                     desktop_name: "Test Napstr".into(),
                     stream_only: true,
+                    rights: Some(DeviceRights::read_only()),
                     pubkey: String::new(),
                 });
                 *remote.connection.write().await = Some(connection);
