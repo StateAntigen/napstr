@@ -170,7 +170,19 @@ export async function mockNative(page, { app = 'napstrfy', nativeLocale = 'en-GB
           case 'remote_track_discussion': return args.before ? [] : window.discussionMessages ?? [];
           case 'remote_send_track_discussion': {
             const said = window.discussionMessages ?? [];
-            const sent = { eventId: `sent-${said.length}`, pubkey: 'c'.repeat(64), npub: 'npub1me', displayName: 'Me', content: args.content, createdAt: 1_800_000_100 };
+            const parent = said.find((message) => message.eventId === args.replyTo);
+            const sent = {
+              eventId: `sent-${said.length}`,
+              pubkey: 'c'.repeat(64),
+              npub: 'npub1me',
+              displayName: 'Me',
+              content: args.content,
+              createdAt: 1_800_000_100,
+              // A reply answers one message and carries its opening line, which is
+              // what the host resolves from its own cache.
+              ...(args.replyTo ? { replyTo: args.replyTo } : {}),
+              ...(parent ? { reply: { author: parent.displayName, excerpt: parent.content } } : {})
+            };
             window.discussionMessages = [...said, sent];
             return sent.eventId;
           }

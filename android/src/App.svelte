@@ -47,6 +47,14 @@
   const MAX_ALBUM_TRACKS = 200;
   /** How many comments a page of a track's conversation holds. */
   const DISCUSSION_PAGE = 100;
+  /**
+   * How stale the player sheet's preview of a conversation may be.
+   *
+   * The card is a preview, not a subscription: asking a relay the same question
+   * every time the sheet is opened would make one line of context the most
+   * expensive thing this app does.
+   */
+  const DISCUSSION_PREVIEW_MS = 5 * 60 * 1000;
   /** Fraction of the screen a right swipe on the liked page must cover to leave it. */
   const LIKED_SWIPE_DISMISS_RATIO = 0.25;
   /** Albums grouped out of the tracks this phone has loaded. */
@@ -266,8 +274,25 @@
   let discussionSending = $state(false);
   let discussionError: string | Message = $state('');
   let discussionHasMore = $state(true);
+  /** The message the composer is answering, or null for a fresh comment. */
+  let discussionReply = $state<RemoteDiscussionMessage | null>(null);
   /** The list itself, so a new comment can be brought into view. */
   let discussionScroller = $state<HTMLDivElement | undefined>(undefined);
+  /** The box, so starting a reply can put the cursor in it. */
+  let discussionInput = $state<HTMLInputElement | undefined>(undefined);
+  /**
+   * The newest page for the track the player sheet is showing.
+   *
+   * Held apart from what the thread holds, because the card is read before the
+   * thread is ever opened - and shared with it on the way in, so opening the
+   * thread does not start by showing nothing.
+   */
+  let sheetDiscussion = $state<RemoteDiscussionMessage[]>([]);
+  let sheetDiscussionFileId = $state('');
+  /** The line the card shows, or null when nobody has said anything yet. */
+  let sheetNewest = $derived(sheetDiscussion.at(-1) ?? null);
+  /** When each track's preview was last asked for, so it is asked for once. */
+  const sheetDiscussionAskedAt = new Map<string, number>();
   let showSleepOptions = $state(false);
   let actionTrack = $state<RemoteTrack | null>(null);
   let sleepValue = $state('');
@@ -2422,6 +2447,16 @@
     await playTrack(track);
   }
 
+  // The preview is asked for when the player sheet opens, and the pacing lives in
+  // the call rather than here, so re-opening a sheet for the same track costs
+  // nothing while a different track does ask.
+  $effect(() => {
+    const open = showNowPlaying || pinned;
+    const fileId = shownTrack?.fileId ?? '';
+    if (!open || !fileId) return;
+    untrack(() => void refreshSheetDiscussion());
+  });
+
   /** The quality profile the connection this phone is on uses right now. */
   function currentProfile(): QualityProfile {
     return activeProfile(quality, metered);
@@ -4058,10 +4093,13 @@
   async function openDiscussion(track: RemoteTrack) {
     closeActions();
     discussionTrack = track;
-    discussionMessages = [];
+    // Whatever the card already knew, so the thread opens on something rather
+    // than on a spinner while the same page is fetched again.
+    discussionMessages = sheetDiscussionFileId === track.fileId ? sheetDiscussion : [];
     discussionDraft = '';
     discussionError = '';
     discussionHasMore = true;
+    discussionReply = null;
     await refreshDiscussion();
   }
 
@@ -4070,6 +4108,23 @@
     discussionMessages = [];
     discussionDraft = '';
     discussionError = '';
+    discussionReply = null;
+  }
+
+  /**
+   * Answers one message rather than the conversation.
+   *
+   * The reply is not a different kind of message: it is another one that quotes
+   * its parent, so the thread stays one stream and the context travels with it.
+   */
+  async function startReply(message: RemoteDiscussionMessage) {
+    discussionReply = message;
+    await tick();
+    discussionInput?.focus();
+  }
+
+  function cancelReply() {
+    discussionReply = null;
   }
 
   /**
@@ -4117,8 +4172,13 @@
     discussionSending = true;
     discussionError = '';
     try {
-      await invoke<string>('remote_send_track_discussion', { fileId: track.fileId, content });
+      await invoke<string>('remote_send_track_discussion', {
+        fileId: track.fileId,
+        content,
+        replyTo: discussionReply?.eventId
+      });
       discussionDraft = '';
+      discussionReply = null;
       await refreshDiscussion();
     } catch (nextError) {
       discussionError = String(nextError);
@@ -4133,6 +4193,44 @@
     return Number.isNaN(at.getTime())
       ? ''
       : at.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+  }
+
+  /**
+   * Reads the newest page for the track on the player sheet.
+   *
+   * Once per track, and no more often than a few minutes: a conversation that
+   * nobody is reading does not need to be re-fetched every time a sheet is opened,
+   * and a relay should not be asked the same question for the sake of one line.
+   */
+  async function refreshSheetDiscussion() {
+    const track = shownTrack;
+    if (!track || !status.connected) return;
+    const asked = sheetDiscussionAskedAt.get(track.fileId) ?? 0;
+    if (Date.now() - asked < DISCUSSION_PREVIEW_MS) return;
+    sheetDiscussionAskedAt.set(track.fileId, Date.now());
+    try {
+      const messages = await invoke<RemoteDiscussionMessage[]>('remote_track_discussion', {
+        fileId: track.fileId
+      });
+      if (shownTrack?.fileId !== track.fileId) return;
+      sheetDiscussionFileId = track.fileId;
+      sheetDiscussion = messages;
+    } catch {
+      // A card is a courtesy. Offline, or an older computer, and the sheet simply
+      // has one card fewer.
+    }
+  }
+
+  /** Opens the thread from the card, writing straight away when there is nothing to read. */
+  async function openSheetDiscussion() {
+    const track = shownTrack;
+    if (!track) return;
+    const writing = !sheetNewest;
+    await openDiscussion(track);
+    if (writing) {
+      await tick();
+      discussionInput?.focus();
+    }
   }
 
   function openActions(track: RemoteTrack | null) {
@@ -5834,6 +5932,26 @@
               </svg>
             </button>
           </div>
+
+          <!-- The social card: always here, one line tall when nobody has spoken,
+               and the doorway to the whole thread. It takes its space from the art
+               above it rather than from a scroll, because this sheet is one screen. -->
+          {#if shownTrack}
+            <button class="sheet-card" onclick={() => void openSheetDiscussion()}>
+              <span class="sheet-card-head">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4.2 5.4h15.6v9.8H9.6L5.2 19v-3.8H4.2z" /></svg>
+                <b>{$t("Track discussion")}</b>
+              </span>
+              {#if sheetNewest}
+                <span class="sheet-card-line">
+                  <b>{sheetNewest.displayName || sheetNewest.npub}</b>
+                  {sheetNewest.content}
+                </span>
+              {:else}
+                <span class="sheet-card-line quiet">{$t("Comment on this track…")}</span>
+              {/if}
+            </button>
+          {/if}
         </div>
       </div>
     {/if}
@@ -6294,7 +6412,25 @@
       {/if}
       {#each discussionMessages as message (message.eventId)}
         <article class="discussion-message" class:mine={message.pubkey === status.pubkey}>
-          <header><b>{message.displayName || message.npub}</b><time>{discussionStamp(message.createdAt)}</time></header>
+          <header>
+            <b>{message.displayName || message.npub}</b>
+            <span class="discussion-message-tools">
+              <time>{discussionStamp(message.createdAt)}</time>
+              {#if !status.streamOnly}
+                <button class="discussion-reply" onclick={() => void startReply(message)} aria-label={$t("Reply")} title={$t("Reply")}>
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9.5 6 4.5 11l5 5" /><path d="M4.5 11h9a5.5 5.5 0 0 1 5.5 5.5V18" /></svg>
+                </button>
+              {/if}
+            </span>
+          </header>
+          <!-- What this is answering, resolved by the computer so the phone draws
+               one line instead of fetching a whole parent message. -->
+          {#if message.reply}
+            <span class="discussion-quote">
+              <b>{message.reply.author}</b>
+              <span>{message.reply.excerpt}</span>
+            </span>
+          {/if}
           <p>{message.content}</p>
         </article>
       {/each}
@@ -6304,14 +6440,23 @@
       <p class="settings-note">{$t("This pairing is read only: it can browse and play, but cannot ask Napstr to download or publish.")}</p>
     {:else}
       <form class="discussion-compose" onsubmit={(event) => { event.preventDefault(); void sendDiscussion(); }}>
-        <input
-          bind:value={discussionDraft}
-          maxlength="500"
-          autocomplete="off"
-          aria-label={$t("Track discussion comment")}
-          placeholder={$t("Comment on this track…")}
-        />
-        <button disabled={!discussionDraft.trim() || discussionSending} aria-busy={discussionSending}>{discussionSending ? '…' : $t("Send")}</button>
+        {#if discussionReply}
+          <button class="discussion-replying" type="button" onclick={cancelReply} aria-label={$t("Cancel reply")}>
+            <span>{$t("Replying to {p0}", { p0: discussionReply.displayName || discussionReply.npub })}</span>
+            <small>{discussionReply.content}</small>
+          </button>
+        {/if}
+        <div class="discussion-compose-row">
+          <input
+            bind:this={discussionInput}
+            bind:value={discussionDraft}
+            maxlength="500"
+            autocomplete="off"
+            aria-label={$t("Track discussion comment")}
+            placeholder={discussionReply ? $t("Write a reply…") : $t("Comment on this track…")}
+          />
+          <button disabled={!discussionDraft.trim() || discussionSending} aria-busy={discussionSending}>{discussionSending ? '…' : $t("Send")}</button>
+        </div>
       </form>
     {/if}
   </div>

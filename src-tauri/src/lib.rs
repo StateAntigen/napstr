@@ -2080,11 +2080,12 @@ async fn track_discussion_activity(
 async fn send_track_discussion_message(
     file_id: String,
     content: String,
+    reply_to: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
     state
         .network
-        .send_track_discussion_message(file_id, content)
+        .send_track_discussion_message(file_id, content, reply_to)
         .await
 }
 

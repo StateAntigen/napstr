@@ -2374,6 +2374,7 @@ async fn remote_track_discussion(
 async fn remote_send_track_discussion(
     file_id: String,
     content: String,
+    reply_to: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
     match state
@@ -2381,6 +2382,7 @@ async fn remote_send_track_discussion(
         .request(ClientRequest::SendTrackDiscussion {
             file_id: file_id.clone(),
             content,
+            reply_to,
         })
         .await
     {

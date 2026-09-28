@@ -9,9 +9,9 @@ use crate::art_fetch::ArtWant;
 use napstr_remote_protocol::{
     ArtRendition, ClientRequest, CoverReportResult, PairingTicket, PlaybackCommand, RemoteAlbumCover,
     RemoteAudiobook, RemoteAudiobookSummary, RemoteDiscussionActivity, RemoteDiscussionMessage,
-    RemoteSource, RemoteTrack, RemoteTransfer, ServerResponse, ALPN, MAX_ART_KEY_CHARS,
-    MAX_CONTROL_FRAME_BYTES, MAX_COVER_KEYS, MAX_PAGE_SIZE, MAX_PLAYLIST_PAGE, MAX_PLAY_QUEUE,
-    MAX_POSITION_MS, MAX_TRACKS_BY_ID, PROTOCOL_VERSION,
+    RemoteDiscussionReply, RemoteSource, RemoteTrack, RemoteTransfer, ServerResponse, ALPN,
+    MAX_ART_KEY_CHARS, MAX_CONTROL_FRAME_BYTES, MAX_COVER_KEYS, MAX_PAGE_SIZE, MAX_PLAYLIST_PAGE,
+    MAX_PLAY_QUEUE, MAX_POSITION_MS, MAX_TRACKS_BY_ID, PROTOCOL_VERSION,
 };
 use qrcode::{render::svg, QrCode};
 use rusqlite::{params, OptionalExtension};
@@ -1011,7 +1011,11 @@ impl MobileService {
                     .collect();
                 write_response(send, &ServerResponse::TrackDiscussion { messages }).await
             }
-            ClientRequest::SendTrackDiscussion { file_id, content } => {
+            ClientRequest::SendTrackDiscussion {
+                file_id,
+                content,
+                reply_to,
+            } => {
                 if !is_sha256_file_id(&file_id.trim()) {
                     return Err("That track has no valid file ID".into());
                 }
@@ -1026,7 +1030,11 @@ impl MobileService {
                 // hears about a comment sent from a phone.
                 let event_id = self
                     .network
-                    .send_track_discussion_message(file_id.trim().to_string(), content)
+                    .send_track_discussion_message(
+                        file_id.trim().to_string(),
+                        content,
+                        reply_to,
+                    )
                     .await?;
                 write_response(send, &ServerResponse::TrackDiscussionSent { event_id }).await
             }
@@ -1425,6 +1433,11 @@ fn remote_discussion_message(
         display_name: message.display_name,
         content: message.content,
         created_at: message.created_at,
+        reply_to: message.reply_to,
+        reply: message.reply.map(|reply| RemoteDiscussionReply {
+            author: reply.author,
+            excerpt: reply.excerpt,
+        }),
     }
 }
 
@@ -1986,13 +1999,21 @@ mod tests {
         }
         // Posting is signed with the user's own key and published under their
         // name, which is the same line read-only access already draws for reports
-        // and for playlists.
+        // and for playlists. A reply is the same act with a parent attached.
         let comment = ClientRequest::SendTrackDiscussion {
-            file_id,
+            file_id: file_id.clone(),
             content: "Nice track".into(),
+            reply_to: None,
         };
         assert!(check_request_permission(true, &comment).is_err());
         assert!(check_request_permission(false, &comment).is_ok());
+        let reply = ClientRequest::SendTrackDiscussion {
+            file_id,
+            content: "Yes it is".into(),
+            reply_to: Some("b".repeat(64)),
+        };
+        assert!(check_request_permission(true, &reply).is_err());
+        assert!(check_request_permission(false, &reply).is_ok());
     }
 
     #[test]

@@ -519,16 +519,40 @@ svg .filled { fill: currentColor; stroke: none; }
 /* What this identity said is marked, which is what `status.pubkey` is for. */
 .discussion-message.mine { background: #191733; border-color: #34305c; }
 .discussion-message header { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 5px; }
+.discussion-message-tools { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 6px; }
+.discussion-reply { width: 26px; height: 26px; display: inline-flex; align-items: center; justify-content: center; color: #8f8f9c; background: transparent; border: 0; }
+.discussion-reply svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.7; }
+.discussion-reply:active { color: #cbc4ff; }
+/* What a message answers: a line of context, not a nested thread. NIP-C7 keeps a
+   chat view as one ordered stream, so a reply sits in the stream like any other. */
+.discussion-quote { display: block; margin: 0 0 7px; padding: 6px 9px; border-left: 2px solid #514b78; background: rgba(81, 75, 120, .16); border-radius: 0 8px 8px 0; }
+.discussion-quote b { color: #cbc4ff; font-size: 11px; }
+.discussion-quote span { display: block; margin-top: 2px; color: #9d9da7; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .discussion-message header b { color: #cbc4ff; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .discussion-message header time { flex: 0 0 auto; color: #6f6f7a; font-size: 11px; }
 .discussion-message p { margin: 0; color: #ececf1; font-size: 14px; line-height: 1.45; overflow-wrap: anywhere; }
 .discussion-error { margin: 0 0 12px; padding: 10px 12px; color: #ffb3bd; background: #2a1a1f; border: 1px solid #4a2b33; border-radius: 10px; font-size: 12px; }
 .discussion-older { width: 100%; min-height: 36px; margin-bottom: 12px; color: #b9b9c4; background: #16161c; border: 1px solid #26262e; border-radius: 10px; font-size: 12px; font-weight: 700; }
-.discussion-compose { display: flex; gap: 8px; padding: 10px 16px calc(12px + env(safe-area-inset-bottom)); border-top: 1px solid #1c1c22; background: #0e0e12; }
+.discussion-compose { display: block; padding: 10px 16px calc(12px + env(safe-area-inset-bottom)); border-top: 1px solid #1c1c22; background: #0e0e12; }
+.discussion-compose-row { display: flex; gap: 8px; }
+/* What the box is answering. Tapping it drops the reply and writes a fresh one. */
+.discussion-replying { width: 100%; margin-bottom: 8px; padding: 7px 10px; display: block; color: #ececf1; background: #16161c; border: 0; border-left: 2px solid #c9c2ff; border-radius: 0 8px 8px 0; text-align: left; }
+.discussion-replying span { display: block; color: #cbc4ff; font-size: 11px; font-weight: 700; }
+.discussion-replying small { display: block; margin-top: 2px; color: #9d9da7; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .discussion-compose input { min-width: 0; flex: 1 1 auto; min-height: 42px; padding: 0 14px; color: #ececf1; background: #16161c; border: 1px solid #26262e; border-radius: 21px; font-size: 14px; }
 .discussion-compose button { flex: 0 0 auto; min-width: 74px; min-height: 42px; padding: 0 16px; color: #0b0b0f; background: #c9c2ff; border: 0; border-radius: 21px; font-size: 13px; font-weight: 700; }
 .discussion-compose button:disabled { opacity: .5; }
 
+
+/* The social card in the player sheet: one line of the conversation when there is
+   one, an invitation when there is not. Always drawn, because a card that only
+   appears once somebody has spoken is one nobody finds on a quiet network. */
+.sheet-card { width: 100%; padding: 10px 12px; display: block; color: #ececf1; background: #131318; border: 1px solid #1f1f27; border-radius: 12px; text-align: left; }
+.sheet-card-head { display: flex; align-items: center; gap: 7px; color: #cbc4ff; font-size: 10px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
+.sheet-card-head svg { width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-width: 1.6; }
+.sheet-card-line { display: block; margin-top: 5px; color: #b9b9c4; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sheet-card-line b { color: #ececf1; }
+.sheet-card-line.quiet { color: #7f7f8b; font-style: italic; }
 
 /* Temporary cover-art diagnostics, reached from Settings. Delete with
    CoverDebug.svelte. */

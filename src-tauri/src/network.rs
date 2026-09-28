@@ -238,6 +238,90 @@ pub struct TrollboxMessage {
     pub display_name: String,
     pub content: String,
     pub created_at: u64,
+    /// The event this one answers, when it says. NIP-C7 replies quote their
+    /// parent with a `q` tag, so a stream stays a stream and the parent is
+    /// context rather than a tree.
+    pub reply_to: Option<String>,
+    /// What the parent said, resolved by the host so both clients draw the same
+    /// thing without either of them fetching it again.
+    pub reply: Option<PublicChatReply>,
+}
+
+/// The shape of what a message answers: who said it, and the start of it.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicChatReply {
+    /// A display name, or a short key when this host has never seen the author.
+    pub author: String,
+    /// The opening of the parent, bounded and sanitised like any other text.
+    pub excerpt: String,
+}
+
+/// How much of a parent message a reply carries with it.
+const PUBLIC_CHAT_EXCERPT_CHARS: usize = 160;
+
+/// The `q` tag that makes a chat message a reply, as NIP-C7 defines it.
+///
+/// Only the parent's id is written: NIP-C7's fuller form has room for a relay and
+/// the parent's author, and this host knows neither from an event alone - the
+/// relay it came from is not part of the event, and adding a wrong hint would be
+/// worse than leaving it out.
+fn discussion_reply_tag(parent: &str) -> Result<Tag, String> {
+    let parent = parent.trim().to_ascii_lowercase();
+    if !is_sha256_hex(&parent) {
+        return Err("A reply needs the event ID it answers".into());
+    }
+    Tag::parse(["q", &parent]).map_err(|error| error.to_string())
+}
+
+/// A reply's content, as NIP-C7 writes it: a reference to the parent, then the text.
+///
+/// The reference is what other clients follow, and this host takes it back off
+/// again when displaying, so nobody reads bech32 where a sentence should be.
+fn discussion_reply_content(parent: &str, content: &str) -> String {
+    let Ok(parent) = parent.trim().parse::<EventId>() else {
+        return content.to_string();
+    };
+    match parent.to_bech32() {
+        Ok(reference) => format!("nostr:{reference}\n{content}"),
+        Err(_) => content.to_string(),
+    }
+}
+
+/// The parent a message answers, when it names one.
+fn public_chat_reply_to(event: &Event) -> Option<String> {
+    event.tags.iter().find_map(|tag| {
+        if tag.kind() != TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::Q)) {
+            return None;
+        }
+        let parent = tag.content()?.trim().to_ascii_lowercase();
+        is_sha256_hex(&parent).then_some(parent)
+    })
+}
+
+/// A message's text, with a leading NIP-21 reference taken off.
+///
+/// A reply opens with `nostr:note1...` so other clients can follow it back; the
+/// reader already has the parent from the `q` tag, and drawing the reference
+/// itself would put a wall of bech32 in front of every reply.
+fn public_chat_text(content: &str) -> &str {
+    let trimmed = content.trim_start();
+    let Some(rest) = trimmed.strip_prefix("nostr:") else {
+        return content;
+    };
+    let Some((reference, text)) = rest.split_once(char::is_whitespace) else {
+        return content;
+    };
+    const HRPS: [&str; 6] = ["note1", "nevent1", "naddr1", "nprofile1", "npub1", "nsec1"];
+    if HRPS.iter().any(|hrp| reference.starts_with(hrp)) {
+        text.trim_start()
+    } else {
+        content
+    }
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1798,9 +1882,41 @@ impl NetworkService {
             .insert(current_key.to_hex(), safe_trollbox_name(&current_name));
 
         let cached = self.trollbox_profiles.read().await.clone();
+        // What these replies are answering, read from the cache rather than asked
+        // for again: a parent is almost always a message this host already holds,
+        // because a reply is read after the thread it belongs to. Resolved here so
+        // both clients draw the same line above it.
+        let mut answered: HashMap<String, (String, String)> = HashMap::new();
+        let parents = chat_events
+            .iter()
+            .filter_map(public_chat_reply_to)
+            .collect::<HashSet<_>>();
+        if !parents.is_empty() {
+            let ids = parents
+                .iter()
+                .filter_map(|parent| parent.parse::<EventId>().ok())
+                .collect::<Vec<_>>();
+            if let Ok(events) = client.database().query(Filter::new().ids(ids)).await {
+                for event in events.iter() {
+                    let excerpt = sanitise_public_chat_content(public_chat_text(&event.content));
+                    answered.insert(
+                        event.id.to_hex(),
+                        (
+                            event.pubkey.to_hex(),
+                            excerpt.chars().take(PUBLIC_CHAT_EXCERPT_CHARS).collect(),
+                        ),
+                    );
+                }
+            }
+        }
         let missing = chat_events
             .iter()
             .map(|event| event.pubkey)
+            .chain(
+                answered
+                    .values()
+                    .filter_map(|(pubkey, _)| pubkey.parse::<PublicKey>().ok()),
+            )
             .filter(|pubkey| !cached.contains_key(&pubkey.to_hex()))
             .collect::<HashSet<_>>()
             .into_iter()
@@ -1844,6 +1960,17 @@ impl NetworkService {
             .into_iter()
             .map(|event| {
                 let pubkey = event.pubkey.to_hex();
+                let reply_to = public_chat_reply_to(&event);
+                let reply = reply_to.as_ref().and_then(|parent| {
+                    let (author, excerpt) = answered.get(parent)?;
+                    Some(PublicChatReply {
+                        author: profiles
+                            .get(author)
+                            .cloned()
+                            .unwrap_or_else(|| "napstr-user".into()),
+                        excerpt: excerpt.clone(),
+                    })
+                });
                 Ok(TrollboxMessage {
                     event_id: event.id.to_hex(),
                     npub: event
@@ -1855,8 +1982,10 @@ impl NetworkService {
                         .cloned()
                         .unwrap_or_else(|| "napstr-user".into()),
                     pubkey,
-                    content: sanitise_public_chat_content(&event.content),
+                    content: sanitise_public_chat_content(public_chat_text(&event.content)),
                     created_at: event.created_at.as_secs(),
+                    reply_to,
+                    reply,
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -1869,20 +1998,29 @@ impl NetworkService {
             TROLLBOX_HASHTAG,
             content,
             "Public message in the Napstr trollbox",
+            None,
         )
         .await
     }
 
+    /// Say something in a track's discussion, optionally answering a message in it.
+    ///
+    /// A reply is not a different kind of event: NIP-C7 makes it another message
+    /// that quotes its parent with a `q` tag and opens with a reference to it, so a
+    /// chat view stays one ordered stream and the parent is context rather than a
+    /// tree.
     pub async fn send_track_discussion_message(
         &self,
         file_id: String,
         content: String,
+        reply_to: Option<String>,
     ) -> Result<String, String> {
         let topic = track_discussion_topic(&file_id)?;
         self.send_public_chat_message(
             &topic,
             content,
             "Public message in a Napstr track discussion",
+            reply_to.as_deref(),
         )
         .await
     }
@@ -1997,6 +2135,7 @@ impl NetworkService {
         topic: &str,
         content: String,
         alt: &str,
+        reply_to: Option<&str>,
     ) -> Result<String, String> {
         let content = content.trim();
         let character_count = content.chars().count();
@@ -2014,7 +2153,7 @@ impl NetworkService {
             .await
             .clone()
             .ok_or("Nostr is not connected")?;
-        let tags = vec![
+        let mut tags = vec![
             Tag::parse(["t", topic]),
             Tag::parse(["client", "Napstr"]),
             Tag::parse(["alt", alt]),
@@ -2022,6 +2161,15 @@ impl NetworkService {
         .into_iter()
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
+        // A reply is a normal message that names its parent twice over: once as the
+        // machine-readable `q` tag, and once as the reference NIP-C7 opens the
+        // content with. The text is what the author wrote either way, so the
+        // reference is added around it rather than counted as part of it.
+        let mut content = content.to_string();
+        if let Some(parent) = reply_to {
+            tags.push(discussion_reply_tag(parent).map_err(|error| error.to_string())?);
+            content = discussion_reply_content(parent, &content);
+        }
         let event = client
             .sign_event_builder(
                 EventBuilder::new(Kind::from(TROLLBOX_MESSAGE_KIND), content).tags(tags),
@@ -6174,6 +6322,49 @@ mod tests {
             HashSet::from(["held-private".to_string()]),
             "only the file held without being published is kept out of the question"
         );
+    }
+
+    /// What a reply is, as NIP-C7 defines it, and what it reads as.
+    ///
+    /// A reply is not a second kind of event: it is another message that names its
+    /// parent with a `q` tag and opens with a reference to it. Both halves are
+    /// written on the way out and read back on the way in, so a chat view stays one
+    /// ordered stream and no reader is shown a wall of bech32.
+    #[test]
+    fn a_reply_quotes_its_parent_and_reads_back_as_a_sentence() {
+        let parent = "ab".repeat(32);
+        // Rubbish is refused rather than signed: a `q` tag with a value that is not
+        // an event id tells every other client nothing.
+        assert!(discussion_reply_tag("not-an-event").is_err());
+        let tag = discussion_reply_tag(&parent).unwrap();
+        assert_eq!(tag.kind(), TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::Q)));
+        assert_eq!(tag.content(), Some(parent.as_str()));
+
+        let written = discussion_reply_content(&parent, "yes");
+        let (reference, text) = written.split_once('\n').unwrap();
+        assert!(reference.starts_with("nostr:note1"), "wrote {reference}");
+        assert_eq!(text, "yes");
+        // ...and the reader takes exactly that reference off again.
+        assert_eq!(public_chat_text(&written), "yes");
+        assert_eq!(public_chat_text("a plain message"), "a plain message");
+        // Something that merely starts with the scheme is somebody's own text.
+        assert_eq!(public_chat_text("nostr:not-a-reference\nhi"), "nostr:not-a-reference\nhi");
+
+        let keys = Keys::generate();
+        let reply = EventBuilder::new(Kind::from(TROLLBOX_MESSAGE_KIND), "nostr:note1qqq\nok")
+            .tag(Tag::parse(["q", parent.as_str()]).unwrap())
+            .sign_with_keys(&keys)
+            .unwrap();
+        assert_eq!(public_chat_reply_to(&reply).as_deref(), Some(parent.as_str()));
+        let plain = EventBuilder::new(Kind::from(TROLLBOX_MESSAGE_KIND), "hello")
+            .sign_with_keys(&keys)
+            .unwrap();
+        assert_eq!(public_chat_reply_to(&plain), None);
+        let broken = EventBuilder::new(Kind::from(TROLLBOX_MESSAGE_KIND), "hello")
+            .tag(Tag::parse(["q", "not-an-event"]).unwrap())
+            .sign_with_keys(&keys)
+            .unwrap();
+        assert_eq!(public_chat_reply_to(&broken), None);
     }
 
     /// What a row is allowed to claim about the conversation around a file.

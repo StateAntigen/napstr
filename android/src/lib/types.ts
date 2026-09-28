@@ -15,6 +15,19 @@ export type RemoteDiscussionMessage = {
   content: string;
   /** The event's own timestamp, in seconds since the epoch. */
   createdAt: number;
+  /** The message this one answers, when it says. */
+  replyTo?: string;
+  /**
+   * What the parent said, resolved by the computer: this phone holds no relay pool
+   * and should not have to fetch a parent to draw one line of context.
+   */
+  reply?: RemoteDiscussionReply;
+};
+
+/** What a message in a conversation is answering. */
+export type RemoteDiscussionReply = {
+  author: string;
+  excerpt: string;
 };
 
 /**

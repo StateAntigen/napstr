@@ -189,6 +189,23 @@ pub struct RemoteDiscussionMessage {
     pub content: String,
     /// The event's own timestamp, in seconds since the epoch.
     pub created_at: u64,
+    /// The message this one answers, when it says.
+    #[serde(default)]
+    pub reply_to: Option<String>,
+    /// What the parent said, resolved by the host: a phone holds no relay pool and
+    /// should not have to fetch a parent to draw one line of context.
+    #[serde(default)]
+    pub reply: Option<RemoteDiscussionReply>,
+}
+
+/// What a message in a conversation is answering.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteDiscussionReply {
+    /// A display name, or a short key when the host has never seen the author.
+    pub author: String,
+    /// The opening of the parent, bounded and sanitised by the host.
+    pub excerpt: String,
 }
 
 /// How much conversation a file has attracted, as a row's mark reads it.
@@ -689,6 +706,11 @@ pub enum ClientRequest {
     SendTrackDiscussion {
         file_id: String,
         content: String,
+        /// The message this one answers, when it answers one. NIP-C7 replies quote
+        /// their parent, so this becomes a `q` tag and a reference at the front of
+        /// the text rather than a second kind of event.
+        #[serde(default)]
+        reply_to: Option<String>,
     },
     /// How much conversation a page of files has attracted, for the marks on rows.
     /// The host answers about the files it is willing to name to a relay; a file
@@ -1003,7 +1025,7 @@ mod tests {
             }
         );
 
-        let messages = (0..100)
+        let messages = (0..100u32)
             .map(|index| RemoteDiscussionMessage {
                 event_id: format!("{index:064x}"),
                 pubkey: "b".repeat(64),
@@ -1011,12 +1033,20 @@ mod tests {
                 display_name: "d".repeat(64),
                 content: "e".repeat(500),
                 created_at: 1_800_000_000,
+                // A page of replies is the biggest this answer gets: every message
+                // quoting the one before it.
+                reply_to: Some(format!("{:064x}", index.saturating_sub(1))),
+                reply: Some(RemoteDiscussionReply {
+                    author: "f".repeat(64),
+                    excerpt: "g".repeat(160),
+                }),
             })
             .collect::<Vec<_>>();
         let payload = serde_json::to_vec(&ServerResponse::TrackDiscussion {
             messages: messages.clone(),
         })
         .unwrap();
+        assert!(String::from_utf8_lossy(&payload).contains("replyTo"));
         assert!(
             payload.len() <= MAX_CONTROL_FRAME_BYTES,
             "a page of comments is {} bytes, over the {MAX_CONTROL_FRAME_BYTES} byte frame limit",
