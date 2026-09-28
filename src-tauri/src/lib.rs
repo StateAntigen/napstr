@@ -2069,6 +2069,14 @@ async fn get_track_discussion_messages(
 }
 
 #[tauri::command]
+async fn track_discussion_activity(
+    file_ids: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<network::TrackDiscussionActivity>, String> {
+    state.network.track_discussion_activity(file_ids).await
+}
+
+#[tauri::command]
 async fn send_track_discussion_message(
     file_id: String,
     content: String,
@@ -2749,6 +2757,7 @@ pub fn run() {
             send_trollbox_message,
             get_track_discussion_messages,
             send_track_discussion_message,
+            track_discussion_activity,
             request_network_download,
             mobile_status,
             create_mobile_pairing,

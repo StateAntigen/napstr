@@ -39,6 +39,18 @@ const PUBLIC_CHAT_EVENT: &str = "napstr-public-chat";
 const TRANSFERS_CHANGED_EVENT: &str = "napstr-transfers-changed";
 const TROLLBOX_CACHE_LIMIT: usize = 200;
 const PUBLIC_CHAT_PAGE_SIZE: usize = 100;
+/// How long a comment keeps a file worth mentioning.
+const TRACK_DISCUSSION_ACTIVITY_WINDOW: u64 = 30 * 24 * 60 * 60;
+/// Topics per read: the same size the catalogue uses for file ids, so a page of
+/// rows is one request rather than one per row.
+const TRACK_DISCUSSION_ACTIVITY_BATCH: usize = 100;
+/// The most files one question may be about, whatever the caller asks for.
+const TRACK_DISCUSSION_ACTIVITY_IDS_MAX: usize = 200;
+/// Events per read.
+const TRACK_DISCUSSION_ACTIVITY_LIMIT: usize = 500;
+/// A comment dated further ahead than this is ignored: a clock can be wrong, but
+/// an event dated 2099 would otherwise sit inside every window forever.
+const TRACK_DISCUSSION_ACTIVITY_FUTURE_SLACK: u64 = 60 * 60;
 const LIVE_NOSTR_EVENT_LIMIT: usize = 35_000;
 const MAX_SEEDER_CANDIDATES: usize = 3;
 const DOWNLOAD_QUEUED: &str = "Queued";
@@ -1857,6 +1869,111 @@ impl NetworkService {
             "Public message in a Napstr track discussion",
         )
         .await
+    }
+
+    /// How much conversation a set of files has attracted.
+    ///
+    /// The question a row asks is "has anyone had anything to say about this",
+    /// and answering it costs one read: kind 9 is a shared kind, and relays index
+    /// the `t` tag but cannot search inside it, so the topics have to be named -
+    /// in batches, for the rows actually on screen, and never for all of a library
+    /// at once.
+    ///
+    /// A file this host holds *without having published it* is left out of the
+    /// question entirely: asking a relay about those bytes would say "this
+    /// computer has them", which is what not publishing them kept private. A file
+    /// nobody here holds is free to ask about, since the question says nothing
+    /// about this library.
+    ///
+    /// A topic is a claim rather than an ownership, so a count can be inflated by
+    /// one author posting a lot. What is reported is therefore *people*, not
+    /// messages. A relay that does not answer leaves its files looking quiet - the
+    /// discussion panel is where the truth is read.
+    pub async fn track_discussion_activity(
+        &self,
+        file_ids: Vec<String>,
+    ) -> Result<Vec<TrackDiscussionActivity>, String> {
+        // A page of rows, and never a library: the size of this question is the
+        // size of what a relay learns about what this computer has.
+        let file_ids = file_ids
+            .into_iter()
+            .take(TRACK_DISCUSSION_ACTIVITY_IDS_MAX)
+            .collect::<Vec<_>>();
+        let unpublished = self.unpublished_holds(&file_ids)?;
+        let mut asked: HashMap<String, String> = HashMap::new();
+        for file_id in file_ids {
+            if unpublished.contains(&file_id) {
+                continue;
+            }
+            if let Ok(topic) = track_discussion_topic(&file_id) {
+                asked.insert(topic, file_id);
+            }
+        }
+        if asked.is_empty() {
+            return Ok(Vec::new());
+        }
+        let client = self
+            .client
+            .read()
+            .await
+            .clone()
+            .ok_or("Nostr is not connected")?;
+        let blocked = blocked_pubkeys(&self.db_path)?;
+        let now = Utc::now().timestamp().max(0) as u64;
+        let mut tallies: HashMap<String, DiscussionTally> = HashMap::new();
+        let topics = asked.keys().cloned().collect::<Vec<_>>();
+        for batch in topics.chunks(TRACK_DISCUSSION_ACTIVITY_BATCH) {
+            let filter = Filter::new()
+                .kind(Kind::from(TROLLBOX_MESSAGE_KIND))
+                .hashtags(batch.iter().map(String::as_str))
+                .since(Timestamp::from(
+                    now.saturating_sub(TRACK_DISCUSSION_ACTIVITY_WINDOW),
+                ))
+                .limit(TRACK_DISCUSSION_ACTIVITY_LIMIT);
+            // A relay that is down, or that refuses a filter naming this many
+            // topics, leaves its files quiet rather than failing the page.
+            let Ok(events) = client.fetch_events(filter, Duration::from_secs(8)).await else {
+                continue;
+            };
+            let asked_topics = batch.iter().map(|topic| (*topic).clone()).collect();
+            tallies.extend(discussion_tallies(
+                events.iter(),
+                &asked_topics,
+                &blocked,
+                now,
+            ));
+            for event in events.iter() {
+                let _ = client.database().save_event(event).await;
+            }
+        }
+        let mut rows = tallies
+            .into_iter()
+            .filter_map(|(topic, tally)| {
+                Some(TrackDiscussionActivity {
+                    file_id: asked.get(&topic)?.clone(),
+                    authors: tally.authors,
+                    messages: tally.messages,
+                    last_at: tally.last_at,
+                })
+            })
+            .collect::<Vec<_>>();
+        // The most talked about first, so a caller that only wants the top of the
+        // list does not have to sort it again.
+        rows.sort_by(|left, right| {
+            right
+                .authors
+                .cmp(&left.authors)
+                .then_with(|| right.last_at.cmp(&left.last_at))
+                .then_with(|| left.file_id.cmp(&right.file_id))
+        });
+        Ok(rows)
+    }
+
+    /// The files in this batch that are held here and never published.
+    ///
+    /// The question above is only ever asked about what this leaves out.
+    fn unpublished_holds(&self, file_ids: &[String]) -> Result<HashSet<String>, String> {
+        unpublished_holds(&super::open_connection(&self.db_path)?, file_ids)
     }
 
     async fn send_public_chat_message(
@@ -3890,6 +4007,109 @@ fn public_chat_topic(event: &Event) -> Option<String> {
     })
 }
 
+/// The files in a batch that this host holds without having published them.
+///
+/// These are the ones a relay must never be asked about: the question names the
+/// bytes, so asking would say "this computer has them", which is exactly what not
+/// publishing them kept private. Anything else - a file nobody here holds, or one
+/// already published under this identity - gives nothing away.
+fn unpublished_holds(
+    connection: &Connection,
+    file_ids: &[String],
+) -> Result<HashSet<String>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT EXISTS(
+               SELECT 1 FROM files
+               WHERE file_id=?1 AND file_id NOT IN (SELECT file_id FROM published_catalogue)
+             )",
+        )
+        .map_err(|error| error.to_string())?;
+    let mut unpublished = HashSet::new();
+    for file_id in file_ids {
+        let held: bool = statement
+            .query_row([file_id], |row| row.get(0))
+            .map_err(|error| error.to_string())?;
+        if held {
+            unpublished.insert(file_id.clone());
+        }
+    }
+    Ok(unpublished)
+}
+
+/// What a row can say about the conversation around a file.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TrackDiscussionActivity {
+    pub file_id: String,
+    /// Distinct people, because one person answering themselves twenty times is
+    /// not twenty people talking.
+    pub authors: usize,
+    /// Comments, including the ones from people counted once.
+    pub messages: usize,
+    /// The newest of them, in seconds since the epoch.
+    pub last_at: u64,
+}
+
+#[derive(Default, Clone, Copy)]
+struct DiscussionTally {
+    authors: usize,
+    messages: usize,
+    last_at: u64,
+}
+
+/// Counts the conversation in a batch of events, one tally per topic.
+///
+/// Only topics that were asked about are counted: an event naming some other
+/// file is not an answer to this question, and neither is one from a blocked
+/// author, one whose text sanitises to nothing, one written before the window
+/// opened, or one dated in the future.
+///
+/// A batch holds whole topics, so counting authors per batch cannot double-count
+/// anyone- but within one it must, which is why they are collected in a set.
+fn discussion_tallies<'a>(
+    events: impl Iterator<Item = &'a Event>,
+    asked: &HashSet<String>,
+    blocked: &HashSet<String>,
+    now: u64,
+) -> HashMap<String, DiscussionTally> {
+    let cutoff = now.saturating_sub(TRACK_DISCUSSION_ACTIVITY_WINDOW);
+    let future = now.saturating_add(TRACK_DISCUSSION_ACTIVITY_FUTURE_SLACK);
+    let mut seen: HashMap<String, (HashSet<String>, DiscussionTally)> = HashMap::new();
+    for event in events {
+        let Some(topic) = public_chat_topic(event) else {
+            continue;
+        };
+        if !asked.contains(&topic) {
+            continue;
+        }
+        let author = event.pubkey.to_hex();
+        let written = event.created_at.as_secs();
+        if blocked.contains(&author)
+            || written < cutoff
+            || written > future
+            || sanitise_public_chat_content(&event.content).is_empty()
+        {
+            continue;
+        }
+        let (voices, tally) = seen.entry(topic).or_default();
+        voices.insert(author);
+        tally.messages += 1;
+        tally.last_at = tally.last_at.max(written);
+    }
+    seen.into_iter()
+        .map(|(topic, (voices, tally))| {
+            (
+                topic,
+                DiscussionTally {
+                    authors: voices.len(),
+                    ..tally
+                },
+            )
+        })
+        .collect()
+}
+
 fn valid_cached_trollbox_event(event: &Event) -> bool {
     event.verify().is_ok()
         && public_chat_topic(event).as_deref() == Some(TROLLBOX_HASHTAG)
@@ -5907,6 +6127,85 @@ mod tests {
             }
             assert_eq!(seen.len(), 250);
         }
+    }
+
+    /// The one rule that keeps this read from saying what the library holds.
+    ///
+    /// A question about a file names it, so a file this host has but has not
+    /// published is the only kind it must never ask about. A file nobody here
+    /// holds gives nothing away, and neither does one already published under this
+    /// identity.
+    #[test]
+    fn discussion_questions_never_name_a_file_this_host_kept_private() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE files (file_id TEXT PRIMARY KEY);
+                 CREATE TABLE published_catalogue (file_id TEXT PRIMARY KEY);
+                 INSERT INTO files(file_id) VALUES('held-private'),('held-published');
+                 INSERT INTO published_catalogue(file_id) VALUES('held-published');",
+            )
+            .unwrap();
+        let asked = ["held-private", "held-published", "not-held-here"]
+            .iter()
+            .map(|file_id| file_id.to_string())
+            .collect::<Vec<_>>();
+
+        let unpublished = unpublished_holds(&connection, &asked).unwrap();
+
+        assert_eq!(
+            unpublished,
+            HashSet::from(["held-private".to_string()]),
+            "only the file held without being published is kept out of the question"
+        );
+    }
+
+    /// What a row is allowed to claim about the conversation around a file.
+    ///
+    /// The count is people rather than messages, because messages are what one
+    /// author can inflate; it is a window rather than all of history, because a
+    /// comment from 2019 is not a reason to surface anything; and a topic nobody
+    /// asked about is not an answer, however many events carry it.
+    #[test]
+    fn discussion_activity_counts_people_in_the_window_rather_than_messages() {
+        let now = 1_800_000_000u64;
+        let chatty = Keys::generate();
+        let other = Keys::generate();
+        let blocked_keys = Keys::generate();
+        let topic = track_discussion_topic(&"cd".repeat(32)).unwrap();
+        let elsewhere = track_discussion_topic(&"ef".repeat(32)).unwrap();
+        let asked = HashSet::from([topic.clone()]);
+        let blocked = HashSet::from([blocked_keys.public_key().to_hex()]);
+        let message = |keys: &Keys, topic: &str, content: &str, when: u64| {
+            EventBuilder::new(Kind::from(TROLLBOX_MESSAGE_KIND), content)
+                .tag(Tag::hashtag(topic))
+                .custom_created_at(Timestamp::from(when))
+                .sign_with_keys(keys)
+                .unwrap()
+        };
+        let events = vec![
+            message(&chatty, &topic, "first", now - 10),
+            message(&chatty, &topic, "second", now - 5),
+            message(&other, &topic, "third", now - 1),
+            // One author talking to themselves is still one author, but it is
+            // also still one message each.
+            message(&chatty, &topic, "again", now),
+            // A blocked author, a comment from before the window, one dated in the
+            // future, one with nothing in it, and one about another file.
+            message(&blocked_keys, &topic, "blocked", now),
+            message(&other, &topic, "ancient", now - TRACK_DISCUSSION_ACTIVITY_WINDOW - 1),
+            message(&other, &topic, "tomorrow", now + 2 * TRACK_DISCUSSION_ACTIVITY_FUTURE_SLACK),
+            message(&other, &topic, "   ", now),
+            message(&other, &elsewhere, "somewhere else", now),
+        ];
+
+        let tallies = discussion_tallies(events.iter(), &asked, &blocked, now);
+
+        assert_eq!(tallies.len(), 1, "only the topic that was asked about counts");
+        let tally = tallies.get(&topic).expect("the asked topic is absent");
+        assert_eq!(tally.authors, 2);
+        assert_eq!(tally.messages, 4);
+        assert_eq!(tally.last_at, now);
     }
 
     #[test]

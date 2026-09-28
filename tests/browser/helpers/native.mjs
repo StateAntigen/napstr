@@ -139,6 +139,13 @@ export async function mockNative(page, { app = 'napstrfy', nativeLocale = 'en-GB
           case 'network_search_audiobooks': return [];
           case 'get_track_discussion_messages':
           case 'get_trollbox_messages': return [{ eventId: 'event', content: 'Search', displayName: 'Settings', npub: 'npubother', pubkey: 'd'.repeat(64), createdAt: 1700000000 }];
+          // What the host counts about the rows on screen: people, not messages,
+          // and only for files a test has said anything about. A file it has no row
+          // for is simply not in the answer, which is how a quiet file looks.
+          case 'track_discussion_activity': {
+            const known = window.discussionActivity ?? {};
+            return (args.fileIds ?? []).map((fileId) => known[fileId]).filter(Boolean);
+          }
           case 'mobile_status': return { running: true, online: true, endpointId: 'endpoint', error: '', devices: [] };
           case 'play_audio': return { fileId: track.fileId, currentTime: 0, duration: 60, playing: true, ended: false, error: '' };
           case 'client_platform': return platform;

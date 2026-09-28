@@ -104,6 +104,8 @@
   type ReleaseStatus = { version: string; url: string };
   type GitHubRelease = { tag_name?: unknown; html_url?: unknown };
   type TrollboxMessage = { eventId: string; pubkey: string; npub: string; displayName: string; content: string; createdAt: number };
+  /** What the conversation around a file looks like to a row that shows it. */
+  type TrackDiscussionActivity = { fileId: string; authors: number; messages: number; lastAt: number };
   type IndexProgress = { scanning: boolean; processedFiles: number; indexedFiles: number; message: string };
   type IndexBatch = { files: NativeFile[]; fileCount: number; totalBytes: number };
   type MobileDevice = { endpointId: string; name: string; pairedAt: string; lastSeen: string; streamOnly: boolean };
@@ -267,6 +269,16 @@
   let trackDiscussionHasMore = true;
   let trackDiscussionGeneration = 0;
   let trackDiscussionLog: HTMLDivElement;
+  /**
+   * What the conversation looks like from a row, by file id.
+   *
+   * A row is not the place to read a discussion - that is what the panel beside
+   * it is for - so all this carries is whether anyone has had anything to say at
+   * all, and how many people that was.
+   */
+  let discussionActivity: Record<string, TrackDiscussionActivity> = {};
+  /** Files already asked about, so scrolling past them costs nothing. */
+  const discussionAsked = new Set<string>();
   let searchAction: 'search' | 'surprise' | null = null;
   let browseCursor: CatalogueBrowseCursor | null = null;
   let browseLoading = false;
@@ -694,6 +706,10 @@
   // each one re-runs when that state changes.
   $: resultPageTotal = resultPageCount(results);
   $: resultPageItems = paginatedResults(results, resultPage);
+  $: resultPageRange = resultPageItems.map((item) => item.fileId);
+  // The rows on screen are what get asked about, once each: a discussion read is
+  // a question to the relays, and a page of them is the size of the question.
+  $: if (nativeReady && networkConnected && resultPageRange.length) void refreshDiscussionActivity(resultPageRange);
   $: resultRangeLabel = resultRange(results, resultPage);
   $: resultAvailableTotal = availableResultTotal(results, browseTotalAvailable);
   $: sharedVisible = visibleSharedFiles(sharedFiles, libraryFolderView);
@@ -2359,6 +2375,46 @@
     }
   }
 
+  /**
+   * Asks how much conversation the rows on screen have attracted.
+   *
+   * One read for the page, for files nobody has asked about yet, and no polling:
+   * a mark that is a few minutes stale is worth far more than a relay being asked
+   * about the same rows every time a page is turned. A file the host holds and has
+   * not published is left out of the question by the host itself, because asking
+   * a relay about those bytes would say what this computer has.
+   */
+  async function refreshDiscussionActivity(fileIds: string[]) {
+    const wanted = fileIds.filter((fileId) => !discussionAsked.has(fileId));
+    if (!wanted.length) return;
+    for (const fileId of wanted) discussionAsked.add(fileId);
+    try {
+      const rows = await invoke<TrackDiscussionActivity[]>('track_discussion_activity', { fileIds: wanted });
+      if (!rows.length) return;
+      discussionActivity = {
+        ...discussionActivity,
+        ...Object.fromEntries(rows.map((row) => [row.fileId, row]))
+      };
+    } catch {
+      // A mark is a courtesy. A relay that does not answer leaves the rows quiet,
+      // and the panel beside them is where the discussion itself is read.
+    }
+  }
+
+  /**
+   * How many people have commented, in words, for the mark that shows a number.
+   *
+   * The template reads `discussionActivity` itself rather than asking a helper
+   * for it: Svelte follows the variables an expression names, not the ones a
+   * function it calls happens to read, so a mark drawn through a helper would
+   * never appear when the answer arrived.
+   */
+  function discussionMarkLabel(activity: TrackDiscussionActivity) {
+    return activity.authors === 1
+      ? $t("One person commented in the last 30 days")
+      : $t("{p0} people commented in the last 30 days", { p0: activity.authors });
+  }
+
   async function sendTrackDiscussionMessage() {
     const fileId = selected?.fileId;
     const content = trackDiscussionDraft.trim();
@@ -3601,6 +3657,11 @@
                     <small title={item.artist || undefined}>{item.artist || $t('Unknown artist')}</small>
                     <small class="result-card-album" title={item.album || undefined}>{item.album || '—'}</small>
                     <span class="result-card-meta"><i class="source-dot"></i>{item.sources} {item.sources === 1 ? $t('seeder') : $t('seeders')} · {item.size}</span>
+                    {#if discussionActivity[item.fileId]}
+                      <span class="discussion-mark" title={discussionMarkLabel(discussionActivity[item.fileId])}>
+                        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4.2 5.4h15.6v9.8H9.6L5.2 19v-3.8H4.2z" /></svg>{discussionActivity[item.fileId].authors}
+                      </span>
+                    {/if}
                   </button>
                 {/each}
                 {#if results.length === 0}<p class="empty-state">{$t("Nothing to show yet.")}</p>{/if}
@@ -3615,7 +3676,7 @@
                       onclick={(event) => selectResultRange(item, event)}
                       onkeydown={(event) => { if (event.key === ' ' || event.key === 'Enter') { event.preventDefault(); selectResultRange(item, event); } }}
                       ondblclick={(event) => { if (!event.shiftKey) void activateSelected(); }}>
-                      <td><span class:audiobook-icon={Boolean(item.audiobook)} class="file-icon">{item.audiobook ? '▥' : '▶'}</span>{item.name}</td><td>{item.format}</td><td class="number">{item.size}</td><td class="number"><span class="source-dot"></span>{item.sources}</td><td>{$t(item.speed)}</td><td>{item.length}</td>
+                      <td><span class:audiobook-icon={Boolean(item.audiobook)} class="file-icon">{item.audiobook ? '▥' : '▶'}</span>{item.name}{#if discussionActivity[item.fileId]}<span class="discussion-mark" title={discussionMarkLabel(discussionActivity[item.fileId])}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4.2 5.4h15.6v9.8H9.6L5.2 19v-3.8H4.2z" /></svg>{discussionActivity[item.fileId].authors}</span>{/if}</td><td>{item.format}</td><td class="number">{item.size}</td><td class="number"><span class="source-dot"></span>{item.sources}</td><td>{$t(item.speed)}</td><td>{item.length}</td>
                     </tr>
                   {/each}
                 </tbody>

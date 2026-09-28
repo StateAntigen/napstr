@@ -443,6 +443,12 @@ body.resizing-transfer-pane, body.resizing-transfer-pane * { cursor: ns-resize !
 .result-card-meta { margin-top: 2px; display: inline-flex; align-items: center; gap: 3px; color: #444; font: 10px "Courier New", monospace; }
 .result-card-meta .source-dot { margin-right: 0; }
 .result-card .cover-art { box-shadow: 2px 2px 0 rgba(0, 0, 0, .3); }
+/* The conversation mark on a result row: people, not messages, because a count of
+   comments is what one author can inflate. */
+.discussion-mark { margin-left: 8px; display: inline-flex; align-items: center; gap: 3px; color: #6a6a6a; font: 10px "Courier New", monospace; vertical-align: 1px; white-space: nowrap; }
+.discussion-mark svg { width: 11px; height: 11px; fill: none; stroke: currentColor; stroke-width: 1.6; }
+.result-card .discussion-mark { margin: 2px 0 0; }
+.result-card.selected .discussion-mark { color: #ccd6ea; }
 
 /* Text can expand when translated; keep the existing desktop grid usable. */
 .toolbar { overflow-x: auto; }
