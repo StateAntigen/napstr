@@ -7,7 +7,8 @@ use chrono::Utc;
 use iroh::{endpoint::presets, Endpoint, SecretKey};
 use crate::art_fetch::ArtWant;
 use napstr_remote_protocol::{
-    ArtRendition, ClientRequest, CoverReportResult, PairingTicket, PlaybackCommand, RemoteAlbumCover,
+    ArtRendition, ClientRequest, CoverReportResult, DeviceRights, PairingTicket, PlaybackCommand,
+    RemoteAlbumCover,
     RemoteAudiobook, RemoteAudiobookSummary, RemoteDiscussionActivity, RemoteDiscussionMessage,
     RemoteDiscussionReply, RemoteSource, RemoteTrack, RemoteTransfer, ServerResponse, ALPN,
     MAX_ART_KEY_CHARS, MAX_CONTROL_FRAME_BYTES, MAX_COVER_KEYS, MAX_PAGE_SIZE, MAX_PLAYLIST_PAGE,
@@ -48,7 +49,7 @@ pub struct PairedDevice {
     name: String,
     paired_at: String,
     last_seen: String,
-    stream_only: bool,
+    rights: DeviceRights,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -73,8 +74,7 @@ pub struct MobilePairingOffer {
 struct PairingSession {
     token: String,
     expires_at: i64,
-    // Legacy wire/database name: read-only host access still allows phone caching.
-    stream_only: bool,
+    rights: DeviceRights,
 }
 
 #[derive(Default)]
@@ -242,7 +242,7 @@ impl MobileService {
 
     pub async fn create_pairing(
         self: &Arc<Self>,
-        stream_only: bool,
+        rights: DeviceRights,
     ) -> Result<MobilePairingOffer, String> {
         self.start().await?;
         if let Some(endpoint) = self.endpoint.read().await.clone() {
@@ -250,7 +250,7 @@ impl MobileService {
             // endpoint identity. A DNS lookup remains available if it times out.
             let _ = tokio::time::timeout(Duration::from_secs(12), endpoint.online()).await;
         }
-        self.issue_pairing(stream_only).await
+        self.issue_pairing(rights).await
     }
 
     /// Mint a one-use code for the endpoint that is already running.
@@ -259,7 +259,7 @@ impl MobileService {
     /// and a request that arrived over Iroh has already proved the endpoint is
     /// up. Calling `start` from there would make `start` reachable through its
     /// own spawned tasks, which the compiler cannot type (E0391).
-    async fn issue_pairing(&self, stream_only: bool) -> Result<MobilePairingOffer, String> {
+    async fn issue_pairing(&self, rights: DeviceRights) -> Result<MobilePairingOffer, String> {
         let endpoint = self
             .endpoint
             .read()
@@ -276,12 +276,14 @@ impl MobileService {
                 .lock()
                 .map_err(|_| "pairing state lock was poisoned")?;
             pairing.retain(|session| {
-                session.stream_only != stream_only && session.expires_at >= Utc::now().timestamp()
+                // One live code per distinct grant, so minting a second read-only
+                // code replaces the first rather than leaving two valid ones.
+                session.rights != rights && session.expires_at >= Utc::now().timestamp()
             });
             pairing.push(PairingSession {
                 token: token.clone(),
                 expires_at,
-                stream_only,
+                rights,
             });
         }
         let desktop_name = self.desktop_name();
@@ -323,6 +325,17 @@ impl MobileService {
             updates.remove(endpoint_id);
         }
         Ok(())
+    }
+
+    /// What this computer may do for this device, set after it has paired.
+    ///
+    /// The grant used to be fixed by the code that let a device in, so changing
+    /// your mind meant pairing again. It belongs to the device now, and this is the
+    /// one place it changes. An endpoint that is not paired is refused rather than
+    /// written: a row here is what makes a device real, so writing one would be a
+    /// way of pairing without a code.
+    pub fn set_rights(&self, endpoint_id: &str, rights: DeviceRights) -> Result<(), String> {
+        set_device_rights(&self.db_path, endpoint_id, rights)
     }
 
     /// The name shown to a phone. One place, so every answer agrees.
@@ -421,7 +434,7 @@ impl MobileService {
     async fn audiobook_catalogue(
         &self,
         query: &str,
-        stream_only: bool,
+        rights: DeviceRights,
     ) -> Result<Vec<RemoteAudiobook>, String> {
         let (local_books, local_tracks) = load_local_remote_audiobooks(&self.db_path)?;
         let mut books = std::collections::HashMap::new();
@@ -442,10 +455,10 @@ impl MobileService {
         }) {
             books.insert(book.audiobook_id.clone(), book);
         }
-        let remote = if stream_only {
-            Vec::new()
-        } else {
+        let remote = if rights.privileged {
             self.network.search_audiobooks(query).await?
+        } else {
+            Vec::new()
         };
         for book in remote {
             books
@@ -548,19 +561,20 @@ impl MobileService {
             device_name,
         } = request
         {
-            let stream_only =
+            let rights =
                 self.accept_pairing(remote_id, &token, &device_name)?;
             return write_response(
                 send,
                 &ServerResponse::Paired {
-                    stream_only,
+                    stream_only: rights.is_read_only(),
+                    rights: Some(rights),
                     desktop_name: self.desktop_name(),
                 },
             )
             .await;
         }
-        let stream_only = self.authorise(remote_id)?;
-        check_request_permission(stream_only, &request)?;
+        let rights = self.authorise(remote_id)?;
+        check_request_permission(rights, &request)?;
         self.touch_device(remote_id);
         match request {
             ClientRequest::Library {
@@ -587,10 +601,10 @@ impl MobileService {
                 }
                 let (mut tracks, _, audiobook_chapter_ids) =
                     self.music_library(query, 0, MAX_PAGE_SIZE, None)?;
-                let remote = if stream_only {
-                    Vec::new()
-                } else {
+                let remote = if rights.privileged {
                     self.network.search(query).await?
+                } else {
+                    Vec::new()
                 };
                 for result in remote {
                     if audiobook_chapter_ids.contains(&result.file_id)
@@ -666,7 +680,7 @@ impl MobileService {
                     return Err("Audiobook searches are limited to 120 characters".into());
                 }
                 // Legacy full response retained for older Napstrfy installs.
-                let audiobooks = self.audiobook_catalogue(query, stream_only).await?;
+                let audiobooks = self.audiobook_catalogue(query, rights).await?;
                 write_response(send, &ServerResponse::Audiobooks { audiobooks }).await
             }
             ClientRequest::AudiobookLibrary {
@@ -678,7 +692,7 @@ impl MobileService {
                 if query.chars().count() > 120 {
                     return Err("Audiobook searches are limited to 120 characters".into());
                 }
-                let audiobooks = self.audiobook_catalogue(query, stream_only).await?;
+                let audiobooks = self.audiobook_catalogue(query, rights).await?;
                 let total = audiobooks.len();
                 let summaries = audiobooks
                     .into_iter()
@@ -717,7 +731,10 @@ impl MobileService {
                     }
                     return write_response(send, &ServerResponse::Audiobook { audiobook }).await;
                 }
-                if stream_only {
+                // An audiobook this computer does not hold locally has to be read
+                // out of the relays in the user's own name, which is acting
+                // through this computer rather than reading it.
+                if !rights.privileged {
                     return Err("This audiobook is not in Napstr's local library".into());
                 }
                 let mut audiobook = self
@@ -1131,7 +1148,8 @@ impl MobileService {
                     &ServerResponse::Status {
                         library_revision: library_revision(&self.db_path)?,
                         cover_revision: cover_revision(&self.db_path)?,
-                        stream_only,
+                        stream_only: rights.is_read_only(),
+                        rights: Some(rights),
                         // Who this computer is, which is the only way the phone
                         // can tell its own playlists from public ones. It is a
                         // public key: nothing secret travels, and the phone
@@ -1164,7 +1182,7 @@ impl MobileService {
                 // Only a read-only code can come out of here, which is what lets
                 // a phone with write access lend its access on without ever
                 // widening it: whoever scans this browses and plays, no more.
-                let offer = self.issue_pairing(true).await?;
+                let offer = self.issue_pairing(DeviceRights::read_only()).await?;
                 let desktop_name = self.desktop_name();
                 let mut qr_svg = offer.qr_svg;
                 let candidate = ServerResponse::ReadOnlyTicket {
@@ -1217,7 +1235,7 @@ impl MobileService {
         remote_id: &str,
         token: &str,
         name: &str,
-    ) -> Result<bool, String> {
+    ) -> Result<DeviceRights, String> {
         let mut pairing = self
             .pairing
             .lock()
@@ -1231,8 +1249,11 @@ impl MobileService {
         )
     }
 
-    fn authorise(&self, remote_id: &str) -> Result<bool, String> {
-        device_stream_only(&self.db_path, remote_id)
+    /// What this device may do, which is also what proves it is paired at all:
+    /// there is no such thing as a device in the table with no grant, because a
+    /// grant of nothing is a device that can do nothing.
+    fn authorise(&self, remote_id: &str) -> Result<DeviceRights, String> {
+        device_rights(&self.db_path, remote_id)
     }
 
     fn touch_device(&self, remote_id: &str) {
@@ -1261,14 +1282,16 @@ fn accept_pairing(
     remote_id: &str,
     token: &str,
     name: &str,
-) -> Result<bool, String> {
+) -> Result<DeviceRights, String> {
     let now = Utc::now();
     pairing.retain(|session| session.expires_at >= now.timestamp());
     let index = pairing
         .iter()
         .position(|session| session.token.as_bytes() == token.as_bytes())
         .ok_or("The pairing code is invalid or expired")?;
-    let stream_only = pairing[index].stream_only;
+    // The grant travels with the code that was scanned, and a code minted by a
+    // phone can only ever carry the lent gift: see `ReadOnlyTicket`.
+    let rights = pairing[index].rights;
     let endpoint = remote_id
         .parse::<iroh::EndpointId>()
         .map_err(|_| "invalid mobile Iroh identity")?;
@@ -1276,40 +1299,88 @@ fn accept_pairing(
     let connection = open_connection(db_path)?;
     connection
             .execute(
-                "INSERT INTO mobile_devices(endpoint_id,name,paired_at,last_seen,stream_only)
-                 VALUES(?1,?2,?3,?3,?4)
-                 ON CONFLICT(endpoint_id) DO UPDATE SET name=excluded.name,last_seen=excluded.last_seen,stream_only=excluded.stream_only",
-                params![endpoint.to_string(), name, now.to_rfc3339(), stream_only],
+                "INSERT INTO mobile_devices(endpoint_id,name,paired_at,last_seen,stream_only,rights)
+                 VALUES(?1,?2,?3,?3,?4,?5)
+                 ON CONFLICT(endpoint_id) DO UPDATE SET name=excluded.name,last_seen=excluded.last_seen,stream_only=excluded.stream_only,rights=excluded.rights",
+                params![
+                    endpoint.to_string(),
+                    name,
+                    now.to_rfc3339(),
+                    rights.is_read_only(),
+                    rights.bits() as i64
+                ],
             )
             .map_err(|error| error.to_string())?;
     pairing.remove(index);
-    Ok(stream_only)
-}
-fn device_stream_only(db_path: &Path, remote_id: &str) -> Result<bool, String> {
-    open_connection(db_path)?
-        .query_row(
-            "SELECT stream_only FROM mobile_devices WHERE endpoint_id=?1",
-            [remote_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "This phone is not paired with Napstr".into())
+    Ok(rights)
 }
 
-fn check_request_permission(stream_only: bool, request: &ClientRequest) -> Result<(), String> {
-    if !stream_only {
+/// What this device may do. `None` for the column means a row written before
+/// grants existed and read without the migration having run: the old boolean's
+/// default was the owner's own device, so that is what it reads as.
+fn device_rights(db_path: &Path, remote_id: &str) -> Result<DeviceRights, String> {
+    let stored = open_connection(db_path)?
+        .query_row(
+            "SELECT rights FROM mobile_devices WHERE endpoint_id=?1",
+            [remote_id],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    match stored {
+        None => Err("This phone is not paired with Napstr".into()),
+        Some(None) => Ok(DeviceRights::full()),
+        Some(Some(bits)) => Ok(DeviceRights::from_bits(bits as u32)),
+    }
+}
+
+/// Write a device's grant. One place, so the window, any future menu and the
+/// tests all go through the same rule: the endpoint must be one this computer
+/// paired with, because writing a row here is what makes a device real, and a
+/// device that was never paired must not become one by being written.
+fn set_device_rights(
+    db_path: &Path,
+    endpoint_id: &str,
+    rights: DeviceRights,
+) -> Result<(), String> {
+    let parsed = endpoint_id
+        .parse::<iroh::EndpointId>()
+        .map_err(|_| "invalid Iroh endpoint ID")?;
+    let changed = open_connection(db_path)?
+        .execute(
+            "UPDATE mobile_devices SET stream_only=?2, rights=?3 WHERE endpoint_id=?1",
+            params![
+                parsed.to_string(),
+                rights.is_read_only(),
+                rights.bits() as i64
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    if changed == 0 {
+        return Err("That device is not paired with Napstr".into());
+    }
+    Ok(())
+}
+
+/// What one request needs, and what to say when the device was not given it.
+///
+/// Reads come first because they are the larger half: a device lent only the
+/// index may still search it, read its playlists, covers and comments, and watch
+/// what this computer is playing without being able to change any of it.
+fn check_request_permission(rights: DeviceRights, request: &ClientRequest) -> Result<(), String> {
+    if rights.is_full() {
+        // The owner's own device. Nothing to weigh.
         return Ok(());
     }
     match request {
+        // Reading this computer's index, and the public things attached to it.
         ClientRequest::Library { .. }
+        | ClientRequest::LibraryByIds { .. }
         | ClientRequest::Search { .. }
         | ClientRequest::Audiobooks { .. }
         | ClientRequest::AudiobookLibrary { .. }
         | ClientRequest::Audiobook { .. }
-        | ClientRequest::FetchAudio { .. }
         | ClientRequest::Available { .. }
-        | ClientRequest::LibraryByIds { .. }
         // A playlist is a list of names, and reading it is reading the library.
         | ClientRequest::Playlists { .. }
         | ClientRequest::Playlist { .. }
@@ -1320,41 +1391,81 @@ fn check_request_permission(stream_only: bool, request: &ClientRequest) -> Resul
         // is published in the user's own name, which is why it is not here.
         | ClientRequest::TrackDiscussion { .. }
         | ClientRequest::TrackDiscussionActivity { .. }
-        // Art is a read, and a phone lent read-only access should see covers:
-        // the bytes come from this computer, so this reveals nothing the phone
-        // could not already ask for by key.
+        // Art is a read, and a device lent the index should see covers: the bytes
+        // come from this computer, so this reveals nothing the device could not
+        // already ask for by key.
         | ClientRequest::FetchArt { .. }
         // Seeing what the computer is playing is not a way of changing it.
-        | ClientRequest::PlaybackState
-        | ClientRequest::Status
-        | ClientRequest::Ping => Ok(()),
+        | ClientRequest::PlaybackState => require(
+            rights,
+            DeviceRights::BROWSE,
+            "This device was not given access to this computer's library.",
+        ),
+        // The channel's own business rather than the library's: a device has to be
+        // able to ask where it is and what it may do, or a grant of nothing would
+        // look like a computer that is not there at all.
+        ClientRequest::Status | ClientRequest::Ping => Ok(()),
+        ClientRequest::FetchAudio { .. } => require(
+            rights,
+            DeviceRights::FETCH,
+            "This device was not given access to this computer's audio.",
+        ),
+        ClientRequest::Playback { .. } => require(
+            rights,
+            DeviceRights::CONTROL,
+            "This phone has read-only access, so it cannot control Napstr on the computer.",
+        ),
         // A playlist a phone edits is the same playlist the author could edit on
-        // the computer, so read-only access cannot reach any of these: an id for
+        // the computer, so browsing access cannot reach any of these: an id for
         // a playlist that does not exist yet included, because a listing minted
         // there would only be a promise this phone could not keep.
         ClientRequest::NewPlaylistId
         | ClientRequest::SavePlaylist { .. }
         | ClientRequest::DeletePlaylist { .. }
         | ClientRequest::PublishPlaylist { .. }
-        | ClientRequest::WithdrawPlaylist { .. } => Err(
-            "This phone has read-only access, so it cannot create or edit playlists.".into(),
+        | ClientRequest::WithdrawPlaylist { .. } => require(
+            rights,
+            DeviceRights::PRIVILEGED,
+            "This phone has read-only access, so it cannot create or edit playlists.",
         ),
-        ClientRequest::Playback { .. } => Err(
-            "This phone has read-only access, so it cannot control Napstr on the computer.".into(),
+        ClientRequest::ReadOnlyTicket => require(
+            rights,
+            DeviceRights::PRIVILEGED,
+            "This phone has read-only access, so it cannot lend access to another device.",
         ),
-        ClientRequest::ReadOnlyTicket => Err(
-            "This phone has read-only access, so it cannot lend access to another device.".into(),
-        ),
-        ClientRequest::ReportCover { .. } => Err(
-            "This phone has read-only access, so it cannot publish reports.".into(),
+        ClientRequest::ReportCover { .. } => require(
+            rights,
+            DeviceRights::PRIVILEGED,
+            "This phone has read-only access, so it cannot publish reports.",
         ),
         // A comment is signed with the user's own key and published to public
         // relays, under their name. That is an act rather than a read, and it is
         // the same line read-only access already draws for reports and playlists.
-        ClientRequest::SendTrackDiscussion { .. } => Err(
-            "This phone has read-only access, so it cannot post comments.".into(),
+        ClientRequest::SendTrackDiscussion { .. } => require(
+            rights,
+            DeviceRights::PRIVILEGED,
+            "This phone has read-only access, so it cannot post comments.",
         ),
-        _ => Err("This phone has read-only access. Downloads on the Napstr host are not permitted.".into()),
+        // Asking this computer to fetch something, or to account for what it is
+        // fetching, is acting through it rather than reading it.
+        ClientRequest::RequestDownload { .. } | ClientRequest::Transfers => require(
+            rights,
+            DeviceRights::PRIVILEGED,
+            "This phone has read-only access. Downloads on the Napstr host are not permitted.",
+        ),
+        // Pairing is answered before this is reached, and a code is not a grant,
+        // so there is nothing here to weigh.
+        ClientRequest::Pair { .. } => {
+            Err("Pairing is not a request a paired device makes.".into())
+        }
+    }
+}
+
+fn require(rights: DeviceRights, right: u32, message: &str) -> Result<(), String> {
+    if rights.grants(right) {
+        Ok(())
+    } else {
+        Err(message.to_string())
     }
 }
 
@@ -1555,6 +1666,29 @@ fn initialise_schema(db_path: &Path) -> Result<(), String> {
         connection.execute_batch("ALTER TABLE mobile_devices ADD COLUMN stream_only INTEGER NOT NULL DEFAULT 0 CHECK(stream_only IN (0,1));")
             .map_err(|error| error.to_string())?;
     }
+    // A device's grant, held as one integer. `stream_only` above is the summary of
+    // it that a companion older than grants still reads.
+    let has_rights: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('mobile_devices') WHERE name='rights')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if !has_rights {
+        connection
+            .execute_batch("ALTER TABLE mobile_devices ADD COLUMN rights INTEGER;")
+            .map_err(|error| error.to_string())?;
+        // Every device paired before this had the boolean, and it meant exactly one
+        // of two things: browse and play, or the owner's own.
+        connection
+            .execute_batch(&format!(
+                "UPDATE mobile_devices SET rights = CASE WHEN stream_only = 1 THEN {} ELSE {} END WHERE rights IS NULL;",
+                DeviceRights::read_only().bits(),
+                DeviceRights::full().bits()
+            ))
+            .map_err(|error| error.to_string())?;
+    }
     Ok(())
 }
 
@@ -1562,7 +1696,7 @@ fn load_devices(db_path: &Path) -> Result<Vec<PairedDevice>, String> {
     let connection = open_connection(db_path)?;
     let mut statement = connection
         .prepare(
-            "SELECT endpoint_id,name,paired_at,last_seen,stream_only FROM mobile_devices ORDER BY last_seen DESC",
+            "SELECT endpoint_id,name,paired_at,last_seen,rights FROM mobile_devices ORDER BY last_seen DESC",
         )
         .map_err(|error| error.to_string())?;
     let devices = statement
@@ -1572,7 +1706,12 @@ fn load_devices(db_path: &Path) -> Result<Vec<PairedDevice>, String> {
                 name: row.get(1)?,
                 paired_at: row.get(2)?,
                 last_seen: row.get(3)?,
-                stream_only: row.get(4)?,
+                // A row written before grants existed reads as the owner's own,
+                // which is what the old boolean's default meant.
+                rights: DeviceRights::from_bits(
+                    row.get::<_, Option<i64>>(4)?
+                        .unwrap_or(DeviceRights::FULL as i64) as u32,
+                ),
             })
         })
         .map_err(|error| error.to_string())?
@@ -1952,7 +2091,7 @@ mod tests {
     }
 
     #[test]
-    fn read_only_requests_can_cache_but_cannot_download_on_host_or_inspect_transfers() {
+    fn browsing_access_can_cache_but_cannot_download_on_host_or_inspect_transfers() {
         for request in [
             ClientRequest::RequestDownload {
                 file_id: "a".repeat(64),
@@ -1961,15 +2100,15 @@ mod tests {
             },
             ClientRequest::Transfers,
         ] {
-            assert!(check_request_permission(true, &request).is_err());
-            assert!(check_request_permission(false, &request).is_ok());
+            assert!(check_request_permission(DeviceRights::read_only(), &request).is_err());
+            assert!(check_request_permission(DeviceRights::full(), &request).is_ok());
         }
         assert!(check_request_permission(
-            true,
+            DeviceRights::read_only(),
             &ClientRequest::FetchAudio { file_id: "a".repeat(64) }
         ).is_ok());
         assert!(check_request_permission(
-            true,
+            DeviceRights::read_only(),
             &ClientRequest::Library {
                 query: String::new(),
                 offset: 0,
@@ -1978,6 +2117,102 @@ mod tests {
             }
         )
         .is_ok());
+    }
+
+    /// The three rights that are not "may read" are separable, which is the whole
+    /// point of naming them: a device can be lent the index without the audio,
+    /// or the audio without the owner's identity, and each refusal says which
+    /// right is missing rather than describing the device as read-only.
+    #[test]
+    fn each_right_is_enforced_on_its_own() {
+        let audio = ClientRequest::FetchAudio {
+            file_id: "a".repeat(64),
+        };
+        let library = ClientRequest::Library {
+            query: String::new(),
+            offset: 0,
+            limit: 100,
+            shuffle_seed: None,
+        };
+        let control = ClientRequest::Playback {
+            command: PlaybackCommand::Toggle,
+        };
+        let publish = ClientRequest::NewPlaylistId;
+        let comment = ClientRequest::SendTrackDiscussion {
+            file_id: "a".repeat(64),
+            content: "Nice track".into(),
+            reply_to: None,
+        };
+
+        // Browse only: the index, and nothing behind it.
+        let index_only = DeviceRights {
+            browse: true,
+            fetch: false,
+            control: false,
+            privileged: false,
+        };
+        assert!(check_request_permission(index_only, &library).is_ok());
+        assert!(check_request_permission(index_only, &audio).is_err());
+        assert!(check_request_permission(index_only, &control).is_err());
+        assert!(check_request_permission(index_only, &publish).is_err());
+
+        // Browse and play: what a lent phone has always been given.
+        let lent = DeviceRights::read_only();
+        assert!(check_request_permission(lent, &audio).is_ok());
+        assert!(check_request_permission(lent, &control).is_err());
+        assert!(check_request_permission(lent, &comment).is_err());
+
+        // Browse, play and drive this computer, but not to act as its owner.
+        let remote = DeviceRights {
+            browse: true,
+            fetch: true,
+            control: true,
+            privileged: false,
+        };
+        assert!(check_request_permission(remote, &control).is_ok());
+        assert!(check_request_permission(remote, &publish).is_err());
+        assert!(check_request_permission(remote, &comment).is_err());
+
+        // Nothing at all is a device that may only ask who it is talking to.
+        let nothing = DeviceRights::default();
+        assert!(check_request_permission(nothing, &library).is_err());
+        assert!(check_request_permission(nothing, &ClientRequest::Ping).is_ok());
+        assert!(check_request_permission(nothing, &ClientRequest::Status).is_ok());
+    }
+
+    /// A grant is a property of the device now, so changing your mind must not
+    /// mean pairing again - and an endpoint that was never paired must not be
+    /// writable, or a row could be created without a code.
+    #[test]
+    fn a_devices_rights_can_be_changed_without_pairing_again() {
+        let directory =
+            std::env::temp_dir().join(format!("napstr-rights-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let db = directory.join("napstr.sqlite3");
+        initialise_schema(&db).unwrap();
+        let endpoint = SecretKey::generate().public().to_string();
+
+        assert!(set_device_rights(&db, &endpoint, DeviceRights::read_only()).is_err());
+        assert!(set_device_rights(&db, "not-an-endpoint", DeviceRights::read_only()).is_err());
+
+        let mut sessions = vec![PairingSession {
+            token: "code".into(),
+            rights: DeviceRights::read_only(),
+            expires_at: Utc::now().timestamp() + 60,
+        }];
+        assert_eq!(
+            accept_pairing(&db, &mut sessions, &endpoint, "code", "Ada's phone").unwrap(),
+            DeviceRights::read_only()
+        );
+        set_device_rights(&db, &endpoint, DeviceRights::full()).unwrap();
+        assert_eq!(device_rights(&db, &endpoint).unwrap(), DeviceRights::full());
+        assert_eq!(
+            load_devices(&db).unwrap().first().unwrap().rights,
+            DeviceRights::full()
+        );
+        set_device_rights(&db, &endpoint, DeviceRights::default()).unwrap();
+        assert_eq!(device_rights(&db, &endpoint).unwrap(), DeviceRights::default());
+        let _ = fs::remove_dir_all(&directory);
     }
 
     #[test]
@@ -1995,7 +2230,7 @@ mod tests {
                 file_ids: vec![file_id.clone()],
             },
         ] {
-            assert!(check_request_permission(true, &request).is_ok());
+            assert!(check_request_permission(DeviceRights::read_only(), &request).is_ok());
         }
         // Posting is signed with the user's own key and published under their
         // name, which is the same line read-only access already draws for reports
@@ -2005,15 +2240,15 @@ mod tests {
             content: "Nice track".into(),
             reply_to: None,
         };
-        assert!(check_request_permission(true, &comment).is_err());
-        assert!(check_request_permission(false, &comment).is_ok());
+        assert!(check_request_permission(DeviceRights::read_only(), &comment).is_err());
+        assert!(check_request_permission(DeviceRights::full(), &comment).is_ok());
         let reply = ClientRequest::SendTrackDiscussion {
             file_id,
             content: "Yes it is".into(),
             reply_to: Some("b".repeat(64)),
         };
-        assert!(check_request_permission(true, &reply).is_err());
-        assert!(check_request_permission(false, &reply).is_ok());
+        assert!(check_request_permission(DeviceRights::read_only(), &reply).is_err());
+        assert!(check_request_permission(DeviceRights::full(), &reply).is_ok());
     }
 
     #[test]
@@ -2087,47 +2322,58 @@ mod tests {
             INSERT INTO mobile_devices VALUES('legacy','Old phone','now','now');").unwrap();
         initialise_schema(&db).unwrap();
         initialise_schema(&db).unwrap();
-        assert!(!device_stream_only(&db, "legacy").unwrap());
+        // The column this predates said "full access", and it still means that.
+        assert_eq!(device_rights(&db, "legacy").unwrap(), DeviceRights::full());
         let endpoint = SecretKey::generate().public().to_string();
         let mut sessions = vec![
             PairingSession {
                 token: "full".into(),
-                stream_only: false,
+                rights: DeviceRights::full(),
                 expires_at: Utc::now().timestamp() + 60,
             },
             PairingSession {
                 token: "stream".into(),
-                stream_only: true,
+                rights: DeviceRights::read_only(),
                 expires_at: Utc::now().timestamp() + 60,
             },
             PairingSession {
                 token: "expired".into(),
-                stream_only: true,
+                rights: DeviceRights::read_only(),
                 expires_at: Utc::now().timestamp() - 1,
             },
         ];
         assert!(accept_pairing(&db, &mut sessions, &endpoint, "expired", "Guest").is_err());
         assert!(accept_pairing(&db, &mut sessions, &endpoint, "wrong", "Guest").is_err());
         // Older clients can also fetch/cache audio; the host enforces their read-only grant.
-        assert!(accept_pairing(&db, &mut sessions, &endpoint, "stream", "Guest").unwrap());
-        assert!(device_stream_only(&db, &endpoint).unwrap());
+        assert_eq!(
+            accept_pairing(&db, &mut sessions, &endpoint, "stream", "Guest").unwrap(),
+            DeviceRights::read_only()
+        );
+        assert_eq!(device_rights(&db, &endpoint).unwrap(), DeviceRights::read_only());
         assert!(accept_pairing(&db, &mut sessions, &endpoint, "stream", "Guest").is_err());
-        assert!(!accept_pairing(&db, &mut sessions, &endpoint, "full", "Owner").unwrap());
-        assert!(!device_stream_only(&db, &endpoint).unwrap());
+        assert_eq!(
+            accept_pairing(&db, &mut sessions, &endpoint, "full", "Owner").unwrap(),
+            DeviceRights::full()
+        );
+        assert_eq!(device_rights(&db, &endpoint).unwrap(), DeviceRights::full());
         assert!(sessions.is_empty());
         sessions.push(PairingSession {
             token: "downgrade".into(),
-            stream_only: true,
+            rights: DeviceRights::read_only(),
             expires_at: Utc::now().timestamp() + 60,
         });
-        assert!(accept_pairing(&db, &mut sessions, &endpoint, "downgrade", "Guest").unwrap());
-        assert!(
+        assert_eq!(
+            accept_pairing(&db, &mut sessions, &endpoint, "downgrade", "Guest").unwrap(),
+            DeviceRights::read_only()
+        );
+        assert_eq!(
             load_devices(&db)
                 .unwrap()
                 .iter()
                 .find(|device| device.endpoint_id == endpoint)
                 .unwrap()
-                .stream_only
+                .rights,
+            DeviceRights::read_only()
         );
         connection
             .execute(
@@ -2135,7 +2381,9 @@ mod tests {
                 [&endpoint],
             )
             .unwrap();
-        assert!(device_stream_only(&db, &endpoint).is_err());
+        // A revoked device has no rights to read, which is the same call that
+        // authorises it: one question, asked once.
+        assert!(device_rights(&db, &endpoint).is_err());
         drop(connection);
         fs::remove_dir_all(directory).unwrap();
     }

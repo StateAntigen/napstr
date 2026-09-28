@@ -2110,14 +2110,36 @@ async fn mobile_status(state: State<'_, AppState>) -> Result<mobile::MobileStatu
 #[tauri::command]
 async fn create_mobile_pairing(
     stream_only: Option<bool>,
+    rights: Option<napstr_remote_protocol::DeviceRights>,
     state: State<'_, AppState>,
 ) -> Result<mobile::MobilePairingOffer, String> {
-    state.mobile.create_pairing(stream_only.unwrap_or(false)).await
+    // `streamOnly` is what the window sent before rights existed, and a window
+    // that still sends it means exactly what it always meant. `rights` wins when
+    // both are present, because the two-tab picker cannot say "browse and
+    // control, but do not publish".
+    let rights = rights.unwrap_or_else(|| {
+        if stream_only.unwrap_or(false) {
+            napstr_remote_protocol::DeviceRights::read_only()
+        } else {
+            napstr_remote_protocol::DeviceRights::full()
+        }
+    });
+    state.mobile.create_pairing(rights).await
 }
 
 #[tauri::command]
 fn revoke_mobile_device(endpoint_id: String, state: State<'_, AppState>) -> Result<(), String> {
     state.mobile.revoke(&endpoint_id)
+}
+
+/// Change what a paired device may do, without pairing it again.
+#[tauri::command]
+fn set_mobile_device_rights(
+    endpoint_id: String,
+    rights: napstr_remote_protocol::DeviceRights,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state.mobile.set_rights(&endpoint_id, rights)
 }
 
 #[tauri::command]

@@ -525,6 +525,96 @@ impl RemotePlaylist {
     }
 }
 
+/// What a paired device is allowed to do.
+///
+/// This used to be one boolean - "read only", or not - which conflated three
+/// unrelated things: reading this computer's index, being handed its audio, and
+/// acting as its owner. A second computer's phone needs the first two and must
+/// never have the third, so each right is named rather than implied.
+///
+/// `Default` is no rights at all: a response that says nothing grants nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceRights {
+    /// Read this computer's index: its library, searches within it, playlists,
+    /// audiobooks, album art, and the comments on a track.
+    pub browse: bool,
+    /// Be handed this computer's audio, and keep a copy.
+    pub fetch: bool,
+    /// Drive what this computer plays.
+    pub control: bool,
+    /// Act as this computer's owner: edit and publish playlists, post comments,
+    /// file reports, ask for downloads, search the relays, and lend access on.
+    pub privileged: bool,
+}
+
+impl DeviceRights {
+    pub const BROWSE: u32 = 1;
+    pub const FETCH: u32 = 2;
+    pub const CONTROL: u32 = 4;
+    pub const PRIVILEGED: u32 = 8;
+    /// Everything, which is what the owner's own devices get.
+    pub const FULL: u32 = Self::BROWSE | Self::FETCH | Self::CONTROL | Self::PRIVILEGED;
+
+    /// What a lent phone gets, and all one can ever get: browse and play.
+    pub const fn read_only() -> Self {
+        Self {
+            browse: true,
+            fetch: true,
+            control: false,
+            privileged: false,
+        }
+    }
+
+    /// The owner's own device.
+    pub const fn full() -> Self {
+        Self {
+            browse: true,
+            fetch: true,
+            control: true,
+            privileged: true,
+        }
+    }
+
+    /// Held as one integer, so a grant is a column and adding a right later is
+    /// not a schema change.
+    pub const fn bits(self) -> u32 {
+        (if self.browse { Self::BROWSE } else { 0 })
+            | (if self.fetch { Self::FETCH } else { 0 })
+            | (if self.control { Self::CONTROL } else { 0 })
+            | (if self.privileged { Self::PRIVILEGED } else { 0 })
+    }
+
+    pub const fn from_bits(bits: u32) -> Self {
+        Self {
+            browse: bits & Self::BROWSE != 0,
+            fetch: bits & Self::FETCH != 0,
+            control: bits & Self::CONTROL != 0,
+            privileged: bits & Self::PRIVILEGED != 0,
+        }
+    }
+
+    /// Whether this device has one particular right.
+    ///
+    /// One right, not a mask: `grants(DeviceRights::FULL)` asks whether *any* of
+    /// those bits is set, which is true of a device that has only one of them.
+    /// [`Self::is_full`] is the question to ask about all of them.
+    pub const fn grants(self, right: u32) -> bool {
+        self.bits() & right != 0
+    }
+
+    /// Whether every right is granted, which is the owner's own device.
+    pub const fn is_full(self) -> bool {
+        self.bits() & Self::FULL == Self::FULL
+    }
+
+    /// What the old boolean said about a grant, so a companion that predates
+    /// this type still hides what it should.
+    pub const fn is_read_only(self) -> bool {
+        !self.privileged
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(
     tag = "type",
@@ -751,8 +841,15 @@ pub enum ClientRequest {
 pub enum ServerResponse {
     Paired {
         desktop_name: String,
+        /// Legacy summary of the grant, for a companion that predates rights.
+        /// Still sent, and still means what it always meant: the owner's own
+        /// device, or one that may only browse and play.
         #[serde(default)]
         stream_only: bool,
+        /// What this device may do. A host older than this field omits it, which
+        /// reads as `None`: the companion then falls back to `stream_only`.
+        #[serde(default)]
+        rights: Option<DeviceRights>,
     },
     Library {
         tracks: Vec<RemoteTrack>,
@@ -863,6 +960,11 @@ pub enum ServerResponse {
         cover_revision: u64,
         #[serde(default)]
         stream_only: bool,
+        /// What this device may do, and how the phone knows what to offer it.
+        /// Omitting it means the same as on `Paired`: an older host has only
+        /// the boolean above to go on.
+        #[serde(default)]
+        rights: Option<DeviceRights>,
         /// This computer's own public key: the author half of every playlist it
         /// wrote down.
         ///
@@ -1077,6 +1179,9 @@ mod tests {
 
     #[test]
     fn older_pairing_and_status_messages_keep_full_access() {
+        // An older host sends no `rights` at all, which reads as `None`: the
+        // companion falls back to the boolean, whose `false` has always meant
+        // the owner's own device.
         assert_eq!(
             serde_json::from_str::<ServerResponse>(
                 r#"{"type":"paired","desktopName":"Old Napstr"}"#
@@ -1084,7 +1189,8 @@ mod tests {
             .unwrap(),
             ServerResponse::Paired {
                 desktop_name: "Old Napstr".into(),
-                stream_only: false
+                stream_only: false,
+                rights: None
             }
         );
         assert_eq!(
@@ -1094,6 +1200,7 @@ mod tests {
                 library_revision: 1,
                 cover_revision: 0,
                 stream_only: false,
+                rights: None,
                 pubkey: String::new()
             }
         );
@@ -1131,6 +1238,7 @@ mod tests {
             library_revision: 42,
             cover_revision: 9,
             stream_only: true,
+            rights: Some(DeviceRights::read_only()),
             pubkey: "c".repeat(64),
         };
         let json = serde_json::to_string(&response).unwrap();
@@ -1138,6 +1246,57 @@ mod tests {
             serde_json::from_str::<ServerResponse>(&json).unwrap(),
             response
         );
+        // The legacy summary still says what an older companion needs, and the
+        // grant travels beside it.
+        assert!(json.contains(r#""streamOnly":true"#), "wrote {json}");
+        assert!(json.contains(r#""privileged":false"#), "wrote {json}");
+    }
+
+    /// The grant is one integer on disk, so the two views of it must agree
+    /// exactly - a right that exists in neither the wire type nor the bits is a
+    /// right that silently does nothing.
+    #[test]
+    fn the_grant_survives_being_stored_as_bits() {
+        for rights in [
+            DeviceRights::default(),
+            DeviceRights::read_only(),
+            DeviceRights::full(),
+            DeviceRights {
+                browse: true,
+                fetch: false,
+                control: false,
+                privileged: false,
+            },
+            DeviceRights {
+                browse: false,
+                fetch: false,
+                control: true,
+                privileged: false,
+            },
+        ] {
+            assert_eq!(DeviceRights::from_bits(rights.bits()), rights);
+        }
+        assert_eq!(DeviceRights::default().bits(), 0);
+        assert_eq!(DeviceRights::read_only().bits(), 3);
+        assert_eq!(DeviceRights::full().bits(), DeviceRights::FULL);
+        // A bit this build does not know cannot survive the round trip: four
+        // named rights are all the type can hold, so an unknown bit is dropped
+        // when the row is written back. That narrows a grant rather than
+        // widening one, which is the way round to fail - and the only writer is
+        // a person choosing rights in the desktop's own list, which cannot set
+        // a right it cannot name.
+        assert_eq!(DeviceRights::from_bits(0b1_0000), DeviceRights::default());
+        assert_eq!(DeviceRights::from_bits(0b1_0000).bits(), 0);
+        assert!(DeviceRights::read_only().grants(DeviceRights::FETCH));
+        assert!(!DeviceRights::read_only().grants(DeviceRights::PRIVILEGED));
+        assert!(DeviceRights::read_only().is_read_only());
+        assert!(!DeviceRights::full().is_read_only());
+        // The mask is a trap, so it is pinned here: one right set is not every
+        // right set, however the question is worded.
+        assert!(DeviceRights::read_only().grants(DeviceRights::FULL));
+        assert!(!DeviceRights::read_only().is_full());
+        assert!(DeviceRights::full().is_full());
+        assert!(!DeviceRights::default().is_full());
     }
 
     /// A phone that asks for the computer's own playlists alone.
@@ -1180,6 +1339,7 @@ mod tests {
                 library_revision: 3,
                 cover_revision: 0,
                 stream_only: true,
+                rights: None,
                 pubkey: String::new(),
             }
         );
@@ -1199,6 +1359,7 @@ mod tests {
                 library_revision: 3,
                 cover_revision: 0,
                 stream_only: false,
+                rights: None,
                 pubkey: String::new(),
             }
         );

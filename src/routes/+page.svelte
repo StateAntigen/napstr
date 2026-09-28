@@ -108,7 +108,8 @@
   type TrackDiscussionActivity = { fileId: string; authors: number; messages: number; lastAt: number };
   type IndexProgress = { scanning: boolean; processedFiles: number; indexedFiles: number; message: string };
   type IndexBatch = { files: NativeFile[]; fileCount: number; totalBytes: number };
-  type MobileDevice = { endpointId: string; name: string; pairedAt: string; lastSeen: string; streamOnly: boolean };
+  type DeviceRights = { browse: boolean; fetch: boolean; control: boolean; privileged: boolean };
+  type MobileDevice = { endpointId: string; name: string; pairedAt: string; lastSeen: string; rights: DeviceRights };
   type MobileStatus = { running: boolean; online: boolean; endpointId: string; error: string; devices: MobileDevice[] };
   type MobilePairingOffer = { ticket: string; qrSvg: string; expiresAt: number; endpointId: string };
   type BlockConfirmation =
@@ -4217,7 +4218,7 @@
                 {#each mobileStatusValue?.devices ?? [] as device (device.endpointId)}
                   <div class="paired-device">
                     <span class="phone-glyph">▯</span>
-                    <div><b>{device.name}</b><small>{device.streamOnly ? $t("Read only") : $t("Full access")}</small><small>{$t("Last connected")} {mobileLastSeen(device.lastSeen)}</small><code title={device.endpointId}>{device.endpointId}</code></div>
+                    <div><b>{device.name}</b><small>{device.rights.privileged ? $t("Full access") : $t("Read only")}</small><small>{$t("Last connected")} {mobileLastSeen(device.lastSeen)}</small><code title={device.endpointId}>{device.endpointId}</code></div>
                     <button class="classic-button" onclick={() => revokeMobileDevice(device)}>{$t("Remove")}</button>
                   </div>
                 {/each}
