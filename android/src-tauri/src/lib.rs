@@ -1465,6 +1465,14 @@ struct RemoteClient {
     /// The rows of the shuffled mix collected so far, for the seed they belong
     /// to. Empty until a shuffle is asked for.
     mixed: tokio::sync::RwLock<Option<MixedLibrary>>,
+    /// Which computer answered with which file.
+    ///
+    /// A queue is a list of file ids, and a file id is a hash of the file's own
+    /// bytes, so any computer holding it can serve it. What this remembers is the
+    /// one that answered with the row, so that playing a friend's track asks the
+    /// friend rather than asking the phone's own computer and waiting for it to
+    /// say it has no such file.
+    origins: tokio::sync::RwLock<HashMap<String, String>>,
     start_lock: tokio::sync::Mutex<()>,
 }
 
@@ -1591,6 +1599,48 @@ fn next_mix_request(held: usize, total: Option<usize>, need: usize) -> Option<(u
     Some((held, (need - held).min(MAX_PAGE_SIZE).min(remaining)))
 }
 
+/// The computers to ask for a file, in the order to ask them, or why none of them
+/// may be asked.
+///
+/// The computer that answered with the file is asked first, because it is the one
+/// known to hold it, then the computer this phone acts through, then the others as
+/// it holds them. Every one of them is a copy of the same file: a file id is a
+/// hash of the file's own bytes, so a copy that differs is not this file and is
+/// refused when its bytes are checked. That is what makes a fallback safe rather
+/// than a guess - and what makes a queue built from several computers play on.
+///
+/// Only computers granted the fetching right are asked. One that may be read but
+/// not taken audio from is not asked for a file at all, which is the same refusal
+/// the computer itself would give, made here where it can name the problem.
+fn fetch_order(origin: Option<&str>, hosts: &[SavedHost]) -> Result<Vec<SavedHost>, String> {
+    if hosts.is_empty() {
+        return Err("Pair Napstrfy with Napstr first".into());
+    }
+    let primary = primary_host(hosts).map(|host| host.endpoint_id);
+    let mut may_fetch = hosts
+        .iter()
+        .filter(|host| host.grant().fetch)
+        .cloned()
+        .collect::<Vec<_>>();
+    // Stable, so the computers after the first keep the order they were paired in.
+    may_fetch.sort_by_key(|host| primary.as_deref() != Some(host.endpoint_id.as_str()));
+    let mut order = Vec::new();
+    if let Some(origin) = origin {
+        if let Some(host) = may_fetch.iter().find(|host| host.endpoint_id == origin) {
+            order.push(host.clone());
+        }
+    }
+    for host in may_fetch {
+        if !order.iter().any(|asked| asked.endpoint_id == host.endpoint_id) {
+            order.push(host);
+        }
+    }
+    if order.is_empty() {
+        return Err("This phone may not take audio from these computers".into());
+    }
+    Ok(order)
+}
+
 impl RemoteClient {
     async fn close_connection(&self, endpoint_id: &str) {
         if let Some(connection) = self.connections.write().await.remove(endpoint_id) {
@@ -1615,6 +1665,7 @@ impl RemoteClient {
             connections: tokio::sync::RwLock::new(std::collections::HashMap::new()),
             hosts: tokio::sync::RwLock::new(hosts),
             mixed: tokio::sync::RwLock::new(None),
+            origins: tokio::sync::RwLock::new(HashMap::new()),
             start_lock: tokio::sync::Mutex::new(()),
         })
     }
@@ -1740,6 +1791,7 @@ impl RemoteClient {
     async fn forget(&self) -> Result<(), String> {
         self.disconnect().await;
         self.hosts.write().await.clear();
+        self.origins.write().await.clear();
         // Both files. Forgetting and then reading the file the older build wrote
         // is how a pairing comes back from the dead.
         for name in [PAIRED_HOSTS_FILE, LEGACY_PAIRED_FILE] {
@@ -1860,7 +1912,13 @@ impl RemoteClient {
         let mut merged = Vec::new();
         for (endpoint_id, answer) in answers {
             match answer {
-                Ok(ServerResponse::Search { tracks }) => merged.push(tracks),
+                Ok(ServerResponse::Search { tracks }) => {
+                    // Remembered before the rows are merged: a result from a
+                    // friend is playable because the friend is on record as the
+                    // one holding it.
+                    self.remember_origins(&endpoint_id, &tracks).await;
+                    merged.push(tracks);
+                }
                 Ok(response) => {
                     if asks_the_primary(&endpoint_id) {
                         return Err(unexpected_response(&response));
@@ -1945,6 +2003,8 @@ impl RemoteClient {
                 let endpoint_id = mix.hosts[index].endpoint_id.clone();
                 match self.try_request(&hosts[index], request).await {
                     Ok(ServerResponse::Library { tracks, total }) => {
+                        let endpoint_id = mix.hosts[index].endpoint_id.clone();
+                        self.remember_origins(&endpoint_id, &tracks).await;
                         let host = &mut mix.hosts[index];
                         host.total = Some(total);
                         if tracks.is_empty() {
@@ -1977,6 +2037,65 @@ impl RemoteClient {
         Ok(mixed_page(&mix.hosts, seed, offset, limit))
     }
 
+    /// Remember which computer answered with which files.
+    ///
+    /// Only rows from another computer are worth keeping: the one this phone acts
+    /// through is asked for a file anyway, and a map of every file it holds would
+    /// be a copy of its library on a phone that has no room for one.
+    async fn remember_origins(&self, endpoint_id: &str, rows: &[RemoteTrack]) {
+        if self
+            .primary()
+            .await
+            .map(|host| host.endpoint_id)
+            .is_ok_and(|primary| primary == endpoint_id)
+        {
+            return;
+        }
+        let mut origins = self.origins.write().await;
+        for row in rows {
+            origins.insert(row.file_id.clone(), endpoint_id.to_string());
+        }
+    }
+
+    /// One file's audio, from the first computer that offers it.
+    ///
+    /// A queue entry does not have to know which computer it came from: what came
+    /// from a friend was remembered when the row arrived, so a friend's track is
+    /// asked of the friend. If the friend is out of reach, the phone's own
+    /// computer is asked next, and then any other that may be read - a file id is
+    /// a hash, so whoever serves it is serving the same file.
+    ///
+    /// Each computer is tried once, except the last, which is tried twice because
+    /// after it there is nowhere else to go. A second attempt at a computer that
+    /// has already not answered puts its wait in front of the fallback, and the
+    /// fallback is the whole point of the others.
+    async fn fetch_audio_from_somewhere(
+        &self,
+        file_id: &str,
+    ) -> Result<(RemoteTrack, iroh::endpoint::RecvStream), String> {
+        let origin = self.origins.read().await.get(file_id).cloned();
+        let hosts = fetch_order(origin.as_deref(), &self.hosts().await)?;
+        let last = hosts.len() - 1;
+        let mut last_error = None;
+        for (index, host) in hosts.into_iter().enumerate() {
+            let request = ClientRequest::FetchAudio {
+                file_id: file_id.to_string(),
+            };
+            let answer = if index == last {
+                self.exchange_with(&host, request).await
+            } else {
+                self.exchange_attempt(&host, request).await
+            };
+            match answer {
+                Ok((ServerResponse::AudioReady { track }, receive)) => return Ok((track, receive)),
+                Ok((ServerResponse::Error { message }, _)) => last_error = Some(message),
+                Ok((other, _)) => last_error = Some(unexpected_response(&other)),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| "Napstr is unavailable".into()))
+    }
+
     /// One request to one computer, retried once on a fresh tunnel.
     async fn exchange_with(
         &self,
@@ -1985,22 +2104,43 @@ impl RemoteClient {
     ) -> Result<(ServerResponse, iroh::endpoint::RecvStream), String> {
         let mut last_error = "Napstr is unavailable".to_string();
         for _ in 0..2 {
-            match self.connection(host).await {
-                Ok(connection) => match tokio::time::timeout(
-                    Duration::from_secs(30),
-                    exchange_on(&connection, request.clone()),
-                )
-                .await
-                {
-                    Ok(Ok(response)) => return Ok(response),
-                    Ok(Err(error)) => last_error = error,
-                    Err(_) => last_error = "Napstr did not answer the request in time".into(),
-                },
+            match self.exchange_attempt(host, request.clone()).await {
+                Ok(response) => return Ok(response),
                 Err(error) => last_error = error,
             }
-            self.close_connection(&host.endpoint_id).await;
         }
         Err(last_error)
+    }
+
+    /// One request to one computer, tried once.
+    ///
+    /// The tunnel is dropped when an attempt fails, whichever way it failed: what
+    /// went wrong is as likely to be the connection as the request, and the next
+    /// attempt is what opens a fresh one.
+    async fn exchange_attempt(
+        &self,
+        host: &SavedHost,
+        request: ClientRequest,
+    ) -> Result<(ServerResponse, iroh::endpoint::RecvStream), String> {
+        let result = match self.connection(host).await {
+            Ok(connection) => match tokio::time::timeout(
+                Duration::from_secs(30),
+                exchange_on(&connection, request),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err("Napstr did not answer the request in time".into()),
+            },
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                self.close_connection(&host.endpoint_id).await;
+                Err(error)
+            }
+        }
     }
 
     /// Fetch one rendition of one album's art from the paired computer.
@@ -2190,16 +2330,9 @@ impl RemoteClient {
             });
         }
 
-        let (response, mut receive) = self
-            .exchange(ClientRequest::FetchAudio {
-                file_id: requested_track.file_id.clone(),
-            })
+        let (track, mut receive) = self
+            .fetch_audio_from_somewhere(&requested_track.file_id)
             .await?;
-        let track = match response {
-            ServerResponse::AudioReady { track } => track,
-            ServerResponse::Error { message } => return Err(message),
-            other => return Err(unexpected_response(&other)),
-        };
         validate_cache_track(&track)?;
         validate_matching_track(&requested_track, &track)?;
         let _ = tokio::fs::remove_file(&path).await;
@@ -2484,7 +2617,14 @@ async fn remote_library(
         )
         .await?
     {
-        ServerResponse::Library { tracks, total } => Ok(LibraryPage { tracks, total }),
+        ServerResponse::Library { tracks, total } => {
+            // Rows from a friend are on record as theirs, so playing one asks the
+            // friend rather than the phone's own computer.
+            if let Some(source) = source.as_deref() {
+                state.remote.remember_origins(source, &tracks).await;
+            }
+            Ok(LibraryPage { tracks, total })
+        }
         response => Err(unexpected_response(&response)),
     }
 }
@@ -2516,7 +2656,14 @@ async fn remote_library_by_ids(
             )
             .await?;
         match response {
-            ServerResponse::LibraryByIds { tracks: batch } => tracks.extend(batch),
+            ServerResponse::LibraryByIds { tracks: batch } => {
+                // A queue handed over by a friend's computer, or a playlist read
+                // from one, is playable because those rows are on record as theirs.
+                if let Some(source) = source.as_deref() {
+                    state.remote.remember_origins(source, &batch).await;
+                }
+                tracks.extend(batch);
+            }
             response => return Err(unexpected_response(&response)),
         }
     }
@@ -3112,7 +3259,12 @@ async fn remote_search(
         .request_from(source.as_deref(), ClientRequest::Search { query })
         .await?
     {
-        ServerResponse::Search { tracks } => Ok(tracks),
+        ServerResponse::Search { tracks } => {
+            if let Some(source) = source.as_deref() {
+                state.remote.remember_origins(source, &tracks).await;
+            }
+            Ok(tracks)
+        }
         response => Err(unexpected_response(&response)),
     }
 }
@@ -3964,6 +4116,57 @@ mod tests {
         assert_eq!(next_mix_request(200, Some(400), 100), None);
         assert_eq!(next_mix_request(30, Some(30), 100), None);
         assert_eq!(next_mix_request(30, Some(40), 100), Some((30, 10)));
+    }
+
+    /// The order a file is asked for in: the computer that answered with it, then
+    /// the phone's own, then the others - and only computers that let this phone
+    /// take audio.
+    #[test]
+    fn a_file_is_asked_for_from_the_computer_that_answered_with_it() {
+        let own = host("own", DeviceRights::full(), "My Napstr");
+        let friend = host("friend", DeviceRights::read_only(), "Ada's Napstr");
+        let reader = host(
+            "reader",
+            DeviceRights {
+                browse: true,
+                ..DeviceRights::default()
+            },
+            "A Laptop",
+        );
+        // A nested function rather than a closure: the answer borrows the hosts
+        // it was read from, which a closure cannot say.
+        fn ordered(hosts: &[SavedHost]) -> Vec<&str> {
+            hosts
+                .iter()
+                .map(|host| host.endpoint_id.as_str())
+                .collect()
+        }
+
+        // A friend's row is asked of the friend, then of the phone's own computer,
+        // which may well hold the same file.
+        assert_eq!(
+            ordered(&fetch_order(Some("friend"), &[own.clone(), friend.clone()]).unwrap()),
+            ["friend", "own"]
+        );
+        // A row from the phone's own computer, or from nowhere in particular.
+        assert_eq!(
+            ordered(&fetch_order(None, &[friend.clone(), own.clone()]).unwrap()),
+            ["own", "friend"]
+        );
+        // A computer that may be read but not taken audio from is not asked for a
+        // file, however it is named.
+        assert_eq!(
+            ordered(&fetch_order(Some("reader"), &[own.clone(), reader.clone()]).unwrap()),
+            ["own"]
+        );
+        // A computer this phone no longer holds is not asked at all, and a phone
+        // that may take audio from nobody at all is told which of the two it is.
+        assert_eq!(
+            ordered(&fetch_order(Some("gone"), &[own]).unwrap()),
+            ["own"]
+        );
+        assert!(fetch_order(None, &[reader]).is_err());
+        assert!(fetch_order(None, &[]).is_err());
     }
 
     /// A playlist is edited on a phone by sending the whole of it, so the one
