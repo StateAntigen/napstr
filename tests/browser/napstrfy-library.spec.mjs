@@ -184,7 +184,9 @@ test('Napstrfy draws the player bar and the cover stretched behind it from the t
   const bar = await page.locator('.now-playing').getAttribute('style');
   expect(bar).toContain(coverThumb);
   expect(bar).not.toContain(coverFull);
-  releaseFullCover();
+  // Awaited: the page must not be closing while this call is in flight, which is
+  // how this test failed the first time it ran beside the playlists line.
+  await releaseFullCover();
 });
 
 test('Napstrfy gives the lock screen the thumbnail, then the full cover once it has landed', async ({ page }) => {
@@ -196,7 +198,7 @@ test('Napstrfy gives the lock screen the thumbnail, then the full cover once it 
   // What the lock screen is given while the bigger rendition is on its way is the
   // one already on this phone.
   await expect.poll(artwork).toBe(coverThumb);
-  releaseFullCover();
+  await releaseFullCover();
   // The full cover takes its place as soon as it has loaded, which the media
   // service takes as a new URL for the same art.
   await expect.poll(artwork).toBe(coverFull);
@@ -270,7 +272,7 @@ test('Napstrfy opens the now-playing drawer on the thumbnail rather than a blank
   // no layer to fade in until the host has handed the bigger picture over.
   await expect(thumb).toHaveAttribute('src', coverThumb);
   await expect(full).toHaveCount(0);
-  releaseFullCover();
+  await releaseFullCover();
   await expect(full).toHaveAttribute('src', coverFull);
   await expect(full).toHaveClass(/ready/);
   // The backdrop is blurred too far to show a bigger image, so it takes the
