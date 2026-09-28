@@ -201,3 +201,14 @@ test('Napstrfy shows what each file is on the row it is listed on', async ({ pag
   await expect(meta).toContainText('FLAC · lossless · 900 kb/s');
   await expect(page.locator('.track-row').filter({ hasText: 'Small and fine' }).locator('.track-meta')).toContainText('MP3 · 128 kb/s');
 });
+
+test("Napstrfy's now playing drawer repeats the file's bitrate rather than working it out", async ({ page }) => {
+  // 4 MB over 200 seconds is 160 kb/s by arithmetic; the file says 128. The
+  // drawer has to say what the file says, since that is the audio and not the
+  // whole file.
+  await openApp(page, { library: [plainSong], metered: false });
+  await play(page, 'Small and fine');
+  await settle(page);
+  await page.locator('.now-playing .now-open').click();
+  await expect(page.locator('.now-sheet-copy em')).toHaveText('MP3 · 128 kb/s');
+});

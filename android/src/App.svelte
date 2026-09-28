@@ -4227,18 +4227,38 @@
     }
   }
 
-  /** `MP3 · 320 kb/s`. The rate is the file's own average, not a claim. */
+  /**
+   * `FLAC · 900 kb/s`, from what the file itself says.
+   *
+   * The bitrate is the host's own reading of the container when it reported one,
+   * which is the audio rather than the file: size over length counts the tags,
+   * the artwork and every other byte along with the music. The fallback is that
+   * arithmetic, for an older host and for an episode nothing has probed, and it
+   * is a real number for the track playing when this phone listened.
+   */
   function fileSummary(track: RemoteTrack): string {
     const parts: string[] = [];
     if (track.format) parts.push(track.format.toUpperCase());
-    const bitrate = averageBitrate(track);
+    const bitrate = track.bitrateKbps > 0 ? track.bitrateKbps : averageBitrate(track);
     if (bitrate > 0) parts.push(`${bitrate} kb/s`);
     return parts.join(' · ');
   }
 
+  /**
+   * The bitrate a file works out to, when nothing has read it out of the file.
+   *
+   * The host's own duration is preferred because it describes *this* track; the
+   * length of whatever this phone is playing is only used for the track it is
+   * actually playing, since that is the only one the number belongs to.
+   */
   function averageBitrate(track: RemoteTrack): number {
-    if (!track.size || duration <= 0) return 0;
-    return Math.round((track.size * 8) / duration / 1000);
+    const seconds = track.durationMs > 0
+      ? track.durationMs / 1000
+      : track.fileId === current?.fileId
+        ? duration
+        : 0;
+    if (!track.size || seconds <= 0) return 0;
+    return Math.round((track.size * 8) / seconds / 1000);
   }
 
   async function moveTrack(direction: -1 | 1) {
