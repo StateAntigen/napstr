@@ -2193,9 +2193,54 @@
     mobileLoading = true;
     mobileError = '';
     try {
-      const offer = await invoke<MobilePairingOffer>('create_mobile_pairing', { streamOnly });
+      const offer = await invoke<MobilePairingOffer>('create_mobile_pairing', { rights: streamOnly ? READ_ONLY_RIGHTS : FULL_RIGHTS });
       if (streamOnly) mobileStreamPairing = offer;
       else mobilePairing = offer;
+      await refreshMobileStatus();
+    } catch (error) {
+      mobileError = String(error);
+    } finally {
+      mobileLoading = false;
+    }
+  }
+
+  /**
+   * What a pairing code hands over, in the two sizes the picker offers.
+   *
+   * A code is an invitation now rather than a permanent grant: it says what the
+   * device may do *to begin with*, and every one of those rights can be changed
+   * afterwards from the list below, so a misjudged code is no longer a reason to
+   * pair again.
+   */
+  const READ_ONLY_RIGHTS: DeviceRights = { browse: true, fetch: true, control: false, privileged: false };
+  const FULL_RIGHTS: DeviceRights = { browse: true, fetch: true, control: true, privileged: true };
+
+  /** The four rights, in the order they build on each other. */
+  function deviceRightChoices(): { key: keyof DeviceRights; label: string }[] {
+    return [
+      { key: 'browse', label: $t("Read the library") },
+      { key: 'fetch', label: $t("Play and keep audio") },
+      { key: 'control', label: $t("Control playback") },
+      { key: 'privileged', label: $t("Act as you") }
+    ];
+  }
+
+  /**
+   * Change one right on one device, and ask again rather than guessing.
+   *
+   * The write goes to the host, which refuses a device it never paired with, so
+   * a failure here means the list on screen was stale instead of the tick being
+   * wrong - and the refresh shows what is actually true.
+   */
+  async function setDeviceRight(device: MobileDevice, key: keyof DeviceRights, allowed: boolean) {
+    if (mobileLoading) return;
+    mobileLoading = true;
+    mobileError = '';
+    try {
+      await invoke('set_mobile_device_rights', {
+        endpointId: device.endpointId,
+        rights: { ...device.rights, [key]: allowed }
+      });
       await refreshMobileStatus();
     } catch (error) {
       mobileError = String(error);
@@ -4213,13 +4258,31 @@
             <section class="paired-devices-card">
               <p>{$t("Napstrfy creates a private, encrypted tunnel from your phone to Napstr, letting you listen to your catalogue by connecting directly to your Napstr instance. Only for your own use and for people you trust.")}</p>
               <h2>{$t("Paired phones")}</h2>
-              <p>{$t("Each phone keeps the access granted by its pairing code. Scan a new code to change its access.")}</p>
+              <p>{$t("Each phone keeps the access its code gave it, and you can change it here at any time.")}</p>
               <div class="paired-device-list">
                 {#each mobileStatusValue?.devices ?? [] as device (device.endpointId)}
-                  <div class="paired-device">
-                    <span class="phone-glyph">▯</span>
-                    <div><b>{device.name}</b><small>{device.rights.privileged ? $t("Full access") : $t("Read only")}</small><small>{$t("Last connected")} {mobileLastSeen(device.lastSeen)}</small><code title={device.endpointId}>{device.endpointId}</code></div>
-                    <button class="classic-button" onclick={() => revokeMobileDevice(device)}>{$t("Remove")}</button>
+                  <div class="paired-device-block">
+                    <div class="paired-device">
+                      <span class="phone-glyph">▯</span>
+                      <!-- The ticks below are what this phone may do, so the row
+                           does not also summarise it: "read only" was already
+                           untrue of a device lent the index alone. -->
+                      <div><b>{device.name}</b><small>{$t("Last connected")} {mobileLastSeen(device.lastSeen)}</small><code title={device.endpointId}>{device.endpointId}</code></div>
+                      <button class="classic-button" onclick={() => revokeMobileDevice(device)}>{$t("Remove")}</button>
+                    </div>
+                    <div class="device-rights" role="group" aria-label={$t("What {p0} may do", { p0: device.name })}>
+                      {#each deviceRightChoices() as choice}
+                        <label class:on={device.rights[choice.key]}>
+                          <input
+                            type="checkbox"
+                            checked={device.rights[choice.key]}
+                            disabled={mobileLoading}
+                            onchange={(event) => void setDeviceRight(device, choice.key, event.currentTarget.checked)}
+                          />
+                          <span>{choice.label}</span>
+                        </label>
+                      {/each}
+                    </div>
                   </div>
                 {/each}
                 {#if (mobileStatusValue?.devices.length ?? 0) === 0}<p class="empty-state compact">{$t("No phones are paired yet.")}</p>{/if}

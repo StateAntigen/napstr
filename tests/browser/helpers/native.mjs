@@ -146,7 +146,15 @@ export async function mockNative(page, { app = 'napstrfy', nativeLocale = 'en-GB
             const known = window.discussionActivity ?? {};
             return (args.fileIds ?? []).map((fileId) => known[fileId]).filter(Boolean);
           }
-          case 'mobile_status': return { running: true, online: true, endpointId: 'endpoint', error: '', devices: [] };
+          case 'mobile_status': return { running: true, online: true, endpointId: 'endpoint', error: '', devices: window.mobileDevices ?? [] };
+          case 'set_mobile_device_rights': {
+            // The host decides, so the mock applies the write and the list the
+            // window reads back is the answer rather than its own optimism.
+            const row = (window.mobileDevices ?? []).find((entry) => entry.endpointId === args.endpointId);
+            if (!row) throw new Error('That device is not paired with Napstr');
+            row.rights = args.rights;
+            return null;
+          }
           case 'play_audio': return { fileId: track.fileId, currentTime: 0, duration: 60, playing: true, ended: false, error: '' };
           case 'client_platform': return platform;
           case 'companion_status': return status();
