@@ -76,6 +76,24 @@ pub(crate) const USER_AGENT: &str = concat!(
 /// *publishing*, which a relay will take as fast as it arrives.
 const REQUEST_INTERVAL: Duration = Duration::from_millis(1200);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(12);
+/// How long the art fill waits between rounds while it is finding work.
+///
+/// Short enough that a library covers itself in a few minutes and long enough
+/// that this is not a loop spinning on the database. What actually limits the
+/// rate is the fetcher's own permits, not this.
+const ART_FILL_INTERVAL: Duration = Duration::from_secs(2);
+/// How long it waits once there was nothing to queue. A covered library should
+/// cost one query a minute rather than one every two seconds.
+const ART_FILL_IDLE_INTERVAL: Duration = Duration::from_secs(60);
+/// How many albums may be waiting for pictures at once.
+///
+/// The fetcher runs two downloads at a time, so this is the queue it works from
+/// rather than work in flight.
+const ART_FILL_AHEAD: usize = 16;
+/// How stale the art cache's numbers may be in a status. Reading them means
+/// walking the pictures on disk, which is not something to do for every tick of a
+/// thousand-album pass.
+const ART_STATS_INTERVAL: Duration = Duration::from_secs(5);
 /// How long MusicBrainz is given, which is not the same question as how long the
 /// archive is given.
 ///
@@ -220,6 +238,16 @@ pub struct CoverStatus {
     pub backed_off: usize,
     /// True when a pass ended early because the switches were turned off.
     pub stopped: bool,
+    /// Pictures this computer is holding for its phones.
+    pub art_cached: usize,
+    /// What those pictures take on disk.
+    pub art_bytes: u64,
+    /// Albums whose art is resolved here and whose pictures are not held yet.
+    /// This is the work the fill has left, and what a person watching it wants
+    /// to see going down.
+    pub art_pending: usize,
+    /// True while somebody has asked the fill to stop for now.
+    pub art_paused: bool,
     /// The domains this computer will take art from, one per line. Empty means
     /// no restriction, which is what every library had before the setting
     /// existed. Carried in the status so the Covers tab can edit it without a
@@ -242,10 +270,16 @@ pub struct CoverPublisher {
     art: Arc<ArtFetcher>,
     /// Set while a pass is running, to make it stop at the next album.
     cancel: Arc<AtomicBool>,
+    /// Set while somebody has asked the art fill to stop. Not stored: it is a
+    /// "not now", not a preference, and a restart is a fresh start.
+    art_paused: Arc<AtomicBool>,
     /// Woken by [`CoverPublisher::nudge`]; nudges coalesce.
     wake: Arc<Notify>,
     last_report: Mutex<Instant>,
     status: Mutex<CoverStatus>,
+    /// What the art cache is holding, and when that was last read. `None` until
+    /// the first read.
+    art_numbers: Mutex<Option<(Instant, usize, u64, usize)>>,
 }
 
 impl CoverPublisher {
@@ -275,8 +309,10 @@ impl CoverPublisher {
             network,
             app,
             cancel: Arc::new(AtomicBool::new(false)),
+            art_paused: Arc::new(AtomicBool::new(false)),
             wake: Arc::new(Notify::new()),
             last_report: Mutex::new(Instant::now() - REPORT_INTERVAL),
+            art_numbers: Mutex::new(None),
             status: Mutex::new(CoverStatus {
                 lookup_external: preferences.lookup_external,
                 publish_claims: preferences.publish_claims,
@@ -315,10 +351,93 @@ impl CoverPublisher {
     }
 
     pub fn status(&self) -> CoverStatus {
-        self.status
+        let mut status = self
+            .status
             .lock()
             .map(|status| status.clone())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        let (cached, bytes, pending) = self.art_cache_numbers();
+        status.art_cached = cached;
+        status.art_bytes = bytes;
+        status.art_pending = pending;
+        status.art_paused = self.art_paused.load(Ordering::SeqCst);
+        status
+    }
+
+    /// Stop or resume the art fill.
+    ///
+    /// Deliberately not a stored switch. The switches above are promises about
+    /// what this computer does with the network, and they survive a restart; this
+    /// is "not while I am on a train", which should not, because a pause that
+    /// outlived its reason is a cache that never fills and a person with no idea
+    /// why.
+    pub fn set_art_fill_paused(&self, paused: bool) -> CoverStatus {
+        self.art_paused.store(paused, Ordering::SeqCst);
+        if let Ok(mut status) = self.status.lock() {
+            status.message = if paused {
+                "Fetching artwork is paused; what is already here still works".into()
+            } else {
+                "Fetching artwork".into()
+            };
+        }
+        self.report()
+    }
+
+    /// Throw the held pictures away. Returns the status the window should show.
+    ///
+    /// The point of a cache is that it can be emptied: these bytes are all
+    /// re-fetchable from the claims this computer already holds, so clearing them
+    /// is an ordinary action rather than a repair. Nothing about what this
+    /// computer *knows* is touched — the resolutions and the log stay, and the
+    /// fill will download what it needs again.
+    pub fn clear_art_cache(&self) -> Result<CoverStatus, String> {
+        let connection = crate::open_connection(&self.db_path)?;
+        let removed = crate::art_cache::clear(&connection, self.art.root())?;
+        // The numbers are read fresh, because the whole point of this is that
+        // they changed.
+        if let Ok(mut cached) = self.art_numbers.lock() {
+            *cached = None;
+        }
+        self.log_line(
+            "",
+            "",
+            "",
+            "cleared",
+            "",
+            &format!("{removed} entries of artwork were cleared"),
+        );
+        Ok(self.report())
+    }
+
+    /// What the art cache holds, refreshed at most every [`ART_STATS_INTERVAL`].
+    ///
+    /// A status is read on every tick of a pass and on every command, and reading
+    /// these means walking the pictures on disk, so the answer is reused while it
+    /// is fresh. A read that fails leaves the numbers as they were rather than
+    /// reporting an empty cache: nothing here is worth an error, and "nothing is
+    /// cached" is the one wrong answer that looks like a fact.
+    fn art_cache_numbers(&self) -> (usize, u64, usize) {
+        let Ok(mut cached) = self.art_numbers.lock() else {
+            return (0, 0, 0);
+        };
+        let fresh = match cached.as_ref() {
+            Some((at, ..)) => at.elapsed() < ART_STATS_INTERVAL,
+            None => false,
+        };
+        if !fresh {
+            let read = crate::open_connection(&self.db_path).and_then(|connection| {
+                let stats = crate::art_cache::stats(&connection, self.art.root())?;
+                let pending = cover::albums_without_pictures_count(&connection)?;
+                Ok((stats.entries, stats.bytes, pending))
+            });
+            if let Ok((entries, bytes, pending)) = read {
+                *cached = Some((Instant::now(), entries, bytes, pending));
+            }
+        }
+        match cached.as_ref() {
+            Some((_, entries, bytes, pending)) => (*entries, *bytes, *pending),
+            None => (0, 0, 0),
+        }
     }
 
     pub fn preferences(&self) -> CoverPreferences {
@@ -396,6 +515,104 @@ impl CoverPublisher {
         self.cancel.store(true, Ordering::SeqCst);
     }
 
+    /// Keep the art cache filling while there is art to fetch.
+    ///
+    /// Its own loop rather than a step of the lookup pass, because the two are
+    /// paced by different things: lookups are paced by MusicBrainz and happen once
+    /// per album, while this is for albums this computer already has an address
+    /// for and is limited only by the fetcher's own permits.
+    ///
+    /// It exists because resolving an album and holding its picture are two
+    /// different things. A library resolved over months has thousands of addresses
+    /// written down — and, until this, nothing to hand a phone for any of them
+    /// until that phone happened to ask.
+    pub fn start_art_fill(self: &Arc<Self>) {
+        let publisher = self.clone();
+        tauri::async_runtime::spawn(async move {
+            let mut wait = ART_FILL_INTERVAL;
+            loop {
+                tokio::time::sleep(wait).await;
+                // Holding a picture means downloading it from wherever the claim
+                // points, which is what this switch governs, so the fill stops
+                // with it. The domain list is enforced by the fetcher itself.
+                if !publisher.preferences().lookup_external {
+                    wait = ART_FILL_IDLE_INTERVAL;
+                    continue;
+                }
+                if publisher.art_paused.load(Ordering::SeqCst) {
+                    // Asked to stop for now: the albums left are still listed and
+                    // still waiting, so resuming picks up where this left off.
+                    wait = ART_FILL_INTERVAL;
+                    continue;
+                }
+                match publisher.fill_art_once() {
+                    Ok(0) => wait = (wait * 2).min(ART_FILL_IDLE_INTERVAL),
+                    Ok(_) => wait = ART_FILL_INTERVAL,
+                    Err(error) => {
+                        wait = ART_FILL_IDLE_INTERVAL;
+                        if let Ok(mut status) = publisher.status.lock() {
+                            status.message = format!("Could not fill the artwork cache: {error}");
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    /// One round of filling: hand a bounded number of albums to the fetcher, keep
+    /// the cache inside its budget, and say how many albums there are left.
+    fn fill_art_once(&self) -> Result<usize, String> {
+        // Never queue more than the fetcher can work through. Without this, a
+        // library of thousands would be queued in a minute and downloaded over
+        // hours, which is a list nobody asked to keep.
+        let room = ART_FILL_AHEAD.saturating_sub(self.art.in_flight());
+        if room == 0 {
+            return Ok(0);
+        }
+        let connection = crate::open_connection(&self.db_path)?;
+        let albums = cover::albums_without_pictures(&connection, room)?;
+        if albums.is_empty() {
+            // Nothing left to fetch, so this is the moment to bring the cache
+            // back inside its budget rather than adding to it.
+            let evicted = crate::art_cache::evict_to_budget(
+                &connection,
+                self.art.root(),
+                crate::art_cache::ART_BUDGET_BYTES,
+            )?;
+            if evicted > 0 {
+                self.log_line(
+                    "",
+                    "",
+                    "",
+                    "evicted",
+                    "",
+                    &format!("{evicted} entries were dropped to stay inside the artwork budget"),
+                );
+            }
+            return Ok(0);
+        }
+        let wants = albums
+            .iter()
+            .map(|album| ArtWant {
+                key: &album.key,
+                art: &album.art,
+                thumb: &album.thumb,
+                source: &album.source,
+            })
+            .collect::<Vec<_>>();
+        self.art.ensure_all(&wants);
+        // The remaining count is refreshed for the window's own line; the status
+        // message is left to the lookup pass, which is the one that has something
+        // to say about albums. Two writers for one sentence means whichever ran
+        // last wins, and a finished pass whose summary is overwritten by a filler
+        // is a pass that looks like it did nothing.
+        if let Ok(mut status) = self.status.lock() {
+            status.art_pending = cover::albums_without_pictures_count(&connection)?;
+        }
+        self.tick();
+        Ok(albums.len())
+    }
+
     /// Fetch and hold the pictures a batch of claims names, so a paired phone
     /// can be handed bytes rather than an address.
     ///
@@ -412,13 +629,35 @@ impl CoverPublisher {
     /// Logging is diagnostics: a database that cannot be written must not stop
     /// an album being resolved, so the result is dropped on purpose.
     fn log(&self, candidate: &CoverCandidate, outcome: &str, source: &str, message: &str) {
+        self.log_line(
+            &candidate.key,
+            &candidate.artist,
+            &candidate.album,
+            outcome,
+            source,
+            message,
+        );
+    }
+
+    /// The same, for a caller that has no album to name: the artwork cache's own
+    /// events belong in the same log as the lookups, because "why did that picture
+    /// go away" is the same question as "why did that album never get one".
+    fn log_line(
+        &self,
+        key: &str,
+        artist: &str,
+        album: &str,
+        outcome: &str,
+        source: &str,
+        message: &str,
+    ) {
         if let Ok(connection) = crate::open_connection(&self.db_path) {
             let _ = cover::record_lookup_log(
                 &connection,
                 cover::LookupLogEntry {
-                    key: &candidate.key,
-                    artist: &candidate.artist,
-                    album: &candidate.album,
+                    key,
+                    artist,
+                    album,
                     outcome,
                     source,
                     message,

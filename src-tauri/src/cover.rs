@@ -643,6 +643,10 @@ pub(crate) fn initialise_cover_schema(connection: &Connection) -> Result<(), Str
                noted_at TEXT NOT NULL
              );
              CREATE INDEX IF NOT EXISTS cover_watch_noted_at ON cover_watch(noted_at);
+             -- The fill walks resolutions newest first, so the order it reads them
+             -- in is the order they are written in.
+             CREATE INDEX IF NOT EXISTS album_art_lookups_checked_at
+               ON album_art_lookups(checked_at DESC);
              -- One line per external lookup attempt, newest last, pruned to the
              -- last few hundred. This is the only place the *reason* a lookup
              -- failed is written down: `album_art_lookups` remembers the verdict
@@ -1456,6 +1460,76 @@ pub(crate) fn resolved_covers(
     Ok(covers)
 }
 
+/// One album this computer has an address for and no picture of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ArtToFetch {
+    pub key: String,
+    pub art: String,
+    pub thumb: String,
+    pub source: String,
+}
+
+/// Albums whose art this computer resolved but never downloaded, newest first.
+///
+/// This is what a fill pass walks. Resolving an album and holding its picture are
+/// two different things, and until this existed the second only ever happened
+/// because a phone asked for that album: a library resolved over months had
+/// thousands of addresses written down and nothing to hand over for them.
+///
+/// Ordered by when the resolution was made, because the albums this computer
+/// looked at most recently are the ones somebody is most likely to be looking at
+/// now. An album already holding anything is left out: whether its *other*
+/// rendition is worth fetching is decided by the caller, which knows the
+/// difference per rendition, and asking twice about the same album here would
+/// make the walk slower without making it more complete.
+pub(crate) fn albums_without_pictures(
+    connection: &Connection,
+    limit: usize,
+) -> Result<Vec<ArtToFetch>, String> {
+    let rows = connection
+        .prepare(
+            "SELECT l.cover_key, l.art, l.thumb, l.source
+               FROM album_art_lookups l
+              WHERE (l.art <> '' OR l.thumb <> '')
+                AND NOT EXISTS (
+                      SELECT 1 FROM art_cache c WHERE c.cover_key = l.cover_key)
+              ORDER BY l.checked_at DESC
+              LIMIT ?1",
+        )
+        .map_err(|error| error.to_string())?
+        .query_map(params![limit.clamp(1, ART_FETCH_LIMIT) as i64], |row| {
+            Ok(ArtToFetch {
+                key: row.get(0)?,
+                art: row.get(1)?,
+                thumb: row.get(2)?,
+                source: row.get(3)?,
+            })
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    Ok(rows)
+}
+
+/// How many albums one call will name. A fill asks repeatedly rather than
+/// building the whole library's list at once.
+const ART_FETCH_LIMIT: usize = 5_000;
+
+/// How many albums are waiting for their pictures, for the Covers view.
+pub(crate) fn albums_without_pictures_count(connection: &Connection) -> Result<usize, String> {
+    let count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM album_art_lookups l
+              WHERE (l.art <> '' OR l.thumb <> '')
+                AND NOT EXISTS (
+                      SELECT 1 FROM art_cache c WHERE c.cover_key = l.cover_key)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(count.max(0) as usize)
+}
+
 /// Store the newest claim from every author for the given key/event pairs.
 ///
 /// Withdrawals are stored as tombstones so this author's older claim is never
@@ -1634,6 +1708,85 @@ fn blocked_pubkeys(connection: &Connection) -> Result<HashSet<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use napstr_remote_protocol::ArtRendition;
+
+    /// A resolution worth fetching a picture for, as the lookup writes one.
+    fn resolved(key: &str, art: &str) -> ArtLookup {
+        ArtLookup {
+            key: key.to_string(),
+            art: art.to_string(),
+            thumb: String::new(),
+            mbid: String::new(),
+            year: String::new(),
+            collection: String::new(),
+            source: "itunes".into(),
+        }
+    }
+
+    #[test]
+    fn the_fill_walks_the_resolutions_it_has_no_picture_for() {
+        let connection = cover_database();
+        let root = std::env::temp_dir().join("napstr-art-fill-walk");
+        let _ = std::fs::remove_dir_all(&root);
+        for key in ["a|one", "b|two", "c|three"] {
+            record_art_lookup(
+                &connection,
+                key,
+                ArtLookupOutcome::Found(&resolved(key, "https://example.com/a.jpg")),
+            )
+            .unwrap();
+        }
+        // An album nobody has art for is not work: there is nothing to fetch, and
+        // a walk that queued it would ask the same question forever.
+        record_art_lookup(&connection, "d|nothing", ArtLookupOutcome::NoArt).unwrap();
+        // The order is the order the albums were looked at in, so the times are
+        // set rather than left to however fast the test ran.
+        for (key, at) in [
+            ("a|one", "2020-01-01T00:00:00+00:00"),
+            ("b|two", "2021-01-01T00:00:00+00:00"),
+            ("c|three", "2022-01-01T00:00:00+00:00"),
+        ] {
+            connection
+                .execute(
+                    "UPDATE album_art_lookups SET checked_at=?2 WHERE cover_key=?1",
+                    params![key, at],
+                )
+                .unwrap();
+        }
+
+        let waiting = albums_without_pictures(&connection, 10).unwrap();
+        assert_eq!(
+            waiting.iter().map(|album| album.key.as_str()).collect::<Vec<_>>(),
+            vec!["c|three", "b|two", "a|one"],
+            "the most recently resolved album is the one most likely being looked at"
+        );
+        assert_eq!(waiting[0].art, "https://example.com/a.jpg");
+        assert_eq!(albums_without_pictures_count(&connection).unwrap(), 3);
+        // A round asks for as many as it has room for, never the whole library.
+        assert_eq!(albums_without_pictures(&connection, 2).unwrap().len(), 2);
+
+        // Holding a picture for an album takes it out of the walk, which is what
+        // makes the fill safe to run as often as it likes.
+        crate::art_cache::store(
+            &connection,
+            &root,
+            "c|three",
+            ArtRendition::Thumb,
+            &[0xFF, 0xD8, 0xFF, 0x20, 0x20],
+            "itunes",
+        )
+        .unwrap();
+        assert_eq!(
+            albums_without_pictures(&connection, 10)
+                .unwrap()
+                .iter()
+                .map(|album| album.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b|two", "a|one"]
+        );
+        assert_eq!(albums_without_pictures_count(&connection).unwrap(), 2);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     fn signed_event(keys: &Keys, key: &str, content: serde_json::Value) -> Event {
         EventBuilder::new(Kind::from(COVER_KIND), content.to_string())

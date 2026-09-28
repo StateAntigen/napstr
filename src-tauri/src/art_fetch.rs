@@ -97,6 +97,24 @@ impl ArtFetcher {
         }))
     }
 
+    /// The directory the pictures are kept in, for a caller that has to serve
+    /// them or report on them from a different part of the app.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// How many downloads are queued or running right now.
+    ///
+    /// The fill asks before adding more, so a library's worth of albums is not
+    /// queued in one go: what limits this is the work the fetcher can actually
+    /// do, not the size of the list behind it.
+    pub fn in_flight(&self) -> usize {
+        self.in_flight
+            .lock()
+            .map(|in_flight| in_flight.len())
+            .unwrap_or(0)
+    }
+
     /// Take on the pictures a batch of albums needs, and return at once.
     ///
     /// There is no answer here about whether the bytes arrived: a phone that

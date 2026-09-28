@@ -2225,8 +2225,30 @@ fn set_allowed_art_hosts(
     state.covers.set_allowed_art_hosts(&hosts)
 }
 
-/// The newest cover lookup attempts, newest first, for the Covers tab's log.
+/// Stop or resume the artwork fill, for now.
 ///
+/// Not a stored preference: a pause that outlived its reason would be a cache
+/// that never fills and nothing in the window to say why.
+#[tauri::command]
+fn set_art_fill_paused(
+    paused: bool,
+    state: State<'_, AppState>,
+) -> cover_publish::CoverStatus {
+    state.covers.set_art_fill_paused(paused)
+}
+
+/// Throw the pictures this computer is holding away.
+///
+/// Only the pictures: what it knows about album art, and the log of how it found
+/// out, are untouched, so the cache refills from claims it already has.
+#[tauri::command]
+fn clear_art_cache(
+    state: State<'_, AppState>,
+) -> Result<cover_publish::CoverStatus, String> {
+    state.covers.clear_art_cache()
+}
+
+/// The newest cover lookup attempts, newest first, for the Covers tab's log.///
 /// This exists because a failed lookup used to leave nothing behind but a count:
 /// the reason — a DNS failure, a refusal, an album nobody has art for — was
 /// written nowhere, so an outage and a blank square looked identical.
@@ -2383,6 +2405,9 @@ pub fn run() {
             // artwork flowing without the phone asking for anything.
             covers.start();
             covers.nudge();
+            // ...and the art cache keeps filling in the background, so a library
+            // has pictures to hand over before a phone asks for any of them.
+            covers.start_art_fill();
             let scan_lock = Arc::new(Mutex::new(()));
             let scan_cancel = Arc::new(AtomicBool::new(false));
             *setup_shutdown_services
@@ -2493,6 +2518,8 @@ pub fn run() {
             cover_search_candidates,
             cover_apply_pick,
             set_allowed_art_hosts,
+            set_art_fill_paused,
+            clear_art_cache,
             cover_lookup_log,
             cover_missing,
             report_cover,
