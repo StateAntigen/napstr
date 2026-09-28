@@ -1,8 +1,11 @@
 Release artifacts are no longer copied into the website. The download page discovers the
 versioned installers attached to the latest published GitHub Release.
 
-Create a `v*` tag to run `.github/workflows/release.yml`; the Tauri action builds and attaches
-the Windows installer, Linux AppImage, and architecture-specific macOS community DMGs automatically.
+Create a `v*` tag to run `.github/workflows/release.yml`; it builds and attaches
+the Windows installer, Linux AppImage, and architecture-specific macOS DMGs automatically.
+The macOS release helper signs, notarizes, staples, and verifies the app and DMG
+before uploading the installer and its SHA-256 checksum. Configure the six Apple
+secrets described in [macOS release setup](../../docs/macos-releases.md) first.
 The same tag runs `.github/workflows/napstrfy-desktop.yml` for Napstrfy desktop installers;
 `release.yml` also attaches the Napstrfy Android APK.
 

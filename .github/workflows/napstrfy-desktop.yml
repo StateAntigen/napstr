@@ -11,6 +11,8 @@ on:
       - 'remote-protocol/**'
       - 'static/**'
       - '.github/workflows/napstrfy-desktop.yml'
+      - 'scripts/macos-release.mjs'
+      - 'tests/macos-release.test.mjs'
 
 permissions:
   contents: read
@@ -31,9 +33,11 @@ jobs:
           - name: macOS-Intel
             runner: macos-15-intel
             bundles: app
+            mac_arch: x86_64
           - name: macOS-Apple-Silicon
             runner: macos-15
             bundles: app
+            mac_arch: arm64
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
@@ -47,6 +51,9 @@ jobs:
           cache: npm
           cache-dependency-path: android/package-lock.json
       - uses: dtolnay/rust-toolchain@stable
+      - name: Verify native macOS runner
+        if: runner.os == 'macOS'
+        run: test "$(uname -m)" = '${{ matrix.mac_arch }}'
       - name: Install Linux build and audio dependencies
         if: runner.os == 'Linux'
         run: |
@@ -76,26 +83,39 @@ jobs:
           writeFileSync('src-tauri/tauri.ci.conf.json', JSON.stringify({ version: tag ? tag.slice(1) : config.version }));
           JS
       - name: Build installer
+        if: runner.os != 'macOS'
         env:
           APPIMAGE_EXTRACT_AND_RUN: '1'
           NO_STRIP: '1'
         run: npm run bundle -- --verbose --config src-tauri/tauri.ci.conf.json --bundles '${{ matrix.bundles }}' -- --locked
-      - name: Package macOS DMG
+      - name: Test macOS release helper
         if: runner.os == 'macOS'
+        run: node --test ../tests/macos-release.test.mjs
+      - name: Build community macOS DMG for pull requests
+        if: runner.os == 'macOS' && github.event_name == 'pull_request'
+        run: npm run macos-build
+      - name: Build signed and notarized macOS DMG
+        if: runner.os == 'macOS' && github.event_name != 'pull_request'
+        env:
+          BUILD_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
         run: |
-          # Retry only packaging, without recompiling or skipping verification.
-          # Verbose output exposes hdiutil errors hidden by the default logger.
-          for attempt in 1 2 3; do
-            if npm run tauri -- bundle --verbose --ci --config src-tauri/tauri.ci.conf.json --bundles dmg; then
-              break
-            fi
-            if [[ "$attempt" == 3 ]]; then
-              echo 'Napstrfy DMG packaging failed after three attempts' >&2
-              exit 1
-            fi
-            echo "DMG packaging attempt $attempt failed; retrying in 10 seconds" >&2
-            sleep 10
-          done
+          args=(--ci)
+          if [[ -n "$BUILD_TAG" ]]; then
+            args+=(--tag "$BUILD_TAG")
+          fi
+          npm run macos-build:signed -- "${args[@]}"
+      - name: Always clean macOS signing session
+        if: always() && runner.os == 'macOS'
+        run: |
+          if [[ -f ../scripts/macos-release.mjs ]]; then
+            node ../scripts/macos-release.mjs --app napstrfy --cleanup
+          fi
       - name: Prepare and smoke-test AppImage
         if: runner.os == 'Linux'
         run: |
@@ -112,31 +132,17 @@ jobs:
             echo 'Napstrfy failed its AppImage startup check' >&2
             exit 1
           fi
-      - name: Verify macOS application signature
-        if: runner.os == 'macOS'
-        run: |
-          # A DMG-only build removes the intermediate .app after packaging.
-          # Verify the application users will actually install from the DMG.
-          dmg="$(find src-tauri/target/release/bundle/dmg -maxdepth 1 -name '*.dmg' -print -quit)"
-          if [[ -z "$dmg" ]]; then
-            echo 'Tauri did not produce the expected Napstrfy DMG' >&2
-            exit 1
-          fi
-          mount_point="$(mktemp -d "$RUNNER_TEMP/napstrfy-dmg.XXXXXX")"
-          cleanup_dmg() {
-            hdiutil detach -quiet "$mount_point" >/dev/null 2>&1 || true
-            rmdir "$mount_point" >/dev/null 2>&1 || true
-          }
-          trap cleanup_dmg EXIT
-          hdiutil attach -readonly -nobrowse -mountpoint "$mount_point" "$dmg" >/dev/null
-          app="$mount_point/Napstrfy.app"
-          if [[ ! -f "$app/Contents/MacOS/napstrfy" ]]; then
-            echo 'The finished DMG does not contain the Napstrfy application' >&2
-            exit 1
-          fi
-          codesign --verify --deep --strict --verbose=2 "$app"
       - name: Collect installers and checksums
+        env:
+          MACOS_BUILD_MODE: ${{ github.event_name == 'pull_request' && 'unsigned' || 'signed' }}
         run: |
+          if [[ "$RUNNER_OS" == 'macOS' ]]; then
+            artifacts="src-tauri/target/macos-release/$MACOS_BUILD_MODE"
+            (cd "$artifacts" && shasum -a 256 -c ./*.dmg.sha256)
+            mkdir -p installers
+            cp "$artifacts"/*.dmg "$artifacts"/*.dmg.sha256 installers/
+            exit 0
+          fi
           node --input-type=module <<'JS'
           import { readdirSync, readFileSync, mkdirSync, copyFileSync, writeFileSync } from 'node:fs';
           import { join, basename } from 'node:path';
@@ -200,7 +206,7 @@ jobs:
             cat > "$notes" <<'NOTES'
           Napstr and Napstrfy installers.
 
-          The macOS DMGs are ad-hoc-signed, unnotarized community builds. After the first blocked launch, open System Settings → Privacy & Security and choose Open Anyway.
+          Release macOS DMGs are Developer ID signed, notarized, and stapled. SHA-256 checksums accompany the installers.
           NOTES
             create_args=(release create "$RELEASE_TAG" --verify-tag --draft --title "Napstr $RELEASE_TAG" --notes-file "$notes")
             if [[ "$RELEASE_TAG" == *-* ]]; then
@@ -211,4 +217,4 @@ jobs:
             gh "${create_args[@]}" || gh release view "$RELEASE_TAG" >/dev/null
           fi
           shopt -s nullglob
-          gh release upload "$RELEASE_TAG" installers/*.AppImage installers/*.exe installers/*.dmg --clobber
+          gh release upload "$RELEASE_TAG" installers/*.AppImage installers/*.exe installers/*.dmg installers/*.sha256 --clobber

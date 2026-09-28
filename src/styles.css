@@ -251,6 +251,9 @@ body.resizing-transfer-pane, body.resizing-transfer-pane * { cursor: ns-resize !
 .cover-art-hosts-head span { color: #555; }
 .cover-art-hosts textarea { width: 100%; margin-top: 6px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; resize: vertical; }
 .cover-art-hosts-actions { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 6px; }
+/* The held pictures: same panel as the domain list beside it, because they are
+   two halves of one answer - where art may come from, and what was kept. */
+.cover-art-cache { margin: 4px; padding: 8px 10px; background: #d5d5d5; border: 2px solid; border-color: white #777 #777 white; }
 .cover-gap-panel, .cover-log-panel { margin: 4px; padding: 8px 10px; background: #d5d5d5; border: 2px solid; border-color: white #777 #777 white; }
 .cover-gap-list, .cover-log-list { margin-top: 6px; max-height: 320px; overflow: auto; background: #eee; border: 2px inset white; }
 .cover-gap { padding: 6px 9px; display: grid; grid-template-columns: minmax(0, 1fr) 110px 70px auto; gap: 9px; align-items: center; border-bottom: 1px solid #b0b0b0; }

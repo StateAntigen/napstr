@@ -1,15 +1,16 @@
+mod art_store;
 mod public_http;
 use public_http::{podcast_http_client, safe_public_https_url};
 
 use futures_util::StreamExt;
 use iroh::{endpoint::presets, Endpoint, EndpointAddr, EndpointId, SecretKey};
 use napstr_remote_protocol::{
-    ClientRequest, PairingTicket, PlaybackCommand, RemoteAlbumCover, RemoteAudiobook,
+    ArtRendition, ClientRequest, PairingTicket, PlaybackCommand, RemoteAlbumCover, RemoteAudiobook,
     RemoteAudiobookSummary, RemotePlaybackState, RemotePlaylist, RemotePlaylistCoordinate,
-    RemotePlaylistSummary, RemoteTrack,
-    RemoteTransfer, ServerResponse, ALPN, MAX_CONTROL_FRAME_BYTES, MAX_COVER_KEYS,
-    MAX_PLAYLIST_MEMBERS, MAX_PLAYLIST_PAGE, MAX_PLAY_QUEUE, MAX_QR_SVG_BYTES, MAX_REPORT_NOTE_CHARS,
-    MAX_TRACKS_BY_ID, REPORT_REASONS,
+    RemotePlaylistSummary, RemoteTrack, RemoteTransfer, ServerResponse, ALPN, MAX_ART_KEY_CHARS,
+    MAX_CONTROL_FRAME_BYTES, MAX_COVER_KEYS, MAX_PLAYLIST_MEMBERS, MAX_PLAYLIST_PAGE, MAX_PLAY_QUEUE,
+    MAX_QR_SVG_BYTES, MAX_REPORT_NOTE_CHARS, MAX_TRACKS_BY_ID,
+    REPORT_REASONS,
 };
 use quick_xml::{events::Event, Reader};
 use qrcode::{render::svg, QrCode};
@@ -328,13 +329,17 @@ impl MediaEntry {
 struct MediaServer {
     port: u16,
     token: String,
+    /// Where the artwork this phone holds is served from. The same server as
+    /// audio because it is the same origin and the same token: one local address
+    /// for the window's policy to allow, and one place a picture can come from.
+    art_root: PathBuf,
     entries: RwLock<HashMap<String, Arc<MediaEntry>>>,
     prepare_lock: Mutex<()>,
     scheduled_prefetches: Mutex<HashSet<(String, String)>>,
 }
 
 impl MediaServer {
-    fn start() -> Result<Arc<Self>, String> {
+    fn start(art_root: PathBuf) -> Result<Arc<Self>, String> {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
             .map_err(|error| format!("could not start the private audio player: {error}"))?;
         listener
@@ -348,6 +353,7 @@ impl MediaServer {
         let server = Arc::new(Self {
             port,
             token,
+            art_root,
             entries: RwLock::new(HashMap::new()),
             prepare_lock: Mutex::new(()),
             scheduled_prefetches: Mutex::new(HashSet::new()),
@@ -376,6 +382,58 @@ impl MediaServer {
             "http://127.0.0.1:{}/{}/{}.{}",
             self.port, self.token, track.file_id, extension
         ))
+    }
+
+    /// Where one picture may be drawn from.
+    ///
+    /// The hash is in the address rather than a name the server looks up, so a
+    /// webview caching this address caches something that can never change: a
+    /// different picture is a different hash and therefore a different address.
+    /// The token is in it too, which is why this is minted fresh rather than
+    /// stored anywhere: a new run is a new token.
+    fn art_url(&self, hash: &str) -> String {
+        format!(
+            "http://127.0.0.1:{}/{}/art/{}",
+            self.port, self.token, hash
+        )
+    }
+
+    /// Serve one held picture.
+    async fn serve_art(
+        self: &Arc<Self>,
+        socket: &mut TcpStream,
+        method: &str,
+        hash: &str,
+    ) -> Result<(), String> {
+        // Not held, or not a name this store uses: the same answer either way,
+        // because a caller cannot tell the difference and neither can an
+        // attacker who guessed.
+        let Some(path) = art_store::path(&self.art_root, hash) else {
+            return write_http_error(socket, 404, "Not Found").await;
+        };
+        let Some(mime) = art_store::mime_of(&path) else {
+            return write_http_error(socket, 404, "Not Found").await;
+        };
+        let size = std::fs::metadata(&path)
+            .map_err(|error| error.to_string())?
+            .len();
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {size}\r\nCache-Control: private, max-age=31536000, immutable\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
+        );
+        socket
+            .write_all(headers.as_bytes())
+            .await
+            .map_err(|error| error.to_string())?;
+        if method == "HEAD" {
+            return Ok(());
+        }
+        let mut file = tokio::fs::File::open(&path)
+            .await
+            .map_err(|error| error.to_string())?;
+        tokio::io::copy(&mut file, socket)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(())
     }
 
     async fn entry(&self, file_id: &str) -> Option<Arc<MediaEntry>> {
@@ -439,6 +497,13 @@ impl MediaServer {
             return write_http_error(&mut socket, 404, "Not Found").await;
         }
         let requested = segments.next().ok_or("missing audio ID")?;
+        if requested == "art" {
+            let hash = segments.next().ok_or("missing art hash")?;
+            if segments.next().is_some() {
+                return write_http_error(&mut socket, 404, "Not Found").await;
+            }
+            return self.serve_art(&mut socket, method, hash).await;
+        }
         if segments.next().is_some() {
             return write_http_error(&mut socket, 404, "Not Found").await;
         }
@@ -1456,6 +1521,55 @@ impl RemoteClient {
         Err(last_error)
     }
 
+    /// Fetch one rendition of one album's art from the paired computer.
+    ///
+    /// `None` means the host holds no picture for that album, which is a
+    /// considered answer rather than a failure: art it has not fetched yet is an
+    /// ordinary state, and this phone should keep whatever it already holds until
+    /// the host's cover revision says there is something new.
+    ///
+    /// Read whole rather than streamed to disk, because a picture is small and
+    /// its name is only known once all of it is here: a name this phone cannot
+    /// verify is a name it must not write anything under.
+    async fn fetch_art(
+        &self,
+        key: &str,
+        rendition: ArtRendition,
+    ) -> Result<Option<FetchedArt>, String> {
+        let (response, mut receive) = self
+            .exchange(ClientRequest::FetchArt {
+                key: key.to_string(),
+                rendition,
+            })
+            .await?;
+        let (hash, length) = match response {
+            ServerResponse::ArtReady { hash, length, .. } => (hash, length),
+            ServerResponse::ArtMissing { .. } => return Ok(None),
+            ServerResponse::Error { message } => return Err(message),
+            other => return Err(unexpected_response(&other)),
+        };
+        // The size is the host's word, so it is bounded before anything is
+        // allocated on its account.
+        if length == 0 || length > art_store::MAX_ART_BYTES {
+            return Err("Napstr offered artwork of an impossible size".into());
+        }
+        let mut bytes = Vec::with_capacity(length as usize);
+        while (bytes.len() as u64) < length {
+            let Some(chunk) = receive
+                .read_chunk(256 * 1024)
+                .await
+                .map_err(|error| format!("Iroh artwork stream failed: {error}"))?
+            else {
+                return Err("Napstr stopped sending the artwork".into());
+            };
+            bytes.extend_from_slice(&chunk);
+            if bytes.len() as u64 > length {
+                return Err("Napstr sent more artwork than it announced".into());
+            }
+        }
+        Ok(Some(FetchedArt { hash, bytes }))
+    }
+
     /// True when this pairing may only browse and play, which is what keeps the
     /// phone from offering controls the host would refuse anyway.
     async fn stream_only(&self) -> bool {
@@ -1804,6 +1918,9 @@ struct AppState {
     remote: Arc<RemoteClient>,
     media: Arc<MediaServer>,
     podcasts: Arc<PodcastStore>,
+    /// Where the artwork this phone holds is kept. Shared with the server, which
+    /// is the only thing allowed to hand it out.
+    art_root: PathBuf,
 }
 
 #[tauri::command]
@@ -2116,6 +2233,67 @@ async fn remote_covers(
     state: State<'_, AppState>,
 ) -> Result<Vec<RemoteAlbumCover>, String> {
     companion_covers(&state.remote, keys).await
+}
+
+/// Artwork this phone has just been sent, before it is written down.
+struct FetchedArt {
+    hash: String,
+    bytes: Vec<u8>,
+}
+
+/// Where to draw one rendition of one album's art from, fetching it from the
+/// paired computer if this phone is not holding it yet.
+///
+/// `hash` is what the host said it would serve, as it appears in the cover
+/// answer, and it is what makes a screen of albums cheap: an album this phone
+/// already holds costs no request at all, and one it does not costs a single
+/// transfer. An empty address means there is nothing to draw yet, and the caller
+/// keeps whatever it has.
+#[tauri::command]
+async fn remote_art(
+    key: String,
+    rendition: String,
+    hash: String,
+    state: State<'_, AppState>,
+) -> Result<AlbumArtwork, String> {
+    let rendition = match rendition.as_str() {
+        "thumb" => ArtRendition::Thumb,
+        "full" => ArtRendition::Full,
+        other => return Err(format!("{other} is not a rendition of anything")),
+    };
+    if key.is_empty() || key.chars().count() > MAX_ART_KEY_CHARS {
+        return Err("that is not an album key".into());
+    }
+    // Held already: not one byte crosses the wire, which is the ordinary case
+    // for a screen that is drawn twice.
+    if art_store::path(&state.art_root, &hash).is_some() {
+        return Ok(AlbumArtwork {
+            url: state.media.art_url(&hash),
+            hash,
+        });
+    }
+    let Some(art) = state.remote.fetch_art(&key, rendition).await? else {
+        return Ok(AlbumArtwork {
+            url: String::new(),
+            hash: String::new(),
+        });
+    };
+    // Written only after its hash checks out, and only if it is really an image.
+    art_store::store(&state.art_root, &art.hash, &art.bytes)?;
+    Ok(AlbumArtwork {
+        url: state.media.art_url(&art.hash),
+        hash: art.hash,
+    })
+}
+
+/// The address to draw fetched artwork from, and the name of what is at it.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AlbumArtwork {
+    /// Empty when there is nothing to draw.
+    url: String,
+    /// What this phone now holds for that rendition. Empty with an empty url.
+    hash: String,
 }
 
 /// Cover keys are `trim(artist)|trim(album)`, lowercased, exactly one
@@ -2875,10 +3053,14 @@ pub fn run() {
                 .app_data_dir()
                 .map_err(|error| error.to_string())?;
             let podcasts = PodcastStore::new(&app_data)?;
+            // One path, decided once: the server serves from it and the command
+            // that fetches writes into it.
+            let art_root = app_data.join(art_store::ART_DIRECTORY);
             app.manage(AppState {
                 remote: RemoteClient::new(app_data),
-                media: MediaServer::start()?,
+                media: MediaServer::start(art_root.clone())?,
                 podcasts,
+                art_root,
             });
             Ok(())
         })
@@ -2899,6 +3081,7 @@ pub fn run() {
             remote_withdraw_playlist,
             cached_library,
             remote_covers,
+            remote_art,
             remote_playback_state,
             remote_playback,
             remote_read_only_ticket,
@@ -3118,7 +3301,7 @@ mod tests {
                     pubkey: String::new(),
                 });
                 *remote.connection.write().await = Some(connection);
-                let media = MediaServer::start().unwrap();
+                let media = MediaServer::start(root.join(art_store::ART_DIRECTORY)).unwrap();
                 let playback = remote
                     .cache_audio(track.clone(), media.clone(), true)
                     .await

@@ -1377,6 +1377,12 @@
     stopped: boolean;
     /** One domain per line. Empty means any HTTPS host. */
     allowedArtHosts: string;
+    /** Pictures this computer is holding, and what they take on disk. */
+    artCached: number;
+    artBytes: number;
+    /** Albums whose art is resolved here and whose pictures are not held yet. */
+    artPending: number;
+    artPaused: boolean;
     message: string;
   };
   /** How many albums the Covers tab previews. The worker itself is unbounded. */
@@ -1521,6 +1527,54 @@
     } catch (error) {
       coverError = String(error);
     }
+  }
+
+  /**
+   * Stop or resume fetching pictures, for now.
+   *
+   * A pause rather than a switch: what is already held keeps working, and
+   * nothing about it is remembered past this run, because a pause that outlived
+   * its reason would be a cache that silently never fills.
+   */
+  async function setArtPaused(paused: boolean) {
+    coverError = '';
+    try {
+      coverStatus = await invoke<CoverStatus>('set_art_fill_paused', { paused });
+    } catch (error) {
+      coverError = String(error);
+    }
+  }
+
+  /**
+   * Throw the held pictures away.
+   *
+   * Confirmed, because it is the one control here that takes something away: the
+   * artwork on every paired phone has to come back over Iroh, and on a slow
+   * connection that is not free. What this computer *knows* is untouched, so the
+   * cache refills from claims it already holds.
+   */
+  async function clearArtCache() {
+    if (!window.confirm('Throw away every picture this computer is holding? The artwork on your phones will be fetched again.')) {
+      return;
+    }
+    coverError = '';
+    try {
+      coverStatus = await invoke<CoverStatus>('clear_art_cache');
+      // The phones are holding pictures keyed by hashes that are about to be
+      // handed out again from scratch, so they are told to ask again.
+      lastCoverRevisionAt = 0;
+      refreshCoverArtwork();
+    } catch (error) {
+      coverError = String(error);
+    }
+  }
+
+  /** A size a person can read, for the cache's own numbers. */
+  function readableBytes(bytes: number) {
+    if (bytes >= 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+    if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+    if (bytes >= 1024) return `${Math.round(bytes / 1024)} kB`;
+    return `${bytes} B`;
   }
 
   /** Skip the wait: ask the worker to look at whatever is new right now. */
@@ -3923,6 +3977,30 @@
             </div>
             <p class="privacy-note wide"><span>i</span> {"Empty means any HTTPS host, which is what every library had before this list existed. With a list, art is drawn only when it is served from one of these domains or a subdomain of one — somebody else's published claim, art this computer looked up, and a link you paste here, which is refused outright if its host is not listed. It is a filter, not a boundary: the person who sets it is the person it protects, and the real answer is the trust model the cover NIP is heading for."}</p>
           </div>
+
+          <!--
+            The pictures themselves: how many, how much disk, and how many albums
+            are still waiting for theirs. This is the half of the feature a phone
+            sees, and until now it had no window onto it at all - a cache filling
+            in the background, and no way to tell whether it was working or how
+            much it had cost. The numbers are the host's, read at most every few
+            seconds.
+          -->
+          {#if coverStatus}
+            <div class="cover-art-cache">
+              <div class="cover-art-hosts-head">
+                <label for="cover-art-cache">{'Artwork this computer holds'}</label>
+                <span>{coverStatus.artCached} {coverStatus.artCached === 1 ? 'picture' : 'pictures'}{", "}{readableBytes(coverStatus.artBytes)}{", for "}{coverStatus.artPending} {coverStatus.artPending === 1 ? 'album' : 'albums'}{" still to fetch. Paired phones are sent these bytes over the pairing, so they never ask a publisher about themselves."}</span>
+              </div>
+              <div id="cover-art-cache" class="cover-art-hosts-actions">
+                <button class="classic-button" onclick={() => void setArtPaused(!coverStatus?.artPaused)}>
+                  {coverStatus.artPaused ? 'Resume fetching' : 'Pause fetching'}
+                </button>
+                <button class="classic-button" disabled={coverStatus.artCached === 0} onclick={() => void clearArtCache()}>{'Clear the held pictures'}</button>
+              </div>
+              <p class="privacy-note wide"><span>i</span> {"Fetching happens on a schedule of its own, two downloads at a time, and stops with the lookups switch above — a picture means contacting whichever host the claim names. Nothing here is the only copy: every picture can be fetched again from art this computer has already resolved, so clearing them costs time rather than anything that was found. Oldest-used pictures are dropped first when the cache reaches half a gigabyte, so art for albums you actually look at outlives art for albums you only scrolled past."}</p>
+            </div>
+          {/if}
 
           {#if coverError}<div class="trollbox-error">{coverError}</div>{/if}
 

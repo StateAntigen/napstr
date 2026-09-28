@@ -1,21 +1,24 @@
 import { test, expect } from '@playwright/test';
 import { mockNative, serveAudio } from './helpers/native.mjs';
+import { artHashes, heldArtUrl, refusePublisherArtwork, serveHeldArtwork } from './helpers/artwork.mjs';
 
 // The host answers an album query by name, because the companion protocol has no
 // album-level artist field to ask with. These tests pin down what the phone is
 // entitled to do with that answer.
 const id = (letter) => letter.repeat(64);
-// A 1x1 PNG, so the header's two renditions are real images to the browser.
-const tinyPng = Buffer.from(
-  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==',
-  'base64'
-);
-const coverThumb = 'https://example.com/cover-thumb.jpg';
-const coverFull = 'https://example.com/cover-full.jpg';
 const track = (letter, title, artist, album, local = true) => ({
   fileId: id(letter), filename: `${title}.wav`, title, artist, album,
   format: 'WAV', mime: 'audio/wav', size: 1234567, tags: '', local, sources: []
 });
+
+// The album's two renditions, as the host names them and as this phone serves
+// them. Everything drawn here is drawn from the second pair; the first pair is
+// what the claim came with, and no test lets anything reach it.
+const coverHashes = artHashes('zz top|greatest hits');
+const coverThumb = heldArtUrl(coverHashes.thumb);
+const coverFull = heldArtUrl(coverHashes.full);
+const publisherThumb = 'https://example.com/cover-thumb.jpg';
+const publisherFull = 'https://example.com/cover-full.jpg';
 
 // "Doubleback" is on ZZ Top's Greatest Hits. Linkin Park and Will Smith have
 // albums of that name too, which is how the two ended up in one view.
@@ -32,29 +35,27 @@ const likedSong = track('f', 'Liked song', 'Artist', '');
 // The cover carries the year, and it arrives in the same batch as the album's
 // tracks, so its appearance is how this test knows the host has answered.
 const albumCover = {
-  key: 'zz top|greatest hits', art: coverFull, thumb: coverThumb, mbid: '',
+  key: 'zz top|greatest hits', art: publisherFull, thumb: publisherThumb,
+  artHash: coverHashes.full, thumbHash: coverHashes.thumb, mbid: '',
   year: '1979', genre: '', collection: '', source: 'manual', coverFileId: '', mime: '',
   author: '', eventId: '', createdAt: 0, seeder: false
 };
 
 async function openApp(page, { library = [], album = null, cached = null, likes = null, platform = 'linux', holdFullCover = false, recordMedia = false } = {}) {
-  // A test that needs the full rendition still in flight holds it there, rather
-  // than racing the clock: the player bar fetches that same image, so a delay
-  // can expire before the drawer that is being tested is even open.
-  let releaseFullCover = () => {};
-  const fullCoverGate = holdFullCover ? new Promise((resolve) => { releaseFullCover = resolve; }) : null;
   await mockNative(page, { platform });
   await page.route('**/fixture.wav', serveAudio);
-  // Registered after the blanket https route, so it wins for the covers. The
-  // full rendition is held back to leave the thumbnail on screen on its own.
-  await page.route(coverThumb, (route) => route.fulfill({ contentType: 'image/png', body: tinyPng }));
-  await page.route(coverFull, async (route) => {
-    if (fullCoverGate) await fullCoverGate;
-    else await new Promise((resolve) => setTimeout(resolve, 400));
-    await route.fulfill({ contentType: 'image/png', body: tinyPng });
-  });
-  await page.addInitScript(({ library, album, cover, cached, likes, recordMedia }) => {
+  await serveHeldArtwork(page);
+  // Every address the claim came with is refused, so a build that drew from one
+  // would show a placeholder rather than pass by fetching it.
+  await refusePublisherArtwork(page, [publisherThumb, publisherFull]);
+  await page.addInitScript(({ library, album, cover, cached, likes, recordMedia, holdFullCover }) => {
     if (likes) window.localStorage.setItem('napstrfy-liked-music', JSON.stringify(likes));
+    // A test that needs the full rendition still on its way holds it at the host
+    // rather than racing the clock: the player bar asks for that same picture, so
+    // a delay can expire before the drawer under test is even open. Held here
+    // rather than in a route because this is the fetch the phone makes, which is
+    // what the test is about.
+    window.holdFullCover = holdFullCover;
     if (recordMedia) {
       // The media service is not in the browser either: keep what it is told, so a
       // test can watch the lock screen's artwork arrive and then be replaced.
@@ -78,12 +79,19 @@ async function openApp(page, { library = [], album = null, cached = null, likes 
         return { tracks: album, total: album.length };
       }
       if (album && cmd === 'remote_covers') return [cover];
+      if (cmd === 'remote_art') {
+        // What the host hands over is the bytes; the address is this phone's.
+        if (args.rendition === 'full') {
+          while (window.holdFullCover) await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        return { url: `${location.origin}/test-token/art/${args.hash}`, hash: args.hash };
+      }
       if (cmd === 'remote_library' && !args.query) return { tracks: library, total: library.length };
       return invoke(cmd, args);
     };
-  }, { library, album, cover: albumCover, cached, likes, recordMedia });
+  }, { library, album, cover: albumCover, cached, likes, recordMedia, holdFullCover });
   await page.goto('http://127.0.0.1:15174');
-  return { releaseFullCover };
+  return { releaseFullCover: () => page.evaluate(() => { window.holdFullCover = false; }) };
 }
 
 /** The liked page is only reachable from the chip on the search tab. */
@@ -176,7 +184,7 @@ test('Napstrfy draws the player bar and the cover stretched behind it from the t
   const bar = await page.locator('.now-playing').getAttribute('style');
   expect(bar).toContain(coverThumb);
   expect(bar).not.toContain(coverFull);
-  releaseFullCover();
+  await releaseFullCover();
 });
 
 test('Napstrfy gives the lock screen the thumbnail, then the full cover once it has landed', async ({ page }) => {
@@ -188,7 +196,7 @@ test('Napstrfy gives the lock screen the thumbnail, then the full cover once it 
   // What the lock screen is given while the bigger rendition is on its way is the
   // one already on this phone.
   await expect.poll(artwork).toBe(coverThumb);
-  releaseFullCover();
+  await releaseFullCover();
   // The full cover takes its place as soon as it has loaded, which the media
   // service takes as a new URL for the same art.
   await expect.poll(artwork).toBe(coverFull);
@@ -242,8 +250,10 @@ test('Napstrfy opens an album on its thumbnail and fades the full cover in over 
   const glowStyle = await page.locator('.album-glow').getAttribute('style');
   expect(glowStyle).toContain(coverThumb);
   expect(glowStyle).not.toContain(coverFull);
+  // Opening the album is what asks the host for the full-size picture, and the
+  // layer over the thumbnail appears once there is one to fade in.
   const full = page.locator('.album-art-full');
-  await expect(full).not.toHaveClass(/ready/);
+  await expect(full).toHaveAttribute('src', coverFull);
   await expect(full).toHaveClass(/ready/);
 });
 
@@ -256,10 +266,12 @@ test('Napstrfy opens the now-playing drawer on the thumbnail rather than a blank
   const thumb = page.locator('.now-sheet-art img.now-sheet-art-thumb');
   const full = page.locator('.now-sheet-art img.now-sheet-art-full');
   // The tile that was tapped fetched the small rendition, so the drawer is a
-  // cover from its first frame while the full one is still on its way.
+  // cover from its first frame while the full one is still on its way: there is
+  // no layer to fade in until the host has handed the bigger picture over.
   await expect(thumb).toHaveAttribute('src', coverThumb);
-  await expect(full).not.toHaveClass(/ready/);
-  releaseFullCover();
+  await expect(full).toHaveCount(0);
+  await releaseFullCover();
+  await expect(full).toHaveAttribute('src', coverFull);
   await expect(full).toHaveClass(/ready/);
   // The backdrop is blurred too far to show a bigger image, so it takes the
   // small rendition rather than making a second request for the large one.

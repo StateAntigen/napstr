@@ -5,11 +5,12 @@ use crate::{
 };
 use chrono::Utc;
 use iroh::{endpoint::presets, Endpoint, SecretKey};
+use crate::art_fetch::ArtWant;
 use napstr_remote_protocol::{
-    ClientRequest, CoverReportResult, PairingTicket, PlaybackCommand, RemoteAlbumCover,
+    ArtRendition, ClientRequest, CoverReportResult, PairingTicket, PlaybackCommand, RemoteAlbumCover,
     RemoteAudiobook, RemoteAudiobookSummary, RemoteSource, RemoteTrack, RemoteTransfer,
-    ServerResponse, ALPN, MAX_CONTROL_FRAME_BYTES, MAX_COVER_KEYS, MAX_PAGE_SIZE, MAX_PLAYLIST_PAGE,
-    MAX_PLAY_QUEUE, MAX_POSITION_MS, MAX_TRACKS_BY_ID, PROTOCOL_VERSION,
+    ServerResponse, ALPN, MAX_ART_KEY_CHARS, MAX_CONTROL_FRAME_BYTES, MAX_COVER_KEYS, MAX_PAGE_SIZE,
+    MAX_PLAYLIST_PAGE, MAX_PLAY_QUEUE, MAX_POSITION_MS, MAX_TRACKS_BY_ID, PROTOCOL_VERSION,
 };
 use qrcode::{render::svg, QrCode};
 use rusqlite::{params, OptionalExtension};
@@ -27,6 +28,11 @@ const PAIRING_LIFETIME_SECONDS: i64 = 5 * 60;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How much art travels per frame. Smaller than the audio chunk on purpose: art
+/// is tens of kilobytes, so this is one frame for a thumbnail and a handful for
+/// a full rendition, and a smaller frame keeps a slow link from holding a large
+/// buffer between permission checks.
+const ART_CHUNK_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -80,6 +86,10 @@ struct MusicLibraryCache {
 
 pub struct MobileService {
     db_path: PathBuf,
+    /// Where the art this service hands to phones lives. The app's cache
+    /// directory, because these bytes are evictable by design: every one of them
+    /// can be fetched again, and a person must be able to clear them.
+    art_root: PathBuf,
     key_path: PathBuf,
     network: Arc<crate::network::NetworkService>,
     /// The cover worker, so a phone's own results join the queue the window
@@ -103,6 +113,7 @@ impl MobileService {
     pub fn new(
         db_path: PathBuf,
         app_data: PathBuf,
+        art_root: PathBuf,
         network: Arc<crate::network::NetworkService>,
         covers: Arc<CoverPublisher>,
         playback: Arc<crate::playback_bridge::PlaybackBridge>,
@@ -110,6 +121,7 @@ impl MobileService {
         initialise_schema(&db_path)?;
         Ok(Arc::new(Self {
             db_path,
+            art_root,
             key_path: app_data.join("iroh-identity"),
             network,
             covers,
@@ -909,14 +921,109 @@ impl MobileService {
                 // see the art this computer resolved for itself, exactly as the
                 // desktop's own window does. Reporting one of those is refused
                 // by `report_cover`, because there is no claim to report.
-                let covers = self
-                    .network
-                    .best_known_covers(keys)
-                    .await?
-                    .into_iter()
-                    .map(remote_album_cover)
-                    .collect();
-                write_response(send, &ServerResponse::AlbumCovers { covers }).await
+                let covers = self.network.best_known_covers(keys).await?;
+                // ...and the part that makes a phone private: the hashes of the
+                // pictures this computer can hand over, which is what it draws
+                // from now. A rendition it is not holding yet is answered with
+                // no hash, which is not a failure - the claim's own URL stays on
+                // the cover, so the phone can tell "no art exists" from "this
+                // computer has not fetched it yet" and keep the copy it already
+                // has until the bytes arrive and the cover revision moves.
+                let connection = open_connection(&self.db_path)?;
+                let mut answer = Vec::with_capacity(covers.len());
+                for cover in covers {
+                    let mut remote = remote_album_cover(cover);
+                    let (full, thumb) =
+                        cached_art_hashes(&connection, &self.art_root, &remote.key)?;
+                    // A hash is only ever reported for a picture this computer
+                    // is still willing to show. The domain list already decided
+                    // that `art` and `thumb` survive, and the bytes behind a
+                    // hash are held to the same promise.
+                    remote.art_hash = if remote.art.is_empty() {
+                        String::new()
+                    } else {
+                        full
+                    };
+                    remote.thumb_hash = if remote.thumb.is_empty() {
+                        String::new()
+                    } else {
+                        thumb
+                    };
+                    // ...and, having just been asked about exactly these
+                    // albums, this is the moment to go and get the pictures that
+                    // are missing. It is bounded and deduped by the fetcher, so a
+                    // phone opening a screen is a small number of downloads
+                    // rather than a small number of requests per album, and the
+                    // answer above goes out without waiting for any of them.
+                    answer.push(remote);
+                }
+                self.covers.ensure_art(
+                    &answer
+                        .iter()
+                        .map(|cover| ArtWant {
+                            key: &cover.key,
+                            art: &cover.art,
+                            thumb: &cover.thumb,
+                            source: &cover.source,
+                        })
+                        .collect::<Vec<_>>(),
+                );
+                write_response(send, &ServerResponse::AlbumCovers { covers: answer }).await
+            }
+            ClientRequest::FetchArt { key, rendition } => {
+                if key.is_empty() || key.chars().count() > MAX_ART_KEY_CHARS {
+                    return Err("Invalid art request".into());
+                }
+                let connection = open_connection(&self.db_path)?;
+                let Some(art) =
+                    crate::art_cache::lookup(&connection, &self.art_root, &key, rendition)?
+                else {
+                    // A considered answer, not an error: a phone may ask about an
+                    // album this computer has not fetched art for yet, and the
+                    // right thing for it to do is paint its placeholder and ask
+                    // again when the cover revision moves.
+                    return write_response(send, &ServerResponse::ArtMissing { key }).await;
+                };
+                // Handing them out is what "used" means, and it is what eviction
+                // orders by — so a library's own art outlives art for albums this
+                // computer merely browsed past.
+                let _ = crate::art_cache::touch(&connection, &key, rendition);
+                write_response(
+                    send,
+                    &ServerResponse::ArtReady {
+                        key: key.clone(),
+                        rendition,
+                        hash: art.hash.clone(),
+                        mime: art.mime.clone(),
+                        length: art.bytes,
+                    },
+                )
+                .await?;
+                let mut file = tokio::fs::File::open(&art.path)
+                    .await
+                    .map_err(|error| format!("could not open the artwork: {error}"))?;
+                let mut buffer = vec![0u8; ART_CHUNK_BYTES];
+                loop {
+                    // Asked again for every chunk, exactly as audio is: a pairing
+                    // that is revoked mid-transfer stops at the next frame rather
+                    // than at the end of the file.
+                    check_request_permission(
+                        self.authorise(remote_id)?,
+                        &ClientRequest::FetchArt {
+                            key: key.clone(),
+                            rendition,
+                        },
+                    )?;
+                    let count = file
+                        .read(&mut buffer)
+                        .await
+                        .map_err(|error| format!("could not read the artwork: {error}"))?;
+                    if count == 0 {
+                        break;
+                    }
+                    write_bytes(send, &buffer[..count]).await?;
+                }
+                Ok(())
             }
             ClientRequest::Status => {
                 write_response(
@@ -1109,6 +1216,10 @@ fn check_request_permission(stream_only: bool, request: &ClientRequest) -> Resul
         // Which playlists hold a file is one more way of reading a playlist.
         | ClientRequest::PlaylistsContaining { .. }
         | ClientRequest::AlbumCovers { .. }
+        // Art is a read, and a phone lent read-only access should see covers:
+        // the bytes come from this computer, so this reveals nothing the phone
+        // could not already ask for by key.
+        | ClientRequest::FetchArt { .. }
         // Seeing what the computer is playing is not a way of changing it.
         | ClientRequest::PlaybackState
         | ClientRequest::Status
@@ -1179,6 +1290,22 @@ fn bounded_playback(command: PlaybackCommand) -> Result<PlaybackCommand, String>
     }
 }
 
+/// The hashes of the art this computer is holding for an album: the full
+/// rendition first, the smaller one second. Either is empty when that rendition
+/// has not been fetched here yet.
+fn cached_art_hashes(
+    connection: &rusqlite::Connection,
+    root: &std::path::Path,
+    key: &str,
+) -> Result<(String, String), String> {
+    let hash = |rendition| -> Result<String, String> {
+        Ok(crate::art_cache::lookup(connection, root, key, rendition)?
+            .map(|art| art.hash)
+            .unwrap_or_default())
+    };
+    Ok((hash(ArtRendition::Full)?, hash(ArtRendition::Thumb)?))
+}
+
 /// Trim the host's bookkeeping (event ids, timestamps) from a resolved cover
 /// before it crosses the wire.
 fn remote_album_cover(cover: crate::network::AlbumCover) -> RemoteAlbumCover {
@@ -1186,6 +1313,8 @@ fn remote_album_cover(cover: crate::network::AlbumCover) -> RemoteAlbumCover {
         key: cover.key,
         art: cover.art,
         thumb: cover.thumb,
+        art_hash: String::new(),
+        thumb_hash: String::new(),
         mbid: cover.mbid,
         year: cover.year,
         genre: cover.genre,

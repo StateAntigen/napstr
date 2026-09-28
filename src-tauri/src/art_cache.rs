@@ -1,0 +1,747 @@
+//! Album art bytes, held by the computer that fetched them.
+//!
+//! The claims in `cover.rs` carry URLs; this holds the pictures those URLs point
+//! at, so a paired phone can be handed pixels instead of an address. Before this
+//! existed, the phone asked the host *which* art an album had and then fetched
+//! the pixels itself, which told `is1-ssl.mzstatic.com` and
+//! `coverartarchive.org` the phone's address and the album it was looking at.
+//!
+//! Two properties shape everything here:
+//!
+//! * **Content-addressed.** A file is named by the SHA-256 of its own bytes, so
+//!   storing one cover twice costs one file, a cover that changes becomes a
+//!   different file rather than a stale one, and the phone can verify what it was
+//!   sent without being told what to expect. Two albums with identical art — a
+//!   single and the album it came from — share one file.
+//! * **Validated on the way in.** What a URL claims to be and what its bytes are
+//!   need not agree, and these bytes are served to a webview from a local
+//!   address. The magic bytes decide the mime, and anything that is not an image
+//!   is refused rather than cached. A file the cache serves therefore can never
+//!   be something other than what it says it is.
+//!
+//! Nothing here fetches. The pass that fills the cache lives with the cover
+//! worker, which already knows which albums are worth asking about and how to be
+//! polite to the services that answer.
+
+use crate::cover::COVER_REVISION_TABLE;
+use napstr_remote_protocol::ArtRendition;
+use rusqlite::{params, Connection, OptionalExtension};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
+
+/// The directory the bytes live in, under the app's cache directory.
+pub const ART_DIRECTORY: &str = "art";
+
+/// How much art this computer will keep, in bytes.
+///
+/// A cache with no ceiling grows with every album anybody ever browsed, and this
+/// one is a means rather than an end: it holds pictures for a phone. Half a
+/// gigabyte is around two thousand full-size sleeves, which is more than a person
+/// browses in a session and far less than a disk filling up unnoticed.
+pub const ART_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
+
+/// How many entries one eviction step removes.
+///
+/// Chunked rather than one at a time because the directory is swept once at the
+/// end: dropping row by row would walk every picture on disk for each entry it
+/// removed, which on a full cache is minutes of work instead of a moment.
+const EVICT_CHUNK: usize = 256;
+
+/// One rendition of one album's art, as it sits on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedArt {
+    /// Lowercase SHA-256 of the bytes, which is also the file's name.
+    pub hash: String,
+    pub mime: String,
+    pub bytes: u64,
+    pub path: PathBuf,
+}
+
+/// What the cache is holding, for the Covers view.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtCacheStats {
+    /// Rows, which is renditions of albums rather than files: two albums sharing
+    /// a picture are two entries and one file.
+    pub entries: usize,
+    /// Files on disk.
+    pub files: usize,
+    pub bytes: u64,
+}
+
+/// The table that maps an album and a rendition to the bytes that answer it.
+///
+/// `used_at` is what eviction orders by, and `source` is kept so the Covers view
+/// can say where a picture came from rather than only that it exists.
+///
+/// This also owns the half of the cover revision that says "the pictures this
+/// computer can serve have moved", declared here rather than moved by callers
+/// for the same reason the rest of the schema does it with triggers: a phone
+/// re-asks for art it was told was missing when the revision moves, and a write
+/// path that forgets to move it is a phone that never sees the art. Only a
+/// different picture moves it — touching `used_at` and re-storing identical
+/// bytes are not news to anybody.
+pub fn initialise_schema(connection: &Connection) -> Result<(), String> {
+    connection
+        .execute_batch(&format!(
+            "CREATE TABLE IF NOT EXISTS art_cache (
+               cover_key TEXT NOT NULL,
+               rendition TEXT NOT NULL,
+               hash TEXT NOT NULL,
+               mime TEXT NOT NULL,
+               bytes INTEGER NOT NULL,
+               source TEXT NOT NULL DEFAULT '',
+               fetched_at TEXT NOT NULL,
+               used_at TEXT NOT NULL,
+               PRIMARY KEY(cover_key, rendition)
+             );
+             CREATE INDEX IF NOT EXISTS art_cache_used ON art_cache(used_at);
+             CREATE INDEX IF NOT EXISTS art_cache_hash ON art_cache(hash);
+             {COVER_REVISION_TABLE}
+             CREATE TRIGGER IF NOT EXISTS art_cache_cover_revision
+             AFTER INSERT ON art_cache BEGIN
+               UPDATE cover_state SET revision = revision + 1 WHERE id = 1;
+             END;
+             CREATE TRIGGER IF NOT EXISTS art_cache_cover_revision_changed
+             AFTER UPDATE OF hash ON art_cache
+             WHEN old.hash <> new.hash BEGIN
+               UPDATE cover_state SET revision = revision + 1 WHERE id = 1;
+             END;"
+        ))
+        .map_err(|error| error.to_string())
+}
+
+/// The mime these bytes really are, from their own first bytes.
+///
+/// Only the formats a cover is published in: JPEG because the Cover Art Archive
+/// and Apple both serve it, PNG because the archive holds some scans as PNG, and
+/// WebP because it is what a smaller rendition is likely to be. `None` means
+/// "not a picture", and the caller refuses it.
+pub fn image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        return Some("image/png");
+    }
+    // WebP is `RIFF` + four length bytes + `WEBP`, so the tag is not at the
+    // start and the length has to be skipped over.
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    None
+}
+
+/// The file suffix a mime gets. Only ever chosen by [`image_mime`], so the
+/// fallback is unreachable rather than a guess.
+fn extension_for(mime: &str) -> &'static str {
+    match mime {
+        "image/png" => "png",
+        "image/webp" => "webp",
+        _ => "jpg",
+    }
+}
+
+/// The `rendition` column's value for a rendition.
+pub fn rendition_name(rendition: ArtRendition) -> &'static str {
+    match rendition {
+        ArtRendition::Thumb => "thumb",
+        ArtRendition::Full => "full",
+    }
+}
+
+/// Keep these bytes for one album's rendition, and say where they are.
+///
+/// Idempotent: the file is named by the hash of its own bytes, so storing the
+/// same picture again writes nothing and leaves the row where it was. If the
+/// album's art has changed, the row moves to the new hash and the old file is
+/// removed when nothing else points at it.
+pub fn store(
+    connection: &Connection,
+    root: &Path,
+    key: &str,
+    rendition: ArtRendition,
+    bytes: &[u8],
+    source: &str,
+) -> Result<CachedArt, String> {
+    let mime = image_mime(bytes)
+        .ok_or_else(|| "those bytes are not an image this cache will hold".to_string())?;
+    let hash = hex::encode(Sha256::digest(bytes));
+    let path = root.join(format!("{hash}.{}", extension_for(mime)));
+    // The mime of the row being replaced is kept so the file it named can be
+    // removed by name rather than by walking the directory looking for it.
+    let previous: Option<(String, String)> = connection
+        .query_row(
+            "SELECT hash, mime FROM art_cache WHERE cover_key=?1 AND rendition=?2",
+            params![key, rendition_name(rendition)],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+
+    if !path.exists() {
+        std::fs::create_dir_all(root).map_err(|error| error.to_string())?;
+        // Written under a temporary name and moved into place, so a file that
+        // exists is always a whole picture: an interrupted write cannot leave a
+        // half-sized file that the cache then serves.
+        let staging = root.join(format!("{hash}.part"));
+        std::fs::write(&staging, bytes).map_err(|error| error.to_string())?;
+        std::fs::rename(&staging, &path).map_err(|error| error.to_string())?;
+    }
+
+    let now = chrono::Utc::now().to_rfc3339();
+    connection
+        .execute(
+            "INSERT INTO art_cache(cover_key,rendition,hash,mime,bytes,source,fetched_at,used_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?7)
+             ON CONFLICT(cover_key,rendition) DO UPDATE SET
+               hash=excluded.hash, mime=excluded.mime, bytes=excluded.bytes,
+               source=excluded.source, fetched_at=excluded.fetched_at, used_at=excluded.used_at",
+            params![
+                key,
+                rendition_name(rendition),
+                hash,
+                mime,
+                bytes.len() as i64,
+                source,
+                now
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+
+    if let Some((hash, mime)) = previous.filter(|(previous, _)| *previous != hash) {
+        drop_picture(connection, root, &hash, &mime)?;
+    }
+    Ok(CachedArt {
+        hash,
+        mime: mime.to_string(),
+        bytes: bytes.len() as u64,
+        path,
+    })
+}
+
+/// The bytes held for one album's rendition, if they are still there.
+///
+/// A row whose file has been deleted behind the cache's back — someone emptied
+/// the directory, or a disk was cleaned by hand — is removed as it is found and
+/// answered as absent. Clearing the cache is a supported action, so finding it
+/// already clear must not be an error a caller has to handle.
+pub fn lookup(
+    connection: &Connection,
+    root: &Path,
+    key: &str,
+    rendition: ArtRendition,
+) -> Result<Option<CachedArt>, String> {
+    let row: Option<(String, String, i64)> = connection
+        .query_row(
+            "SELECT hash,mime,bytes FROM art_cache WHERE cover_key=?1 AND rendition=?2",
+            params![key, rendition_name(rendition)],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some((hash, mime, bytes)) = row else {
+        return Ok(None);
+    };
+    let path = root.join(format!("{hash}.{}", extension_for(&mime)));
+    if !path.exists() {
+        connection
+            .execute(
+                "DELETE FROM art_cache WHERE cover_key=?1 AND rendition=?2",
+                params![key, rendition_name(rendition)],
+            )
+            .map_err(|error| error.to_string())?;
+        return Ok(None);
+    }
+    Ok(Some(CachedArt {
+        hash,
+        mime,
+        bytes: bytes.max(0) as u64,
+        path,
+    }))
+}
+
+/// Note that these bytes were just used, which is what eviction orders by.
+pub fn touch(
+    connection: &Connection,
+    key: &str,
+    rendition: ArtRendition,
+) -> Result<(), String> {
+    connection
+        .execute(
+            "UPDATE art_cache SET used_at=?3 WHERE cover_key=?1 AND rendition=?2",
+            params![
+                key,
+                rendition_name(rendition),
+                chrono::Utc::now().to_rfc3339()
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// Forget everything. Returns how many entries went.
+///
+/// This is what "clear the artwork" means: the rows and the files, not one or the
+/// other. Clearing is a supported action rather than a repair, so it has to leave
+/// nothing behind that a later read could serve.
+pub fn clear(connection: &Connection, root: &Path) -> Result<usize, String> {
+    let removed = connection
+        .execute("DELETE FROM art_cache", [])
+        .map_err(|error| error.to_string())?;
+    // The directory is this cache's own, so removing it outright is what
+    // guarantees nothing survives that no row points at.
+    let _ = std::fs::remove_dir_all(root);
+    Ok(removed)
+}
+
+/// Bring the cache back inside its budget, least recently used first.
+///
+/// Ordering is by [`touch`], so what a phone has actually been shown is what
+/// survives. Art fetched for an album nobody then looked at goes first, which is
+/// the art this computer spent a request on and got nothing back for — and art
+/// for an album being browsed right now is at the other end of the order, because
+/// serving it is what moves it there. Files are shared between albums, so a
+/// picture only goes when the last row naming it has.
+///
+/// Exactly as much is removed as the budget needs: a cache is not emptied because
+/// it is a kilobyte over. The rows to drop are decided first and then deleted in
+/// batches, so a full cache takes a handful of statements rather than thousands.
+pub fn evict_to_budget(connection: &Connection, root: &Path, budget: u64) -> Result<usize, String> {
+    let mut held = held_bytes(connection)?;
+    if held <= budget {
+        return Ok(0);
+    }
+    let oldest: Vec<(i64, i64)> = connection
+        .prepare("SELECT rowid, bytes FROM art_cache ORDER BY used_at ASC")
+        .map_err(|error| error.to_string())?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    let mut doomed = Vec::new();
+    for (rowid, bytes) in oldest {
+        if held <= budget {
+            break;
+        }
+        doomed.push(rowid);
+        held = held.saturating_sub(bytes.max(0) as u64);
+    }
+    if doomed.is_empty() {
+        return Ok(0);
+    }
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    let mut removed = 0usize;
+    for chunk in doomed.chunks(EVICT_CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        removed += transaction
+            .execute(
+                &format!("DELETE FROM art_cache WHERE rowid IN ({placeholders})"),
+                rusqlite::params_from_iter(chunk.iter().copied()),
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    transaction.commit().map_err(|error| error.to_string())?;
+    remove_unreferenced_files(connection, root)?;
+    Ok(removed)
+}
+
+/// What the rows say the cache is holding, which is what a budget is about.
+fn held_bytes(connection: &Connection) -> Result<u64, String> {
+    let held: i64 = connection
+        .query_row("SELECT COALESCE(SUM(bytes),0) FROM art_cache", [], |row| {
+            row.get(0)
+        })
+        .map_err(|error| error.to_string())?;
+    Ok(held.max(0) as u64)
+}
+
+/// What the cache is holding.
+///
+/// The file count is read from the directory rather than from the table,
+/// because the difference between the two is exactly what a person clearing the
+/// cache by hand would cause, and the Covers view should not lie about it.
+pub fn stats(connection: &Connection, root: &Path) -> Result<ArtCacheStats, String> {
+    let (entries, bytes): (i64, i64) = connection
+        .query_row(
+            "SELECT COUNT(*), COALESCE(SUM(bytes),0) FROM art_cache",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|error| error.to_string())?;
+    let files = std::fs::read_dir(root)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| entry.path().is_file())
+                .count()
+        })
+        .unwrap_or(0);
+    Ok(ArtCacheStats {
+        entries: entries.max(0) as usize,
+        files,
+        bytes: bytes.max(0) as u64,
+    })
+}
+
+/// Remove one picture's file once no entry points at it any more.
+///
+/// Two albums can share one sleeve, so the file may only go when the last row
+/// naming it has. The extension comes from the mime the row was written with, so
+/// the file is named rather than looked for: this runs on every replacement, and
+/// walking a directory of thousands of pictures to find one of them is the whole
+/// cost of a fill.
+fn drop_picture(connection: &Connection, root: &Path, hash: &str, mime: &str) -> Result<(), String> {
+    let referenced: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM art_cache WHERE hash=?1)",
+            params![hash],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if referenced {
+        return Ok(());
+    }
+    let _ = std::fs::remove_file(root.join(format!("{hash}.{}", extension_for(mime))));
+    Ok(())
+}
+
+/// Remove every file no row names any more, in one pass over the directory.
+///
+/// For the operations that drop many rows at once: after an eviction, asking
+/// what is still referenced is one query, and the sweep is one walk.
+fn remove_unreferenced_files(connection: &Connection, root: &Path) -> Result<usize, String> {
+    let referenced: HashSet<String> = connection
+        .prepare("SELECT DISTINCT hash FROM art_cache")
+        .map_err(|error| error.to_string())?
+        .query_map([], |row| row.get(0))
+        .map_err(|error| error.to_string())?
+        .collect::<Result<HashSet<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Ok(0);
+    };
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let named = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|stem| referenced.contains(stem));
+        if !named && path.is_file() && std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cover::cover_revision;
+
+    /// A directory of its own per test, so nothing depends on the order tests
+    /// run in. Removed by the test that made it.
+    fn scratch(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("napstr-art-cache-{name}"));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn database() -> Connection {
+        let connection = Connection::open_in_memory().unwrap();
+        initialise_schema(&connection).unwrap();
+        connection
+    }
+
+    /// The smallest thing that passes for a JPEG: the three bytes that identify
+    /// one, then whatever the test needs to make it unique.
+    fn jpeg(tail: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0xFF, 0xD8, 0xFF];
+        bytes.extend_from_slice(tail);
+        bytes
+    }
+
+    #[test]
+    fn the_mime_comes_from_the_bytes_rather_than_from_the_url() {
+        assert_eq!(image_mime(&jpeg(b"body")), Some("image/jpeg"));
+        assert_eq!(
+            image_mime(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00]),
+            Some("image/png")
+        );
+        let mut webp = b"RIFF".to_vec();
+        webp.extend_from_slice(&[0, 0, 0, 0]);
+        webp.extend_from_slice(b"WEBP");
+        assert_eq!(image_mime(&webp), Some("image/webp"));
+        // Everything else is refused, including things that are pictures to a
+        // human reader but not to this: the point is a mime this cache chose.
+        assert_eq!(image_mime(b"<html><body>not a picture"), None);
+        assert_eq!(image_mime(b""), None);
+        // A `RIFF` header that is not WebP is a wave file, not a picture.
+        let mut wav = b"RIFF".to_vec();
+        wav.extend_from_slice(&[0, 0, 0, 0]);
+        wav.extend_from_slice(b"WAVE");
+        assert_eq!(image_mime(&wav), None);
+    }
+
+    #[test]
+    fn a_stored_image_is_found_by_its_own_hash() {
+        let root = scratch("stored");
+        let connection = database();
+        let bytes = jpeg(b"a cover");
+        let stored = store(
+            &connection,
+            &root,
+            "kream|annihilation",
+            ArtRendition::Thumb,
+            &bytes,
+            "musicbrainz",
+        )
+        .unwrap();
+        assert_eq!(stored.hash, hex::encode(Sha256::digest(&bytes)));
+        assert_eq!(stored.hash.len(), 64);
+        assert_eq!(stored.mime, "image/jpeg");
+        assert!(stored.path.ends_with(format!("{}.jpg", stored.hash)));
+        assert!(stored.path.exists());
+
+        let found = lookup(&connection, &root, "kream|annihilation", ArtRendition::Thumb)
+            .unwrap()
+            .expect("the bytes were just stored");
+        assert_eq!(found, stored);
+        // The other rendition of the same album is a different question, and the
+        // answer to it is "not yet".
+        assert!(lookup(&connection, &root, "kream|annihilation", ArtRendition::Full)
+            .unwrap()
+            .is_none());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn bytes_that_are_not_an_image_are_refused_rather_than_cached() {
+        let root = scratch("refused");
+        let connection = database();
+        let refused = store(
+            &connection,
+            &root,
+            "kream|annihilation",
+            ArtRendition::Thumb,
+            b"<html>this is what a 404 page looks like</html>",
+            "musicbrainz",
+        );
+        assert!(refused.is_err(), "a body that is not a picture must not land");
+        assert!(
+            lookup(&connection, &root, "kream|annihilation", ArtRendition::Thumb)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(stats(&connection, &root).unwrap().entries, 0);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn two_albums_with_one_picture_share_one_file() {
+        let root = scratch("shared");
+        let connection = database();
+        // The same sleeves published for a single and for the album it came off
+        // is an ordinary case, and it should cost one file.
+        let bytes = jpeg(b"one sleeve, two albums");
+        let first = store(&connection, &root, "a|single", ArtRendition::Full, &bytes, "").unwrap();
+        let second = store(&connection, &root, "a|album", ArtRendition::Full, &bytes, "").unwrap();
+        assert_eq!(first.hash, second.hash);
+        assert_eq!(stats(&connection, &root).unwrap().files, 1);
+        assert_eq!(stats(&connection, &root).unwrap().entries, 2);
+
+        // The single's sleeve is the one being used, so it is the last entry
+        // eviction will consider, and the one that keeps the shared file alive.
+        touch(&connection, "a|album", ArtRendition::Full).unwrap();
+        assert_eq!(
+            evict_to_budget(&connection, &root, bytes.len() as u64).unwrap(),
+            1,
+            "a budget of one sleeve removes exactly one entry"
+        );
+        assert!(first.path.exists(), "the other album still points at it");
+        assert!(lookup(&connection, &root, "a|album", ArtRendition::Full)
+            .unwrap()
+            .is_some());
+        assert!(lookup(&connection, &root, "a|single", ArtRendition::Full)
+            .unwrap()
+            .is_none());
+        // And dropping the last row takes the file with it.
+        assert_eq!(evict_to_budget(&connection, &root, 0).unwrap(), 1);
+        assert!(!first.path.exists(), "nothing points at it any more");
+        assert_eq!(stats(&connection, &root).unwrap().files, 0);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn eviction_removes_the_least_recently_used_and_no_more_than_it_has_to() {
+        let root = scratch("evict");
+        let connection = database();
+        // Three albums, each its own picture, used in a known order.
+        let keys = ["a|one", "b|two", "c|three"];
+        for key in keys {
+            let mut bytes = jpeg(key.as_bytes());
+            bytes.resize(1024, 0x11);
+            store(&connection, &root, key, ArtRendition::Full, &bytes, "").unwrap();
+            touch(&connection, key, ArtRendition::Full).unwrap();
+        }
+        let total = held_bytes(&connection).unwrap();
+        assert_eq!(stats(&connection, &root).unwrap().files, 3);
+
+        // Nothing to do while the cache is inside its budget.
+        assert_eq!(evict_to_budget(&connection, &root, total).unwrap(), 0);
+        assert_eq!(stats(&connection, &root).unwrap().files, 3);
+
+        // A budget of two pictures takes exactly the oldest, and leaves a little
+        // room rather than emptying the cache.
+        assert_eq!(
+            evict_to_budget(&connection, &root, total / 3 * 2).unwrap(),
+            1
+        );
+        assert!(lookup(&connection, &root, "a|one", ArtRendition::Full)
+            .unwrap()
+            .is_none());
+        assert_eq!(stats(&connection, &root).unwrap().files, 2);
+        assert_eq!(stats(&connection, &root).unwrap().entries, 2);
+
+        // And a budget of nothing empties it, files included.
+        assert_eq!(evict_to_budget(&connection, &root, 0).unwrap(), 2);
+        assert_eq!(stats(&connection, &root).unwrap().entries, 0);
+        assert_eq!(stats(&connection, &root).unwrap().files, 0);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn clearing_takes_the_rows_and_the_files_together() {
+        let root = scratch("clear");
+        let connection = database();
+        store(&connection, &root, "a|one", ArtRendition::Full, &jpeg(b"one"), "").unwrap();
+        store(&connection, &root, "b|two", ArtRendition::Thumb, &jpeg(b"two"), "").unwrap();
+        assert_eq!(clear(&connection, &root).unwrap(), 2);
+        assert_eq!(stats(&connection, &root).unwrap().entries, 0);
+        assert_eq!(stats(&connection, &root).unwrap().files, 0, "nothing is left behind");
+        // Clearing a cache that is already clear is not an error: it is what a
+        // person asking twice, or a second window, does.
+        assert_eq!(clear(&connection, &root).unwrap(), 0);
+        // Nothing to tidy: clearing took the directory with it, which is what
+        // `stats` reporting no files above means.
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn art_that_changes_replaces_the_row_and_takes_the_old_file() {
+        let root = scratch("replaced");
+        let connection = database();
+        let older = jpeg(b"the first scan");
+        let newer = jpeg(b"a better scan");
+        let first = store(&connection, &root, "a|album", ArtRendition::Full, &older, "").unwrap();
+        let second = store(&connection, &root, "a|album", ArtRendition::Full, &newer, "itunes").unwrap();
+        assert_ne!(first.hash, second.hash);
+        let found = lookup(&connection, &root, "a|album", ArtRendition::Full)
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.hash, second.hash, "the row moved to the new bytes");
+        assert!(!first.path.exists(), "the abandoned file went with it");
+        assert_eq!(first.hash, hex::encode(Sha256::digest(&older)));
+        assert_eq!(stats(&connection, &root).unwrap().files, 1);
+        // Storing the same bytes again is not a change and does not rewrite it.
+        let again = store(&connection, &root, "a|album", ArtRendition::Full, &newer, "itunes").unwrap();
+        assert_eq!(again.hash, second.hash);
+        assert_eq!(stats(&connection, &root).unwrap().files, 1);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_file_deleted_behind_the_cache_reports_itself_missing() {
+        let root = scratch("cleared");
+        let connection = database();
+        let stored = store(
+            &connection,
+            &root,
+            "a|album",
+            ArtRendition::Thumb,
+            &jpeg(b"a cover"),
+            "",
+        )
+        .unwrap();
+        // Clearing the cache is a supported action, and a person may simply
+        // empty the directory. That has to read as "no art", not as a path to a
+        // file that is not there.
+        std::fs::remove_file(&stored.path).unwrap();
+        assert!(lookup(&connection, &root, "a|album", ArtRendition::Thumb)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            stats(&connection, &root).unwrap().entries,
+            0,
+            "the stale row was tidied as it was found"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_new_picture_moves_the_cover_revision_and_a_touch_does_not() {
+        let root = scratch("revision");
+        let connection = database();
+        // A phone re-asks about the albums it was told had no art when this
+        // moves, so arriving bytes have to move it - otherwise the phone that
+        // asked a moment too early keeps its placeholder until something else
+        // happens to change the covers.
+        let settled = cover_revision(&connection).unwrap();
+        let fresh = jpeg(b"the first picture");
+        store(
+            &connection,
+            &root,
+            "a|album",
+            ArtRendition::Thumb,
+            &fresh,
+            "",
+        )
+        .unwrap();
+        let arrived = cover_revision(&connection).unwrap();
+        assert!(arrived > settled, "art arriving is news to a phone");
+
+        // Serving it is not a change to it, and fetching art must not set every
+        // other album's question off again.
+        touch(&connection, "a|album", ArtRendition::Thumb).unwrap();
+        assert_eq!(cover_revision(&connection).unwrap(), arrived);
+
+        // Neither is being told the same thing twice, which is what a fill pass
+        // looking at an album it already has does every time it runs.
+        store(
+            &connection,
+            &root,
+            "a|album",
+            ArtRendition::Thumb,
+            &fresh,
+            "",
+        )
+        .unwrap();
+        assert_eq!(cover_revision(&connection).unwrap(), arrived);
+
+        // A different picture for the same album and rendition is news again.
+        store(
+            &connection,
+            &root,
+            "a|album",
+            ArtRendition::Thumb,
+            &jpeg(b"a better picture"),
+            "itunes",
+        )
+        .unwrap();
+        assert!(cover_revision(&connection).unwrap() > arrived);
+
+        // The full rendition is its own question, and its own change.
+        let before_full = cover_revision(&connection).unwrap();
+        store(&connection, &root, "a|album", ArtRendition::Full, &fresh, "").unwrap();
+        assert!(cover_revision(&connection).unwrap() > before_full);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+}
