@@ -7,16 +7,20 @@ const manifestPath = resolve(main, 'AndroidManifest.xml');
 let manifest = await readFile(manifestPath, 'utf8');
 
 const internetPermission = '    <uses-permission android:name="android.permission.INTERNET" />';
-const mediaPermissions = [
+// ACCESS_NETWORK_STATE is what lets the page ask the phone whether the
+// connection it is spending is metered, which is the one thing the music quality
+// setting needs and the host cannot answer.
+const extraPermissions = [
+  '    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />',
   '    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />',
   '    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />',
   '    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />',
   '    <uses-permission android:name="android.permission.WAKE_LOCK" />',
 ].filter((permission) => !manifest.includes(permission.trim()));
-if (mediaPermissions.length > 0) {
+if (extraPermissions.length > 0) {
   manifest = manifest.replace(
     internetPermission,
-    `${internetPermission}\n${mediaPermissions.join('\n')}`,
+    `${internetPermission}\n${extraPermissions.join('\n')}`,
   );
 }
 
@@ -64,6 +68,7 @@ for (const filename of [
   'MediaControlBridge.kt',
   'MediaNotificationService.kt',
   'BackBridge.kt',
+  'NetworkBridge.kt',
 ]) {
   await copyFile(resolve(native, filename), resolve(javaDirectory, filename));
 }

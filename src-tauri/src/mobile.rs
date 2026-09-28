@@ -610,6 +610,17 @@ impl MobileService {
                                 display_name: source.display_name,
                             })
                             .collect(),
+                        // A catalogue result is somebody else's event, and a
+                        // catalogue entry says what a file is called and how big
+                        // it is, not what the audio in it is. Reporting zero is
+                        // the honest answer here: the only row that knows is the
+                        // library row, and a file this host holds is taken from
+                        // there and never from the catalogue.
+                        bitrate_kbps: 0,
+                        sample_rate_hz: 0,
+                        channels: 0,
+                        lossless: false,
+                        duration_ms: 0,
                     });
                 }
                 tracks.sort_by(|left, right| {
@@ -1377,6 +1388,13 @@ fn remote_audiobook(
                     tags: "audiobook".into(),
                     local: false,
                     sources: sources.clone(),
+                    // A chapter the library does not hold is only known by its
+                    // manifest, which says nothing about the audio in it.
+                    bitrate_kbps: 0,
+                    sample_rate_hz: 0,
+                    channels: 0,
+                    lossless: false,
+                    duration_ms: 0,
                 })
         })
         .collect();
@@ -1595,6 +1613,11 @@ fn remote_track(file: SharedFile) -> RemoteTrack {
         tags: file.tags,
         local: true,
         sources: Vec::new(),
+        bitrate_kbps: file.bitrate_kbps,
+        sample_rate_hz: file.sample_rate_hz,
+        channels: file.channels,
+        lossless: file.lossless,
+        duration_ms: file.duration_ms,
     }
 }
 
@@ -2057,6 +2080,11 @@ mod tests {
                 tags: String::new(),
                 local: true,
                 sources: Vec::new(),
+                bitrate_kbps: 900,
+                sample_rate_hz: 44_100,
+                channels: 2,
+                lossless: true,
+                duration_ms: 60_000,
             }
         }
         let tracks = (0..40).map(track).collect::<Vec<_>>();

@@ -130,6 +130,25 @@ pub struct RemoteTrack {
     pub tags: String,
     pub local: bool,
     pub sources: Vec<RemoteSource>,
+    /// What the audio is, so a phone can decide before it spends a phone's data
+    /// on it: "is this lossless, and how many kilobits is it" is a question only
+    /// the file answers, and the answer decides whether somebody on a metered
+    /// connection wants it at all.
+    ///
+    /// Each of these defaults, because a host older than this sends none of them
+    /// and a phone must read that as "not known" rather than as a track with no
+    /// bitrate. Bitrate is in kilobits per second and duration in milliseconds;
+    /// zero in either means the host could not tell.
+    #[serde(default)]
+    pub bitrate_kbps: u32,
+    #[serde(default)]
+    pub sample_rate_hz: u32,
+    #[serde(default)]
+    pub channels: u32,
+    #[serde(default)]
+    pub lossless: bool,
+    #[serde(default)]
+    pub duration_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1527,6 +1546,11 @@ mod tests {
                 tags: "g".repeat(256),
                 local: true,
                 sources: Vec::new(),
+                bitrate_kbps: 4_608,
+                sample_rate_hz: 96_000,
+                channels: 2,
+                lossless: true,
+                duration_ms: 3_600_000,
             }),
             queue: (0..MAX_PLAY_QUEUE)
                 .map(|index| format!("{index:064x}"))

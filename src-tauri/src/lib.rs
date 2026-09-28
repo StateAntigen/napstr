@@ -35,7 +35,7 @@ const HASH_BUFFER_SIZE: usize = 256 * 1024;
 const MAX_INDEX_ERRORS: usize = 100;
 const INDEX_PROGRESS_INTERVAL: usize = 25;
 const INDEX_COMMIT_BATCH_SIZE: usize = 50;
-const AUDIO_METADATA_VERSION: i64 = 2;
+const AUDIO_METADATA_VERSION: i64 = 3;
 const LIBRARY_CHANGED_EVENT: &str = "napstr-library-changed";
 const INDEX_BATCH_EVENT: &str = "napstr-index-batch";
 const INDEX_PROGRESS_EVENT: &str = "napstr-index-progress";
@@ -89,6 +89,12 @@ struct SharedFile {
     license: String,
     description: String,
     tags: String,
+    /// What the audio is, so the window and a phone can both say it.
+    bitrate_kbps: u32,
+    sample_rate_hz: u32,
+    channels: u32,
+    lossless: bool,
+    duration_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -233,6 +239,13 @@ fn initialise_database(path: &Path, app_data: &Path) -> Result<(), String> {
         ("metadata_version", "INTEGER NOT NULL DEFAULT 0"),
         ("track_number", "INTEGER NOT NULL DEFAULT 0"),
         ("disc_number", "INTEGER NOT NULL DEFAULT 0"),
+        // What the audio actually is, which is what a phone choosing between
+        // what it can fetch needs to know and nothing else in the row says.
+        ("bitrate_kbps", "INTEGER NOT NULL DEFAULT 0"),
+        ("sample_rate_hz", "INTEGER NOT NULL DEFAULT 0"),
+        ("channels", "INTEGER NOT NULL DEFAULT 0"),
+        ("lossless", "INTEGER NOT NULL DEFAULT 0"),
+        ("duration_ms", "INTEGER NOT NULL DEFAULT 0"),
     ] {
         ensure_column(&connection, "files", column, declaration)?;
     }
@@ -411,13 +424,18 @@ fn shared_file_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SharedFile>
         license: "unspecified".into(),
         description: String::new(),
         tags: row.get(7)?,
+        bitrate_kbps: row.get::<_, i64>(13)?.max(0) as u32,
+        sample_rate_hz: row.get::<_, i64>(14)?.max(0) as u32,
+        channels: row.get::<_, i64>(15)?.max(0) as u32,
+        lossless: row.get::<_, i64>(16)? != 0,
+        duration_ms: row.get::<_, i64>(17)?.max(0) as u64,
     })
 }
 
 fn load_files(connection: &Connection, query: Option<&str>) -> Result<Vec<SharedFile>, String> {
     let mut statement = connection
         .prepare(
-            "SELECT file_id, filename, path, size, format, mime, folder, tags, title, artist, album, track_number, disc_number FROM files
+            "SELECT file_id, filename, path, size, format, mime, folder, tags, title, artist, album, track_number, disc_number, bitrate_kbps, sample_rate_hz, channels, lossless, duration_ms FROM files
          WHERE format IN ('MP3','FLAC','WAV','OGG','OPUS')
            AND NOT EXISTS(SELECT 1 FROM blocked_files WHERE blocked_files.file_id=files.file_id)
          ORDER BY filename",
@@ -453,7 +471,7 @@ fn load_files_by_id(
 ) -> Result<Vec<SharedFile>, String> {
     let mut statement = connection
         .prepare(
-            "SELECT file_id, filename, path, size, format, mime, folder, tags, title, artist, album, track_number, disc_number FROM files
+            "SELECT file_id, filename, path, size, format, mime, folder, tags, title, artist, album, track_number, disc_number, bitrate_kbps, sample_rate_hz, channels, lossless, duration_ms FROM files
              WHERE file_id=?1
                AND format IN ('MP3','FLAC','WAV','OGG','OPUS')
                AND NOT EXISTS(SELECT 1 FROM blocked_files WHERE blocked_files.file_id=files.file_id)",
@@ -904,12 +922,14 @@ pub(crate) fn upsert_verified_file(
         .unwrap_or(0);
     connection
         .execute(
-            "INSERT INTO files (file_id, filename, path, size, format, indexed_at, mime, folder, modified_ns, title, artist, album, metadata_version, track_number, disc_number)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+            "INSERT INTO files (file_id, filename, path, size, format, indexed_at, mime, folder, modified_ns, title, artist, album, metadata_version, track_number, disc_number, bitrate_kbps, sample_rate_hz, channels, lossless, duration_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
              ON CONFLICT(file_id) DO UPDATE SET filename=excluded.filename,path=excluded.path,size=excluded.size,
              format=excluded.format,mime=excluded.mime,folder=excluded.folder,indexed_at=excluded.indexed_at,
              modified_ns=excluded.modified_ns,title=excluded.title,artist=excluded.artist,album=excluded.album,
-             metadata_version=excluded.metadata_version,track_number=excluded.track_number,disc_number=excluded.disc_number",
+             metadata_version=excluded.metadata_version,track_number=excluded.track_number,disc_number=excluded.disc_number,
+             bitrate_kbps=excluded.bitrate_kbps,sample_rate_hz=excluded.sample_rate_hz,channels=excluded.channels,
+             lossless=excluded.lossless,duration_ms=excluded.duration_ms",
             params![
                 file_id,
                 filename,
@@ -925,7 +945,12 @@ pub(crate) fn upsert_verified_file(
                 audio.metadata.album,
                 AUDIO_METADATA_VERSION,
                 audio.metadata.track_number,
-                audio.metadata.disc_number
+                audio.metadata.disc_number,
+                audio.properties.bitrate_kbps,
+                audio.properties.sample_rate_hz,
+                audio.properties.channels,
+                audio.properties.lossless as i64,
+                audio.properties.duration_ms as i64,
             ],
         )
         .map_err(|error| error.to_string())?;

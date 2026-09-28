@@ -12,6 +12,17 @@ export type RemoteTrack = {
   tags: string;
   local: boolean;
   sources: RemoteSource[];
+  /**
+   * What the audio is, as the file itself declares it, so this phone can decide
+   * before it spends data on it. Zero means the host could not tell, which is
+   * what an older host sends and what a track from a peer's catalogue entry
+   * looks like, because a catalogue entry says nothing about the audio in it.
+   */
+  bitrateKbps: number;
+  sampleRateHz: number;
+  channels: number;
+  lossless: boolean;
+  durationMs: number;
 };
 
 export type RemoteAudiobook = {

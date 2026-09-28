@@ -1,4 +1,9 @@
-use lofty::{config::ParseOptions, file::TaggedFileExt, probe::Probe, tag::Accessor};
+use lofty::{
+    config::ParseOptions,
+    file::{AudioFile, TaggedFileExt},
+    probe::Probe,
+    tag::Accessor,
+};
 use std::{
     fs::File,
     io::{Read, Seek, SeekFrom},
@@ -17,11 +22,46 @@ pub struct AudioMetadata {
     pub disc_number: u32,
 }
 
+/// What a file's audio actually is, as its own container states it.
+///
+/// This exists because of a question only the container can answer: a phone
+/// choosing what to fetch asks "is this lossless, and how many kilobits is it",
+/// and neither is in the filename or in the tags. Anything the reader could not
+/// determine is left at zero, which reads as "not known" rather than as a guess.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioProperties {
+    /// Kilo-bits per second, zero when the container does not say.
+    pub bitrate_kbps: u32,
+    pub sample_rate_hz: u32,
+    pub channels: u8,
+    /// True when the format stores the samples rather than an approximation of
+    /// them. Decided by the format, because each of the five Napstr accepts is
+    /// unambiguously one or the other: FLAC and WAV keep the samples, and MP3,
+    /// Vorbis and Opus do not.
+    pub lossless: bool,
+    /// Milliseconds, zero when unknown, which is an ordinary answer for a file
+    /// whose header was truncated.
+    pub duration_ms: u64,
+}
+
+impl Default for AudioProperties {
+    fn default() -> Self {
+        Self {
+            bitrate_kbps: 0,
+            sample_rate_hz: 0,
+            channels: 0,
+            lossless: false,
+            duration_ms: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioInfo {
     pub format: &'static str,
     pub mime: &'static str,
     pub metadata: AudioMetadata,
+    pub properties: AudioProperties,
 }
 
 pub fn validate_audio(path: &Path) -> Result<AudioInfo, String> {
@@ -55,38 +95,63 @@ pub fn validate_audio(path: &Path) -> Result<AudioInfo, String> {
             )
         }
     };
-    info.metadata = read_metadata(path);
+    let (metadata, properties) = read_details(path);
+    info.metadata = metadata;
+    info.properties = AudioProperties {
+        lossless: matches!(info.format, "FLAC" | "WAV"),
+        ..properties
+    };
     Ok(info)
 }
 
-pub fn read_metadata(path: &Path) -> AudioMetadata {
-    let options = ParseOptions::new()
-        .read_properties(false)
-        .read_cover_art(false);
+/// Everything the reader can tell about a file in one pass: its tags, and what
+/// the audio in it actually is.
+///
+/// One probe rather than two, because this runs once per file in a library scan
+/// and opening every file twice to ask two questions about it is the sort of
+/// thing that turns a scan of a large library into a long one.
+pub fn read_details(path: &Path) -> (AudioMetadata, AudioProperties) {
+    // Properties are the point here, so unlike a tag read they are not skipped;
+    // cover art still is, because the pictures live in the cover cache and
+    // reading them into memory for every file would be a waste of both.
+    let options = ParseOptions::new().read_cover_art(false);
     let Ok(probe) = Probe::open(path) else {
-        return AudioMetadata::default();
+        return (AudioMetadata::default(), AudioProperties::default());
     };
     let Ok(probe) = probe.options(options).guess_file_type() else {
-        return AudioMetadata::default();
+        return (AudioMetadata::default(), AudioProperties::default());
     };
     let Ok(tagged_file) = probe.read() else {
-        return AudioMetadata::default();
+        return (AudioMetadata::default(), AudioProperties::default());
     };
-    AudioMetadata {
-        title: first_safe_metadata_value(&tagged_file, |tag| tag.title()),
-        artist: first_safe_metadata_value(&tagged_file, |tag| tag.artist()),
-        album: first_safe_metadata_value(&tagged_file, |tag| tag.album()),
-        track_number: tagged_file
-            .tags()
-            .iter()
-            .find_map(|tag| tag.track())
-            .unwrap_or_default(),
-        disc_number: tagged_file
-            .tags()
-            .iter()
-            .find_map(|tag| tag.disk())
-            .unwrap_or_default(),
-    }
+    let properties = tagged_file.properties();
+    (
+        AudioMetadata {
+            title: first_safe_metadata_value(&tagged_file, |tag| tag.title()),
+            artist: first_safe_metadata_value(&tagged_file, |tag| tag.artist()),
+            album: first_safe_metadata_value(&tagged_file, |tag| tag.album()),
+            track_number: tagged_file
+                .tags()
+                .iter()
+                .find_map(|tag| tag.track())
+                .unwrap_or_default(),
+            disc_number: tagged_file
+                .tags()
+                .iter()
+                .find_map(|tag| tag.disk())
+                .unwrap_or_default(),
+        },
+        AudioProperties {
+            bitrate_kbps: properties.audio_bitrate().unwrap_or_default(),
+            sample_rate_hz: properties.sample_rate().unwrap_or_default(),
+            channels: properties.channels().unwrap_or_default(),
+            // Not the reader's business: losslessness is a property of the
+            // format, and the caller knows the format. `validate_audio` is where
+            // it is filled in, from the container it just accepted.
+            lossless: false,
+            duration_ms: properties.duration().as_millis().min(u64::MAX as u128) as u64,
+        },
+    )
 }
 
 fn first_safe_metadata_value<'a>(
@@ -167,6 +232,7 @@ fn validate_mp3(file: &mut File, size: u64) -> Result<AudioInfo, String> {
             format: "MP3",
             mime: "audio/mpeg",
             metadata: AudioMetadata::default(),
+            properties: AudioProperties::default(),
         })
     } else {
         Err("file does not contain a valid MPEG audio stream".into())
@@ -277,6 +343,7 @@ fn validate_flac(file: &mut File, size: u64) -> Result<AudioInfo, String> {
         format: "FLAC",
         mime: "audio/flac",
         metadata: AudioMetadata::default(),
+            properties: AudioProperties::default(),
     })
 }
 
@@ -361,6 +428,7 @@ fn validate_wav(file: &mut File, size: u64) -> Result<AudioInfo, String> {
         format: "WAV",
         mime: "audio/wav",
         metadata: AudioMetadata::default(),
+            properties: AudioProperties::default(),
     })
 }
 
@@ -445,12 +513,14 @@ fn validate_ogg(file: &mut File, size: u64, expect_opus: bool) -> Result<AudioIn
             format: "OPUS",
             mime: "audio/ogg",
             metadata: AudioMetadata::default(),
+            properties: AudioProperties::default(),
         }
     } else {
         AudioInfo {
             format: "OGG",
             mime: "audio/ogg",
             metadata: AudioMetadata::default(),
+            properties: AudioProperties::default(),
         }
     })
 }
@@ -570,6 +640,63 @@ mod tests {
         assert!(validate_audio(&appended).is_err());
         let _ = fs::remove_file(renamed);
         let _ = fs::remove_file(appended);
+    }
+
+    #[test]
+    fn reports_what_the_audio_is() {
+        // One second of 44.1 kHz mono 16-bit PCM. The fmt chunk declares a byte
+        // rate of 88 200, which is 705.6 kbit/s.
+        let wav_file = path("facts.wav");
+        fs::write(&wav_file, wav(&[0u8; 88_200])).unwrap();
+        let properties = validate_audio(&wav_file).unwrap().properties;
+        assert_eq!(properties.sample_rate_hz, 44_100);
+        assert_eq!(properties.channels, 1);
+        assert_eq!(properties.duration_ms, 1_000);
+        assert_eq!(properties.bitrate_kbps, 706);
+        assert!(properties.lossless);
+        let _ = fs::remove_file(wav_file);
+
+        // A library that says nothing about the audio still answers the one
+        // question the format decides, which is the question a phone on a metered
+        // connection actually filters on.
+        let flac = path("facts.flac");
+        let mut flac_bytes = b"fLaC".to_vec();
+        flac_bytes.extend_from_slice(&[0x80, 0, 0, 34]);
+        flac_bytes.extend_from_slice(&[0; 34]);
+        flac_bytes.extend_from_slice(&[0xff, 0xf8]);
+        fs::write(&flac, flac_bytes).unwrap();
+        assert!(validate_audio(&flac).unwrap().properties.lossless);
+
+        let mp3 = path("facts.mp3");
+        let mut frame = vec![0u8; 417];
+        frame[..4].copy_from_slice(&[0xff, 0xfb, 0x90, 0x00]);
+        let mut mp3_bytes = frame.clone();
+        mp3_bytes.extend_from_slice(&frame);
+        fs::write(&mp3, mp3_bytes).unwrap();
+        let mp3_properties = validate_audio(&mp3).unwrap().properties;
+        assert!(!mp3_properties.lossless);
+        // The frame header is a 128 kbit/s, 44.1 kHz one.
+        assert_eq!(mp3_properties.bitrate_kbps, 128);
+        assert_eq!(mp3_properties.sample_rate_hz, 44_100);
+
+        let ogg = path("facts.ogg");
+        fs::write(&ogg, ogg_page(&[b"\x01vorbis", b"\x03vorbiscomments"])).unwrap();
+        assert!(!validate_audio(&ogg).unwrap().properties.lossless);
+
+        let opus = path("facts.opus");
+        fs::write(
+            &opus,
+            ogg_page(&[
+                b"OpusHead\x01\x01\0\0\0\0\0\0\0\0\0",
+                b"OpusTags\0\0\0\0\0\0\0\0",
+            ]),
+        )
+        .unwrap();
+        assert!(!validate_audio(&opus).unwrap().properties.lossless);
+
+        for file in [flac, mp3, ogg, opus] {
+            let _ = fs::remove_file(file);
+        }
     }
 
     #[test]

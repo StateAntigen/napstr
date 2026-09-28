@@ -37,8 +37,10 @@ class MainActivity : TauriActivity() {
     webView.settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
     MediaControlBridge.attach(webView)
     BackBridge.attach(webView)
+    NetworkBridge.attach(webView)
     webView.addJavascriptInterface(MediaControlBridge(this), "NapstrfyMedia")
     webView.addJavascriptInterface(BackBridge(), "NapstrfyBack")
+    webView.addJavascriptInterface(NetworkBridge(this), "NapstrfyNetwork")
   }
 
   fun ensureMediaNotificationPermission() {
@@ -60,6 +62,7 @@ class MainActivity : TauriActivity() {
   override fun onDestroy() {
     MediaControlBridge.detach()
     BackBridge.detach()
+    NetworkBridge.detach()
     super.onDestroy()
   }
 

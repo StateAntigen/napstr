@@ -19,6 +19,8 @@
   import CoverDebug from './lib/CoverDebug.svelte';
   import SeekIcon from './lib/SeekIcon.svelte';
   import { rateLimitedTask, safePosition, validDuration } from './lib/playback';
+  import { AUDIO_FORMATS, BITRATE_CHOICES, activeProfile, fitsProfile, readQuality, writeQuality, type QualityProfile } from './lib/quality';
+  import { meteredNow, watchNetwork } from './lib/network';
   import appIcon from '../src-tauri/icons/icon.png';
   import { artworkHue, coverFor, coverKey, invalidateCoverNegatives, loadFullCover, preloadArtwork, type AlbumCover } from './lib/artwork';
   import { reportReasons } from './lib/types';
@@ -332,6 +334,32 @@
    */
   let playlistRowTracks = $state<Record<string, RemoteTrack>>({});
   let showSettings = $state(false);
+  /**
+   * Whether the connection this phone is spending is one it pays for.
+   *
+   * The phone answers this, not Napstr: only the phone knows whether the bytes
+   * it asks for are billed, and a Wi-Fi hotspot can be somebody's data plan.
+   */
+  let metered = $state(meteredNow());
+  /** What this phone is willing to fetch on each kind of connection. */
+  let quality = $state(readQuality());
+  /** The profile the settings list has open, or '' when they are both closed. */
+  let qualityEditor = $state<'' | 'metered' | 'unmetered'>('');
+  /**
+   * Set once the user has said "fetch it anyway".
+   *
+   * A queue is many tracks and a question per track is an argument rather than a
+   * choice, so one answer covers the session - and stops covering it the moment
+   * the connection changes, because that is what the answer was about.
+   */
+  let qualityOverride = $state(false);
+
+  // The phone announces a change of connection, and that is what decides which
+  // profile applies and what a "fetch it anyway" was an answer about.
+  $effect(() => watchNetwork(() => {
+    metered = meteredNow();
+    qualityOverride = false;
+  }));
   /** The computer's player, drawn by the same drawer as this phone's. */
   let remoteState = $state<RemotePlaybackState | null>(null);
   let remoteBusy = $state(false);
@@ -1613,7 +1641,13 @@
       size: 0,
       tags: '',
       local: false,
-      sources: []
+      sources: [],
+      // No file has answered for this one, so nothing is claimed about it.
+      bitrateKbps: 0,
+      sampleRateHz: 0,
+      channels: 0,
+      lossless: false,
+      durationMs: 0
     };
   }
 
@@ -2370,8 +2404,77 @@
     await playTrack(track);
   }
 
+  /** The quality profile the connection this phone is on uses right now. */
+  function currentProfile(): QualityProfile {
+    return activeProfile(quality, metered);
+  }
+
+  /**
+   * Why this phone would not ask for this track right now, in words, or ''.
+   *
+   * A file this phone already holds is never held back: nothing is being spent
+   * on it, and a setting about data must not stop music that is already here.
+   * The connection is named because the answer differs on each one, and because
+   * what is refused is a size rather than a song.
+   */
+  function holdReason(track: RemoteTrack): string {
+    if (qualityOverride || cachedFileIds.has(track.fileId)) return '';
+    const verdict = fitsProfile(track, currentProfile());
+    if (!verdict.held) return '';
+    const connection = metered ? 'mobile data' : 'Wi-Fi';
+    if (verdict.reason === 'bitrate') {
+      return `${verdict.bitrateKbps} kb/s is above the ${verdict.ceilingKbps} kb/s you allow on ${connection}`;
+    }
+    return verdict.lossless
+      ? `Lossless files are held back on ${connection}`
+      : `${verdict.format} files are held back on ${connection}`;
+  }
+
+  /** What a profile does, in a few words, for the row that opens it. */
+  function profileSummary(profile: QualityProfile): (string | Message)[] {
+    const formats =
+      profile.formats.length === AUDIO_FORMATS.length
+        ? msg("All formats")
+        : profile.formats.length === 0
+          ? msg("No formats")
+          : profile.formats.join(', ');
+    const ceiling = profile.maxBitrateKbps === 0
+      ? msg("No limit")
+      : msg("Up to {p0} kb/s", { p0: String(profile.maxBitrateKbps) });
+    return [formats, ceiling];
+  }
+
+  /** The audio facts Napstr reported for a track, for the row's meta line. */
+  function audioFacts(track: RemoteTrack): string {
+    const format = (track.format ?? '').toUpperCase();
+    if (!AUDIO_FORMATS.includes(format)) return '';
+    const parts = [format];
+    if (track.lossless || format === 'FLAC' || format === 'WAV') parts.push('lossless');
+    if (track.bitrateKbps > 0) parts.push(`${track.bitrateKbps} kb/s`);
+    return parts.join(' · ');
+  }
+
+  function toggleQualityFormat(name: 'metered' | 'unmetered', format: string) {
+    const profile = quality[name];
+    profile.formats = profile.formats.includes(format)
+      ? profile.formats.filter((item) => item !== format)
+      : AUDIO_FORMATS.filter((item) => item === format || profile.formats.includes(item));
+    writeQuality(quality);
+  }
+
+  function setQualityCeiling(name: 'metered' | 'unmetered', ceiling: number) {
+    quality[name].maxBitrateKbps = ceiling;
+    writeQuality(quality);
+  }
+
   async function playTrack(track: RemoteTrack, libraryVisible = playerQueueLibraryVisible) {
     if (caching) return;
+    const held = holdReason(track);
+    if (held && !window.confirm(`${held}. Fetch it anyway?`)) {
+      notice = `${held}. Music quality in Settings decides this.`;
+      return;
+    }
+    if (held) qualityOverride = true;
     caching = true;
     error = '';
     current = track;
@@ -2402,7 +2505,7 @@
           ? (playerIndex + 1 < playerQueue.length ? playerIndex + 1 : loopMode === 'off' ? -1 : 0)
           : -1;
       const next = nextIndex >= 0 ? playerQueue[nextIndex] : undefined;
-      if (next?.local) {
+      if (next?.local && !holdReason(next)) {
         void invoke('prefetch_remote_audio', {
           afterFileId: cached.track.fileId,
           track: next,
@@ -3404,7 +3507,13 @@
       size: 0,
       tags: '',
       local: false,
-      sources: []
+      sources: [],
+      // Rebuilt from the computer's own words, which say nothing about the file.
+      bitrateKbps: 0,
+      sampleRateHz: 0,
+      channels: 0,
+      lossless: false,
+      durationMs: 0
     };
   }
 
@@ -4678,7 +4787,7 @@
           <span class="track-copy">
             <strong>{title(track)}</strong>
             <small>{artist(track)}{track.album ? ` · ${track.album}` : ''}</small>
-            <span class="track-meta">{readableSize(track.size)}</span>
+            <span class="track-meta">{readableSize(track.size)}{audioFacts(track) ? ` · ${audioFacts(track)}` : ''}</span>
           </span>
           <TrackBadge {track} cached={cachedFileIds.has(track.fileId)} pending={pending.has(track.fileId)} />
         </button>
@@ -4694,6 +4803,32 @@
     {/each}
     {#if showLoadMore && tracks.length < total}<button class="load-more" onclick={() => loadLibrary(true)} disabled={loadingMore}>{loadingMore ? 'Loading…' : `Load more · ${tracks.length} of ${total}`}</button>{/if}
   </section>
+{/snippet}
+
+{#snippet qualityPanel(name: 'metered' | 'unmetered')}
+  <div class="quality-panel">
+    <div class="quality-chips" role="group" aria-label={$t("Formats")}>
+      {#each AUDIO_FORMATS as format (format)}
+        <button
+          class="quality-chip"
+          class:on={quality[name].formats.includes(format)}
+          aria-pressed={quality[name].formats.includes(format)}
+          onclick={() => toggleQualityFormat(name, format)}
+        >{format}</button>
+      {/each}
+    </div>
+    <div class="quality-chips" role="group" aria-label={$t("Bitrate ceiling")}>
+      {#each BITRATE_CHOICES as choice (choice)}
+        <button
+          class="quality-chip"
+          class:on={quality[name].maxBitrateKbps === choice}
+          aria-pressed={quality[name].maxBitrateKbps === choice}
+          onclick={() => setQualityCeiling(name, choice)}
+        >{choice === 0 ? $t("No limit") : `${choice} kb/s`}</button>
+      {/each}
+    </div>
+    <p class="quality-hint">{$t("FLAC and WAV keep every sample, so they cost the most data. Napstr reports each file's bitrate, and files it does not report are judged by their format alone.")}</p>
+  </div>
 {/snippet}
 
 {#snippet playbackTargetRows()}
@@ -5661,6 +5796,34 @@
           </button>
         </div>
       {/if}
+
+      <!-- Its own section rather than a row inside another: it is the only
+           setting here about what this phone spends, and it differs by
+           connection, so it is two rows and not one. -->
+      <div class="settings-section">
+        <p>{$t("Music quality")}</p>
+        <button
+          class="settings-row"
+          onclick={() => (qualityEditor = qualityEditor === 'unmetered' ? '' : 'unmetered')}
+          aria-expanded={qualityEditor === 'unmetered'}
+        >
+          <span>{$t("On Wi-Fi")}</span>
+          <small>{profileSummary(quality.unmetered).map((part) => $t(part)).join(' · ')}</small>
+        </button>
+        {#if qualityEditor === 'unmetered'}{@render qualityPanel('unmetered')}{/if}
+        <button
+          class="settings-row"
+          onclick={() => (qualityEditor = qualityEditor === 'metered' ? '' : 'metered')}
+          aria-expanded={qualityEditor === 'metered'}
+        >
+          <span>{$t("On mobile data")}</span>
+          <small>{profileSummary(quality.metered).map((part) => $t(part)).join(' · ')}</small>
+        </button>
+        {#if qualityEditor === 'metered'}{@render qualityPanel('metered')}{/if}
+        <p class="settings-note">
+          {$t("This phone only asks for files that fit this connection. A track it holds back asks once when you tap it, and your answer lasts until the connection changes.")}
+        </p>
+      </div>
 
       {#if status.paired && !status.streamOnly}
         <div class="settings-section">

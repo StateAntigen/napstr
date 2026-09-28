@@ -1357,6 +1357,14 @@ fn podcast_media_track(episode: &PodcastEpisode, size: u64) -> Result<RemoteTrac
         tags: "podcast".into(),
         local: true,
         sources: Vec::new(),
+        // A podcast episode is not in the music library and a feed's duration
+        // field is not reliable enough to be worth filtering on, so a podcast
+        // track reports nothing about its audio.
+        bitrate_kbps: 0,
+        sample_rate_hz: 0,
+        channels: 0,
+        lossless: false,
+        duration_ms: 0,
     })
 }
 
@@ -3247,6 +3255,11 @@ mod tests {
                     tags: String::new(),
                     local: true,
                     sources: Vec::new(),
+                    bitrate_kbps: 128,
+                    sample_rate_hz: 44_100,
+                    channels: 2,
+                    lossless: false,
+                    duration_ms: 0,
                 };
                 let desktop_endpoint = Endpoint::builder(presets::Minimal)
                     .clear_ip_transports()
@@ -3380,6 +3393,11 @@ mod tests {
             tags: String::new(),
             local: true,
             sources: Vec::new(),
+            bitrate_kbps: 128,
+            sample_rate_hz: 44_100,
+            channels: 2,
+            lossless: false,
+            duration_ms: 0,
         };
         fs::write(audio.join(format!("{file_id}.mp3")), bytes).unwrap();
         save_json(
