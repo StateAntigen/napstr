@@ -24,7 +24,7 @@
   import appIcon from '../src-tauri/icons/icon.png';
   import { artworkHue, coverFor, coverKey, invalidateCoverNegatives, loadFullCover, preloadArtwork, type AlbumCover } from './lib/artwork';
   import { reportReasons } from './lib/types';
-  import type { AudiobookLibraryPage, CachedAudio, CompanionStatus, CoverReport, LibraryPage, PlaybackCommand, PlaylistPage, PodcastDownload, PodcastEpisode, PodcastFeed, ReadOnlyTicketOffer, RemoteAudiobook, RemoteAudiobookSummary, RemoteDiscussionMessage, RemotePlaybackState, RemotePlaylist, RemotePlaylistCoordinate, RemotePlaylistSummary, RemotePlaylistTrack, RemoteRepeat, RemoteTrack, RemoteTransfer, ReportReason } from './lib/types';
+  import type { AudiobookLibraryPage, CachedAudio, CompanionStatus, CoverReport, LibraryPage, PlaybackCommand, PlaylistPage, PodcastDownload, PodcastEpisode, PodcastFeed, ReadOnlyTicketOffer, RemoteAudiobook, RemoteAudiobookSummary, RemoteDiscussionMessage, RemoteHost, RemotePlaybackState, RemotePlaylist, RemotePlaylistCoordinate, RemotePlaylistSummary, RemotePlaylistTrack, RemoteRepeat, RemoteTrack, RemoteTransfer, ReportReason } from './lib/types';
 
   const musicChips = ['Rock', 'Soundtrack', 'Punk', 'Folk', 'Upbeat'];
   const musicHistoryKey = 'napstrfy-played-albums';
@@ -157,6 +157,33 @@
   });
   const pinned = $derived(!mobile && platform !== '' && wideWindow);
   let status = $state<CompanionStatus>({ streamOnly: false, paired: false, connected: false, desktopName: '', endpointId: '', libraryRevision: 0, coverRevision: 0, pubkey: '', error: '' });
+  /**
+   * The computers this phone may talk to, and which one is being browsed.
+   *
+   * An empty `browseSource` is the computer this phone acts through - the one it
+   * was paired with before there could be more than one - so a phone holding a
+   * single computer asks exactly whom it has always asked, and nothing about it
+   * changes.
+   */
+  let knownHosts = $state<RemoteHost[]>([]);
+  let browseSource = $state('');
+
+  async function refreshKnownHosts() {
+    try {
+      knownHosts = await invoke<RemoteHost[]>('remote_hosts');
+      // A computer that is no longer paired is not a library to browse, and the
+      // list on screen must not offer one that has gone.
+      if (browseSource && !knownHosts.some((host) => host.endpointId === browseSource)) browseSource = '';
+    } catch {
+      // Nothing to report: with no answer the phone keeps the one computer it
+      // knows about, which is every phone that has ever been paired once.
+    }
+  }
+
+  $effect(() => {
+    if (!status.connected) return;
+    void refreshKnownHosts();
+  });
   let statusLoading = $state(true);
   let statusPending = $state(false);
   let pairingCode = $state('');
@@ -1244,7 +1271,8 @@
         query: query.trim(),
         offset: append ? tracks.length : 0,
         limit: 100,
-        shuffleSeed: libraryShuffleSeed
+        shuffleSeed: libraryShuffleSeed,
+        source: browseSource || undefined
       });
       if (viewVersion !== musicViewVersion) return;
       tracks = append ? [...tracks, ...page.tracks] : page.tracks;
@@ -1270,7 +1298,7 @@
     }
     silentLibraryRefresh = true;
     try {
-      const page = await invoke<LibraryPage>('remote_library', { query: '', offset: 0, limit: 100, shuffleSeed: libraryShuffleSeed });
+      const page = await invoke<LibraryPage>('remote_library', { query: '', offset: 0, limit: 100, shuffleSeed: libraryShuffleSeed, source: browseSource || undefined });
       tracks = page.tracks;
       total = page.total;
       loadedLibraryRevision = revision;
@@ -1329,13 +1357,14 @@
     const localSearch = invoke<LibraryPage>('remote_library', {
       query: searchQuery,
       offset: 0,
-      limit: MAX_ALBUM_TRACKS
+      limit: MAX_ALBUM_TRACKS,
+      source: browseSource || undefined
     })
       .then((page) => mergeResults(page.tracks))
       .catch((nextError) => { if (viewVersion === musicViewVersion) error = String(nextError); })
       .finally(() => { if (viewVersion === musicViewVersion) loading = false; });
     const networkSearch = searchingNetwork
-      ? invoke<RemoteTrack[]>('remote_search', { query: searchQuery })
+      ? invoke<RemoteTrack[]>('remote_search', { query: searchQuery, source: browseSource || undefined })
         .then(mergeResults)
         .catch((nextError) => {
           if (viewVersion !== musicViewVersion) return;
@@ -3428,7 +3457,7 @@
     );
     try {
       const page = await invoke<LibraryPage>('remote_library', {
-        query: name, offset: 0, limit: MAX_ALBUM_TRACKS
+        query: name, offset: 0, limit: MAX_ALBUM_TRACKS, source: browseSource || undefined
       });
       const sameArtist = page.tracks.filter(
         (track) => (track.artist ?? '').trim().toLocaleLowerCase() === wanted
@@ -4437,7 +4466,7 @@
     if (!name) return album.tracks;
     try {
       const page = await invoke<LibraryPage>('remote_library', {
-        query: name, offset: 0, limit: MAX_ALBUM_TRACKS
+        query: name, offset: 0, limit: MAX_ALBUM_TRACKS, source: browseSource || undefined
       });
       const sameAlbum = (track: RemoteTrack) =>
         (track.album ?? '').trim().toLocaleLowerCase() === name.toLocaleLowerCase();
@@ -5224,7 +5253,26 @@
         )}
       {:else if activeTab === 'music'}
         <section class="library-heading">
-          <div><p>{showingLikedMusic ? 'FAVOURITES' : 'YOUR NAPSTR'}</p><h1>{showingLikedMusic ? 'Liked music' : 'Your music'}</h1></div>
+          <div>
+            <p>{showingLikedMusic ? 'FAVOURITES' : 'YOUR NAPSTR'}</p>
+            <h1>{showingLikedMusic ? 'Liked music' : 'Your music'}</h1>
+            {#if !showingLikedMusic && knownHosts.length > 1}
+              <!-- Offered only when there is more than one computer to choose
+                   from. A phone holding one asks the same computer it always
+                   did, and its screen is left exactly as it was. -->
+              <label class="source-picker">
+                <select
+                  bind:value={browseSource}
+                  onchange={() => void loadLibrary()}
+                  aria-label={$t("Which computer's library")}
+                >
+                  {#each knownHosts as host (host.endpointId)}
+                    <option value={host.primary ? '' : host.endpointId}>{host.desktopName || host.endpointId.slice(0, 8)}</option>
+                  {/each}
+                </select>
+              </label>
+            {/if}
+          </div>
           {#if showingLikedMusic}
             <div class="heading-end">
               <span>{total} {total === 1 ? 'track' : 'tracks'}</span>

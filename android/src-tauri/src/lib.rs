@@ -1641,6 +1641,46 @@ impl RemoteClient {
         self.exchange_with(&host, request).await
     }
 
+    /// Ask one computer, named by the endpoint id a screen chose.
+    ///
+    /// `None` is the computer this phone acts through, which is what every
+    /// caller meant before there could be more than one - so a screen that has
+    /// not learned about sources keeps asking exactly whom it asked before.
+    async fn request_from(
+        &self,
+        source: Option<&str>,
+        request: ClientRequest,
+    ) -> Result<ServerResponse, String> {
+        let (response, _) = self.exchange_from(source, request).await?;
+        match response {
+            ServerResponse::Error { message } => Err(message),
+            response => Ok(response),
+        }
+    }
+
+    async fn exchange_from(
+        &self,
+        source: Option<&str>,
+        request: ClientRequest,
+    ) -> Result<(ServerResponse, iroh::endpoint::RecvStream), String> {
+        let host = self.host_named(source).await?;
+        self.exchange_with(&host, request).await
+    }
+
+    /// One computer out of the ones this phone holds.
+    async fn host_named(&self, source: Option<&str>) -> Result<SavedHost, String> {
+        let Some(endpoint_id) = source else {
+            return self.primary().await;
+        };
+        self.hosts
+            .read()
+            .await
+            .iter()
+            .find(|host| host.endpoint_id == endpoint_id)
+            .cloned()
+            .ok_or_else(|| "That computer is not paired with this phone".into())
+    }
+
     /// One request to one computer, retried once on a fresh tunnel.
     async fn exchange_with(
         &self,
@@ -2122,16 +2162,20 @@ async fn remote_library(
     offset: usize,
     limit: usize,
     shuffle_seed: Option<u64>,
+    source: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<LibraryPage, String> {
     match state
         .remote
-        .request(ClientRequest::Library {
-            query,
-            offset,
-            limit,
-            shuffle_seed,
-        })
+        .request_from(
+            source.as_deref(),
+            ClientRequest::Library {
+                query,
+                offset,
+                limit,
+                shuffle_seed,
+            },
+        )
         .await?
     {
         ServerResponse::Library { tracks, total } => Ok(LibraryPage { tracks, total }),
@@ -2148,6 +2192,7 @@ async fn remote_library(
 #[tauri::command]
 async fn remote_library_by_ids(
     file_ids: Vec<String>,
+    source: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Vec<RemoteTrack>, String> {
     if file_ids.len() > MAX_PLAY_QUEUE {
@@ -2157,9 +2202,12 @@ async fn remote_library_by_ids(
     for batch in file_ids.chunks(MAX_TRACKS_BY_ID) {
         let response = state
             .remote
-            .request(ClientRequest::LibraryByIds {
-                file_ids: batch.to_vec(),
-            })
+            .request_from(
+                source.as_deref(),
+                ClientRequest::LibraryByIds {
+                    file_ids: batch.to_vec(),
+                },
+            )
             .await?;
         match response {
             ServerResponse::LibraryByIds { tracks: batch } => tracks.extend(batch),
@@ -2744,11 +2792,12 @@ async fn reconcile_audio_cache(
 #[tauri::command]
 async fn remote_search(
     query: String,
+    source: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Vec<RemoteTrack>, String> {
     match state
         .remote
-        .request(ClientRequest::Search { query })
+        .request_from(source.as_deref(), ClientRequest::Search { query })
         .await?
     {
         ServerResponse::Search { tracks } => Ok(tracks),

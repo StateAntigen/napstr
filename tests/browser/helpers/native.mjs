@@ -147,6 +147,7 @@ export async function mockNative(page, { app = 'napstrfy', nativeLocale = 'en-GB
             return (args.fileIds ?? []).map((fileId) => known[fileId]).filter(Boolean);
           }
           case 'mobile_status': return { running: true, online: true, endpointId: 'endpoint', error: '', devices: window.mobileDevices ?? [] };
+          case 'remote_hosts': return window.remoteHosts ?? [];
           case 'set_mobile_device_rights': {
             // The host decides, so the mock applies the write and the list the
             // window reads back is the answer rather than its own optimism.
@@ -166,13 +167,17 @@ export async function mockNative(page, { app = 'napstrfy', nativeLocale = 'en-GB
           }
           case 'remote_library': {
             // The whole library unless a page is asked for, which is what the
-            // add sheet's list does as it is scrolled.
-            const rows = window.remoteLibrary ?? [track];
+            // add sheet's list does as it is scrolled. A source is another
+            // computer's library, which is what browsing a friend is.
+            const rows =
+              (args.source && window.remoteLibraryByHost?.[args.source]) ??
+              window.remoteLibrary ??
+              [track];
             const offset = Number(args.offset ?? 0);
             const limit = Number(args.limit ?? rows.length);
             return { tracks: rows.slice(offset, offset + limit), total: rows.length };
           }
-          case 'remote_search': if (window.searchError) throw window.searchError; return window.networkSearchResults ?? [track];
+          case 'remote_search': if (window.searchError) throw window.searchError; return (args.source && window.remoteLibraryByHost?.[args.source]) ?? window.networkSearchResults ?? [track];
           // The conversation around a track: a test seeds what has been said, and
           // a send appends to the same list, so the page asks again and finds it.
           case 'remote_track_discussion': return args.before ? [] : window.discussionMessages ?? [];

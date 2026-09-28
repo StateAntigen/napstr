@@ -86,6 +86,20 @@ export type AudiobookLibraryPage = {
   total: number;
 };
 
+/**
+ * One computer this phone may talk to.
+ *
+ * There may be more than one now: exactly one of them may let this phone act as
+ * its owner, and the others are libraries to read from.
+ */
+export type RemoteHost = {
+  endpointId: string;
+  desktopName: string;
+  rights: { browse: boolean; fetch: boolean; control: boolean; privileged: boolean };
+  /** The computer this phone acts through, whose library the app is drawn from. */
+  primary: boolean;
+};
+
 export type CompanionStatus = {
   streamOnly: boolean;
   paired: boolean;

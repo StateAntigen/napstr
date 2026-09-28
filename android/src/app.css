@@ -559,6 +559,9 @@ svg .filled { fill: currentColor; stroke: none; }
    one, an invitation when there is not. Always drawn, because a card that only
    appears once somebody has spoken is one nobody finds on a quiet network. */
 .sheet-card { width: 100%; padding: 10px 12px; display: block; color: #ececf1; background: #131318; border: 1px solid #1f1f27; border-radius: 12px; text-align: left; }
+/* Which computer's library is on screen. It appears only when this phone holds
+   more than one, so a phone with a single computer keeps the heading it had. */
+.source-picker { display: block; margin-top: 7px; }.source-picker select { max-width: 240px; padding: 5px 9px; color: #ececf1; background: #16161c; border: 1px solid #26262e; border-radius: 9px; font-size: 13px; }
 .sheet-card-head { display: flex; align-items: center; gap: 7px; color: #cbc4ff; font-size: 10px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
 .sheet-card-head svg { width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-width: 1.6; }
 .sheet-card-line { display: block; margin-top: 5px; color: #b9b9c4; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
