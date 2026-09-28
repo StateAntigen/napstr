@@ -849,6 +849,54 @@ mod tests {
         );
     }
 
+    /// The bytes a phone needs to decide about data, as the host writes them.
+    ///
+    /// Both directions of one shape: a host that sends the facts is read, and a
+    /// host too old to send them is read as "not known" rather than as a track
+    /// with no bitrate - which is what lets the two be updated apart.
+    #[test]
+    fn a_track_carries_what_its_audio_is_and_tolerates_a_host_that_says_nothing() {
+        let sent = RemoteTrack {
+            file_id: "a".repeat(64),
+            filename: "song.flac".into(),
+            title: "Song".into(),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            format: "FLAC".into(),
+            mime: "audio/flac".into(),
+            size: 42_000_000,
+            tags: String::new(),
+            local: true,
+            sources: Vec::new(),
+            bitrate_kbps: 900,
+            sample_rate_hz: 48_000,
+            channels: 2,
+            lossless: true,
+            duration_ms: 240_000,
+        };
+        let json = serde_json::to_string(&sent).unwrap();
+        // These names are the contract: the phone is the other end of this type,
+        // and its own copy reads exactly these keys.
+        for field in [
+            "bitrateKbps",
+            "sampleRateHz",
+            "channels",
+            "lossless",
+            "durationMs",
+        ] {
+            assert!(json.contains(field), "the wire is missing {field}: {json}");
+        }
+        assert_eq!(serde_json::from_str::<RemoteTrack>(&json).unwrap(), sent);
+
+        let older = r#"{"fileId":"a","filename":"song.flac","title":"Song","artist":"Artist",
+            "album":"Album","format":"FLAC","mime":"audio/flac","size":42000000,"tags":"",
+            "local":true,"sources":[]}"#;
+        let read = serde_json::from_str::<RemoteTrack>(older).unwrap();
+        assert_eq!(read.format, "FLAC");
+        assert_eq!(read.bitrate_kbps, 0, "a host that says nothing is not a 0 kb/s file");
+        assert!(!read.lossless, "and it says nothing about losslessness either");
+    }
+
     #[test]
     fn older_pairing_and_status_messages_keep_full_access() {
         assert_eq!(

@@ -2822,6 +2822,61 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+    /// What the phone is told about a file is what the host read out of it.
+    ///
+    /// The whole chain on purpose: a real WAV is indexed, and the five facts are
+    /// then read back out of the table by index. A scan that wrote the right
+    /// values into the wrong columns would still compile, and the phone would
+    /// hold back the wrong music - or none of it - without anything failing.
+    #[test]
+    fn an_indexed_file_reports_what_its_audio_is() {
+        let directory = test_directory("audio-properties-test");
+        fs::create_dir_all(&directory).unwrap();
+        let audio = directory.join("second.wav");
+        // One second of 44.1 kHz mono 16-bit PCM: a byte rate of 88 200 bytes a
+        // second, which is 705.6 kbit/s.
+        let payload = 88_200usize;
+        let mut bytes = b"RIFF".to_vec();
+        bytes.extend_from_slice(&((36 + payload) as u32).to_le_bytes());
+        bytes.extend_from_slice(
+            b"WAVEfmt \x10\0\0\0\x01\0\x01\0\x44\xac\0\0\x88\x58\x01\0\x02\0\x10\0data",
+        );
+        bytes.extend_from_slice(&(payload as u32).to_le_bytes());
+        bytes.extend_from_slice(&vec![0u8; payload]);
+        fs::write(&audio, bytes).unwrap();
+        let db_path = directory.join("napstr.sqlite3");
+        initialise_database(&db_path, &directory).unwrap();
+        let mut connection = open_connection(&db_path).unwrap();
+        assert_eq!(index_path(&mut connection, &directory).unwrap().file_count, 1);
+        let indexed = load_files(&connection, None).unwrap();
+        assert_eq!(indexed.len(), 1);
+        let file = &indexed[0];
+        assert_eq!(file.format, "WAV");
+        assert_eq!(file.bitrate_kbps, 706);
+        assert_eq!(file.sample_rate_hz, 44_100);
+        assert_eq!(file.channels, 1);
+        assert!(file.lossless, "a WAV keeps the samples, so it is lossless");
+        assert_eq!(file.duration_ms, 1_000);
+        // And a library indexed by an older build fills them in on its next scan
+        // rather than waiting for every file to be touched: the row below is what
+        // such a build left behind, and the version is what brings it back.
+        connection
+            .execute(
+                "UPDATE files SET metadata_version=2,bitrate_kbps=0,sample_rate_hz=0,channels=0,lossless=0,duration_ms=0",
+                [],
+            )
+            .unwrap();
+        assert_eq!(load_files(&connection, None).unwrap()[0].bitrate_kbps, 0);
+        index_path(&mut connection, &directory).unwrap();
+        let again = load_files(&connection, None).unwrap();
+        assert_eq!(again[0].bitrate_kbps, 706);
+        assert_eq!(again[0].sample_rate_hz, 44_100);
+        assert_eq!(again[0].duration_ms, 1_000);
+        assert!(again[0].lossless);
+        drop(connection);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn recursive_index_keeps_only_valid_audio() {
         let directory = test_directory("audio-index-test");
