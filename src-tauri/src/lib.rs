@@ -2773,6 +2773,7 @@ pub fn run() {
             mobile_status,
             create_mobile_pairing,
             revoke_mobile_device,
+            set_mobile_device_rights,
             block_file,
             block_user,
             report_catalogue,
