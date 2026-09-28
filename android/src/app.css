@@ -26,6 +26,10 @@ audio { display: none; }
 .pair-logo span { color: white; font: 900 italic clamp(43px, 13vw, 68px)/.9 "Arial Black", Arial, sans-serif; letter-spacing: -.075em; text-shadow: 1px 1px 0 #d7d7dd; white-space: nowrap; }
 .eyebrow { margin: 0 0 10px; color: #9e96ff; font-size: 12px; font-weight: 800; letter-spacing: .22em; }
 .pair-screen h1 { max-width: 390px; margin: 0; font-size: clamp(38px, 10vw, 57px); line-height: .98; letter-spacing: -.055em; }
+/* Away from the pairing screen, back to the app: a phone that already holds a
+   computer does not have to be unpaired to pair another. */
+.pair-back { position: absolute; top: calc(env(safe-area-inset-top) + 12px); left: 14px; width: 42px; height: 42px; display: grid; place-items: center; color: #ececf1; background: rgba(12,12,16,.52); border: 0; border-radius: 50%; backdrop-filter: blur(12px); }
+.pair-back svg { width: 21px; height: 21px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 .pair-copy { max-width: 380px; margin: 20px 0 26px; color: #b8b8c1; font-size: 16px; line-height: 1.45; }
 .scan-button { width: min(370px, 100%); min-height: 58px; padding: 11px 20px; display: flex; align-items: center; justify-content: center; gap: 13px; color: #09090b; background: #f5f5f6; border: 0; border-radius: 29px; font-size: 17px; font-weight: 800; box-shadow: 0 12px 32px rgba(0,0,0,.35); }
 .scan-button span { font-size: 28px; }.scan-button:disabled { opacity: .6; }
@@ -497,6 +501,11 @@ svg .filled { fill: currentColor; stroke: none; }
 .settings-row.danger span { color: #ff9aa6; }
 .settings-row:disabled { opacity: .55; }
 .settings-row span:last-child { text-align: right; }
+/* One computer per row once there is a choice between them, with its own way out: the
+   row below forgets all of them, which is the wrong size of hammer for one friend. */
+.computer-row span { display: flex; flex-direction: column; gap: 3px; }
+.computer-row small { color: #8a8a95; font-size: 11px; }
+.settings-action { flex: 0 0 auto; padding: 7px 13px; color: #ff9aa6; background: #211519; border: 1px solid #3a2229; border-radius: 9px; font-size: 12px; }
 /* A labelled group of rows, separated from the one above it. */
 .settings-section { margin-top: 22px; border-top: 8px solid #0c0c10; }
 .settings-section > p { margin: 14px 18px 6px; color: #8b8b96; font-size: 10px; letter-spacing: .16em; text-transform: uppercase; }

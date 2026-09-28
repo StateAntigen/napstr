@@ -167,6 +167,12 @@
    */
   let knownHosts = $state<RemoteHost[]>([]);
   let browseSource = $state('');
+  /**
+   * Whether the pairing screen is open over a phone that already holds a
+   * computer. A phone acts through exactly one computer, so this is how a second
+   * one - a friend's, usually - joins the ones it may read.
+   */
+  let addingComputer = $state(false);
 
   async function refreshKnownHosts() {
     try {
@@ -770,6 +776,12 @@
     // published again: the states that follow this one are not always a change
     // of answer, and a derived value that stays true would publish nothing.
     backPresses += 1;
+    // The pairing screen over a phone that already holds a computer: it covers
+    // everything, so it is the first thing a press takes away.
+    if (addingComputer) {
+      addingComputer = false;
+      return;
+    }
     if (showReport) {
       showReport = false;
       return;
@@ -1185,6 +1197,11 @@
       const desktop = await invoke<string>('pair_desktop', { code: code.trim(), deviceName: `Napstrfy on ${platform}` });
       pairingCode = '';
       notice = `Connected to ${desktop}`;
+      // The list of computers is read again here rather than by the effect that
+      // follows the connection: this pairing happened while already connected,
+      // so there is no change of connection for that effect to notice.
+      await refreshKnownHosts();
+      addingComputer = false;
       await refreshStatus();
       await loadLibrary();
     } catch (nextError) {
@@ -1243,6 +1260,31 @@
     tracks = [];
     current = null;
     audio?.pause();
+    knownHosts = [];
+    browseSource = '';
+  }
+
+  /**
+   * Forget one of the computers this phone may read.
+   *
+   * The phone acts through one computer but may read several, so dropping a
+   * friend's must not cost the phone its own. Forgetting the last one leaves it
+   * holding nothing, and the pairing screen comes back on its own.
+   */
+  async function forgetHost(computer: RemoteHost) {
+    const name = computer.desktopName || 'that computer';
+    if (!window.confirm(`Forget ${name}? Its music will stop appearing on this phone.`)) return;
+    try {
+      await invoke('forget_mobile_host', { endpointId: computer.endpointId });
+      notice = `${name} forgotten`;
+      await refreshKnownHosts();
+      await refreshStatus();
+      // Only when something is still paired: forgetting the last computer answers
+      // with the pairing screen, and there is nothing to load from.
+      if (status.paired) await loadLibrary();
+    } catch (nextError) {
+      notice = String(nextError);
+    }
   }
 
   /**
@@ -3173,7 +3215,8 @@
    * be left standing on.
    */
   let backHasDestination = $derived(
-    showReport ||
+    addingComputer ||
+      showReport ||
       showPlaylistDelete ||
       showPlaylistAdd ||
       showPlaylistSort ||
@@ -5145,13 +5188,26 @@
   </button>
 {/snippet}
 
-{#if !status.paired && activeTab !== 'podcasts'}
+{#if (!status.paired && activeTab !== 'podcasts') || addingComputer}
   <main class="pair-screen">
     <div class="pair-glow"></div>
+    {#if addingComputer}
+      <!-- Reachable while a computer is already held, so it says what is being
+           added: a phone acts through one computer, and the others are
+           libraries it may read. -->
+      <button class="pair-back" onclick={() => (addingComputer = false)} aria-label={$t("Cancel")}>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14.5 5.5 8 12l6.5 6.5" /></svg>
+      </button>
+    {/if}
     <div class="pair-logo" aria-label="Napstrfy"><img src={appIcon} alt="" /><span>napstrfy</span></div>
     <p class="eyebrow">{$t("NAPSTR COMPANION")}</p>
-    <h1>{$t("Your music.")}<br />{$t("Wherever you are.")}</h1>
-    <p class="pair-copy">{$t("Pair securely with Napstr on your computer. Discovery and Tor downloads stay there; your music reaches this phone over encrypted Iroh.")}</p>
+    {#if addingComputer}
+      <h1>{$t("Another computer.")}</h1>
+      <p class="pair-copy">{$t("This phone acts through one computer; the others are libraries to read and play from. A code from someone else's Napstr is read-only.")}</p>
+    {:else}
+      <h1>{$t("Your music.")}<br />{$t("Wherever you are.")}</h1>
+      <p class="pair-copy">{$t("Pair securely with Napstr on your computer. Discovery and Tor downloads stay there; your music reaches this phone over encrypted Iroh.")}</p>
+    {/if}
     {#if error}
       <div class="error-card">
         <span>{$t(error)}</span>
@@ -6098,11 +6154,32 @@
       </div>
 
       {#if status.paired}
+        <div class="settings-section">
+          <p>{$t("Computers")}</p>
+          {#if knownHosts.length > 1}
+            {#each knownHosts as computer (computer.endpointId)}
+              <div class="settings-row computer-row">
+                <span>
+                  {computer.desktopName || computer.endpointId.slice(0, 8)}
+                  {#if computer.primary}<small>{$t("This phone acts through this one")}</small>{/if}
+                </span>
+                <button
+                  class="settings-action"
+                  onclick={() => void forgetHost(computer)}
+                  aria-label={$t("Forget {p0}", { p0: computer.desktopName || computer.endpointId.slice(0, 8) })}
+                >{$t("Forget")}</button>
+              </div>
+            {/each}
+          {/if}
+          <button class="settings-row" onclick={() => { showSettings = false; addingComputer = true; }}>
+            <span>{$t("Add a computer")}</span><small>{$t("A friend's Napstr, or another of your own")}</small>
+          </button>
+        </div>
         <button class="settings-row" onclick={() => { showSettings = false; void reconnect(); }} disabled={statusPending}>
           <span>{$t("Reconnect")}</span><small>{statusPending ? 'Trying…' : 'Refresh the connection now'}</small>
         </button>
         <button class="settings-row danger" onclick={() => { showSettings = false; void forgetDesktop(); }}>
-          <span>{$t("Disconnect this phone")}</span><small>{$t("You will need a new QR code")}</small>
+          <span>{$t("Disconnect this phone")}</span><small>{knownHosts.length > 1 ? $t("Forgets every computer this phone holds") : $t("You will need a new QR code")}</small>
         </button>
       {:else}
         <button class="settings-row" onclick={() => { showSettings = false; showMusic(); }}>

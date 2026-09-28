@@ -1641,6 +1641,24 @@ fn fetch_order(origin: Option<&str>, hosts: &[SavedHost]) -> Result<Vec<SavedHos
     Ok(order)
 }
 
+/// The computers this phone holds, minus the one named, or why it holds no such
+/// computer.
+///
+/// Forgetting one computer is not forgetting the others, which is the whole
+/// reason this is separate from `forget`: a friend who is dropped must not take
+/// the phone's own computer with them. The last computer can be forgotten too -
+/// that is exactly what a phone holding nothing is - and naming one this phone
+/// never had is refused rather than quietly leaving it a host short.
+fn without_host(hosts: Vec<SavedHost>, endpoint_id: &str) -> Result<Vec<SavedHost>, String> {
+    if !hosts.iter().any(|host| host.endpoint_id == endpoint_id) {
+        return Err("That computer is not paired with this phone".into());
+    }
+    Ok(hosts
+        .into_iter()
+        .filter(|host| host.endpoint_id != endpoint_id)
+        .collect())
+}
+
 impl RemoteClient {
     async fn close_connection(&self, endpoint_id: &str) {
         if let Some(connection) = self.connections.write().await.remove(endpoint_id) {
@@ -2055,6 +2073,29 @@ impl RemoteClient {
         for row in rows {
             origins.insert(row.file_id.clone(), endpoint_id.to_string());
         }
+    }
+
+    /// Forget one computer, keeping every other one this phone holds.
+    ///
+    /// What goes is the pairing, its tunnel, and anything remembered as having
+    /// come from it: a file remembered as a friend's must not be fetched from a
+    /// computer this phone no longer speaks to. The mix of libraries goes too,
+    /// because it was collected from a set of computers that has just changed -
+    /// the next page of a shuffle asks again from what is left.
+    async fn forget_host(&self, endpoint_id: &str) -> Result<(), String> {
+        {
+            let mut hosts = self.hosts.write().await;
+            let remaining = without_host(hosts.clone(), endpoint_id)?;
+            *hosts = remaining.clone();
+            save_hosts(&self.app_data.join(PAIRED_HOSTS_FILE), &remaining)?;
+        }
+        self.close_connection(endpoint_id).await;
+        self.origins
+            .write()
+            .await
+            .retain(|_, origin| origin != endpoint_id);
+        *self.mixed.write().await = None;
+        Ok(())
     }
 
     /// One file's audio, from the first computer that offers it.
@@ -2550,6 +2591,16 @@ async fn pair_desktop(
 #[tauri::command]
 async fn forget_desktop(state: State<'_, AppState>) -> Result<(), String> {
     state.remote.forget().await
+}
+
+/// Forget one computer, leaving the others this phone may read.
+///
+/// A phone acts through exactly one computer, but it may read several, so
+/// dropping one - a friend's, usually - has to be possible without unpairing
+/// the one it acts through.
+#[tauri::command]
+async fn forget_mobile_host(endpoint_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    state.remote.forget_host(&endpoint_id).await
 }
 
 /// One computer this phone may talk to, for a screen that offers more than one.
@@ -3833,6 +3884,7 @@ pub fn run() {
             pair_desktop,
             forget_desktop,
             remote_hosts,
+            forget_mobile_host,
             remote_library,
             remote_library_by_ids,
             remote_playlists,
@@ -4167,6 +4219,22 @@ mod tests {
         );
         assert!(fetch_order(None, &[reader]).is_err());
         assert!(fetch_order(None, &[]).is_err());
+    }
+
+    /// Forgetting one computer is not forgetting the others, and a computer this
+    /// phone never held is refused rather than quietly leaving it a host short.
+    #[test]
+    fn forgetting_a_computer_keeps_the_others() {
+        let own = host("own", DeviceRights::full(), "My Napstr");
+        let friend = host("friend", DeviceRights::read_only(), "Ada's Napstr");
+
+        let remaining = without_host(vec![own.clone(), friend.clone()], "friend").unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].endpoint_id, "own");
+        // The last computer can be forgotten as well: that is what leaves a
+        // phone holding nothing, with the pairing screen back.
+        assert!(without_host(vec![friend], "friend").unwrap().is_empty());
+        assert!(without_host(vec![own], "friend").is_err());
     }
 
     /// A playlist is edited on a phone by sending the whole of it, so the one

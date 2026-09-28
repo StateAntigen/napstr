@@ -305,8 +305,35 @@ export async function mockNative(page, { app = 'napstrfy', nativeLocale = 'en-GB
           case 'podcast_downloads': return [{ episode, ready: false, status: 'Downloading', progress: 20 }];
           case 'podcast_parse_search': return [{ id: 1, title: 'Original podcast', author: 'Original author', feedUrl: 'https://example.com/feed', image: '', description: '', language: 'en', episodeCount: 1, genres: ['Music'] }];
           case 'podcast_episodes': return [episode];
-          case 'pair_desktop': paired = true; return 'Music computer';
-          case 'forget_desktop': paired = false; return;
+          case 'pair_desktop': {
+            // Pairing a second computer adds it rather than replacing the first,
+            // which is what the phone's Settings list reads back. A test can name
+            // the computer the next code belongs to.
+            paired = true;
+            const name = window.pairedComputerName ?? 'Music computer';
+            const id = window.pairedComputerId ?? 'paired-computer';
+            const held = (window.remoteHosts ?? []).filter((host) => host.endpointId !== id);
+            held.push({
+              endpointId: id,
+              desktopName: name,
+              rights: { browse: true, fetch: true, control: true, privileged: true },
+              primary: held.length === 0
+            });
+            window.remoteHosts = held;
+            return name;
+          }
+          case 'forget_desktop': paired = false; window.remoteHosts = []; return;
+          case 'forget_mobile_host': {
+            const held = window.remoteHosts ?? [];
+            if (!held.some((host) => host.endpointId === args.endpointId)) {
+              throw new Error('That computer is not paired with this phone');
+            }
+            window.remoteHosts = held.filter((host) => host.endpointId !== args.endpointId);
+            // A phone left holding nothing is unpaired, exactly as the computer
+            // it forgot would leave it.
+            if (!window.remoteHosts.length) paired = false;
+            return null;
+          }
           default: return null;
         }
       }
