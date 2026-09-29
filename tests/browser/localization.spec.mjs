@@ -480,7 +480,12 @@ for (const code of ['ar', 'ur', 'fr', 'bn']) {
       const nav = await page.locator('.bottom-nav').boundingBox();
       if (width >= 800 && ['ar', 'ur'].includes(code)) expect(Math.round(nav.x + nav.width)).toBe(width);
       await page.locator('.header-icon').click();
-      await expect(page.locator('[data-language-select]')).toBeInViewport();
+      // The picker is the last thing in the settings sheet now, so the sheet is
+      // scrolled to it rather than the assertion loosened: it still has to be
+      // reachable in every layout and every language.
+      const language = page.locator('[data-language-select]');
+      await language.scrollIntoViewIfNeeded();
+      await expect(language).toBeInViewport();
       await page.locator('.settings-view .view-icon').click();
     }
   });

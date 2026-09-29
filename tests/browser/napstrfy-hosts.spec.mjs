@@ -38,16 +38,17 @@ const theirs = track(id('b'), 'Ada Ripped This');
 const full = { browse: true, fetch: true, control: true, privileged: true };
 const readable = { browse: true, fetch: true, control: false, privileged: false };
 
-const myComputer = { endpointId: 'endpoint', desktopName: 'My Napstr', rights: full, primary: true };
-const friend = { endpointId: id('f'), desktopName: "Ada's Napstr", rights: readable, primary: false };
+const myComputer = { endpointId: 'endpoint', desktopName: 'My Napstr', rights: full, primary: true, included: true, online: true };
+const friend = { endpointId: id('f'), desktopName: "Ada's Napstr", rights: readable, primary: false, included: true, online: true };
 
-async function openApp(page, { known = [myComputer, friend], library = [mine], libraries = {} } = {}) {
+async function openApp(page, { known = [myComputer, friend], library = [mine], libraries = {}, fileHosts = {} } = {}) {
   await mockNative(page, { platform: 'android' });
   await page.route('**/fixture.wav', serveAudio);
-  await page.addInitScript(({ known, library, libraries }) => {
+  await page.addInitScript(({ known, library, libraries, fileHosts }) => {
     window.remoteHosts = known;
     window.remoteLibrary = library;
     window.remoteLibraryByHost = libraries;
+    window.fileHosts = fileHosts;
     // The hardware back button, the way Android drives it: the page is handed a
     // press only while it advertises a destination, and a press it is not given
     // leaves the app.
@@ -57,7 +58,7 @@ async function openApp(page, { known = [myComputer, friend], library = [mine], l
       setBackAvailable: (available) => { window.backAvailable = available; },
       setDrawerOpen: (open) => { window.backAvailable = open; }
     };
-  }, { known, library, libraries });
+  }, { known, library, libraries, fileHosts });
   await page.goto('http://127.0.0.1:15174');
 }
 
@@ -83,41 +84,30 @@ const lastLibraryCall = (page) =>
     return { count: calls.length, source: calls.at(-1)?.args?.source ?? null };
   });
 
-test('Napstrfy browses the library of the computer it is told to', async ({ page }) => {
+test('Napstrfy shows every computer\u2019s music as one list', async ({ page }) => {
   await openApp(page, { libraries: { [friend.endpointId]: [theirs] } });
 
-  const picker = page.locator('.source-picker select');
-  // The choice is offered because this phone holds two computers.
-  await expect(picker).toBeVisible();
-  await expect(picker).toHaveAttribute('aria-label', "Which computer's library");
-  // It begins on the computer this phone acts through, which is what the app has
-  // always shown.
-  await expect(picker).toHaveValue('');
-  await expect(page.locator('.track-row strong')).toHaveText(['My Song']);
-
-  await picker.selectOption({ label: "Ada's Napstr" });
-
-  await expect(page.locator('.track-row strong')).toHaveText(['Ada Ripped This']);
-  // The asking went to their computer rather than to the one this phone acts
-  // through, which is the whole of the difference being made here.
+  // The phone's own music first, then what the friend holds, and no control for
+  // choosing between them: there is nothing to choose any more.
+  await expect(page.locator('.track-row strong')).toHaveText(['My Song', 'Ada Ripped This']);
+  await expect(page.locator('.source-picker')).toHaveCount(0);
   const asked = await lastLibraryCall(page);
-  expect(asked.source).toBe(id('f'));
-
-  // Choosing the phone's own computer again asks the same way it did before.
-  await picker.selectOption({ label: 'My Napstr' });
-  await expect(page.locator('.track-row strong')).toHaveText(['My Song']);
-  expect((await lastLibraryCall(page)).source).toBe(null);
+  expect(asked.source).toBe(null);
 });
 
-test('Napstrfy offers no choice when it holds a single computer', async ({ page }) => {
-  await openApp(page, { known: [myComputer] });
+test('Napstrfy marks a track that came from another computer', async ({ page }) => {
+  await openApp(page, {
+    libraries: { [friend.endpointId]: [theirs] },
+    fileHosts: { [theirs.fileId]: id('f') }
+  });
 
-  await expect(page.locator('.track-row strong')).toHaveText(['My Song']);
-  // Nothing to pick between, so nothing is offered and the screen is untouched.
-  await expect(page.locator('.source-picker')).toHaveCount(0);
-  // And the asking still names no computer, which is what every phone that has
-  // ever been paired does.
-  expect((await lastLibraryCall(page)).source).toBe(null);
+  const rows = page.locator('.track-row');
+  await expect(rows).toHaveCount(2);
+  // The phone's own row is unmarked; the friend's carries a mark in that
+  // computer's colour and names it.
+  await expect(rows.first().locator('.track-badge.elsewhere')).toHaveCount(0);
+  await expect(rows.last().locator('.track-badge.elsewhere')).toHaveCount(1);
+  await expect(rows.last().locator('.track-badge')).toHaveAttribute('aria-label', "Stored on Ada's Napstr");
 });
 
 /** Opens the settings sheet. */
@@ -151,20 +141,21 @@ test('Napstrfy lists the computers it may read, and forgets one without the rest
     .poll(() => page.evaluate(() => window.calls.filter((call) => call.cmd === 'forget_mobile_host').map((call) => call.args.endpointId)))
     .toEqual([id('f')]);
   expect(asked.some((message) => message.includes("Forget Ada's Napstr"))).toBe(true);
-  // One computer is not a choice, so the list gives way to the row that adds one.
-  await expect(rows).toHaveCount(0);
+  // The computer went, and the row that adds one is still there.
+  await expect(rows).toHaveCount(1);
+  await expect(rows.first()).toContainText('My Napstr');
   await expect(page.getByRole('button', { name: 'Add a computer' })).toBeVisible();
-  // And the library on screen is still this phone's own computer's.
+  // And the library on screen is the phone's own computer's again.
   await expect(page.locator('.track-row strong')).toHaveText(['My Song']);
 });
 
 test('Napstrfy adds a computer from settings, and the choice appears', async ({ page }) => {
   await openApp(page, { known: [myComputer] });
-  // One computer is not a choice, which is why the picker is not there yet.
-  await expect(page.locator('.source-picker')).toHaveCount(0);
+  // One computer is all this phone may read for now.
+  await expect(page.locator('.track-row strong')).toHaveText(['My Song']);
 
   await openSettings(page);
-  await expect(page.locator('.computer-row')).toHaveCount(0);
+  await expect(page.locator('.computer-row')).toHaveCount(1);
   await page.getByRole('button', { name: 'Add a computer' }).click();
 
   // The pairing screen, said the way a phone that already holds a computer
@@ -178,10 +169,12 @@ test('Napstrfy adds a computer from settings, and the choice appears', async ({ 
   await page.locator('.manual-pair textarea').fill('napstrfy://pair/example');
   await page.locator('.manual-pair button').click();
 
-  // Back in the app, holding two computers, so the choice is offered now.
+  // Back in the app, holding two computers, so both are listed and both are read.
   await expect(page.locator('.app-shell')).toBeVisible();
-  await expect(page.locator('.source-picker select')).toBeVisible();
-  await expect(page.locator('.source-picker option')).toHaveCount(2);
+  await expect(page.locator('.track-row strong')).toHaveText(['My Song']);
+  await openSettings(page);
+  await expect(page.locator('.computer-row')).toHaveCount(2);
+  await expect(page.locator('.computer-row').last()).toContainText('Music computer');
 });
 
 test('Napstrfy leaves the adding screen on a back press rather than the app', async ({ page }) => {
@@ -196,4 +189,35 @@ test('Napstrfy leaves the adding screen on a back press rather than the app', as
   await expect(page.locator('.app-shell')).toBeVisible();
   await expect(page.getByText('Another computer.')).toHaveCount(0);
   expect(await page.evaluate(() => window.appExits)).toBe(0);
+});
+
+test('Napstrfy leaves a computer out without unpairing it', async ({ page }) => {
+  await openApp(page, { libraries: { [friend.endpointId]: [theirs] } });
+  await expect(page.locator('.track-row strong')).toHaveText(['My Song', 'Ada Ripped This']);
+
+  await openSettings(page);
+  const friendRow = page.locator('.computer-row').last();
+  await expect(friendRow).toContainText('Connected');
+  await friendRow.locator('.computer-include input').uncheck();
+
+  // The switch is the computer's to keep, so the call is the assertion - and the
+  // library on screen follows it, with the computer still paired.
+  await expect
+    .poll(() => page.evaluate(() => window.calls.filter((call) => call.cmd === 'set_mobile_host_included').map((call) => String(call.args.included))))
+    .toEqual(['false']);
+  await expect(friendRow).toContainText('Left out');
+  await expect(page.locator('.track-row strong')).toHaveText(['My Song']);
+  await expect(page.locator('.computer-row')).toHaveCount(2);
+});
+
+test('Napstrfy counts the computers that answered in the status line', async ({ page }) => {
+  await openApp(page, { known: [{ ...friend, online: false }, myComputer] });
+
+  const chip = page.locator('.status-chip');
+  // One dot per computer, and the one that did not answer is set apart from the
+  // one that did.
+  await expect(chip.locator('.status-dots i')).toHaveCount(2);
+  await expect(chip.locator('.status-dots i.on')).toHaveCount(1);
+  await expect(chip.locator('.status-dots i.away')).toHaveCount(1);
+  await expect(chip).toContainText('1/2 Online');
 });

@@ -819,7 +819,7 @@ test('back walks out of a playlist, its screens and its sheets', async ({ page }
   expect(await pressBack(page)).toBe('handled');
   await expect(page.locator('.playlist-row')).toBeVisible();
   expect(await pressBack(page)).toBe('handled');
-  await expect(page.locator('.library-heading h1')).toHaveText('Your music');
+  await expect(page.locator('button[data-tab="music"]')).toHaveClass(/active/);
 });
 
 /**

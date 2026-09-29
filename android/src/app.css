@@ -501,11 +501,32 @@ svg .filled { fill: currentColor; stroke: none; }
 .settings-row.danger span { color: #ff9aa6; }
 .settings-row:disabled { opacity: .55; }
 .settings-row span:last-child { text-align: right; }
-/* One computer per row once there is a choice between them, with its own way out: the
-   row below forgets all of them, which is the wrong size of hammer for one friend. */
-.computer-row span { display: flex; flex-direction: column; gap: 3px; }
-.computer-row small { color: #8a8a95; font-size: 11px; }
+/* One row per computer: a dot in its own colour, its state, the switch that reads
+   from it and its own way out. That colour is what the same computer's mark in a
+   track row is drawn in, so the two can be read together. */
+.computer-row { gap: 10px; }
+.computer-id { display: flex; align-items: center; gap: 11px; }
+.computer-id > span { display: flex; flex-direction: column; gap: 2px; }
+.computer-id strong { font-size: 15px; }
+.computer-id small { color: #8a8a95; font-size: 11px; text-align: left; }
+.computer-dot { width: 30px; height: 30px; flex: 0 0 auto; display: grid; place-items: center; color: #0b0b0e; background: hsl(var(--host-hue) 40% 44%); border-radius: 50%; font-size: 13px; font-weight: 700; text-transform: uppercase; }
+.computer-dot.online { background: hsl(var(--host-hue) 78% 60%); box-shadow: 0 0 10px hsl(var(--host-hue) 78% 60% / .5); }
+.computer-row.left-out .computer-id { opacity: .45; }
+.computer-include { display: flex; flex: 0 0 auto; align-items: center; gap: 6px; color: #8a8a95; font-size: 11px; }
+.computer-include input { width: 18px; height: 18px; accent-color: #7c6df2; }
 .settings-action { flex: 0 0 auto; padding: 7px 13px; color: #ff9aa6; background: #211519; border: 1px solid #3a2229; border-radius: 9px; font-size: 12px; }
+/* The status line above the pages: one dot per computer, in that computer's own
+   colour. The ones that answered are clustered on the left and the ones that did
+   not sit a little to their right. */
+.status-dots { display: flex; align-items: center; gap: 4px; }
+.status-dots i { width: 9px; height: 9px; flex: 0 0 auto; border-radius: 50%; background: hsl(var(--host-hue) 78% 60%); box-shadow: 0 0 7px hsl(var(--host-hue) 78% 60% / .55); }
+.status-dots i.away { margin-left: 7px; background: hsl(var(--host-hue) 30% 34%); box-shadow: none; }
+/* A track that came from another computer is marked in that computer's colour. */
+.track-badge.elsewhere { color: hsl(var(--host-hue) 78% 64%); }
+/* The language picker is the last thing in the sheet, lined up with the rows. */
+.language-section { padding: 0 18px 20px; }
+.language-section > * { width: 100%; }
+.language-section select { width: 100%; padding: 9px 11px; color: #ececf1; background: #16161c; border: 1px solid #26262e; border-radius: 10px; font-size: 14px; }
 /* A labelled group of rows, separated from the one above it. */
 .settings-section { margin-top: 22px; border-top: 8px solid #0c0c10; }
 .settings-section > p { margin: 14px 18px 6px; color: #8b8b96; font-size: 10px; letter-spacing: .16em; text-transform: uppercase; }
@@ -568,9 +589,6 @@ svg .filled { fill: currentColor; stroke: none; }
    one, an invitation when there is not. Always drawn, because a card that only
    appears once somebody has spoken is one nobody finds on a quiet network. */
 .sheet-card { width: 100%; padding: 10px 12px; display: block; color: #ececf1; background: #131318; border: 1px solid #1f1f27; border-radius: 12px; text-align: left; }
-/* Which computer's library is on screen. It appears only when this phone holds
-   more than one, so a phone with a single computer keeps the heading it had. */
-.source-picker { display: block; margin-top: 7px; }.source-picker select { max-width: 240px; padding: 5px 9px; color: #ececf1; background: #16161c; border: 1px solid #26262e; border-radius: 9px; font-size: 13px; }
 .sheet-card-head { display: flex; align-items: center; gap: 7px; color: #cbc4ff; font-size: 10px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
 .sheet-card-head svg { width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-width: 1.6; }
 .sheet-card-line { display: block; margin-top: 5px; color: #b9b9c4; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

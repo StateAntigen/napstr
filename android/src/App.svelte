@@ -24,6 +24,7 @@
   import appIcon from '../src-tauri/icons/icon.png';
   import { artworkHue, coverFor, coverKey, invalidateCoverNegatives, loadFullCover, preloadArtwork, type AlbumCover } from './lib/artwork';
   import { reportReasons } from './lib/types';
+  import { hostHue } from './lib/hosts';
   import type { AudiobookLibraryPage, CachedAudio, CompanionStatus, CoverReport, LibraryPage, PlaybackCommand, PlaylistPage, PodcastDownload, PodcastEpisode, PodcastFeed, ReadOnlyTicketOffer, RemoteAudiobook, RemoteAudiobookSummary, RemoteDiscussionMessage, RemoteHost, RemotePlaybackState, RemotePlaylist, RemotePlaylistCoordinate, RemotePlaylistSummary, RemotePlaylistTrack, RemoteRepeat, RemoteTrack, RemoteTransfer, ReportReason } from './lib/types';
 
   const musicChips = ['Rock', 'Soundtrack', 'Punk', 'Folk', 'Upbeat'];
@@ -158,15 +159,20 @@
   const pinned = $derived(!mobile && platform !== '' && wideWindow);
   let status = $state<CompanionStatus>({ streamOnly: false, paired: false, connected: false, desktopName: '', endpointId: '', libraryRevision: 0, coverRevision: 0, pubkey: '', error: '' });
   /**
-   * The computers this phone may talk to, and which one is being browsed.
+   * The computers this phone may talk to, and how to reach each of them.
    *
-   * An empty `browseSource` is the computer this phone acts through - the one it
-   * was paired with before there could be more than one - so a phone holding a
-   * single computer asks exactly whom it has always asked, and nothing about it
-   * changes.
+   * Every one of them is read from unless it is left out in Settings, so this is
+   * what the settings list, the status line and the marked rows are drawn from.
    */
   let knownHosts = $state<RemoteHost[]>([]);
-  let browseSource = $state('');
+  /**
+   * Which computer answered with which file, for the rows that say so.
+   *
+   * Only files that came from a computer other than the phone's own are in here:
+   * a row with no mark is one the phone's own computer answered with, which is
+   * what most of them are.
+   */
+  let fileHosts = $state<Record<string, string>>({});
   /**
    * Whether the pairing screen is open over a phone that already holds a
    * computer. A phone acts through exactly one computer, so this is how a second
@@ -177,18 +183,77 @@
   async function refreshKnownHosts() {
     try {
       knownHosts = await invoke<RemoteHost[]>('remote_hosts');
-      // A computer that is no longer paired is not a library to browse, and the
-      // list on screen must not offer one that has gone.
-      if (browseSource && !knownHosts.some((host) => host.endpointId === browseSource)) browseSource = '';
     } catch {
       // Nothing to report: with no answer the phone keeps the one computer it
       // knows about, which is every phone that has ever been paired once.
     }
   }
 
+  async function refreshFileHosts() {
+    try {
+      fileHosts = await invoke<Record<string, string>>('remote_file_hosts');
+    } catch {
+      // The marks are a nicety: without them the rows are what they were.
+    }
+  }
+
+  /** The computers that answered just now, and the ones that did not. */
+  const onlineComputers = () => knownHosts.filter((host) => host.online);
+  const awayComputers = () => knownHosts.filter((host) => !host.online);
+  const everyoneOnline = () => knownHosts.length > 0 && awayComputers().length === 0;
+
+  /**
+   * What the status line says: which computer is being read, or how many of them
+   * are here once there is more than one to count.
+   */
+  function statusLabel(): Message | string {
+    if (statusPending) return $t("Connecting…");
+    if (!status.connected) return $t("Offline");
+    if (knownHosts.length > 1 && !everyoneOnline()) {
+      return msg("{p0}/{p1} Online", {
+        p0: String(onlineComputers().length),
+        p1: String(knownHosts.length)
+      });
+    }
+    return status.desktopName || 'Napstr';
+  }
+
+  /** The letter on a computer's dot, so that a colour can be read as a name. */
+  function hostInitial(computer: RemoteHost) {
+    return (computer.desktopName || computer.endpointId).trim().charAt(0).toUpperCase() || '\u2022';
+  }
+
+  /** The name of a computer by its endpoint id, for a row that marks one. */
+  function hostNameOf(endpointId: string | undefined) {
+    if (!endpointId) return '';
+    return knownHosts.find((computer) => computer.endpointId === endpointId)?.desktopName || '';
+  }
+
+  /** Read from one computer or leave it out, without pairing again. */
+  async function setComputerIncluded(computer: RemoteHost, included: boolean) {
+    try {
+      await invoke('set_mobile_host_included', { endpointId: computer.endpointId, included });
+      await refreshKnownHosts();
+      await loadLibrary();
+    } catch (nextError) {
+      notice = String(nextError);
+    }
+  }
+
   $effect(() => {
     if (!status.connected) return;
     void refreshKnownHosts();
+    // The status line is a picture of who is reachable now, so it is asked again
+    // on a slow timer rather than only when something else changes.
+    const timer = window.setInterval(() => void refreshKnownHosts(), 30_000);
+    return () => window.clearInterval(timer);
+  });
+
+  // The marks in the rows follow whatever the library last answered with.
+  $effect(() => {
+    void tracks.length;
+    void status.libraryRevision;
+    void refreshFileHosts();
   });
   let statusLoading = $state(true);
   let statusPending = $state(false);
@@ -1261,7 +1326,7 @@
     current = null;
     audio?.pause();
     knownHosts = [];
-    browseSource = '';
+    fileHosts = {};
   }
 
   /**
@@ -1278,6 +1343,7 @@
       await invoke('forget_mobile_host', { endpointId: computer.endpointId });
       notice = `${name} forgotten`;
       await refreshKnownHosts();
+      await refreshFileHosts();
       await refreshStatus();
       // Only when something is still paired: forgetting the last computer answers
       // with the pairing screen, and there is nothing to load from.
@@ -1313,8 +1379,7 @@
         query: query.trim(),
         offset: append ? tracks.length : 0,
         limit: 100,
-        shuffleSeed: libraryShuffleSeed,
-        source: browseSource || undefined
+        shuffleSeed: libraryShuffleSeed
       });
       if (viewVersion !== musicViewVersion) return;
       tracks = append ? [...tracks, ...page.tracks] : page.tracks;
@@ -1340,7 +1405,7 @@
     }
     silentLibraryRefresh = true;
     try {
-      const page = await invoke<LibraryPage>('remote_library', { query: '', offset: 0, limit: 100, shuffleSeed: libraryShuffleSeed, source: browseSource || undefined });
+      const page = await invoke<LibraryPage>('remote_library', { query: '', offset: 0, limit: 100, shuffleSeed: libraryShuffleSeed });
       tracks = page.tracks;
       total = page.total;
       loadedLibraryRevision = revision;
@@ -1399,14 +1464,13 @@
     const localSearch = invoke<LibraryPage>('remote_library', {
       query: searchQuery,
       offset: 0,
-      limit: MAX_ALBUM_TRACKS,
-      source: browseSource || undefined
+      limit: MAX_ALBUM_TRACKS
     })
       .then((page) => mergeResults(page.tracks))
       .catch((nextError) => { if (viewVersion === musicViewVersion) error = String(nextError); })
       .finally(() => { if (viewVersion === musicViewVersion) loading = false; });
     const networkSearch = searchingNetwork
-      ? invoke<RemoteTrack[]>('remote_search', { query: searchQuery, source: browseSource || undefined })
+      ? invoke<RemoteTrack[]>('remote_search', { query: searchQuery })
         .then(mergeResults)
         .catch((nextError) => {
           if (viewVersion !== musicViewVersion) return;
@@ -3500,7 +3564,7 @@
     );
     try {
       const page = await invoke<LibraryPage>('remote_library', {
-        query: name, offset: 0, limit: MAX_ALBUM_TRACKS, source: browseSource || undefined
+        query: name, offset: 0, limit: MAX_ALBUM_TRACKS
       });
       const sameArtist = page.tracks.filter(
         (track) => (track.artist ?? '').trim().toLocaleLowerCase() === wanted
@@ -4509,7 +4573,7 @@
     if (!name) return album.tracks;
     try {
       const page = await invoke<LibraryPage>('remote_library', {
-        query: name, offset: 0, limit: MAX_ALBUM_TRACKS, source: browseSource || undefined
+        query: name, offset: 0, limit: MAX_ALBUM_TRACKS
       });
       const sameAlbum = (track: RemoteTrack) =>
         (track.album ?? '').trim().toLocaleLowerCase() === name.toLocaleLowerCase();
@@ -5116,7 +5180,13 @@
             <small>{artist(track)}{track.album ? ` · ${track.album}` : ''}</small>
             <span class="track-meta">{readableSize(track.size)}{audioFacts(track) ? ` · ${audioFacts(track)}` : ''}</span>
           </span>
-          <TrackBadge {track} cached={cachedFileIds.has(track.fileId)} pending={pending.has(track.fileId)} />
+          <TrackBadge
+            {track}
+            cached={cachedFileIds.has(track.fileId)}
+            pending={pending.has(track.fileId)}
+            host={fileHosts[track.fileId] ?? ''}
+            hostName={hostNameOf(fileHosts[track.fileId])}
+          />
         </button>
         <!-- The row's own control is the track menu rather than a heart: liking
              is one of its rows, alongside sharing and the code below, so a
@@ -5231,8 +5301,19 @@
   <main class="app-shell" class:desktop={desktopShell}>
     <header class="mobile-header">
       {#if status.paired}
-        <button class="status-chip" class:offline={!status.connected} onclick={reconnect} title={status.connected ? `Connected to ${status.desktopName || 'Napstr'}` : 'Reconnect to Napstr'}>
-          <i></i><span>{statusPending ? $t("Connecting…") : status.connected ? status.desktopName || 'Napstr' : $t("Offline")}{status.streamOnly ? $t(" · Read only") : ''}</span>
+        <!-- One dot per computer, in that computer's own colour. The ones that
+             are here are clustered on the left and the ones that are not sit a
+             little to their right, so the line itself says who is missing. -->
+        <button class="status-chip" class:offline={!everyoneOnline()} onclick={reconnect} title={status.connected ? `Connected to ${status.desktopName || 'Napstr'}` : 'Reconnect to Napstr'}>
+          <span class="status-dots" aria-hidden="true">
+            {#each onlineComputers() as computer (computer.endpointId)}
+              <i class="on" style={`--host-hue:${hostHue(computer.endpointId)}`}></i>
+            {/each}
+            {#each awayComputers() as computer (computer.endpointId)}
+              <i class="away" style={`--host-hue:${hostHue(computer.endpointId)}`}></i>
+            {/each}
+          </span>
+          <span>{$t(statusLabel())}{status.streamOnly ? $t(" · Read only") : ''}</span>
         </button>
       {:else}
         <button class="status-chip offline" onclick={showMusic}><i></i><span>{$t("Pair Napstr")}</span></button>
@@ -5309,26 +5390,12 @@
         )}
       {:else if activeTab === 'music'}
         <section class="library-heading">
-          <div>
-            <p>{showingLikedMusic ? 'FAVOURITES' : 'YOUR NAPSTR'}</p>
-            <h1>{showingLikedMusic ? 'Liked music' : 'Your music'}</h1>
-            {#if !showingLikedMusic && knownHosts.length > 1}
-              <!-- Offered only when there is more than one computer to choose
-                   from. A phone holding one asks the same computer it always
-                   did, and its screen is left exactly as it was. -->
-              <label class="source-picker">
-                <select
-                  bind:value={browseSource}
-                  onchange={() => void loadLibrary()}
-                  aria-label={$t("Which computer's library")}
-                >
-                  {#each knownHosts as host (host.endpointId)}
-                    <option value={host.primary ? '' : host.endpointId}>{host.desktopName || host.endpointId.slice(0, 8)}</option>
-                  {/each}
-                </select>
-              </label>
-            {/if}
-          </div>
+          {#if showingLikedMusic}
+            <!-- The liked page is a page of its own and still says so; the
+                 library below it is every computer's, all the time. The words
+                 are plain strings, as they were, rather than catalogue keys. -->
+            <div><p>{'FAVOURITES'}</p><h1>{'Liked music'}</h1></div>
+          {/if}
           {#if showingLikedMusic}
             <div class="heading-end">
               <span>{total} {total === 1 ? 'track' : 'tracks'}</span>
@@ -6139,48 +6206,51 @@
       </button>
     </header>
     <div class="settings-scroll">
-      <div class="settings-status">
-        <i class:offline={!status.connected}></i>
-        <div>
-          <strong>{status.paired ? (status.connected ? status.desktopName || 'Napstr' : 'Not reachable') : 'Not paired'}</strong>
-          <small>{status.paired ? (status.connected ? 'Connected over Iroh' : 'Tap reconnect to try again') : 'Pair with Napstr on your computer'}</small>
-        </div>
-      </div>
       {#if status.streamOnly}<p class="settings-note">{$t("This pairing is read only: it can browse and play, but cannot ask Napstr to download or publish.")}</p>{/if}
-
-      <!-- Near the top, so the language can be changed without scrolling. -->
-      <div class="settings-section">
-        <LanguageSelect />
-      </div>
 
       {#if status.paired}
         <div class="settings-section">
           <p>{$t("Computers")}</p>
-          {#if knownHosts.length > 1}
-            {#each knownHosts as computer (computer.endpointId)}
-              <div class="settings-row computer-row">
+          {#each knownHosts as computer (computer.endpointId)}
+            <div class="settings-row computer-row" class:left-out={!computer.included}>
+              <span class="computer-id">
+                <i
+                  class="computer-dot"
+                  class:online={computer.online}
+                  style={`--host-hue:${hostHue(computer.endpointId)}`}
+                >{hostInitial(computer)}</i>
                 <span>
-                  {computer.desktopName || computer.endpointId.slice(0, 8)}
-                  {#if computer.primary}<small>{$t("This phone acts through this one")}</small>{/if}
+                  <strong>{computer.desktopName || computer.endpointId.slice(0, 8)}</strong>
+                  <small>{computer.primary ? $t("This phone acts through this one") : $t("A library this phone reads")}</small>
+                  <small class="computer-state">
+                    {computer.included
+                      ? computer.online
+                        ? $t("Connected")
+                        : $t("Not reachable")
+                      : $t("Left out")}
+                  </small>
                 </span>
-                <button
-                  class="settings-action"
-                  onclick={() => void forgetHost(computer)}
-                  aria-label={$t("Forget {p0}", { p0: computer.desktopName || computer.endpointId.slice(0, 8) })}
-                >{$t("Forget")}</button>
-              </div>
-            {/each}
-          {/if}
+              </span>
+              <label class="computer-include">
+                <input
+                  type="checkbox"
+                  checked={computer.included}
+                  onchange={(event) => void setComputerIncluded(computer, event.currentTarget.checked)}
+                  aria-label={$t("Read from {p0}", { p0: computer.desktopName || computer.endpointId.slice(0, 8) })}
+                />
+                <b>{$t("Include")}</b>
+              </label>
+              <button
+                class="settings-action"
+                onclick={() => void forgetHost(computer)}
+                aria-label={$t("Forget {p0}", { p0: computer.desktopName || computer.endpointId.slice(0, 8) })}
+              >{$t("Forget")}</button>
+            </div>
+          {/each}
           <button class="settings-row" onclick={() => { showSettings = false; addingComputer = true; }}>
             <span>{$t("Add a computer")}</span><small>{$t("A friend's Napstr, or another of your own")}</small>
           </button>
         </div>
-        <button class="settings-row" onclick={() => { showSettings = false; void reconnect(); }} disabled={statusPending}>
-          <span>{$t("Reconnect")}</span><small>{statusPending ? 'Trying…' : 'Refresh the connection now'}</small>
-        </button>
-        <button class="settings-row danger" onclick={() => { showSettings = false; void forgetDesktop(); }}>
-          <span>{$t("Disconnect this phone")}</span><small>{knownHosts.length > 1 ? $t("Forgets every computer this phone holds") : $t("You will need a new QR code")}</small>
-        </button>
       {:else}
         <button class="settings-row" onclick={() => { showSettings = false; showMusic(); }}>
           <span>{$t("Pair Napstr")}</span><small>{$t("Scan a QR code from the computer")}</small>
@@ -6257,6 +6327,12 @@
           <CoverDebug {tracks} {status} embedded />
         </div>
       {/if}
+
+      <!-- At the bottom: it is the one setting about this phone rather than
+           about the computers it reads, and it is set once. -->
+      <div class="settings-section language-section">
+        <LanguageSelect />
+      </div>
     </div>
   </div>
 {/if}

@@ -147,7 +147,7 @@ test('Napstrfy walks back out of every page it advertises, and is only left from
   await page.locator('.bottom-nav button').nth(1).click();
   await expect.poll(() => backFlag(page)).toBe(true);
   expect(await pressBack(page)).toBe('handled');
-  await expect(page.locator('.library-heading h1')).toHaveText('Your music');
+  await expect(page.locator('button[data-tab="music"]')).toHaveClass(/active/);
 
   // The liked page has the search page behind it, and the press after this one is
   // the one that used to leave the app: the flag is taken when a press is
@@ -157,7 +157,7 @@ test('Napstrfy walks back out of every page it advertises, and is only left from
   expect(await pressBack(page)).toBe('handled');
   await searchPageIsBack(page);
   expect(await pressBack(page)).toBe('handled');
-  await expect(page.locator('.library-heading h1')).toHaveText('Your music');
+  await expect(page.locator('button[data-tab="music"]')).toHaveClass(/active/);
 
   // An album preview, and the player drawer, each have the library behind them.
   await page.locator('.album-open').click();

@@ -96,8 +96,12 @@ export type RemoteHost = {
   endpointId: string;
   desktopName: string;
   rights: { browse: boolean; fetch: boolean; control: boolean; privileged: boolean };
-  /** The computer this phone acts through, whose library the app is drawn from. */
+  /** The computer this phone acts through, whose status and writes it carries. */
   primary: boolean;
+  /** Whether this phone reads from it. A computer left out keeps its pairing. */
+  included: boolean;
+  /** Whether it answered just now. */
+  online: boolean;
 };
 
 export type CompanionStatus = {

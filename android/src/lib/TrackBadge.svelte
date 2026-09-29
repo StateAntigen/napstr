@@ -7,11 +7,16 @@
    * state; the phone's own cache has to be asked about separately.
    */
   import type { RemoteTrack } from './types';
+  import { hostHue } from './hosts';
 
-  let { track, cached = false, pending = false }: {
+  let { track, cached = false, pending = false, host = '', hostName = '' }: {
     track: RemoteTrack;
     cached?: boolean;
     pending?: boolean;
+    /** The computer that answered with this row, when it was not this phone's own. */
+    host?: string;
+    /** What that computer is called, for the label. */
+    hostName?: string;
   } = $props();
 </script>
 
@@ -27,7 +32,13 @@
     </svg>
   </span>
 {:else if track.local}
-  <span class="track-badge computer" role="img" aria-label="Stored on your Napstr computer">
+  <span
+    class="track-badge computer"
+    class:elsewhere={Boolean(host)}
+    style={`--host-hue:${host ? hostHue(host) : 0}`}
+    role="img"
+    aria-label={host ? `Stored on ${hostName || 'another computer'}` : 'Stored on your Napstr computer'}
+  >
     <svg viewBox="0 0 24 24" aria-hidden="true">
       <rect x="2.8" y="4.2" width="18.4" height="12.4" rx="2.2" />
       <path d="M12 16.6V20.4" /><path d="M8.6 20.4h6.8" />
