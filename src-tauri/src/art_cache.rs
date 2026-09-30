@@ -29,7 +29,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
 };
 
@@ -73,6 +73,36 @@ pub struct ArtCacheStats {
     pub bytes: u64,
 }
 
+/// The table that remembers a download that failed, and when it may be tried
+/// again.
+///
+/// The cache below holds what arrived; this holds what did not. Without it a dead
+/// address is retried at whatever cadence the caller happens to have — the fill
+/// asks every couple of seconds and a phone asks again every time a row redraws —
+/// so one address that will never work becomes a request a second for as long as
+/// the app is open. Measured: an album whose Cover Art Archive address had been
+/// re-keyed was asked for twice a round, every round, and the round never went
+/// quiet, because the album never stopped being "waiting for a picture".
+///
+/// `url` is part of the answer rather than a detail: the wait applies to *that
+/// address*, so an address that is corrected is asked for at once.
+///
+/// A failure is not news to a phone, so this deliberately does not move the cover
+/// revision: nothing about the pictures this computer can serve has changed.
+const ART_FETCH_FAILURES_TABLE: &str = "
+CREATE TABLE IF NOT EXISTS art_fetch_failures (
+  cover_key TEXT NOT NULL,
+  rendition TEXT NOT NULL,
+  url TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT '',
+  next_at TEXT NOT NULL,
+  failed_at TEXT NOT NULL,
+  PRIMARY KEY(cover_key, rendition)
+);
+CREATE INDEX IF NOT EXISTS art_fetch_failures_next ON art_fetch_failures(next_at);
+";
+
 /// The table that maps an album and a rendition to the bytes that answer it.
 ///
 /// `used_at` is what eviction orders by, and `source` is kept so the Covers view
@@ -85,6 +115,10 @@ pub struct ArtCacheStats {
 /// path that forgets to move it is a phone that never sees the art. Only a
 /// different picture moves it — touching `used_at` and re-storing identical
 /// bytes are not news to anybody.
+///
+/// The second table here remembers what did *not* arrive, which the cache above
+/// cannot: a picture that failed leaves no row, so without this it looks exactly
+/// like one nobody has asked for yet.
 pub fn initialise_schema(connection: &Connection) -> Result<(), String> {
     connection
         .execute_batch(&format!(
@@ -110,7 +144,8 @@ pub fn initialise_schema(connection: &Connection) -> Result<(), String> {
              AFTER UPDATE OF hash ON art_cache
              WHEN old.hash <> new.hash BEGIN
                UPDATE cover_state SET revision = revision + 1 WHERE id = 1;
-             END;"
+             END;
+             {ART_FETCH_FAILURES_TABLE}"
         ))
         .map_err(|error| error.to_string())
 }
@@ -284,14 +319,128 @@ pub fn touch(
     Ok(())
 }
 
+/// A rendition that could not be fetched, and when it may be tried again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtFailure {
+    /// The address that failed. The same rendition at a *different* address is a
+    /// different question, which is what makes a repaired address work at once.
+    pub url: String,
+    /// How many times in a row this rendition has failed, so the wait can grow.
+    pub attempts: i64,
+    /// When it may be tried again, RFC 3339.
+    pub next_at: String,
+    /// What the host said, for a person reading the Covers view.
+    pub status: String,
+}
+
+impl ArtFailure {
+    /// Whether this failure is still in force.
+    ///
+    /// A stamp that cannot be read counts as expired: the safe mistake is asking
+    /// again, not leaving an album waiting for ever.
+    pub fn is_waiting(&self) -> bool {
+        chrono::DateTime::parse_from_rfc3339(&self.next_at)
+            .map(|next_at| next_at > chrono::Utc::now())
+            .unwrap_or(false)
+    }
+}
+
+/// Every rendition of one album that failed, by rendition name.
+///
+/// An album that has never failed is the common case, and the empty map is the
+/// answer for it.
+pub fn failures(connection: &Connection, key: &str) -> Result<HashMap<String, ArtFailure>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT rendition,url,attempts,next_at,status FROM art_fetch_failures
+              WHERE cover_key=?1",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map(params![key], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                ArtFailure {
+                    url: row.get(1)?,
+                    attempts: row.get(2)?,
+                    next_at: row.get(3)?,
+                    status: row.get(4)?,
+                },
+            ))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<HashMap<String, ArtFailure>, _>>()
+        .map_err(|error| error.to_string())?;
+    Ok(rows)
+}
+
+/// Remember that a rendition failed, and when it may be tried again.
+///
+/// One row per rendition: a second failure replaces the first, because what is
+/// being kept is "how long to leave this alone", and two waits for one rendition
+/// would only be one of them.
+pub fn record_failure(
+    connection: &Connection,
+    key: &str,
+    rendition: ArtRendition,
+    url: &str,
+    status: &str,
+    attempts: i64,
+    next_at: &str,
+) -> Result<(), String> {
+    let now = chrono::Utc::now().to_rfc3339();
+    connection
+        .execute(
+            "INSERT INTO art_fetch_failures(cover_key,rendition,url,attempts,status,next_at,failed_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7)
+             ON CONFLICT(cover_key,rendition) DO UPDATE SET
+               url=excluded.url, attempts=excluded.attempts, status=excluded.status,
+               next_at=excluded.next_at, failed_at=excluded.failed_at",
+            params![
+                key,
+                rendition_name(rendition),
+                url,
+                attempts,
+                status,
+                next_at,
+                now
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// Forget a failure, because the picture arrived.
+///
+/// Kept in step with the cache: art that is later evicted to stay inside the
+/// budget has to be fetchable again, and a stale failure row would leave a
+/// download that worked waiting for a month.
+pub fn clear_failure(
+    connection: &Connection,
+    key: &str,
+    rendition: ArtRendition,
+) -> Result<(), String> {
+    connection
+        .execute(
+            "DELETE FROM art_fetch_failures WHERE cover_key=?1 AND rendition=?2",
+            params![key, rendition_name(rendition)],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 /// Forget everything. Returns how many entries went.
 ///
 /// This is what "clear the artwork" means: the rows and the files, not one or the
 /// other. Clearing is a supported action rather than a repair, so it has to leave
-/// nothing behind that a later read could serve.
+/// nothing behind that a later read could serve — including the failures, because
+/// clearing is a person asking this computer to try again.
 pub fn clear(connection: &Connection, root: &Path) -> Result<usize, String> {
     let removed = connection
         .execute("DELETE FROM art_cache", [])
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute("DELETE FROM art_fetch_failures", [])
         .map_err(|error| error.to_string())?;
     // The directory is this cache's own, so removing it outright is what
     // guarantees nothing survives that no row points at.

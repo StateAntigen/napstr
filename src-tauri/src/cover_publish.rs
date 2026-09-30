@@ -119,7 +119,10 @@ const THROTTLE_BACKOFF_MAX: Duration = Duration::from_secs(5 * 60);
 /// How many times the wait doubles before it stops growing.
 const THROTTLE_BACKOFF_DOUBLINGS: u32 = 4;
 /// A transient failure parks the album for this long before it is offered again.
-const FAILED_LOOKUP_RETRY_SECONDS: i64 = 15 * 60;
+///
+/// Shared with the artwork fetcher, which leaves a failed download alone for the
+/// same fifteen minutes: it is the same news about the same kind of service.
+pub(crate) const FAILED_LOOKUP_RETRY_SECONDS: i64 = 15 * 60;
 /// How many of a release group's releases the archive fallback walks before it
 /// gives up. A group with art has it on one of the first few, and every release
 /// walked is another request to the archive.
@@ -638,7 +641,7 @@ impl CoverPublisher {
                 source: &album.source,
             })
             .collect::<Vec<_>>();
-        self.art.ensure_all(&wants);
+        let claimed = self.art.ensure_all(&wants);
         // The remaining count is refreshed for the window's own line; the status
         // message is left to the lookup pass, which is the one that has something
         // to say about albums. Two writers for one sentence means whichever ran
@@ -648,7 +651,12 @@ impl CoverPublisher {
             status.art_pending = cover::albums_without_pictures_count(&connection)?;
         }
         self.tick();
-        Ok(albums.len())
+        // Albums that were offered and not taken are waiting for a reason — their
+        // addresses failed and are being left alone — so this is the fill going
+        // quiet rather than the fill being out of work. Answering with the number
+        // of albums instead is what kept it asking after one dead address every
+        // two seconds for as long as the app was open.
+        Ok(claimed)
     }
 
     /// Fetch and hold the pictures a batch of claims names, so a paired phone
@@ -695,7 +703,9 @@ impl CoverPublisher {
             &cover.source,
             rendition,
         ) {
-            Some(want) => self.art.ensure_all(&[want]),
+            Some(want) => {
+                self.art.ensure_all(&[want]);
+            }
             // A claim that names nothing for that rendition is an ordinary
             // answer: the archive publishes no thumbnail of its own, and a phone
             // asking for one is asking for the full picture, which it does for
@@ -2052,6 +2062,98 @@ async fn archive_lookup_via_archive_org(
         .then(|| format!("{base}/{smaller}"))
         .unwrap_or_default();
     Ok(Some((art, thumb, true)))
+}
+
+/// What asking the archive about one of its own addresses produced.
+pub(crate) enum ArchiveAnswer {
+    /// The front picture's address, and the thumbnail beside it.
+    Front { art: String, thumb: String },
+    /// The archive answered, and that release has no front picture.
+    None,
+    /// Nothing was learned. A host that cannot be reached is not an answer about
+    /// the picture, and the caller must not treat it as one.
+    Unknown,
+}
+
+/// The address a Cover Art Archive picture should have now, when the one a claim
+/// names has gone.
+///
+/// A claim names an address, and an address is not the picture: the archive
+/// re-keys an image when a cover is replaced, and the whole item moves when it is
+/// re-ingested, so a claim that resolved perfectly in September can name a file
+/// that answers `404` in October while the art sits one directory away. Both
+/// questions are asked, because they correct different things: the archive's own
+/// index knows a re-keyed image id, and only archive.org's metadata knows a moved
+/// item. `gone` is the address that failed; an answer that simply repeats it is
+/// no answer at all.
+pub(crate) async fn archive_repaired_front(release_id: &str, gone: &str) -> ArchiveAnswer {
+    let client = match cover_http_client() {
+        Ok(client) => client,
+        Err(_) => return ArchiveAnswer::Unknown,
+    };
+    match archive_image(&client, &format!("release/{release_id}")).await {
+        Ok(Some((art, thumb, _))) if art != gone && !art.is_empty() => {
+            return ArchiveAnswer::Front { art, thumb }
+        }
+        Ok(Some(_)) => {}
+        Ok(None) => return ArchiveAnswer::None,
+        Err(LookupError::Throttled { .. }) | Err(LookupError::Unanswered { .. }) => {
+            return ArchiveAnswer::Unknown
+        }
+        Err(LookupError::Failed(_)) => {}
+    }
+    match archive_lookup_via_archive_org(&client, release_id).await {
+        Ok(Some((art, thumb, _))) if art != gone && !art.is_empty() => {
+            ArchiveAnswer::Front { art, thumb }
+        }
+        Ok(Some(_)) => ArchiveAnswer::Unknown,
+        Ok(None) => ArchiveAnswer::None,
+        Err(_) => ArchiveAnswer::Unknown,
+    }
+}
+
+/// The Cover Art Archive release an address names, when it names one.
+///
+/// Two shapes carry it: the archive's own `coverartarchive.org/release/<id>/…`
+/// path, and the address a redirect lands on, whose `archive.org` item is named
+/// `mbid-<release>`. Anything else — Apple's catalogue, a host somebody else chose
+/// — names no release, and is not something this computer can go and correct.
+pub(crate) fn archive_release_id(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url.trim()).ok()?;
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    let path = parsed.path().to_string();
+    if host == "coverartarchive.org" {
+        let rest = path.strip_prefix("/release/")?;
+        let id = rest.split('/').next()?;
+        return is_release_id(id).then(|| id.to_string());
+    }
+    if host == "archive.org" || host.ends_with(".archive.org") {
+        // `/25/items/mbid-<release>/mbid-<release>-<image>.jpg`
+        for segment in path.split('/') {
+            let Some(candidate) = segment.strip_prefix("mbid-") else {
+                continue;
+            };
+            let candidate = candidate.strip_suffix(".tar").unwrap_or(candidate);
+            if is_release_id(candidate) {
+                return Some(candidate.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Whether this looks like a release UUID, rather than a path segment that
+/// happens to start with `mbid-`.
+fn is_release_id(candidate: &str) -> bool {
+    let bytes = candidate.as_bytes();
+    bytes.len() == 36
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                *byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -4008,5 +4110,87 @@ mod tests {
             "a choice made in one session must still hold in the next"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_archive_address_names_the_release_it_belongs_to() {
+        // The archive's own path, which is what a claim carries when the picture
+        // came from the Cover Art Archive.
+        assert_eq!(
+            archive_release_id(
+                "https://coverartarchive.org/release/c8cb6f90-d97f-4bbb-b79a-35861be2e98e/14894787254.jpg"
+            ),
+            Some("c8cb6f90-d97f-4bbb-b79a-35861be2e98e".to_string())
+        );
+        // And the address a redirect lands on, whose item is named after the
+        // release rather than after the image.
+        assert_eq!(
+            archive_release_id(
+                "https://ia800507.us.archive.org/25/items/mbid-c8cb6f90-d97f-4bbb-b79a-35861be2e98e/mbid-c8cb6f90-d97f-4bbb-b79a-35861be2e98e-46231447287.jpg"
+            ),
+            Some("c8cb6f90-d97f-4bbb-b79a-35861be2e98e".to_string())
+        );
+        // Apple's catalogue names no release, so there is nothing to go and ask
+        // about: an address there can only wait its turn like any other failure.
+        assert_eq!(
+            archive_release_id("https://is1-ssl.mzstatic.com/image/thumb/x/1200x1200bb.jpg"),
+            None
+        );
+        // A release *group* is not a release. A group's own `/front` path is a
+        // different question with a different answer.
+        assert_eq!(
+            archive_release_id(
+                "https://coverartarchive.org/release-group/c8cb6f90-d97f-4bbb-b79a-35861be2e98e/front"
+            ),
+            None
+        );
+        // A path segment that merely starts with `mbid-` is not a release id.
+        assert_eq!(
+            archive_release_id("https://archive.org/items/mbid-music/x.jpg"),
+            None
+        );
+        assert_eq!(archive_release_id("not a url"), None);
+    }
+
+    /// The live archive, for the record whose picture was re-keyed under it: the
+    /// address a claim stored answers `404` while the release answers perfectly.
+    ///
+    /// Ignored because it needs the network:
+    /// `cargo test --ignored live_repair -- --nocapture`
+    #[tokio::test]
+    #[ignore = "requires the Cover Art Archive"]
+    async fn the_live_repair_finds_the_picture_a_dead_address_belonged_to() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = cover_http_client().expect("a client");
+        let release = "c8cb6f90-d97f-4bbb-b79a-35861be2e98e";
+        let dead = format!("https://coverartarchive.org/release/{release}/14894787254.jpg");
+        // The address really is dead. This is what the app was asking about twice
+        // every two seconds.
+        assert_eq!(
+            client
+                .get(&dead)
+                .send()
+                .await
+                .expect("a request")
+                .status()
+                .as_u16(),
+            404
+        );
+        let ArchiveAnswer::Front { art, thumb } = archive_repaired_front(release, &dead).await
+        else {
+            panic!("the archive still holds this release's front cover");
+        };
+        assert_ne!(art, dead, "the repair has to name a different address");
+        assert!(art.ends_with("-1200.jpg"), "{art}");
+        assert!(thumb.ends_with("-250.jpg"), "{thumb}");
+        // And the repaired address serves a picture, which is the only thing that
+        // makes this a repair rather than another dead end.
+        let response = client.get(&art).send().await.expect("a request");
+        assert!(
+            response.status().is_success(),
+            "{} answered {}",
+            art,
+            response.status()
+        );
     }
 }
