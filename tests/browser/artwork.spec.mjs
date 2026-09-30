@@ -213,6 +213,31 @@ test('Napstrfy keeps the art it already holds while the host is still fetching i
   expect(far).toEqual([]);
 });
 
+test('Napstrfy asks the host for a picture the host knows of and has not fetched', async ({ page }) => {
+  await mockNative(page);
+  // The host answers with an address and no hash: a picture waiting to be fetched
+  // rather than "no art". No hash exists for a picture the host has not fetched,
+  // so the phone cannot ask with one - and an ask with nothing to ask with is the
+  // only thing that ever starts that fetch. Waiting for a hash to ask with is
+  // waiting for the fetch the ask performs, which is how an album with a working
+  // address sat undrawn.
+  await seedLibrary(page, 1, { pending: [0] });
+  const far = await refusePublisherArtwork(page, ['**/publisher-*']);
+  await serveHeldArtwork(page);
+  await page.goto('http://127.0.0.1:15174');
+
+  await expect(page.locator('.track-row')).toHaveCount(1);
+  await expect
+    .poll(async () => (await artAsks(page)).filter((ask) => ask.hash === '').length)
+    .toBeGreaterThan(0);
+  const askedWithoutAHash = (await artAsks(page)).filter((ask) => ask.hash === '');
+  expect(
+    [...new Set(askedWithoutAHash.map((ask) => `${ask.key} ${ask.rendition}`))].sort()
+  ).toEqual(['rancid|album 0 full', 'rancid|album 0 thumb']);
+  // Asked for from the host, and never from the address the claim came with.
+  expect(far).toEqual([]);
+});
+
 test('Napstrfy artwork recovers from a transient host failure while the screen stays open', async ({ page }) => {
   await mockNative(page);
   const hashes = await seedLibrary(page, 1);

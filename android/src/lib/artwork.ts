@@ -56,7 +56,19 @@ export type AlbumCover = {
  * not the same as having no art: that difference is why this phone keeps the copy
  * it already holds instead of throwing it away and drawing a placeholder.
  */
-type HostCover = Omit<AlbumCover, 'art' | 'thumb'>;
+type HostCover = Omit<AlbumCover, 'art' | 'thumb'> & {
+  /**
+   * Which renditions the host says it knows of a picture for, whether or not it
+   * is holding one yet.
+   *
+   * This is all that survives an answer whose addresses are dropped, and it is
+   * what makes the difference between "nothing to ask for" and "nothing to ask
+   * with". Optional because a record written by a build before this one has no
+   * such field, and a missing field reads as "nothing known" rather than as
+   * "nothing there" - the next answer about the album carries it.
+   */
+  knows?: { full: boolean; thumb: boolean };
+};
 
 /** What this phone has confirmed it holds, by album: the hash of each picture. */
 type Held = { full: string; thumb: string };
@@ -73,7 +85,7 @@ type StoredCover = { at: number; cover: HostCover; held: Held };
  * nothing here is written to disk — an address that outlives the answer it came
  * in is exactly what this phone stopped fetching from.
  */
-type WireCover = HostCover & { art: string; thumb: string };
+type WireCover = Omit<HostCover, 'knows'> & { art: string; thumb: string };
 
 /** The answer to one ask for one rendition. */
 type AlbumArtwork = { url: string; hash: string };
@@ -315,6 +327,13 @@ export function coverFor(track: RemoteTrack): Promise<AlbumCover | null> {
 const artAsks = new Map<string, Promise<string>>();
 
 /**
+ * Whether the host says it knows of a picture for one rendition.
+ */
+function known(cover: HostCover, rendition: 'thumb' | 'full'): boolean {
+  return rendition === 'thumb' ? Boolean(cover.knows?.thumb) : Boolean(cover.knows?.full);
+}
+
+/**
  * The address to draw one rendition from, fetching it from the host if this
  * phone does not hold it.
  *
@@ -323,14 +342,22 @@ const artAsks = new Map<string, Promise<string>>();
  * 1. What the host says it can serve now, which is what a screen should show.
  * 2. What this phone already holds, which is what it has even when the host's
  *    copy has gone or the host cannot be reached.
- * 3. For a thumbnail, the full picture drawn smaller — the fallback every screen
+ * 3. Nothing at all, when the host has said it knows of a picture and is not
+ *    holding it yet. This ask is the only thing that ever fetches a picture the
+ *    host has not fetched: the host cannot offer a hash until the bytes are
+ *    there, so waiting for a hash to ask with is waiting for the very fetch the
+ *    ask performs. Measured: an album with a working address sat undrawn because
+ *    every ask this phone could make needed a hash that only that fetch produces.
+ * 4. For a thumbnail, the full picture drawn smaller — the fallback every screen
  *    here already used, and cheaper than a placeholder.
  */
 async function ensureRendition(cover: HostCover, rendition: 'thumb' | 'full'): Promise<string> {
   const held = heldFor(cover.key);
   const preferred = rendition === 'thumb' ? cover.thumbHash : cover.artHash;
   const ours = rendition === 'thumb' ? held.thumb : held.full;
-  for (const candidate of new Set([preferred, ours].filter(Boolean))) {
+  const candidates = [preferred, ours].filter(Boolean);
+  const askable = candidates.length ? candidates : known(cover, rendition) ? [''] : [];
+  for (const candidate of new Set(askable)) {
     const url = await askForRendition(cover.key, rendition, candidate);
     if (url) return url;
   }
@@ -470,8 +497,10 @@ export function preloadArtwork(track: RemoteTrack, { full = false }: { full?: bo
  * to draw.
  */
 export function loadFullCover(cover: AlbumCover | null): Promise<string> {
-  if (!cover || !cover.artHash) return Promise.resolve('');
-  return ensureRendition(cover, 'full').then(loadRendition);
+  if (!cover) return Promise.resolve('');
+  // An album the host is not holding yet has no hash to check for, and asking is
+  // what makes it hold one: see `ensureRendition`.
+  return ensureRendition(cover, 'full').then((url) => (url ? loadRendition(url) : ''));
 }
 
 /**
@@ -545,7 +574,12 @@ async function resolveCovers(keys: string[]): Promise<CoverResolution> {
         // it knows of one and has not fetched it yet. Only the album with
         // nothing at all is an album with no art.
         if (art || thumb || host.artHash || host.thumbHash || host.coverFileId) {
-          covers.set(host.key, host);
+          // Which renditions it knows of is kept, because the addresses are not:
+          // they are read here and dropped, and this is what is left to ask with.
+          covers.set(host.key, {
+            ...host,
+            knows: { full: Boolean(art), thumb: Boolean(thumb) },
+          });
         }
       }
     } catch (error) {

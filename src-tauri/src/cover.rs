@@ -1469,20 +1469,114 @@ pub(crate) struct ArtToFetch {
     pub source: String,
 }
 
-/// Albums whose art this computer resolved but never downloaded, newest first.
+/// Albums whose front picture this computer knows of and does not hold.
 ///
-/// This is what a fill pass walks. Resolving an album and holding its picture are
-/// two different things, and until this existed the second only ever happened
-/// because a phone asked for that album: a library resolved over months had
-/// thousands of addresses written down and nothing to hand over for them.
+/// This is what a fill pass walks. Knowing of a picture is two different things,
+/// and for this question they are the same answer:
 ///
-/// Ordered by when the resolution was made, because the albums this computer
-/// looked at most recently are the ones somebody is most likely to be looking at
-/// now. An album already holding anything is left out: whether its *other*
-/// rendition is worth fetching is decided by the caller, which knows the
-/// difference per rendition, and asking twice about the same album here would
-/// make the walk slower without making it more complete.
+/// * A **claim** this computer received (`album_covers`), which is what a paired
+///   phone is told to draw. Where several authors published one, the winner is
+///   the one a phone is shown: fetching a superseded address would put a picture
+///   in the cache that nothing is drawing.
+/// * A **resolution** this computer made for itself (`album_art_lookups`), which
+///   no relay has ever seen and which is only ever good enough for drawing here.
+///
+/// Leaving claims out was a fault rather than a tidy-up. An album whose only
+/// cover was somebody else's claim had a perfectly good address written down and
+/// nothing ever fetched it: the walk only looked at what this computer had
+/// resolved, the phone was told about the claim and drew a placeholder, and the
+/// one thing that would have made the phone ask for the bytes was a hash, which
+/// is only ever offered for a picture that has already been fetched. So the album
+/// waited for ever while the address worked perfectly.
+///
+/// Ordered by when the address was last seen, because the albums somebody is most
+/// likely to be looking at now are the ones that were last in front of somebody.
+/// Claims come before resolutions, because a claim is what a phone is drawing;
+/// the resolutions behind them are reached as the claims are satisfied. An album
+/// already holding anything is left out: whether its *other* rendition is worth
+/// fetching is decided by the caller, which knows the difference per rendition,
+/// and asking twice about the same album here would make the walk slower without
+/// making it more complete. An album whose addresses are all on hosts this
+/// computer will not take art from is left out as well, so the walk never spends
+/// a slot on a download that would be refused.
 pub(crate) fn albums_without_pictures(
+    connection: &Connection,
+    limit: usize,
+) -> Result<Vec<ArtToFetch>, String> {
+    let limit = limit.clamp(1, ART_FETCH_LIMIT);
+    let mut albums = claims_without_pictures(connection, limit)?;
+    let claimed = albums
+        .iter()
+        .map(|album| album.key.clone())
+        .collect::<HashSet<_>>();
+    albums.extend(
+        resolutions_without_pictures(connection, limit)?
+            .into_iter()
+            .filter(|album| !claimed.contains(&album.key)),
+    );
+    albums.truncate(limit);
+    let hosts = allowed_art_hosts(connection);
+    albums.retain(|album| may_draw(&hosts, &album.art, &album.thumb));
+    Ok(albums)
+}
+
+/// Whether an album names at least one address this computer will take art from.
+///
+/// A record that names two and has one refused is still worth its slot: the other
+/// rendition is what a phone would draw.
+fn may_draw(hosts: &[String], art: &str, thumb: &str) -> bool {
+    (!art.is_empty() && art_host_allowed(hosts, art))
+        || (!thumb.is_empty() && art_host_allowed(hosts, thumb))
+}
+
+/// Albums a claim names a picture for, last seen first, without one held.
+///
+/// The claims are resolved through [`load_cover_claims`], which is the same
+/// answer a phone is given: the winning claim, from an author this computer has
+/// not blocked.
+fn claims_without_pictures(
+    connection: &Connection,
+    limit: usize,
+) -> Result<Vec<ArtToFetch>, String> {
+    let keys = connection
+        .prepare(
+            "SELECT cover_key FROM album_covers
+              WHERE deleted=0 AND (art <> '' OR thumb <> '')
+                AND NOT EXISTS (
+                      SELECT 1 FROM art_cache c WHERE c.cover_key = album_covers.cover_key)
+              GROUP BY cover_key
+              ORDER BY MAX(seen_at) DESC
+              LIMIT ?1",
+        )
+        .map_err(|error| error.to_string())?
+        .query_map(params![limit as i64], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let order = keys
+        .iter()
+        .enumerate()
+        .map(|(index, key)| (key.clone(), index))
+        .collect::<HashMap<_, _>>();
+    let mut albums = load_cover_claims(connection, &keys)?
+        .into_iter()
+        .map(|cover| ArtToFetch {
+            key: cover.key,
+            art: cover.art,
+            thumb: cover.thumb,
+            source: cover.source,
+        })
+        .collect::<Vec<_>>();
+    albums.sort_by_key(|album| order.get(&album.key).copied().unwrap_or(usize::MAX));
+    Ok(albums)
+}
+
+/// Albums this computer resolved for itself whose pictures are not held yet,
+/// newest resolution first.
+fn resolutions_without_pictures(
     connection: &Connection,
     limit: usize,
 ) -> Result<Vec<ArtToFetch>, String> {
@@ -1497,7 +1591,7 @@ pub(crate) fn albums_without_pictures(
               LIMIT ?1",
         )
         .map_err(|error| error.to_string())?
-        .query_map(params![limit.clamp(1, ART_FETCH_LIMIT) as i64], |row| {
+        .query_map(params![limit as i64], |row| {
             Ok(ArtToFetch {
                 key: row.get(0)?,
                 art: row.get(1)?,
@@ -1516,18 +1610,13 @@ pub(crate) fn albums_without_pictures(
 const ART_FETCH_LIMIT: usize = 5_000;
 
 /// How many albums are waiting for their pictures, for the Covers view.
+///
+/// The same walk as [`albums_without_pictures`] rather than a second query with
+/// the same rule written out again: a count that includes albums the walk skips
+/// never reaches zero, and one that misses albums the walk takes on moves for no
+/// reason a person can see.
 pub(crate) fn albums_without_pictures_count(connection: &Connection) -> Result<usize, String> {
-    let count: i64 = connection
-        .query_row(
-            "SELECT COUNT(*) FROM album_art_lookups l
-              WHERE (l.art <> '' OR l.thumb <> '')
-                AND NOT EXISTS (
-                      SELECT 1 FROM art_cache c WHERE c.cover_key = l.cover_key)",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|error| error.to_string())?;
-    Ok(count.max(0) as usize)
+    Ok(albums_without_pictures(connection, ART_FETCH_LIMIT)?.len())
 }
 
 /// Store the newest claim from every author for the given key/event pairs.
@@ -1785,6 +1874,98 @@ mod tests {
             vec!["b|two", "a|one"]
         );
         assert_eq!(albums_without_pictures_count(&connection).unwrap(), 2);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn the_fill_walks_the_claims_it_holds_no_picture_for_too() {
+        // The fault this fixes: a claim is what a phone is told to draw, and a
+        // picture this computer has not fetched is a hash a phone cannot ask with
+        // - so an album whose only cover was somebody else's claim was never
+        // fetched by anybody, while the address in it worked perfectly.
+        let connection = cover_database();
+        let author = "aa".repeat(32);
+        let key = "muse|drones";
+        insert_cover_row(
+            &connection,
+            key,
+            &author,
+            100,
+            "https://coverartarchive.org/release-group/3133d4d5-5cfb-4f53-87f5-f3a97c8f310d/front-500",
+            false,
+            false,
+        );
+        assert_eq!(
+            albums_without_pictures(&connection, 10)
+                .unwrap()
+                .iter()
+                .map(|album| album.key.as_str())
+                .collect::<Vec<_>>(),
+            vec![key],
+            "a claim with no picture held is work for the fill"
+        );
+        assert_eq!(albums_without_pictures_count(&connection).unwrap(), 1);
+
+        // A withdrawn claim is not an address worth spending a download on.
+        connection
+            .execute(
+                "UPDATE album_covers SET deleted=1 WHERE cover_key=?1",
+                params![key],
+            )
+            .unwrap();
+        assert!(albums_without_pictures(&connection, 10).unwrap().is_empty());
+        assert_eq!(albums_without_pictures_count(&connection).unwrap(), 0);
+    }
+
+    #[test]
+    fn the_fill_prefers_the_claim_a_phone_is_being_shown() {
+        let connection = cover_database();
+        let author = "aa".repeat(32);
+        let key = "muse|drones";
+        let ours = ArtLookup {
+            key: key.to_string(),
+            art: "https://example.com/ours.jpg".into(),
+            source: "musicbrainz".into(),
+            ..Default::default()
+        };
+        record_art_lookup(&connection, key, ArtLookupOutcome::Found(&ours)).unwrap();
+        insert_cover_row(
+            &connection,
+            key,
+            &author,
+            100,
+            "https://example.com/theirs.jpg",
+            false,
+            false,
+        );
+
+        let albums = albums_without_pictures(&connection, 10).unwrap();
+        assert_eq!(albums.len(), 1, "one album, not a row per table");
+        assert_eq!(
+            albums[0].art, "https://example.com/theirs.jpg",
+            "what is fetched should be what a phone is told to draw"
+        );
+
+        // Nobody claimed it, so the resolution this computer made for itself is
+        // what it fetches.
+        connection.execute("DELETE FROM album_covers", []).unwrap();
+        let albums = albums_without_pictures(&connection, 10).unwrap();
+        assert_eq!(albums[0].art, "https://example.com/ours.jpg");
+
+        // And an album holding anything is done with, whichever half said so.
+        let root = std::env::temp_dir().join("napstr-fill-precedence");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        crate::art_cache::store(
+            &connection,
+            &root,
+            key,
+            ArtRendition::Thumb,
+            &[0xFF, 0xD8, 0xFF, 0x20, 0x20],
+            "musicbrainz",
+        )
+        .unwrap();
+        assert!(albums_without_pictures(&connection, 10).unwrap().is_empty());
         std::fs::remove_dir_all(&root).unwrap();
     }
 
