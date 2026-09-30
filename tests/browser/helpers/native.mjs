@@ -21,6 +21,7 @@ export async function mockNative(page, { app = 'napstrfy', nativeLocale = 'en-GB
       // how a spec asks for it, and every `remote_*` call answers the way the
       // real channel would - with a failure.
       connected: paired && window.desktopReachable !== false,
+      connecting: false,
       desktopName: 'Music computer',
       streamOnly: Boolean(window.streamOnly),
       endpointId: 'endpoint',

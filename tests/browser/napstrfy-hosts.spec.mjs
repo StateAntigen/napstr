@@ -221,3 +221,40 @@ test('Napstrfy counts the computers that answered in the status line', async ({ 
   await expect(chip.locator('.status-dots i.away')).toHaveCount(1);
   await expect(chip).toContainText('1/2 Online');
 });
+
+test('a cold start says it is connecting rather than offline, then connects once', async ({ page }) => {
+  await mockNative(page, { platform: 'android' });
+  await page.addInitScript((row) => {
+    window.remoteLibrary = [row];
+    const invoke = window.__TAURI_INTERNALS__.invoke;
+    let asked = 0;
+    window.__TAURI_INTERNALS__.invoke = async (cmd, args) => {
+      // The first question finds no tunnel, which is where every launch begins.
+      // The phone's own channel reports an attempt in flight rather than a
+      // failure, and the next question is what finds the tunnel - so the app has
+      // to be told the truth about the wait instead of being told it is offline.
+      if (cmd === 'companion_status' && asked++ === 0) {
+        return { ...(await invoke(cmd, args)), connected: false, connecting: true };
+      }
+      // The second one takes long enough to be seen, so the first assertion is
+      // about the word rather than about a race.
+      if (cmd === 'companion_status') await new Promise((done) => window.setTimeout(done, 1000));
+      return invoke(cmd, args);
+    };
+  }, mine);
+  await page.goto('http://127.0.0.1:15174');
+
+  const chip = page.locator('.status-chip');
+  // The word a person used to see for the first seconds of every cold start.
+  await expect(chip).toContainText('Connecting');
+  await expect(chip).toContainText('Music computer');
+  await expect(page.locator('.track-row strong')).toHaveText(['My Song']);
+});
+
+test('a computer that cannot be reached still says offline rather than connecting', async ({ page }) => {
+  await openApp(page, { known: [myComputer] });
+  // The chip is the reconnect button, and this is the state it is there for.
+  await page.evaluate(() => { window.desktopReachable = false; });
+  await page.locator('.status-chip').click();
+  await expect(page.locator('.status-chip')).toContainText('Offline');
+});

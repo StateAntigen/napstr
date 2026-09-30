@@ -108,6 +108,14 @@ export type CompanionStatus = {
   streamOnly: boolean;
   paired: boolean;
   connected: boolean;
+  /**
+   * A tunnel to the computer is being opened right now.
+   *
+   * Its own state rather than a flavour of `connected`: "connecting" is the app
+   * doing something and asking to be waited for, and "offline" is nothing
+   * happening at all. A cold start spends its first seconds in the first.
+   */
+  connecting: boolean;
   desktopName: string;
   endpointId: string;
   libraryRevision: number;

@@ -79,11 +79,12 @@ impl SavedHost {
     /// `connected` is whether the last exchange succeeded; everything else is
     /// what was saved, so an outage changes the flags and nothing about who the
     /// computer is or which playlists are its own.
-    fn status(&self, connected: bool, error: String) -> CompanionStatus {
+    fn status(&self, connected: bool, connecting: bool, error: String) -> CompanionStatus {
         CompanionStatus {
             stream_only: self.grant().is_read_only(),
             paired: true,
             connected,
+            connecting,
             desktop_name: self.desktop_name.clone(),
             endpoint_id: self.endpoint_id.clone(),
             library_revision: 0,
@@ -169,6 +170,14 @@ struct CompanionStatus {
     stream_only: bool,
     paired: bool,
     connected: bool,
+    /// A tunnel to the computer is being opened right now.
+    ///
+    /// Its own state rather than a flavour of `connected`, because the two say
+    /// different things to a person: "connecting" is the app doing something and
+    /// asking to be waited for, and "offline" is nothing happening at all. A cold
+    /// start spends its first seconds in the first, and used to be shown as the
+    /// second.
+    connecting: bool,
     desktop_name: String,
     endpoint_id: String,
     library_revision: u64,
@@ -1482,7 +1491,39 @@ struct RemoteClient {
     /// friend rather than asking the phone's own computer and waiting for it to
     /// say it has no such file.
     origins: tokio::sync::RwLock<HashMap<String, String>>,
+    /// The computers a tunnel is being opened to right now.
+    ///
+    /// A status question that finds no tunnel answers "connecting" and opens one
+    /// in the background rather than waiting for it: the wait is up to
+    /// twenty-five seconds, and a status line should not hold a screen for that.
+    /// Kept here so two questions in the same second do not open two tunnels to
+    /// the same computer.
+    connecting: tokio::sync::RwLock<std::collections::HashSet<String>>,
     start_lock: tokio::sync::Mutex<()>,
+}
+
+/// Why one attempt at one request failed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AttemptFailure {
+    /// The stream or the connection broke, which is the one failure that says
+    /// the tunnel itself is gone.
+    Transport,
+    /// The computer did not answer in time. Slow is not the same as gone: a
+    /// computer busy with a large library page is still a computer.
+    Timeout,
+}
+
+/// Whether a failed attempt should drop the tunnel.
+///
+/// Two reasons to keep it, and both of them were bugs. A probe never drops it: a
+/// question is not evidence about the connection it was asked over, and this one
+/// is asked on every connect and then every thirty seconds, so dropping it took
+/// down every other request using the same tunnel - which is how a phone that was
+/// playing music was reported as offline. A timed-out request does not drop it
+/// either, so that the retry has somewhere to go rather than paying for a fresh
+/// connect.
+fn attempt_drops_tunnel(may_close: bool, failure: AttemptFailure) -> bool {
+    may_close && failure == AttemptFailure::Transport
 }
 
 /// What one computer has given of the mix so far.
@@ -1718,6 +1759,7 @@ impl RemoteClient {
             hosts: tokio::sync::RwLock::new(hosts),
             mixed: tokio::sync::RwLock::new(None),
             origins: tokio::sync::RwLock::new(HashMap::new()),
+            connecting: tokio::sync::RwLock::new(std::collections::HashSet::new()),
             start_lock: tokio::sync::Mutex::new(()),
         })
     }
@@ -2261,12 +2303,26 @@ impl RemoteClient {
     /// line, and a computer that is asleep must not hold up the ones that are
     /// awake. Anything at all back is an answer - a refusal is as good as a
     /// greeting, because both mean the computer is there.
+    ///
+    /// Two things it does not do, and both were bugs. It never drops a tunnel,
+    /// because a question about a computer is not a verdict on a connection. And
+    /// it does not ask the computer this phone acts through while a tunnel to it
+    /// is already open: the status question that opened it has just answered
+    /// this, so asking again spends a round trip per status line learning what is
+    /// already known.
     async fn reachable(&self, hosts: &[SavedHost]) -> HashMap<String, bool> {
+        let primary = self.primary().await.ok().map(|host| host.endpoint_id);
+        let primary = primary.as_ref();
+        let held = self.connections.read().await.clone();
+        let held = &held;
         let answers = futures_util::future::join_all(hosts.iter().map(|host| async move {
+            if primary.is_some_and(|id| id == &host.endpoint_id) && held.contains_key(&host.endpoint_id) {
+                return (host.endpoint_id.clone(), true);
+            }
             let answered = matches!(
                 tokio::time::timeout(
                     Duration::from_secs(6),
-                    self.exchange_attempt(host, ClientRequest::Ping),
+                    self.exchange_probe(host, ClientRequest::Ping),
                 )
                 .await,
                 Ok(Ok(_))
@@ -2342,7 +2398,7 @@ impl RemoteClient {
         Err(last_error.unwrap_or_else(|| "Napstr is unavailable".into()))
     }
 
-    /// One request to one computer, retried once on a fresh tunnel.
+    /// One request to one computer, retried once.
     async fn exchange_with(
         &self,
         host: &SavedHost,
@@ -2359,31 +2415,61 @@ impl RemoteClient {
     }
 
     /// One request to one computer, tried once.
-    ///
-    /// The tunnel is dropped when an attempt fails, whichever way it failed: what
-    /// went wrong is as likely to be the connection as the request, and the next
-    /// attempt is what opens a fresh one.
     async fn exchange_attempt(
         &self,
         host: &SavedHost,
         request: ClientRequest,
     ) -> Result<(ServerResponse, iroh::endpoint::RecvStream), String> {
-        let result = match self.connection(host).await {
+        self.exchange_once(host, request, true).await
+    }
+
+    /// One request to one computer for the sake of the answer alone, tried once.
+    ///
+    /// This is what asks whether a computer is there, so it never drops the
+    /// tunnel: the asker wants one question answered, and the answer is used to
+    /// draw a status line, not to judge the connection.
+    async fn exchange_probe(
+        &self,
+        host: &SavedHost,
+        request: ClientRequest,
+    ) -> Result<(ServerResponse, iroh::endpoint::RecvStream), String> {
+        self.exchange_once(host, request, false).await
+    }
+
+    /// One request to one computer, tried once.
+    async fn exchange_once(
+        &self,
+        host: &SavedHost,
+        request: ClientRequest,
+        may_close: bool,
+    ) -> Result<(ServerResponse, iroh::endpoint::RecvStream), String> {
+        let (result, failure) = match self.connection(host).await {
             Ok(connection) => match tokio::time::timeout(
                 Duration::from_secs(30),
                 exchange_on(&connection, request),
             )
             .await
             {
-                Ok(result) => result,
-                Err(_) => Err("Napstr did not answer the request in time".into()),
+                Ok(Ok(answered)) => (Ok(answered), None),
+                Ok(Err(error)) => (Err(error), Some(AttemptFailure::Transport)),
+                Err(_) => (
+                    Err("Napstr did not answer the request in time".into()),
+                    Some(AttemptFailure::Timeout),
+                ),
             },
-            Err(error) => Err(error),
+            // Nothing was opened, so there is nothing here to drop: the next
+            // attempt is what opens one.
+            Err(error) => (Err(error), None),
         };
         match result {
             Ok(response) => Ok(response),
             Err(error) => {
-                self.close_connection(&host.endpoint_id).await;
+                match failure {
+                    Some(failure) if attempt_drops_tunnel(may_close, failure) => {
+                        self.close_connection(&host.endpoint_id).await;
+                    }
+                    _ => {}
+                }
                 Err(error)
             }
         }
@@ -2447,12 +2533,13 @@ impl RemoteClient {
             .unwrap_or(false)
     }
 
-    async fn status(&self) -> CompanionStatus {
+    async fn status(self: &Arc<Self>) -> CompanionStatus {
         let Ok(host) = self.primary().await else {
             return CompanionStatus {
                 stream_only: false,
                 paired: false,
                 connected: false,
+                connecting: false,
                 desktop_name: String::new(),
                 endpoint_id: String::new(),
                 library_revision: 0,
@@ -2461,10 +2548,23 @@ impl RemoteClient {
                 error: String::new(),
             };
         };
+        // No tunnel to it yet, which is where every cold start begins. Opening one
+        // takes up to twenty-five seconds, and a question that waited that long
+        // would report a failure that only meant "not yet" - so it is opened in the
+        // background and this answer says what is true meanwhile. The next question
+        // is the one that finds the tunnel.
+        if self.connections.read().await.get(&host.endpoint_id).is_none() {
+            self.open_tunnel_in_background(&host).await;
+            // "Connecting" only while something is actually being tried. A computer
+            // that is asleep fails its attempt, and after that "offline" is the
+            // honest word rather than an app that claims to be busy for ever.
+            let trying = self.connecting.read().await.contains(&host.endpoint_id);
+            return host.status(false, trying, String::new());
+        }
         match tokio::time::timeout(Duration::from_secs(8), self.request(ClientRequest::Status))
             .await
         {
-            Err(_) => host.status(false, "Napstr did not answer yet".into()),
+            Err(_) => host.status(false, false, "Napstr did not answer yet".into()),
             Ok(Ok(ServerResponse::Status {
                 library_revision,
                 cover_revision,
@@ -2498,6 +2598,7 @@ impl RemoteClient {
                     stream_only: grant.is_read_only(),
                     paired: true,
                     connected: true,
+                    connecting: false,
                     desktop_name: host.desktop_name,
                     endpoint_id: host.endpoint_id,
                     library_revision,
@@ -2507,9 +2608,33 @@ impl RemoteClient {
                 }
             }
             Ok(Err(error)) if error == "invalid Napstrfy request" => self.legacy_status(host).await,
-            Ok(Ok(other)) => host.status(false, unexpected_response(&other)),
-            Ok(Err(error)) => host.status(false, error),
+            Ok(Ok(other)) => host.status(false, false, unexpected_response(&other)),
+            Ok(Err(error)) => host.status(false, false, error),
         }
+    }
+
+    /// Opens a tunnel without waiting for it.
+    ///
+    /// Called when a status question finds none. Only one may be in flight to one
+    /// computer, so a second question in the same second does not open a second
+    /// tunnel; the mark is cleared when the attempt ends, however it ends.
+    async fn open_tunnel_in_background(self: &Arc<Self>, host: &SavedHost) {
+        {
+            let mut connecting = self.connecting.write().await;
+            if !connecting.insert(host.endpoint_id.clone()) {
+                return;
+            }
+        }
+        let client = Arc::clone(self);
+        let target = host.clone();
+        tokio::spawn(async move {
+            // The failure is deliberately not remembered: a computer asleep now may
+            // be awake in five seconds, and the status timer is what tries again.
+            // Keeping the error would let one old failure outlive the condition that
+            // caused it, which is the shape of the bug this is fixing.
+            let _ = client.connection(&target).await;
+            client.connecting.write().await.remove(&target.endpoint_id);
+        });
     }
 
     async fn legacy_status(&self, host: SavedHost) -> CompanionStatus {
@@ -2519,6 +2644,7 @@ impl RemoteClient {
                 stream_only: host.grant().is_read_only(),
                 paired: true,
                 connected: true,
+                connecting: false,
                 desktop_name: host.desktop_name.clone(),
                 endpoint_id: host.endpoint_id.clone(),
                 library_revision: 0,
@@ -2526,9 +2652,9 @@ impl RemoteClient {
                 pubkey: host.pubkey.clone(),
                 error: String::new(),
             },
-            Ok(Ok(other)) => host.status(false, unexpected_response(&other)),
-            Ok(Err(error)) => host.status(false, error),
-            Err(_) => host.status(false, "Napstr did not answer yet".into()),
+            Ok(Ok(other)) => host.status(false, false, unexpected_response(&other)),
+            Ok(Err(error)) => host.status(false, false, error),
+            Err(_) => host.status(false, false, "Napstr did not answer yet".into()),
         }
     }
 
@@ -4176,6 +4302,20 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bug this guards: the reachability probe ran on every connect and then
+    /// every thirty seconds, and any failed attempt dropped the tunnel - so asking
+    /// whether a computer was there could take down the connection that was
+    /// playing music, and the phone then reported itself offline.
+    #[test]
+    fn only_a_broken_transport_drops_a_tunnel() {
+        assert!(!attempt_drops_tunnel(false, AttemptFailure::Transport));
+        assert!(!attempt_drops_tunnel(false, AttemptFailure::Timeout));
+        assert!(attempt_drops_tunnel(true, AttemptFailure::Transport));
+        // A slow answer is not a broken connection, so the retry has somewhere to
+        // go instead of paying for a fresh connect.
+        assert!(!attempt_drops_tunnel(true, AttemptFailure::Timeout));
+    }
 
     fn host(endpoint: &str, rights: DeviceRights, name: &str) -> SavedHost {
         SavedHost {

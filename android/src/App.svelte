@@ -157,7 +157,7 @@
     return () => query.removeEventListener('change', listener);
   });
   const pinned = $derived(!mobile && platform !== '' && wideWindow);
-  let status = $state<CompanionStatus>({ streamOnly: false, paired: false, connected: false, desktopName: '', endpointId: '', libraryRevision: 0, coverRevision: 0, pubkey: '', error: '' });
+  let status = $state<CompanionStatus>({ streamOnly: false, paired: false, connected: false, connecting: false, desktopName: '', endpointId: '', libraryRevision: 0, coverRevision: 0, pubkey: '', error: '' });
   /**
    * The computers this phone may talk to, and how to reach each of them.
    *
@@ -207,7 +207,10 @@
    * are here once there is more than one to count.
    */
   function statusLabel(): Message | string {
-    if (statusPending) return $t("Connecting…");
+    // Two different things to look at: “connecting” is this app doing something and
+    // asking to be waited for, “offline” is nothing happening at all. A cold start
+    // used to spend its first seconds being told the second.
+    if (statusPending || status.connecting) return $t("Connecting…");
     if (!status.connected) return $t("Offline");
     if (knownHosts.length > 1 && !everyoneOnline()) {
       return msg("{p0}/{p1} Online", {
@@ -257,6 +260,29 @@
   });
   let statusLoading = $state(true);
   let statusPending = $state(false);
+  /**
+   * When the next status question is asked.
+   *
+   * Fifteen seconds is right for a connection that is up and far too slow for one
+   * that is being opened, which is the whole of a cold start: the tunnel lands in a
+   * second or two, and at fifteen the app would sit on the cached list until the next
+   * tick. So every answer arms the next question, and the wait follows what it said -
+   * short while connecting, fifteen seconds otherwise. Deciding this *before* the first
+   * answer is what went wrong first time round: at mount nothing has answered yet, so
+   * the short wait could never be chosen and the first re-check was fifteen seconds out.
+   * Capped, because a computer that is asleep never stops being “connecting”, and a
+   * second is not a poll rate to keep up all evening.
+   */
+  let statusTimer = 0;
+  const statusFastUntil = Date.now() + 30_000;
+  const scheduleStatus = () => {
+    window.clearTimeout(statusTimer);
+    const fast = status.connecting && Date.now() < statusFastUntil;
+    statusTimer = window.setTimeout(async () => {
+      if (!document.hidden) await refreshStatus();
+      scheduleStatus();
+    }, fast ? 1200 : 15000);
+  };
   let pairingCode = $state('');
   let pairing = $state(false);
   let scanning = $state(false);
@@ -280,6 +306,8 @@
   let musicViewVersion = 0;
   let loadedLibraryRevision = 0;
   let silentLibraryRefresh = false;
+  /** A silent refresh was asked for while a load was already running. */
+  let libraryRefreshWanted = false;
   let cacheReconciliationKey = '';
   let cacheReconciliationPending = false;
   let selected = $state<RemoteTrack | null>(null);
@@ -1174,8 +1202,15 @@
         // so the host's own count of how often its art changed is what tells
         // this phone to ask again instead of trusting an answer that has aged.
         invalidateCoverNegatives(status.coverRevision);
-        if (syncLibrary && (!wasConnected || (status.libraryRevision > 0
-          && loadedLibraryRevision > 0 && status.libraryRevision !== loadedLibraryRevision))) {
+        // `loadedLibraryRevision === 0` is the first load, and it has to be caught
+        // here as well as by the change of connection: on a cold start the launch
+        // path's own load is skipped when the first status is not connected yet, and
+        // nothing else would ask. Requiring a revision that has already been loaded
+        // is what left the cached list on screen until the connection happened to
+        // flap and come back, which is why the shuffled library only ever appeared
+        // on the second connect.
+        if (syncLibrary && (!wasConnected || loadedLibraryRevision === 0
+          || (status.libraryRevision > 0 && status.libraryRevision !== loadedLibraryRevision))) {
           void refreshLibrarySilently(status.libraryRevision);
         }
       }
@@ -1184,6 +1219,8 @@
     } finally {
       statusLoading = false;
       statusPending = false;
+      // The wait to the next question follows from what this one answered.
+      scheduleStatus();
     }
   }
 
@@ -1321,7 +1358,7 @@
   async function forgetDesktop() {
     if (!window.confirm('Disconnect this phone from Napstr? You will need to scan a new QR code.')) return;
     await invoke('forget_desktop');
-    status = { streamOnly: false, paired: false, connected: false, desktopName: '', endpointId: '', libraryRevision: 0, coverRevision: 0, pubkey: '', error: '' };
+    status = { streamOnly: false, paired: false, connected: false, connecting: false, desktopName: '', endpointId: '', libraryRevision: 0, coverRevision: 0, pubkey: '', error: '' };
     tracks = [];
     current = null;
     audio?.pause();
@@ -1392,18 +1429,31 @@
       if (viewVersion === musicViewVersion) {
         loading = false;
         loadingMore = false;
+        // A silent refresh asked for while this was running was waiting for it.
+        if (libraryRefreshWanted && status.connected) {
+          void refreshLibrarySilently(status.libraryRevision);
+        }
       }
     }
   }
 
   async function refreshLibrarySilently(revision: number) {
-    if (silentLibraryRefresh || loading || loadingMore || !status.connected) return;
+    if (silentLibraryRefresh) return;
+    // A load already in flight is a reason to wait, not a reason to forget: dropping
+    // the request here is how the shuffled library failed to arrive on the first
+    // connection. The wish is recorded, and whatever is loading asks again as soon as
+    // it lands.
+    if (loading || loadingMore || !status.connected) {
+      libraryRefreshWanted = true;
+      return;
+    }
     if (showingLikedMusic || query.trim()) {
       // These views issue a fresh request when the user opens or submits them.
       loadedLibraryRevision = revision;
       return;
     }
     silentLibraryRefresh = true;
+    libraryRefreshWanted = false;
     try {
       const page = await invoke<LibraryPage>('remote_library', { query: '', offset: 0, limit: 100, shuffleSeed: libraryShuffleSeed });
       tracks = page.tracks;
@@ -5063,9 +5113,15 @@
       .then(() => refreshStatus(true, false))
       .then(() => { if (status.connected) void loadLibrary(); });
     void refreshPodcastDownloads();
-    const statusTimer = window.setInterval(() => {
-      if (!document.hidden) void refreshStatus();
-    }, 15000);
+    // Fifteen seconds is right for a connection that is up, and far too slow for one
+    // that is being opened - which is the whole of a cold start. The tunnel lands in a
+    // second or two, and at fifteen the app would sit on the cached list until the
+    // next tick, so the wait is short until there is something to hear. It is capped,
+    // because a computer that is asleep never stops being “connecting” and a second
+    // is not a poll rate to keep up all evening.
+    // The first question of the run. Every answer after it arms the next one, so a
+    // connection that is up is asked about on the same cadence it always was.
+    scheduleStatus();
     // While the computer is the source, the bar is showing its track and its
     // position, so it has to be asked what it is doing often enough to look live.
     // This keeps running while the app is in the background, and that is the
@@ -5133,7 +5189,7 @@
     window.addEventListener('napstrfy-back', handleSystemBack);
     window.addEventListener('keydown', handleKeyboard);
     return () => {
-      window.clearInterval(statusTimer);
+      window.clearTimeout(statusTimer);
       window.clearInterval(remoteTimer);
       window.clearInterval(remoteTickTimer);
       window.clearInterval(transferTimer);
