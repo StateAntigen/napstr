@@ -20,6 +20,7 @@ use walkdir::WalkDir;
 mod art_cache;
 mod art_fetch;
 mod audio;
+mod catalogue;
 mod cover;
 mod cover_publish;
 mod mobile;
