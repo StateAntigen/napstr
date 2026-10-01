@@ -926,6 +926,33 @@ fn write_catalogue_row(connection: &Connection, row: &CatalogueRow<'_>) -> Resul
         .map_err(|error| error.to_string())
 }
 
+/// Write an announcement into the local catalogue, repairing the index once if
+/// that is what stopped it.
+///
+/// A failure here is never allowed to reach a person: the catalogue is a cache, and
+/// the words of one announcement are not worth a failed search or a failed page.
+/// The interesting case is not the disk — it is a trigger writing into a word index
+/// that has been damaged, which reports itself as a malformed database and is
+/// repaired rather than reported.
+fn store_catalogue_row(connection: &Connection, row: &CatalogueRow<'_>) {
+    let error = match write_catalogue_row(connection, row) {
+        Ok(()) => return,
+        Err(error) => error,
+    };
+    if super::catalogue::index_is_sound(connection) {
+        eprintln!("Could not store an announcement in the local catalogue: {error}");
+        return;
+    }
+    eprintln!("The catalogue's word index was damaged ({error}); rebuilding it");
+    if let Err(error) = super::catalogue::rebuild_index(connection) {
+        eprintln!("Could not rebuild the catalogue's word index: {error}");
+        return;
+    }
+    if let Err(error) = write_catalogue_row(connection, row) {
+        eprintln!("Could not store an announcement after rebuilding the index: {error}");
+    }
+}
+
 fn merge_catalogue_result(
     aggregated: &mut HashMap<String, CatalogueResult>,
     content: CatalogueContent,
@@ -1355,12 +1382,28 @@ impl NetworkService {
             return Ok(None);
         }
         let connection = super::open_connection(&self.db_path)?;
-        let hits = super::catalogue::search(
-            &connection,
-            query,
-            NETWORK_SEARCH_RESULT_LIMIT,
-            Utc::now().timestamp(),
-        )?;
+        let now = Utc::now().timestamp();
+        let mut hits =
+            super::catalogue::search(&connection, query, NETWORK_SEARCH_RESULT_LIMIT, now);
+        if let Err(error) = &hits {
+            // The index is derived data, and a failure here is a failure of an
+            // accelerator: repair a damaged index and try it again, otherwise fall
+            // back to asking the network, which is what would have happened anyway.
+            eprintln!("Could not search the local catalogue: {error}");
+            if super::catalogue::index_is_sound(&connection) {
+                return Ok(None);
+            }
+            eprintln!("The catalogue's word index was damaged; rebuilding it");
+            if let Err(error) = super::catalogue::rebuild_index(&connection) {
+                eprintln!("Could not rebuild the catalogue's word index: {error}");
+                return Ok(None);
+            }
+            hits = super::catalogue::search(&connection, query, NETWORK_SEARCH_RESULT_LIMIT, now);
+        }
+        let Ok(hits) = hits else {
+            eprintln!("The rebuilt catalogue index still could not be searched");
+            return Ok(None);
+        };
         Ok((!hits.is_empty()).then_some(hits))
     }
 
@@ -1379,19 +1422,32 @@ impl NetworkService {
             .map_err(|error| format!("availability heartbeat query failed: {error}"))?;
         let heartbeats = availability_heartbeats(events.iter());
         let now = Utc::now().timestamp();
+        let mut connection = super::open_connection(&self.db_path)?;
         let undescribed = {
-            let connection = super::open_connection(&self.db_path)?;
+            // One transaction for the whole batch. A heartbeat names hundreds of
+            // files and there are hundreds of heartbeats, so committing each row
+            // would be tens of thousands of disk flushes in the seconds after the
+            // window opens — which is exactly when somebody is using it.
+            let transaction = connection
+                .transaction()
+                .map_err(|error| error.to_string())?;
             for beat in &heartbeats {
                 super::catalogue::remember_seeders(
-                    &connection,
+                    &transaction,
                     &beat.file_ids,
                     &beat.pubkey,
                     beat.expires_at,
                     now,
                 )?;
             }
-            super::catalogue::prune(&connection, now)?;
-            super::catalogue::undescribed_live_files(&connection, now, CATALOGUE_MIRROR_FETCH_LIMIT)?
+            super::catalogue::prune(&transaction, now)?;
+            let undescribed = super::catalogue::undescribed_live_files(
+                &transaction,
+                now,
+                CATALOGUE_MIRROR_FETCH_LIMIT,
+            )?;
+            transaction.commit().map_err(|error| error.to_string())?;
+            undescribed
         };
         if undescribed.is_empty() {
             return Ok(());
@@ -2912,7 +2968,7 @@ impl NetworkService {
                 params![content.audiobook_id, pubkey, content_json, event.id.to_hex(), Utc::now().to_rfc3339()],
             ).map_err(|error| error.to_string())?;
             for chapter in &content.chapters {
-                write_catalogue_row(
+                store_catalogue_row(
                     &transaction,
                     &CatalogueRow {
                         file_id: &chapter.file_id,
@@ -2929,7 +2985,7 @@ impl NetworkService {
                         tags: "audiobook",
                         event_id: &event.id.to_hex(),
                     },
-                )?;
+                );
             }
             aggregated
                 .entry(content.audiobook_id.clone())
@@ -3436,7 +3492,7 @@ impl NetworkService {
                 picture: String::new(),
                 event_id: event.id.to_hex(),
             };
-            write_catalogue_row(
+            store_catalogue_row(
                 &connection,
                 &CatalogueRow {
                     file_id: &content.file_id,
@@ -3453,7 +3509,7 @@ impl NetworkService {
                     tags: &catalogue_tags,
                     event_id: &event.id.to_hex(),
                 },
-            )?;
+            );
             cached_source_pairs.insert((pubkey, content.file_id.clone()));
             merge_catalogue_result(&mut aggregated, content, catalogue_tags, source);
         }
@@ -5687,6 +5743,48 @@ mod tests {
             results[0].sources[0].npub.starts_with("npub1"),
             "the source has to be presentable: {}",
             results[0].sources[0].npub
+        );
+    }
+
+    #[test]
+    fn a_catalogue_write_that_cannot_be_indexed_is_let_go() {
+        // The index is taken away, so every write fails inside the trigger that
+        // maintains it. That is the shape of the failure a person saw on the
+        // browse page — a cache write surfacing as a failed page — and what has to
+        // hold is that the app carries on and asks the network instead.
+        let connection = Connection::open_in_memory().unwrap();
+        initialise_network_schema(&connection).unwrap();
+        connection
+            .execute_batch("DROP TABLE remote_catalogue_fts")
+            .unwrap();
+        store_catalogue_row(
+            &connection,
+            &CatalogueRow {
+                file_id: &hex::encode(Sha256::digest(b"first")),
+                source_pubkey: &format!("{:064x}", 7),
+                filename: "midnight.flac",
+                title: "Midnight City",
+                artist: "M83",
+                album: "Hurry Up",
+                format: "FLAC",
+                mime: "audio/flac",
+                size: 42_000_000,
+                license: "unspecified",
+                description: "",
+                tags: "napstr",
+                event_id: &"1".repeat(64),
+            },
+        );
+        // The write is lost rather than raised, and the table is still readable —
+        // and because the backfill only skips files it has really described, the
+        // announcement is simply asked for again on the next pass.
+        assert!(!crate::catalogue::index_is_sound(&connection));
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM remote_catalogue", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
         );
     }
 

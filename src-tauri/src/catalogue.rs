@@ -110,13 +110,47 @@ fn rebuild_index_if_empty(connection: &Connection) -> Result<(), String> {
     if stored == 0 {
         return Ok(());
     }
+    rebuild_index(connection)
+}
+
+/// Build the word index again from the announcements it describes.
+///
+/// The index is derived data: everything in it came from `remote_catalogue`, so
+/// there is nothing to lose by throwing it away and reading the table again. That
+/// is what makes a damaged index a repair rather than a failure, and it is why
+/// callers are willing to reach for this on an error they cannot explain.
+///
+/// Not free on a large catalogue — it reads the whole table — so it belongs after
+/// something has already failed, never on a timer or on the way to a result.
+pub(crate) fn rebuild_index(connection: &Connection) -> Result<(), String> {
     connection
         .execute(
             "INSERT INTO remote_catalogue_fts(remote_catalogue_fts) VALUES('rebuild')",
             [],
         )
-        .map_err(|error| error.to_string())?;
-    Ok(())
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+/// Whether the word index passes its own integrity check.
+///
+/// Better to ask than to infer. A damaged index reports itself in the words of
+/// whatever statement happened to reach it — measured against a deliberately
+/// damaged one, a `MATCH` says the database is malformed while an insert into the
+/// index can say a constraint failed — so the decision to rebuild is made by
+/// asking the index, and only after something has already gone wrong, which is why
+/// this is cheap enough to call on a failure.
+///
+/// A *stale* index — rows whose announcements were deleted without the triggers —
+/// is not damage and this does not report it: it quietly answers with more rows
+/// than the table holds, and the join to `remote_catalogue` drops them.
+pub(crate) fn index_is_sound(connection: &Connection) -> bool {
+    connection
+        .execute(
+            "INSERT INTO remote_catalogue_fts(remote_catalogue_fts) VALUES('integrity-check')",
+            [],
+        )
+        .is_ok()
 }
 
 /// One search result: an announcement, and who is holding it right now.
@@ -151,6 +185,10 @@ fn is_hash(value: &str) -> bool {
 /// this is separate from the catalogue writes — neither implies the other. Rows
 /// carry the heartbeat's own expiry, so a seeder is a fact with a lifetime rather
 /// than a flag that is set once and never cleared.
+///
+/// Runs inside whatever transaction the caller has open. Called outside one, each
+/// row is its own commit — which for a heartbeat naming a few hundred files is a
+/// few hundred disk flushes, so a caller storing many of them should open one.
 ///
 /// Returns how many files were written, which is what a caller logging a
 /// heartbeat wants to say.
@@ -723,6 +761,42 @@ mod tests {
         connection
             .query_row(sql, [], |row| row.get(0))
             .expect("the count query should run")
+    }
+
+    /// A damaged word index is a repair, not a failure.
+    ///
+    /// The damage is real, not simulated: overwriting the index's own b-tree is
+    /// how the failure was reproduced outside the app, and it is what the app
+    /// reported as "database disk image is malformed" while the table beside it
+    /// was perfectly readable. Everything in the index came from that table, so
+    /// the repair is to build it again.
+    #[test]
+    fn a_damaged_index_is_repaired_rather_than_reported() {
+        let connection = database();
+        let now = 1_700_000_000;
+        announce(&connection, &hex_id(1), 9, "Midnight City", "Hurry Up");
+        holding(&connection, &hex_id(1), 9, now);
+        assert_eq!(search(&connection, "midnight", 10, now).unwrap().len(), 1);
+
+        connection
+            .execute("UPDATE remote_catalogue_fts_data SET block = X'DEADBEEF'", [])
+            .unwrap();
+        assert!(
+            !index_is_sound(&connection),
+            "a damaged index has to be able to say so, because that is the \
+             difference between repairing it and reporting it"
+        );
+        // The table itself is untouched, which is what makes the repair safe: a
+        // search can still fall back to it, and nothing has been lost.
+        assert_eq!(rows(&connection, "SELECT COUNT(*) FROM remote_catalogue"), 1);
+
+        rebuild_index(&connection).unwrap();
+        assert!(index_is_sound(&connection));
+        assert_eq!(
+            search(&connection, "midnight", 10, now).unwrap().len(),
+            1,
+            "the rebuilt index answers again"
+        );
     }
 
     #[test]
