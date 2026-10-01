@@ -2148,6 +2148,9 @@ async fn block_file(file_id: String, state: State<'_, AppState>) -> Result<(), S
     connection
         .execute("DELETE FROM remote_catalogue WHERE file_id=?1", [&file_id])
         .map_err(|error| error.to_string())?;
+    // The index over that table is maintained by triggers, but the heartbeats are
+    // their own table: left behind, they would keep the file in the results.
+    catalogue::forget_file(&connection, &file_id)?;
     drop(connection);
     state.network.queue_catalogue_publish(false);
     Ok(())
@@ -2167,6 +2170,7 @@ fn block_user(pubkey: String, state: State<'_, AppState>) -> Result<(), String> 
             [&pubkey],
         )
         .map_err(|error| error.to_string())?;
+    catalogue::forget_author(&connection, &pubkey)?;
     connection
         .execute("DELETE FROM trollbox_events WHERE pubkey=?1", [&pubkey])
         .map_err(|error| error.to_string())?;

@@ -95,6 +95,19 @@ const CATALOGUE_BROWSE_SESSION_LIFETIME: Duration = Duration::from_secs(10 * 60)
 const CATALOGUE_BROWSE_SESSION_LIMIT: usize = 8;
 const NETWORK_SEARCH_RESULT_LIMIT: usize = 500;
 const CATALOGUE_CACHE_SCAN_LIMIT: usize = 25_000;
+/// How often the catalogue this computer holds is brought up to date.
+///
+/// Shorter than the 240 seconds a heartbeat is published on, so what is held here
+/// is at worst one beat old rather than one beat plus a missed round.
+const CATALOGUE_MIRROR_INTERVAL_SECONDS: u64 = 60;
+/// How many undescribed files one pass will ask the network about.
+///
+/// A pass runs a minute apart and each file is asked about once, so this is also
+/// the rate at which a fresh mirror fills: a few hundred a minute would leave
+/// searches falling back to the relays for hours. The fetch is batched
+/// seventy-five at a time, eight in flight, so this is about twenty batches of
+/// work in one pass.
+const CATALOGUE_MIRROR_FETCH_LIMIT: usize = 1_500;
 const CATALOGUE_SEARCH_TOKEN_LIMIT: usize = 20;
 const CATALOGUE_SEARCH_TOKEN_LENGTH: usize = 32;
 const CATALOGUE_QUERY_TOKEN_LIMIT: usize = 4;
@@ -780,11 +793,22 @@ fn valid_catalogue_event(event: &Event, content: &CatalogueContent) -> bool {
         && event.tags.hashtags().any(|tag| tag == "napstr")
 }
 
-fn merge_availability_events<'a>(
+/// One valid heartbeat, and what it claims.
+struct AvailabilityHeartbeat {
+    pubkey: String,
+    file_ids: Vec<String>,
+    expires_at: i64,
+}
+
+/// The valid heartbeats in a relay answer, with what each one claims.
+///
+/// One place for the rules — the marker, the signature, the expiry, the shape of
+/// the content and the size cap — so the picture held in memory and the copy this
+/// computer keeps on disk cannot disagree about what a heartbeat is.
+fn availability_heartbeats<'a>(
     events: impl IntoIterator<Item = &'a Event>,
-    online: &mut HashSet<(String, String)>,
-    available_by_file: &mut HashMap<String, HashSet<String>>,
-) {
+) -> Vec<AvailabilityHeartbeat> {
+    let mut heartbeats = Vec::new();
     for event in events {
         if event.kind != Kind::from(AVAILABILITY_KIND)
             || event.verify().is_err()
@@ -792,35 +816,114 @@ fn merge_availability_events<'a>(
                 .tags
                 .hashtags()
                 .any(|tag| tag == "napstr-availability")
-            || event
-                .tags
-                .expiration()
-                .map(|expires| *expires <= Timestamp::now())
-                .unwrap_or(true)
         {
             continue;
         }
+        let Some(expires_at) = event
+            .tags
+            .expiration()
+            .filter(|expires| **expires > Timestamp::now())
+            .map(|expires| expires.as_secs() as i64)
+        else {
+            continue;
+        };
         let Ok(ids) = serde_json::from_str::<Vec<String>>(&event.content) else {
             continue;
         };
         if ids.len() > 400 {
             continue;
         }
-        let pubkey = event.pubkey.to_hex();
-        for id in ids {
-            if !valid_file_id(&id) {
-                continue;
-            }
+        let file_ids = ids
+            .into_iter()
+            .filter(|id| valid_file_id(id))
+            .collect::<Vec<_>>();
+        if file_ids.is_empty() {
+            continue;
+        }
+        heartbeats.push(AvailabilityHeartbeat {
+            pubkey: event.pubkey.to_hex(),
+            file_ids,
+            expires_at,
+        });
+    }
+    heartbeats
+}
+
+fn merge_availability_events<'a>(
+    events: impl IntoIterator<Item = &'a Event>,
+    online: &mut HashSet<(String, String)>,
+    available_by_file: &mut HashMap<String, HashSet<String>>,
+) {
+    for beat in availability_heartbeats(events) {
+        for id in beat.file_ids {
             if online.len() >= AVAILABILITY_FILE_LIMIT {
                 return;
             }
-            online.insert((pubkey.clone(), id.clone()));
+            online.insert((beat.pubkey.clone(), id.clone()));
             available_by_file
                 .entry(id)
                 .or_default()
-                .insert(pubkey.clone());
+                .insert(beat.pubkey.clone());
         }
     }
+}
+
+/// One row of the local catalogue, as its writers describe one.
+struct CatalogueRow<'a> {
+    file_id: &'a str,
+    source_pubkey: &'a str,
+    filename: &'a str,
+    title: &'a str,
+    artist: &'a str,
+    album: &'a str,
+    format: &'a str,
+    mime: &'a str,
+    size: u64,
+    license: &'a str,
+    description: &'a str,
+    tags: &'a str,
+    event_id: &'a str,
+}
+
+/// Write one announcement into the local catalogue.
+///
+/// The only writer of this table, because the index over it is maintained by
+/// triggers: this has to be an upsert — a `REPLACE` is a delete and an insert where
+/// the delete trigger never runs — and with several callers, one statement is one
+/// chance to get that wrong rather than three.
+fn write_catalogue_row(connection: &Connection, row: &CatalogueRow<'_>) -> Result<(), String> {
+    connection
+        .execute(
+            "INSERT INTO remote_catalogue (file_id,source_pubkey,filename,title,artist,album,format,mime,size,license,description,tags,event_id,seen_at,cover_key,canonical_cover_key)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
+             ON CONFLICT(file_id,source_pubkey) DO UPDATE SET
+               filename=excluded.filename, title=excluded.title, artist=excluded.artist,
+               album=excluded.album, format=excluded.format, mime=excluded.mime,
+               size=excluded.size, license=excluded.license,
+               description=excluded.description, tags=excluded.tags,
+               event_id=excluded.event_id, seen_at=excluded.seen_at,
+               cover_key=excluded.cover_key, canonical_cover_key=excluded.canonical_cover_key",
+            params![
+                row.file_id,
+                row.source_pubkey,
+                row.filename,
+                row.title,
+                row.artist,
+                row.album,
+                row.format,
+                row.mime,
+                row.size as i64,
+                row.license,
+                row.description,
+                row.tags,
+                row.event_id,
+                Utc::now().to_rfc3339(),
+                super::cover::cover_key(row.artist, row.album).unwrap_or_default(),
+                super::cover::canonical_cover_key(row.artist, row.album).unwrap_or_default(),
+            ],
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 fn merge_catalogue_result(
@@ -863,6 +966,78 @@ fn merge_catalogue_result(
             tags: catalogue_tags,
             sources: vec![source],
         });
+}
+
+/// Fold the mirror's answer into the results being built.
+///
+/// The words already match: the index decided that, and asking a second matcher to
+/// agree would drop the results the two do not share. So what is applied here is
+/// only what is about safety and about who is showing — blocked files, blocked
+/// authors, and the claim checks a download would otherwise fail on.
+fn merge_mirror_hits(
+    aggregated: &mut HashMap<String, CatalogueResult>,
+    mirror_hits: Vec<super::catalogue::Hit>,
+    blocked_files: &HashSet<String>,
+    blocked_pubkeys: &HashSet<String>,
+) {
+    for hit in mirror_hits {
+        if blocked_files.contains(&hit.file_id)
+            || !valid_file_id(&hit.file_id)
+            || hit.size == 0
+            || !audio_claim_valid(&hit.filename, &hit.format, &hit.mime)
+            || !valid_catalogue_metadata(&[
+                &hit.filename,
+                &hit.title,
+                &hit.artist,
+                &hit.album,
+                &hit.tags,
+            ])
+        {
+            continue;
+        }
+        let Ok(catalogue_tags) = super::normalise_tags(&hit.tags) else {
+            continue;
+        };
+        // A file can be announced by several people; only the ones who are still
+        // holding it were named, and a blocked one among them does not take the
+        // file away from the others.
+        for (pubkey, event_id) in hit.sources {
+            if blocked_pubkeys.contains(&pubkey) {
+                continue;
+            }
+            let Ok(public_key) = PublicKey::from_str(&pubkey) else {
+                continue;
+            };
+            let source = CatalogueSource {
+                npub: public_key.to_bech32().unwrap_or_else(|_| pubkey.clone()),
+                display_name: short_key(&pubkey),
+                relay: String::new(),
+                about: String::new(),
+                picture: String::new(),
+                event_id,
+                pubkey,
+            };
+            merge_catalogue_result(
+                aggregated,
+                CatalogueContent {
+                    protocol: "napstr/1".into(),
+                    file_id: hit.file_id.clone(),
+                    filename: hit.filename.clone(),
+                    title: hit.title.clone(),
+                    artist: hit.artist.clone(),
+                    album: hit.album.clone(),
+                    format: hit.format.clone(),
+                    mime: hit.mime.clone(),
+                    size: hit.size,
+                    license: hit.license.clone(),
+                    description: String::new(),
+                    tags: catalogue_tags.clone(),
+                },
+                catalogue_tags.clone(),
+                source,
+            );
+        }
+    }
 }
 
 struct AvailabilitySnapshot {
@@ -1159,6 +1334,130 @@ impl NetworkService {
         queue_interrupted_downloads(&super::open_connection(&self.db_path)?)
     }
 
+    /// A named search answered from the catalogue this computer holds.
+    ///
+    /// `None` means the mirror does not know these words, which is a question for
+    /// the network; an empty `Some` would be indistinguishable from "nothing
+    /// matches", and those two want opposite answers. A thin mirror therefore
+    /// falls back rather than answering with a shorter list than the network has.
+    ///
+    /// Searches scoped to an author, and the ones that exclude what this computer
+    /// already has, keep going through the relay path: the first is a question
+    /// about that author rather than about the catalogue, and the second needs the
+    /// local library to answer.
+    async fn mirror_search(
+        &self,
+        query: &str,
+        author: Option<PublicKey>,
+        unowned_only: bool,
+    ) -> Result<Option<Vec<super::catalogue::Hit>>, String> {
+        if query.is_empty() || author.is_some() || unowned_only {
+            return Ok(None);
+        }
+        let connection = super::open_connection(&self.db_path)?;
+        let hits = super::catalogue::search(
+            &connection,
+            query,
+            NETWORK_SEARCH_RESULT_LIMIT,
+            Utc::now().timestamp(),
+        )?;
+        Ok((!hits.is_empty()).then_some(hits))
+    }
+
+    /// One pass of keeping a local copy of the network's catalogue.
+    ///
+    /// Heartbeats first: they are the part that changes minute to minute, and they
+    /// are what makes a seeder true. Then the announcements behind the files those
+    /// heartbeats name, which are what a search matches on — asked for only where
+    /// nothing here has described the file, so a pass costs what is new rather than
+    /// what exists. Then the heartbeats that have run out, because a seeder that
+    /// has stopped saying it is there is not a seeder.
+    async fn refresh_catalogue_mirror(&self, client: &Client) -> Result<(), String> {
+        let events = client
+            .fetch_events(availability_search_filter(), Duration::from_secs(8))
+            .await
+            .map_err(|error| format!("availability heartbeat query failed: {error}"))?;
+        let heartbeats = availability_heartbeats(events.iter());
+        let now = Utc::now().timestamp();
+        let undescribed = {
+            let connection = super::open_connection(&self.db_path)?;
+            for beat in &heartbeats {
+                super::catalogue::remember_seeders(
+                    &connection,
+                    &beat.file_ids,
+                    &beat.pubkey,
+                    beat.expires_at,
+                    now,
+                )?;
+            }
+            super::catalogue::prune(&connection, now)?;
+            super::catalogue::undescribed_live_files(&connection, now, CATALOGUE_MIRROR_FETCH_LIMIT)?
+        };
+        if undescribed.is_empty() {
+            return Ok(());
+        }
+        let (events, _) = fetch_catalogue_identifiers(client, &undescribed, None).await?;
+        if events.is_empty() {
+            return Ok(());
+        }
+        let mut connection = super::open_connection(&self.db_path)?;
+        let blocked_files = load_blocked_values(&connection, "blocked_files", "file_id")?;
+        let blocked_pubkeys = load_blocked_values(&connection, "blocked_pubkeys", "pubkey")?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        for event in &events {
+            let Ok(content) = serde_json::from_str::<CatalogueContent>(&event.content) else {
+                continue;
+            };
+            // The same checks a search applies before it stores an announcement,
+            // minus the availability one: what is stored here is what was said, and
+            // whether anybody is holding it is the heartbeat table's business.
+            if !valid_catalogue_event(event, &content)
+                || content.protocol != "napstr/1"
+                || !valid_file_id(&content.file_id)
+                || content.size == 0
+                || !audio_claim_valid(&content.filename, &content.format, &content.mime)
+                || !valid_catalogue_metadata(&[
+                    &content.filename,
+                    &content.title,
+                    &content.artist,
+                    &content.album,
+                    &content.tags,
+                ])
+            {
+                continue;
+            }
+            let Ok(catalogue_tags) = super::normalise_tags(&content.tags) else {
+                continue;
+            };
+            let pubkey = event.pubkey.to_hex();
+            if blocked_files.contains(&content.file_id) || blocked_pubkeys.contains(&pubkey) {
+                continue;
+            }
+            write_catalogue_row(
+                &transaction,
+                &CatalogueRow {
+                    file_id: &content.file_id,
+                    source_pubkey: &pubkey,
+                    filename: &content.filename,
+                    title: &content.title,
+                    artist: &content.artist,
+                    album: &content.album,
+                    format: &content.format,
+                    mime: &content.mime,
+                    size: content.size,
+                    license: "unspecified",
+                    description: &content.description,
+                    tags: &catalogue_tags,
+                    event_id: &event.id.to_hex(),
+                },
+            )?;
+        }
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
     async fn availability_snapshot(
         &self,
         client: &Client,
@@ -1343,8 +1642,8 @@ impl NetworkService {
         *self.last_error.write().await = String::new();
 
         let service = self.clone();
+        let listener_client = client.clone();
         tokio::spawn(async move {
-            let listener_client = client.clone();
             let event_client = listener_client.clone();
             let event_service = service.clone();
             let result = listener_client
@@ -1433,6 +1732,21 @@ impl NetworkService {
                 {
                     let _ = heartbeat.publish_availability().await;
                 }
+            }
+        });
+        // The other half of the same loop: while this computer is connected it keeps
+        // a copy of the network's catalogue, so a search is an index lookup rather
+        // than a question about the current state of the network for every word.
+        let mirror = self.clone();
+        let mirror_client = client.clone();
+        tokio::spawn(async move {
+            while mirror.connected.load(Ordering::SeqCst)
+                && mirror.generation.load(Ordering::SeqCst) == generation
+            {
+                if let Err(error) = mirror.refresh_catalogue_mirror(&mirror_client).await {
+                    eprintln!("Could not bring the local catalogue up to date: {error}");
+                }
+                tokio::time::sleep(Duration::from_secs(CATALOGUE_MIRROR_INTERVAL_SECONDS)).await;
             }
         });
         self.status().await
@@ -2598,11 +2912,24 @@ impl NetworkService {
                 params![content.audiobook_id, pubkey, content_json, event.id.to_hex(), Utc::now().to_rfc3339()],
             ).map_err(|error| error.to_string())?;
             for chapter in &content.chapters {
-                transaction.execute(
-                    "INSERT OR REPLACE INTO remote_catalogue(file_id,source_pubkey,filename,title,artist,album,format,mime,size,license,description,tags,event_id,seen_at,cover_key,canonical_cover_key)
-                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'unspecified','','audiobook',?10,?11,?12,?13)",
-                    params![chapter.file_id, pubkey, chapter.filename, chapter.title, content.author, content.title, chapter.format, chapter.mime, chapter.size as i64, event.id.to_hex(), Utc::now().to_rfc3339(), super::cover::cover_key(&content.author, &content.title).unwrap_or_default(), super::cover::canonical_cover_key(&content.author, &content.title).unwrap_or_default()],
-                ).map_err(|error| error.to_string())?;
+                write_catalogue_row(
+                    &transaction,
+                    &CatalogueRow {
+                        file_id: &chapter.file_id,
+                        source_pubkey: &pubkey,
+                        filename: &chapter.filename,
+                        title: &chapter.title,
+                        artist: &content.author,
+                        album: &content.title,
+                        format: &chapter.format,
+                        mime: &chapter.mime,
+                        size: chapter.size,
+                        license: "unspecified",
+                        description: "",
+                        tags: "audiobook",
+                        event_id: &event.id.to_hex(),
+                    },
+                )?;
             }
             aggregated
                 .entry(content.audiobook_id.clone())
@@ -2660,6 +2987,7 @@ impl NetworkService {
         let mut events_by_id: HashMap<EventId, Event> = HashMap::new();
         let mut catalogue_search_error = None;
         let mut next_browse_cursor = None;
+        let mut mirror_hits: Option<Vec<super::catalogue::Hit>> = None;
         let mut online: HashSet<(String, String)>;
         let mut available_by_file: HashMap<String, HashSet<String>>;
         let mut continuation_session: Option<(String, CatalogueBrowseSession)> = None;
@@ -2756,6 +3084,24 @@ impl NetworkService {
                     available_by_file = availability.available_by_file.clone();
                 }
             }
+        } else if let Some(hits) = self.mirror_search(query, author, unowned_only).await? {
+            // The mirror knows these words, so the network is not asked for the
+            // current state of itself at all — which is the whole point of holding
+            // a copy of it. Who is holding each file comes from the heartbeats the
+            // mirror kept, which are the same events the relay query below would
+            // have returned, only already read.
+            online = HashSet::new();
+            available_by_file = HashMap::new();
+            for hit in &hits {
+                for (pubkey, _) in &hit.sources {
+                    online.insert((pubkey.clone(), hit.file_id.clone()));
+                    available_by_file
+                        .entry(hit.file_id.clone())
+                        .or_default()
+                        .insert(pubkey.clone());
+                }
+            }
+            mirror_hits = Some(hits);
         } else {
             let availability_query = self.availability_snapshot(&client);
             let mut filters = vec![catalogue_name_search_filter(query)];
@@ -2892,6 +3238,11 @@ impl NetworkService {
         // Previously verified relay events are an acceleration cache, not the
         // source of availability truth. Only rows paired with a fresh heartbeat
         // are eligible, and named searches are verified locally again.
+        //
+        // The scan is skipped when the index already answered: it reads the same
+        // table, a page of it at a time, and would bring back rows the index has
+        // already matched — with a second, less forgiving matcher than the one
+        // that produced them.
         let cached = {
             let mut statement = connection
                 .prepare(
@@ -2901,7 +3252,14 @@ impl NetworkService {
                 .map_err(|error| error.to_string())?;
             let rows = statement
                 .query_map(
-                    params![CATALOGUE_CACHE_SCAN_LIMIT as i64, author_hex],
+                    params![
+                        if mirror_hits.is_some() {
+                            0
+                        } else {
+                            CATALOGUE_CACHE_SCAN_LIMIT as i64
+                        },
+                        author_hex
+                    ],
                     |row| {
                         let size = row.get::<_, i64>(8)?;
                         Ok((
@@ -3021,6 +3379,11 @@ impl NetworkService {
             );
         }
 
+        // What the index answered, on the path where the network was not asked.
+        if let Some(mirror_hits) = mirror_hits {
+            merge_mirror_hits(&mut aggregated, mirror_hits, &blocked_files, &blocked_pubkeys);
+        }
+
         for event in events_by_id.values() {
             let Ok(content) = serde_json::from_str::<CatalogueContent>(&event.content) else {
                 continue;
@@ -3073,11 +3436,24 @@ impl NetworkService {
                 picture: String::new(),
                 event_id: event.id.to_hex(),
             };
-            let catalogue_name = content.filename.clone();
-            connection.execute(
-                "INSERT OR REPLACE INTO remote_catalogue (file_id,source_pubkey,filename,title,artist,album,format,mime,size,license,description,tags,event_id,seen_at,cover_key,canonical_cover_key) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
-                params![content.file_id, pubkey, catalogue_name, content.title, content.artist, content.album, content.format, content.mime, content.size as i64, "unspecified", "", catalogue_tags, event.id.to_hex(), Utc::now().to_rfc3339(), super::cover::cover_key(&content.artist, &content.album).unwrap_or_default(), super::cover::canonical_cover_key(&content.artist, &content.album).unwrap_or_default()],
-            ).map_err(|error| error.to_string())?;
+            write_catalogue_row(
+                &connection,
+                &CatalogueRow {
+                    file_id: &content.file_id,
+                    source_pubkey: &pubkey,
+                    filename: &content.filename,
+                    title: &content.title,
+                    artist: &content.artist,
+                    album: &content.album,
+                    format: &content.format,
+                    mime: &content.mime,
+                    size: content.size,
+                    license: "unspecified",
+                    description: "",
+                    tags: &catalogue_tags,
+                    event_id: &event.id.to_hex(),
+                },
+            )?;
             cached_source_pairs.insert((pubkey, content.file_id.clone()));
             merge_catalogue_result(&mut aggregated, content, catalogue_tags, source);
         }
@@ -5214,6 +5590,104 @@ mod tests {
         exclude_local_availability(&connection, &mut available, &mut online).unwrap();
         assert!(!available.contains_key(&completed));
         assert!(online.iter().all(|(_, id)| id != &completed));
+    }
+
+    /// The words of a superseded announcement have to leave the index with it.
+    ///
+    /// Written through the production writer rather than through a test's own
+    /// insert, because what this is about is the pair of them — the upsert and the
+    /// trigger it fires — and a test that writes its own rows cannot see it.
+    #[test]
+    fn a_re_announcement_through_the_catalogue_writer_replaces_its_words() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialise_network_schema(&connection).unwrap();
+        let file_id = hex::encode(Sha256::digest(b"a track"));
+        let source = format!("{:064x}", 7);
+        let first_event = "1".repeat(64);
+        let second_event = "2".repeat(64);
+        let mut row = CatalogueRow {
+            file_id: &file_id,
+            source_pubkey: &source,
+            filename: "wrong.flac",
+            title: "Wrong Title",
+            artist: "M83",
+            album: "Hurry Up",
+            format: "FLAC",
+            mime: "audio/flac",
+            size: 42_000_000,
+            license: "unspecified",
+            description: "",
+            tags: "napstr",
+            event_id: &first_event,
+        };
+        write_catalogue_row(&connection, &row).unwrap();
+        row.filename = "midnight.flac";
+        row.title = "Midnight City";
+        row.event_id = &second_event;
+        write_catalogue_row(&connection, &row).unwrap();
+
+        let now = Utc::now().timestamp();
+        crate::catalogue::remember_seeders(&connection, &[file_id.clone()], &source, now + 600, now)
+            .unwrap();
+        assert!(
+            crate::catalogue::search(&connection, "wrong", 10, now)
+                .unwrap()
+                .is_empty(),
+            "the words of the row that was superseded are still in the index"
+        );
+        let hits = crate::catalogue::search(&connection, "midnight", 10, now).unwrap();
+        assert_eq!(hits.len(), 1, "one file, however many times it is announced");
+        assert_eq!(hits[0].title, "Midnight City");
+        assert_eq!(
+            hits[0].sources,
+            vec![(source, second_event)],
+            "the source a download is verified against is the announcement being shown"
+        );
+    }
+
+    #[test]
+    fn a_mirrored_hit_becomes_a_result_with_the_authors_that_announced_it() {
+        let blocked = format!("{:064x}", 9);
+        let allowed = format!("{:064x}", 10);
+        let file_id = "ab".repeat(32);
+        let hit = crate::catalogue::Hit {
+            file_id: file_id.clone(),
+            filename: "song.flac".into(),
+            title: "Song".into(),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            format: "FLAC".into(),
+            mime: "audio/flac".into(),
+            size: 12_345,
+            license: "CC0-1.0".into(),
+            tags: "napstr".into(),
+            sources: vec![
+                (blocked.clone(), "cd".repeat(32)),
+                (allowed.clone(), "ef".repeat(32)),
+            ],
+        };
+        let mut aggregated = HashMap::new();
+        merge_mirror_hits(
+            &mut aggregated,
+            vec![hit],
+            &HashSet::new(),
+            &HashSet::from([blocked]),
+        );
+        let results = aggregated.values().collect::<Vec<_>>();
+        assert_eq!(results.len(), 1, "one file is one result");
+        assert_eq!(results[0].file_id, file_id);
+        assert_eq!(
+            results[0].sources.len(),
+            1,
+            "a blocked author does not take the file away from the others"
+        );
+        assert_eq!(results[0].sources[0].pubkey, allowed);
+        assert_eq!(results[0].sources[0].event_id, "ef".repeat(32));
+        assert!(
+            results[0].sources[0].npub.starts_with("npub1"),
+            "the source has to be presentable: {}",
+            results[0].sources[0].npub
+        );
     }
 
     fn insert_interrupted_download(
