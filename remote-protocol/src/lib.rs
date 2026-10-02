@@ -55,6 +55,22 @@ pub enum ArtRendition {
     Full,
 }
 
+/// How a discover list is chosen out of the whole live network.
+///
+/// A wire value rather than a flag, and deliberately a list with room in it: the
+/// catalogue mirror can rank the live set in ways that say different things about
+/// it — what everybody is seeding today, and what nobody but one person is
+/// keeping alive — and a phone asks for the one it means rather than the host
+/// guessing. A host that does not know a mode refuses the ask, which is the
+/// honest answer for a companion newer than the computer it is paired with.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub enum DiscoverMode {
+    /// Live files with the most seeders first, varied inside each tier of
+    /// seeders, with anything this computer already holds left out.
+    MostSeeded,
+}
+
 /// Longest queue either side may hand to the other. 200 file ids of the 64
 /// characters a SHA-256 takes is about 13 KB, so a full queue always fits in one
 /// control frame, in a request or in the answer a handoff gets back.
@@ -71,6 +87,18 @@ pub const MAX_TRACKS_BY_ID: usize = 100;
 /// playlist may name 500 members, so a page of them is what keeps an answer
 /// inside one control frame.
 pub const MAX_PLAYLIST_PAGE: usize = 100;
+/// Rows per discover page.
+///
+/// Smaller than a library page because a discover row is fatter than a library
+/// row: it carries the seeders who have it, and a file twenty people are holding
+/// names twenty of them. Thirty rows of maximum-length fields with the most
+/// seeders a row may name still fits one control frame, which
+/// `a_full_discover_page_fits_in_one_control_frame` is what keeps true. Forty did
+/// not: measured, that page was 266,486 bytes against a 262,144 byte frame.
+pub const MAX_DISCOVER_PAGE: usize = 30;
+/// Seeders a discover row may name, matching the catalogue mirror's own cap on
+/// the sources of one hit.
+pub const MAX_DISCOVER_SEEDERS: usize = 32;
 /// Members one playlist may name, which is the spec's own limit. A phone edits a
 /// playlist by sending the whole of it, so this is also the most a save can
 /// carry - see `a_full_playlist_save_fits_in_one_control_frame`.
@@ -678,6 +706,20 @@ pub enum ClientRequest {
     Search {
         query: String,
     },
+    /// A list of the live network, chosen rather than searched.
+    ///
+    /// Nothing is matched here: the question is what is out there, which the
+    /// computer answers from the catalogue it already mirrors instead of asking
+    /// the relays for the state of the network again.
+    Discover {
+        mode: DiscoverMode,
+        /// The order inside a tier of seeders is derived from this, so the same
+        /// seed gives the same list and a page is an offset into it rather than a
+        /// cursor. A phone mints one per session.
+        seed: u64,
+        offset: usize,
+        limit: usize,
+    },
     Audiobooks {
         query: String,
     },
@@ -887,6 +929,11 @@ pub enum ServerResponse {
     },
     Search {
         tracks: Vec<RemoteTrack>,
+    },
+    /// A page of that list, and how many live files the whole of it holds.
+    Discover {
+        tracks: Vec<RemoteTrack>,
+        total: usize,
     },
     Audiobooks {
         audiobooks: Vec<RemoteAudiobook>,
@@ -1949,6 +1996,48 @@ mod tests {
         assert!(
             payload.len() <= MAX_CONTROL_FRAME_BYTES,
             "a full play queue is {} bytes, over the {MAX_CONTROL_FRAME_BYTES} byte frame limit",
+            payload.len()
+        );
+    }
+
+    /// A discover page names the seeders of every row, so it is the fattest page
+    /// either side sends: maximum-length fields, the most seeders a row may name,
+    /// and it still has to fit in one control frame.
+    #[test]
+    fn a_full_discover_page_fits_in_one_control_frame() {
+        let tracks = (0..MAX_DISCOVER_PAGE)
+            .map(|index| RemoteTrack {
+                file_id: format!("{index:064x}"),
+                filename: "f".repeat(256),
+                title: "t".repeat(256),
+                artist: "a".repeat(256),
+                album: "b".repeat(256),
+                format: "FLAC".to_string(),
+                mime: "audio/flac".to_string(),
+                size: 4_000_000_000,
+                tags: "c".repeat(256),
+                local: false,
+                sources: (0..MAX_DISCOVER_SEEDERS)
+                    .map(|seeder| RemoteSource {
+                        pubkey: format!("{seeder:064x}"),
+                        display_name: "n".repeat(64),
+                    })
+                    .collect(),
+                bitrate_kbps: 0,
+                sample_rate_hz: 0,
+                channels: 0,
+                lossless: true,
+                duration_ms: 0,
+            })
+            .collect::<Vec<_>>();
+        let payload = serde_json::to_vec(&ServerResponse::Discover {
+            tracks,
+            total: 1_000_000,
+        })
+        .unwrap();
+        assert!(
+            payload.len() <= MAX_CONTROL_FRAME_BYTES,
+            "a full discover page is {} bytes, over the {MAX_CONTROL_FRAME_BYTES} byte frame limit",
             payload.len()
         );
     }

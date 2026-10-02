@@ -29,6 +29,7 @@
 
 use std::collections::HashSet;
 
+use napstr_remote_protocol::{shuffle_key, DiscoverMode};
 use rusqlite::{params, Connection};
 
 /// The most seeders named for one result. A row shows who can serve a file;
@@ -39,6 +40,16 @@ const MAX_NAMED_SEEDERS: usize = 32;
 /// narrow a result set that is already narrow, which is what the relay-side search
 /// does with them too.
 const MAX_QUERY_TERMS: usize = 8;
+
+/// How many live files a discover list is chosen from.
+///
+/// The live set is ordered by seeders first, and variety is chosen inside that: a
+/// window is what makes a shuffle possible at all, because an order that depends on
+/// a seed cannot be written as one SQL `ORDER BY` — there is no hash to sort by,
+/// and rotating the file ids would give 64 possible orders rather than a spread.
+/// Five hundred is the top of the live set by how many people are serving it, which
+/// is the part of it worth discovering anyway.
+const DISCOVER_CANDIDATE_WINDOW: usize = 500;
 
 /// What this module remembers about its own index, so the one-off walk below
 /// happens once per database instead of on every start.
@@ -419,6 +430,85 @@ pub(crate) fn search(
     partial_search(connection, query, limit, now)
 }
 
+/// A page of the live network, chosen rather than searched.
+///
+/// The mirror knows every live file and how many people are serving it, which is
+/// what makes this a question the relay pool is not asked: a discover list matches
+/// no words, so there is nothing for the index to look up — it is the live set
+/// ordered by whether anybody can actually play it.
+///
+/// What comes back is a window of the most-seeded live files, ordered the way a
+/// search orders its hits (how many seeders, then how recently they said so) and
+/// then shuffled *inside* each tier of seeders by [`shuffle_key`] — the same
+/// function the phone's own shuffled library browse uses. So the order is one order
+/// for a given seed, which is what lets a page be an offset rather than a cursor,
+/// and a different seed presents the same files in a different order.
+///
+/// `total` is how many files that list holds — the window, not the whole live set,
+/// because a page past the end of it is not a page.
+///
+/// A file this computer holds is left out: what you already have is not a
+/// discovery. So is anything blocked, in either direction.
+pub(crate) fn discover(
+    connection: &Connection,
+    mode: DiscoverMode,
+    seed: u64,
+    offset: usize,
+    limit: usize,
+    now: i64,
+) -> Result<(Vec<Hit>, usize), String> {
+    match mode {
+        DiscoverMode::MostSeeded => discover_most_seeded(connection, seed, offset, limit, now),
+    }
+}
+
+/// The live network's most-seeded files, varied inside each tier of seeders.
+fn discover_most_seeded(
+    connection: &Connection,
+    seed: u64,
+    offset: usize,
+    limit: usize,
+    now: i64,
+) -> Result<(Vec<Hit>, usize), String> {
+    let mut statement = connection
+        .prepare(&format!(
+            "SELECT {HIT_COLUMNS}
+               FROM remote_catalogue c
+               {LIVE_SEEDERS}
+              WHERE NOT EXISTS (SELECT 1 FROM files f WHERE f.file_id = c.file_id)
+                AND NOT EXISTS (SELECT 1 FROM blocked_files b WHERE b.file_id = c.file_id)
+                AND NOT EXISTS (SELECT 1 FROM blocked_pubkeys p WHERE p.pubkey = c.source_pubkey)
+              GROUP BY c.file_id
+              ORDER BY seeders DESC, newest DESC
+              LIMIT ?2"
+        ))
+        .map_err(|error| error.to_string())?;
+    let mut hits = statement
+        .query_map(params![now, DISCOVER_CANDIDATE_WINDOW as i64], read_hit)
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    // Within one tier of seeders the order belongs to the seed, so opening discover
+    // twice does not show the same files in the same order — and the file id breaks
+    // the tie, because a shuffled order still has to be *an* order for paging to
+    // mean anything.
+    hits.sort_by(|left, right| {
+        right
+            .sources
+            .len()
+            .cmp(&left.sources.len())
+            .then_with(|| shuffle_key(seed, &left.file_id).cmp(&shuffle_key(seed, &right.file_id)))
+            .then_with(|| left.file_id.cmp(&right.file_id))
+    });
+    let total = hits.len();
+    let page = hits
+        .into_iter()
+        .skip(offset)
+        .take(limit.clamp(1, DISCOVER_CANDIDATE_WINDOW))
+        .collect();
+    Ok((page, total))
+}
+
 /// Every word of the query has to appear in the row, as a substring.
 ///
 /// The second chance for a query the word index cannot answer: half a word, the
@@ -713,14 +803,15 @@ pub(crate) fn prune(connection: &Connection, now: i64) -> Result<usize, String> 
 mod tests {
     use super::*;
 
-    /// The catalogue's own tables, plus the two the backfill's question reads:
-    /// `files` and `published_catalogue` belong to the main schema, which is what
-    /// decides whether a file this computer holds is one it has published.
+    /// The catalogue's own tables, plus the three the discover and backfill
+    /// questions read: `files`, and the two block lists, belong to the main schema.
     fn database() -> Connection {
         let connection = Connection::open_in_memory().unwrap();
         connection
             .execute_batch(
-                "CREATE TABLE files (file_id TEXT PRIMARY KEY);",
+                "CREATE TABLE files (file_id TEXT PRIMARY KEY);
+                 CREATE TABLE blocked_files (file_id TEXT PRIMARY KEY, reason TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT '');
+                 CREATE TABLE blocked_pubkeys (pubkey TEXT PRIMARY KEY, reason TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT '');",
             )
             .unwrap();
         crate::network::initialise_network_schema(&connection).unwrap();
@@ -1137,6 +1228,70 @@ mod tests {
             undescribed_live_files(&connection, now, 10).unwrap(),
             vec![hex_id(3)],
             "once it is published, asking about it says nothing new"
+        );
+    }
+
+    #[test]
+    fn a_discover_list_leads_with_what_most_people_are_holding() {
+        let connection = database();
+        let now = 1_700_000_000;
+        // One file two people announced and are still holding, and one that a
+        // single person is keeping alive.
+        announce(&connection, &hex_id(1), 9, "Ghost", "One");
+        announce(&connection, &hex_id(1), 10, "Ghost", "One");
+        holding(&connection, &hex_id(1), 9, now);
+        holding(&connection, &hex_id(1), 10, now);
+        announce(&connection, &hex_id(2), 11, "Ghost", "Two");
+        holding(&connection, &hex_id(2), 11, now);
+        // And one nobody is holding any more, which is not a discovery either.
+        announce(&connection, &hex_id(3), 12, "Ghost", "Three");
+
+        let (page, total) = discover(&connection, DiscoverMode::MostSeeded, 5, 0, 10, now).unwrap();
+        assert_eq!(total, 2, "the live set, not everything the catalogue remembers");
+        assert_eq!(
+            page.iter().map(|hit| hit.file_id.clone()).collect::<Vec<_>>(),
+            vec![hex_id(1), hex_id(2)]
+        );
+        assert_eq!(page[0].sources.len(), 2);
+    }
+
+    #[test]
+    fn a_file_this_computer_already_holds_is_not_a_discovery() {
+        let connection = database();
+        let now = 1_700_000_000;
+        announce(&connection, &hex_id(1), 9, "Ghost", "One");
+        holding(&connection, &hex_id(1), 9, now);
+        announce(&connection, &hex_id(2), 10, "Ghost", "Two");
+        holding(&connection, &hex_id(2), 10, now);
+        connection
+            .execute("INSERT INTO files(file_id) VALUES(?1)", params![hex_id(2)])
+            .unwrap();
+
+        let (page, total) = discover(&connection, DiscoverMode::MostSeeded, 1, 0, 10, now).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(page[0].file_id, hex_id(1));
+    }
+
+    #[test]
+    fn a_discover_page_is_an_offset_into_one_order() {
+        let connection = database();
+        let now = 1_700_000_000;
+        for (index, seeder) in [(1u8, 9u8), (2, 10), (3, 11)] {
+            announce(&connection, &hex_id(index), seeder, "Ghost", "Album");
+            holding(&connection, &hex_id(index), seeder, now);
+        }
+        let order = |(page, _): (Vec<Hit>, usize)| {
+            page.into_iter().map(|hit| hit.file_id).collect::<Vec<_>>()
+        };
+        let whole = order(discover(&connection, DiscoverMode::MostSeeded, 7, 0, 10, now).unwrap());
+        let first = order(discover(&connection, DiscoverMode::MostSeeded, 7, 0, 2, now).unwrap());
+        let second = order(discover(&connection, DiscoverMode::MostSeeded, 7, 2, 2, now).unwrap());
+
+        assert_eq!(first, whole[..2].to_vec(), "the same seed asks the same question");
+        assert_eq!(
+            first.into_iter().chain(second).collect::<Vec<_>>(),
+            whole,
+            "and the pages of that order are that order, with nothing repeated"
         );
     }
 

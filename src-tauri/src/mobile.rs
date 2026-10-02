@@ -11,7 +11,8 @@ use napstr_remote_protocol::{
     RemoteAlbumCover,
     RemoteAudiobook, RemoteAudiobookSummary, RemoteDiscussionActivity, RemoteDiscussionMessage,
     RemoteDiscussionReply, RemoteSource, RemoteTrack, RemoteTransfer, ServerResponse, ALPN,
-    MAX_ART_KEY_CHARS, MAX_CONTROL_FRAME_BYTES, MAX_COVER_KEYS, MAX_PAGE_SIZE, MAX_PLAYLIST_PAGE,
+    MAX_ART_KEY_CHARS, MAX_CONTROL_FRAME_BYTES, MAX_COVER_KEYS, MAX_DISCOVER_PAGE, MAX_PAGE_SIZE,
+    MAX_PLAYLIST_PAGE,
     MAX_PLAY_QUEUE, MAX_POSITION_MS, MAX_TRACKS_BY_ID, PROTOCOL_VERSION, shuffle_key,
 };
 use qrcode::{render::svg, QrCode};
@@ -592,6 +593,67 @@ impl MobileService {
                     shuffle_seed,
                 )?;
                 write_response(send, &ServerResponse::Library { tracks, total }).await
+            }
+            ClientRequest::Discover {
+                mode,
+                seed,
+                offset,
+                limit,
+            } => {
+                // The catalogue is the network's, not this computer's, so it is
+                // lent on the same terms as a network search: the owner's own
+                // device gets it, a device lent the index does not.
+                let (hits, total) = if rights.privileged {
+                    let connection = open_connection(&self.db_path)?;
+                    crate::catalogue::discover(
+                        &connection,
+                        mode,
+                        seed,
+                        offset,
+                        limit.clamp(1, MAX_DISCOVER_PAGE),
+                        Utc::now().timestamp(),
+                    )?
+                } else {
+                    (Vec::new(), 0)
+                };
+                let tracks = hits
+                    .into_iter()
+                    .map(|hit| RemoteTrack {
+                        file_id: hit.file_id,
+                        filename: hit.filename,
+                        title: hit.title,
+                        artist: hit.artist,
+                        album: hit.album,
+                        format: hit.format,
+                        mime: hit.mime,
+                        size: hit.size,
+                        tags: hit.tags,
+                        // Nobody here holds it: the bytes are on somebody else's
+                        // computer, which is what a discover row is — and what
+                        // makes playing one a fetch rather than a read.
+                        local: false,
+                        sources: hit
+                            .sources
+                            .into_iter()
+                            .map(|(pubkey, _event_id)| RemoteSource {
+                                pubkey,
+                                // The mirror remembers who announced a file, not
+                                // what they call themselves. A phone shows the
+                                // npub it can derive when there is no name.
+                                display_name: String::new(),
+                            })
+                            .collect(),
+                        // What a catalogue entry says, which is what a file is
+                        // called and how big it is — never what the audio in it
+                        // is. Reporting zeros is the honest answer.
+                        bitrate_kbps: 0,
+                        sample_rate_hz: 0,
+                        channels: 0,
+                        lossless: false,
+                        duration_ms: 0,
+                    })
+                    .collect();
+                write_response(send, &ServerResponse::Discover { tracks, total }).await
             }
             ClientRequest::Search { query } => {
                 let query = query.trim();
@@ -1376,6 +1438,10 @@ fn check_request_permission(rights: DeviceRights, request: &ClientRequest) -> Re
         ClientRequest::Library { .. }
         | ClientRequest::LibraryByIds { .. }
         | ClientRequest::Search { .. }
+        // Choosing out of the whole live network is one more read of it, and it
+        // is answered from this computer's own mirror, so it costs less than the
+        // search beside it rather than more.
+        | ClientRequest::Discover { .. }
         | ClientRequest::Audiobooks { .. }
         | ClientRequest::AudiobookLibrary { .. }
         | ClientRequest::Audiobook { .. }
