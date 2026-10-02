@@ -3435,6 +3435,42 @@
     await playTrack(track);
   }
 
+  /**
+   * Put a track at the end of the playlist, wherever it came from.
+   *
+   * The playlist is what the player walks, and on a phone whose music lives on
+   * somebody else's disk that is the whole point: a queued track is fetched when
+   * its turn comes, from whichever computer holds it, so nothing has to be kept
+   * here first. The entry is the track itself rather than a copy of it, which is
+   * also what lets a search result be queued without leaving the search.
+   *
+   * Adding to a playlist nobody is playing starts it, because an entry nobody can
+   * hear is not what a person meant by "add".
+   */
+  function addToQueue(track: RemoteTrack) {
+    closeActions();
+    if (playerIndex < 0 || playerQueue.length === 0) {
+      playerQueue = [track];
+      playerIndex = 0;
+      resetRandomOrder();
+      void playTrack(track);
+      return;
+    }
+    // The playlist is keyed by file, and a keyed list cannot hold the same track
+    // twice, so a second tap says what it did instead of appending a duplicate the
+    // queue view would collapse anyway.
+    if (playerQueue.some((item) => item.fileId === track.fileId)) {
+      notice = msg("Already in the queue: {p0}", { p0: title(track) });
+      return;
+    }
+    // `playerQueueLibraryVisible` is deliberately left as it was. It is not "which
+    // list is the queue" — it is what says a music queue exists at all, and
+    // `nowPlayingAvailable` refuses to open the drawer without it, so clearing it
+    // here would have made the queue unreachable from the menu that filled it.
+    playerQueue = [...playerQueue, track];
+    notice = msg("Added to the queue: {p0}", { p0: title(track) });
+  }
+
   /** Play a row of the playlist on whichever player it belongs to. */
   async function playQueueRow(index: number) {
     if (playbackTarget === 'desktop') {
@@ -6817,6 +6853,11 @@
         <button class="actions-row" onclick={() => toggleTrackLike(menuTrack)}>
           <svg class:filled={isTrackLiked(menuTrack)} viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20.3c-1.4-1-7.2-5.2-7.2-9.4A4.2 4.2 0 0 1 12 8.2a4.2 4.2 0 0 1 7.2 2.7c0 4.2-5.8 8.4-7.2 9.4z" /></svg>
           <span>{isTrackLiked(menuTrack) ? 'Remove from Liked Songs' : 'Add to Liked Songs'}</span>
+        </button>
+        <button class="actions-row" disabled={playbackTarget === 'desktop'} onclick={() => addToQueue(menuTrack as RemoteTrack)}>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h10" /><path d="M4 12h10" /><path d="M4 17h6" /><path d="M18 11.5V19" /><path d="M15 16l3 3 3-3" /></svg>
+          <span>{$t("Add to queue")}</span>
+          {#if playbackTarget === 'desktop'}<small>{$t("Playing on {p0}", { p0: playbackTargetLabel() })}</small>{/if}
         </button>
         <button class="actions-row" disabled={!remoteAvailable()} onclick={() => void openPlaylistPicker(menuTrack as RemoteTrack)}>
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6.5h11" /><path d="M4 12h11" /><path d="M4 17.5h7" /><path d="M17 14v6" /><path d="M14 17h6" /></svg>
