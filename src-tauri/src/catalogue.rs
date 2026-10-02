@@ -40,9 +40,27 @@ const MAX_NAMED_SEEDERS: usize = 32;
 /// does with them too.
 const MAX_QUERY_TERMS: usize = 8;
 
+/// What this module remembers about its own index, so the one-off walk below
+/// happens once per database instead of on every start.
+///
+/// `-1` is "the announcements that were already stored have not been indexed yet",
+/// which is also what an upgrade reads as: a database created before any of this
+/// existed has the row inserted with the default. `0` is a legitimate answer — a
+/// fresh installation whose catalogue was empty when it was marked — so the two
+/// cannot share a value.
+const CATALOGUE_STATE_TABLE: &str = "\
+  CREATE TABLE IF NOT EXISTS catalogue_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    announcements_indexed INTEGER NOT NULL DEFAULT -1
+  );
+  INSERT OR IGNORE INTO catalogue_state(id, announcements_indexed) VALUES (1, -1);";
+
 /// Every table, index and trigger this module needs. Idempotent, like the rest of
 /// the schema in this app.
 pub(crate) fn initialise_schema(connection: &Connection) -> Result<(), String> {
+    connection
+        .execute_batch(CATALOGUE_STATE_TABLE)
+        .map_err(|error| error.to_string())?;
     connection
         .execute_batch(
             "CREATE TABLE IF NOT EXISTS catalogue_seeder (
@@ -84,33 +102,66 @@ pub(crate) fn initialise_schema(connection: &Connection) -> Result<(), String> {
              END;",
         )
         .map_err(|error| error.to_string())?;
-    rebuild_index_if_empty(connection)
+    if let Err(error) = index_stored_announcements(connection) {
+        // A catalogue whose words could not all be indexed is slower to search,
+        // not broken: a search the index cannot answer falls through to the
+        // substring pass and then to the network, and the next start tries again
+        // because the marker is only written when the count came out right.
+        eprintln!("Could not index the stored catalogue: {error}");
+    }
+    Ok(())
 }
 
 /// Index what is already stored, once.
 ///
-/// An installation that had a catalogue before this index existed would otherwise
-/// answer every search from the substring fallback until something was
-/// re-announced — a slow answer rather than a fast one. Cheap to check, and it
-/// only ever does anything once per database.
-fn rebuild_index_if_empty(connection: &Connection) -> Result<(), String> {
-    let indexed: i64 = connection
-        .query_row("SELECT COUNT(*) FROM remote_catalogue_fts", [], |row| {
-            row.get(0)
-        })
-        .map_err(|error| error.to_string())?;
-    if indexed > 0 {
-        return Ok(());
-    }
-    let stored: i64 = connection
-        .query_row("SELECT COUNT(*) FROM remote_catalogue", [], |row| {
-            row.get(0)
-        })
+/// An installation that had a catalogue before this index existed answers a search
+/// for anything in it from the substring fallback: slower, and blind past the page
+/// of rows that pass reads. This is what walks that catalogue into the index.
+///
+/// **A bare count over an external-content index is not a count of the index.** An
+/// external-content table answers a plain `SELECT` with the content table's rows,
+/// so `SELECT COUNT(*) FROM remote_catalogue_fts` returns the announcement count
+/// whatever the index holds. Measured on a real installation it said 34,792 while
+/// the index held 2,399 documents — which is how this function's predecessor
+/// concluded there was nothing to do, and left a day of searches to the fallback
+/// without saying so. The documents are counted instead, one per indexed
+/// announcement, and the pass is only marked done when the two agree, so an
+/// attempt that did not take is made again on the next start.
+fn index_stored_announcements(connection: &Connection) -> Result<i64, String> {
+    let already = connection
+        .query_row(
+            "SELECT announcements_indexed FROM catalogue_state WHERE id=1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
         .unwrap_or(0);
-    if stored == 0 {
-        return Ok(());
+    if already >= 0 {
+        return Ok(0);
     }
-    rebuild_index(connection)
+    let stored = count(connection, "SELECT COUNT(*) FROM remote_catalogue")?;
+    if stored > 0 {
+        rebuild_index(connection)?;
+    }
+    let documents = count(connection, "SELECT COUNT(*) FROM remote_catalogue_fts_docsize")?;
+    if documents < stored {
+        return Err(format!(
+            "the word index holds {documents} of {stored} announcements"
+        ));
+    }
+    connection
+        .execute(
+            "UPDATE catalogue_state SET announcements_indexed=?1 WHERE id=1",
+            params![stored],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(stored)
+}
+
+/// How many rows a count answers, for the two counts this module compares.
+fn count(connection: &Connection, sql: &str) -> Result<i64, String> {
+    connection
+        .query_row(sql, [], |row| row.get::<_, i64>(0))
+        .map_err(|error| error.to_string())
 }
 
 /// Build the word index again from the announcements it describes.
@@ -832,11 +883,69 @@ mod tests {
             )
             .unwrap();
         announce(&connection, &hex_id(1), 9, "Midnight City", "Hurry Up");
+        announce(&connection, &hex_id(2), 9, "Ghost Song", "One");
         let now = 1_700_000_000;
         // The seeder table does not exist until the schema runs, so nothing can
         // have been indexed before it either.
         initialise_schema(&connection).unwrap();
         holding(&connection, &hex_id(1), 9, now);
+        holding(&connection, &hex_id(2), 9, now);
+
+        // The index itself, not a result the substring fallback could have
+        // produced: this asserted a hit once before, and the fallback answered it
+        // while the index held nothing at all.
+        assert_eq!(
+            rows(&connection, "SELECT COUNT(*) FROM remote_catalogue_fts_docsize"),
+            rows(&connection, "SELECT COUNT(*) FROM remote_catalogue"),
+            "every stored announcement has to have a document of its own"
+        );
+        assert!(found_by_the_index(&connection, "midnight", &hex_id(1)));
+        assert!(found_by_the_index(&connection, "ghost", &hex_id(2)));
         assert_eq!(search(&connection, "midnight", 50, now).unwrap().len(), 1);
+
+        // And the walk is remembered, so it is not repeated on every start.
+        assert_eq!(index_stored_announcements(&connection).unwrap(), 0);
+    }
+
+    /// The trap that hid the fault above for a day.
+    ///
+    /// An external-content index answers a plain `SELECT` with the content
+    /// table's rows, so counting the index counts the announcement table and says
+    /// everything is in step whether it is or not. Measured on a real
+    /// installation: 34,792 against 2,399 documents.
+    #[test]
+    fn a_bare_count_over_the_index_is_not_a_count_of_the_index() {
+        // The state that installation was in: every announcement stored, and not
+        // one of them in the index. Reached here by emptying the index afterwards,
+        // which is what it was — a table created after the catalogue was filled.
+        let connection = database();
+        announce(&connection, &hex_id(1), 9, "Midnight City", "Hurry Up");
+        connection
+            .execute("DELETE FROM remote_catalogue_fts", [])
+            .unwrap();
+        assert_eq!(rows(&connection, "SELECT COUNT(*) FROM remote_catalogue"), 1);
+        assert_eq!(
+            rows(&connection, "SELECT COUNT(*) FROM remote_catalogue_fts_docsize"),
+            0
+        );
+        assert_eq!(
+            count(&connection, "SELECT COUNT(*) FROM remote_catalogue_fts").unwrap(),
+            1,
+            "a bare count reports the announcement, whatever the index holds"
+        );
+        assert!(!found_by_the_index(&connection, "midnight", &hex_id(1)));
+    }
+
+    /// Whether the *index* answers for a word, with no fallback behind it.
+    fn found_by_the_index(connection: &Connection, word: &str, file_id: &str) -> bool {
+        connection
+            .query_row(
+                "SELECT 1 FROM remote_catalogue_fts
+                   JOIN remote_catalogue c ON c.rowid = remote_catalogue_fts.rowid
+                  WHERE remote_catalogue_fts MATCH ?1 AND c.file_id = ?2 LIMIT 1",
+                params![format!("\"{word}\""), file_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .is_ok()
     }
 }
