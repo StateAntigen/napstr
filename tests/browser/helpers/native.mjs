@@ -197,6 +197,12 @@ export async function mockNative(page, { app = 'napstrfy', nativeLocale = 'en-GB
             return { tracks: rows.slice(offset, offset + limit), total: rows.length };
           }
           case 'remote_search': if (window.searchError) throw window.searchError; return (args.source && window.remoteLibraryByHost?.[args.source]) ?? window.networkSearchResults ?? [track];
+          // What the computer's own mirror says is live on the network. Empty
+          // unless a spec seeds it, because it is a suggestion and not a page.
+          case 'remote_discover': {
+            const found = window.discoverTracks ?? [];
+            return { tracks: found.slice(args.offset ?? 0, (args.offset ?? 0) + (args.limit ?? found.length)), total: found.length };
+          }
           // The conversation around a track: a test seeds what has been said, and
           // a send appends to the same list, so the page asks again and finds it.
           case 'remote_track_discussion': return args.before ? [] : window.discussionMessages ?? [];

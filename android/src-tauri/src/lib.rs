@@ -5,7 +5,7 @@ use public_http::{podcast_http_client, safe_public_https_url};
 use futures_util::StreamExt;
 use iroh::{endpoint::presets, Endpoint, EndpointAddr, EndpointId, SecretKey};
 use napstr_remote_protocol::{
-    ArtRendition, ClientRequest, DeviceRights, PairingTicket, PlaybackCommand, RemoteAlbumCover,
+    ArtRendition, ClientRequest, DeviceRights, DiscoverMode, PairingTicket, PlaybackCommand, RemoteAlbumCover,
     RemoteAudiobook, RemoteAudiobookSummary, RemoteDiscussionActivity, RemoteDiscussionMessage,
     RemotePlaybackState, RemotePlaylist, RemotePlaylistCoordinate, RemotePlaylistSummary,
     RemoteTrack, RemoteTransfer, ServerResponse, ALPN, MAX_ART_KEY_CHARS, MAX_CONTROL_FRAME_BYTES,
@@ -3692,6 +3692,55 @@ async fn remote_search(
     }
 }
 
+/// The computer's own list of what is live on the network.
+///
+/// The computer answers this from the catalogue it already mirrors rather than by
+/// asking the relays, so it is the one network read that costs the far end
+/// nothing. Nothing is searched: `mode` says how to choose, `seed` fixes the order
+/// inside a tier of seeders so a page is an offset into one list, and anything the
+/// computer already holds is left out — what you have is not a discovery.
+#[tauri::command]
+async fn remote_discover(
+    mode: String,
+    seed: u64,
+    offset: usize,
+    limit: usize,
+    state: State<'_, AppState>,
+) -> Result<DiscoverPage, String> {
+    let mode = match mode.as_str() {
+        "mostSeeded" => DiscoverMode::MostSeeded,
+        other => {
+            return Err(format!(
+                "that is not a way this phone knows to choose a list: {other}"
+            ))
+        }
+    };
+    // The primary computer, the way a library browse asks it: the list is one
+    // computer's view of the network, and a list stitched from several would be
+    // three different rankings interleaved.
+    match state
+        .remote
+        .request_from(None, ClientRequest::Discover {
+            mode,
+            seed,
+            offset,
+            limit,
+        })
+        .await?
+    {
+        ServerResponse::Discover { tracks, total } => Ok(DiscoverPage { tracks, total }),
+        response => Err(unexpected_response(&response)),
+    }
+}
+
+/// One page of that list, and how many the whole of it holds.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiscoverPage {
+    tracks: Vec<RemoteTrack>,
+    total: usize,
+}
+
 #[tauri::command]
 async fn remote_audiobooks(
     query: String,
@@ -4281,6 +4330,7 @@ pub fn run() {
             track_code,
             remote_report_cover,
             reconcile_audio_cache,
+            remote_discover,
             remote_search,
             remote_audiobooks,
             remote_audiobook_library,

@@ -84,6 +84,13 @@
   const LOOP_MODES: LoopMode[] = ['off', 'all', 'one'];
   /** Mirrors `MAX_PLAY_QUEUE` on the host: one request carries the whole list. */
   const MAX_DESKTOP_QUEUE = 200;
+  /**
+   * Rows per discover page. The computer's own cap is the same number, and it is
+   * the protocol's rather than this file's to invent: a discover row names every
+   * seeder it has, so a page of them is the fattest answer either side sends and
+   * has to fit in one control frame.
+   */
+  const DISCOVER_PAGE = 30;
   /** Mirrors `MAX_PLAYLIST_PAGE` on the host: the most members one answer carries. */
   const PLAYLIST_PAGE = 100;
   /** Mirrors `MAX_PLAYLIST_MEMBERS`: the spec's limit on a playlist's members. */
@@ -1404,6 +1411,69 @@
     ? window.crypto.getRandomValues(new Uint32Array(1))[0]
     : Math.floor(Math.random() * 0xffffffff);
 
+  /**
+   * The seed for the network's discover list, minted the same way and for the same
+   * reason: the computer varies the order inside each tier of seeders by it, so a
+   * page is an offset into one list rather than a cursor into a moving one.
+   */
+  const networkDiscoverSeed = window.crypto?.getRandomValues
+    ? window.crypto.getRandomValues(new Uint32Array(1))[0]
+    : Math.floor(Math.random() * 0xffffffff);
+
+  /** What the network has that these computers do not. */
+  let discoverTracks = $state<RemoteTrack[]>([]);
+  let discoverTotal = $state(0);
+  let discoverLoading = $state(false);
+  /** Asked once per session: an empty list is an answer, not a reason to ask again. */
+  let discoverAsked = false;
+
+  /**
+   * One page of that list, from the computer that keeps the mirror.
+   *
+   * Nothing is searched here: the computer chooses out of what it already knows is
+   * live, so this is the one network read that costs the far end nothing. Rows
+   * arrive with `local: false`, which is what makes playing one a fetch rather
+   * than a read - the computer goes and gets it from the seeders the row names.
+   */
+  async function loadDiscover() {
+    if (discoverLoading || !status.connected || status.streamOnly) return;
+    discoverAsked = true;
+    discoverLoading = true;
+    try {
+      const page = await invoke<{ tracks: RemoteTrack[]; total: number }>('remote_discover', {
+        mode: 'mostSeeded',
+        seed: networkDiscoverSeed,
+        offset: discoverTracks.length,
+        limit: DISCOVER_PAGE
+      });
+      discoverTracks = [...discoverTracks, ...page.tracks];
+      discoverTotal = page.total;
+    } catch {
+      // A list of suggestions, not a page of the app: a computer that will not
+      // answer leaves the search tab exactly as it was.
+    } finally {
+      discoverLoading = false;
+    }
+  }
+
+  /** Play the list from its first row, which is the one the computer ranked highest. */
+  function playDiscover() {
+    if (discoverTracks.length === 0) return;
+    playerQueue = discoverTracks;
+    playerIndex = 0;
+    resetRandomOrder();
+    void activateTrack(discoverTracks[0]);
+  }
+
+  // Asked when the search tab is opened on nothing, which is where the network's
+  // own list belongs. Guarded by a flag rather than by what it reads, because an
+  // effect that writes what it just read runs for ever.
+  $effect(() => {
+    const wanted = status.connected && activeTab === 'search' && !query.trim() && !showingLikedMusic;
+    if (!wanted || discoverAsked || discoverTracks.length > 0) return;
+    untrack(() => void loadDiscover());
+  });
+
   async function loadLibrary(append = false) {
     if (!status.paired || loading || loadingMore) return;
     const viewVersion = ++musicViewVersion;
@@ -2647,11 +2717,22 @@
     await playTrack(track);
   }
 
+  /**
+   * Files the phone was asked to *play* that had to be fetched first.
+   *
+   * On this phone playing a file no computer here holds is a fetch, because that
+   * is the only way the bytes can arrive — so the tap means play, and this is what
+   * remembers that the download is not the whole of it. Not reactive: nothing
+   * draws it, and it is read only where a transfer finishes or fails.
+   */
+  const playingWhenReady = new Set<string>();
+
   async function activateTrack(track: RemoteTrack) {
     activeMedia = 'music';
     selected = track;
     if (playbackTarget === 'desktop') return playOnDesktop(track);
     if (!track.local) {
+      playingWhenReady.add(track.fileId);
       await requestDownload(track);
       return;
     }
@@ -2850,6 +2931,7 @@
           const nextAudiobooks = new Map(pendingAudiobooks);
           nextAudiobooks.delete(pendingFileId);
           pendingAudiobooks = nextAudiobooks;
+          playingWhenReady.delete(pendingFileId);
           error = `${transfer.filename}: ${transfer.status}`;
           continue;
         }
@@ -2885,6 +2967,9 @@
         pendingAudiobooks = nextAudiobooks;
         notice = `${title(local)} is ready to play`;
         void refreshCachedIds();
+        // Asked to play, fetched first: this is where "play a file nobody here
+        // holds" finishes, rather than leaving the tap one short of a sound.
+        if (playingWhenReady.delete(pendingFileId)) void activateTrack(local);
       }
     } catch { /* the next foreground poll retries */ }
   }
@@ -5264,34 +5349,38 @@
       <div class="empty-library"><img src="/napstr-logo-small.png" alt="" /><h2>{emptyTitle}</h2><p>{emptyHint}</p></div>
     {/if}
     {#each tracks as track (track.fileId)}
-      <div class:selected={selected?.fileId === track.fileId} class:remote={!track.local} class:liked={isTrackLiked(track)} class="track-row" role="listitem">
-        <button class="track-open" disabled={status.streamOnly && !track.local} onclick={() => activateTrack(track)}>
-          <TrackArtwork {track} lookup />
-          <span class="track-copy">
-            <strong>{title(track)}</strong>
-            <small>{artist(track)}{track.album ? ` · ${track.album}` : ''}</small>
-            <span class="track-meta">{readableSize(track.size)}{audioFacts(track) ? ` · ${audioFacts(track)}` : ''}</span>
-          </span>
-          <TrackBadge
-            {track}
-            cached={cachedFileIds.has(track.fileId)}
-            pending={pending.has(track.fileId)}
-            host={fileHosts[track.fileId] ?? ''}
-            hostName={hostNameOf(fileHosts[track.fileId])}
-          />
-        </button>
-        <!-- The row's own control is the track menu rather than a heart: liking
-             is one of its rows, alongside sharing and the code below, so a
-             second place to press would only compete with it. -->
-        <button class="track-more" onclick={() => openActions(track)} aria-label={$t("Track options")}>
-          <svg viewBox="0 0 24 24" aria-hidden="true">
-            <circle class="filled" cx="12" cy="5.6" r="1.5" /><circle class="filled" cx="12" cy="12" r="1.5" /><circle class="filled" cx="12" cy="18.4" r="1.5" />
-          </svg>
-        </button>
-      </div>
+      {@render trackRow(track)}
     {/each}
     {#if showLoadMore && tracks.length < total}<button class="load-more" onclick={() => loadLibrary(true)} disabled={loadingMore}>{loadingMore ? 'Loading…' : `Load more · ${tracks.length} of ${total}`}</button>{/if}
   </section>
+{/snippet}
+
+{#snippet trackRow(track: RemoteTrack)}
+  <div class:selected={selected?.fileId === track.fileId} class:remote={!track.local} class:liked={isTrackLiked(track)} class="track-row" role="listitem">
+    <button class="track-open" disabled={status.streamOnly && !track.local} onclick={() => activateTrack(track)}>
+      <TrackArtwork {track} lookup />
+      <span class="track-copy">
+        <strong>{title(track)}</strong>
+        <small>{artist(track)}{track.album ? ` · ${track.album}` : ''}</small>
+        <span class="track-meta">{readableSize(track.size)}{audioFacts(track) ? ` · ${audioFacts(track)}` : ''}</span>
+      </span>
+      <TrackBadge
+        {track}
+        cached={cachedFileIds.has(track.fileId)}
+        pending={pending.has(track.fileId)}
+        host={fileHosts[track.fileId] ?? ''}
+        hostName={hostNameOf(fileHosts[track.fileId])}
+      />
+    </button>
+    <!-- The row's own control is the track menu rather than a heart: liking
+         is one of its rows, alongside sharing and the code below, so a
+         second place to press would only compete with it. -->
+    <button class="track-more" onclick={() => openActions(track)} aria-label={$t("Track options")}>
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <circle class="filled" cx="12" cy="5.6" r="1.5" /><circle class="filled" cx="12" cy="12" r="1.5" /><circle class="filled" cx="12" cy="18.4" r="1.5" />
+      </svg>
+    </button>
+  </div>
 {/snippet}
 
 {#snippet qualityPanel(name: 'metered' | 'unmetered')}
@@ -5473,6 +5562,24 @@
           <div class="section-label tracks-label"><b>{$t("Tracks")}</b><span>{tracks.length} {tracks.length === 1 ? 'result' : 'results'}</span></div>
         {:else if !query.trim()}
           <section class="library-heading"><div><p>{$t("SEARCH")}</p><h1>{$t("Find something")}</h1></div><span>{$t("Your library and the network")}</span></section>
+          {#if discoverTracks.length > 0}
+            <!-- What the network has, above the library it is not. The rows are
+                 the same rows: a discover track is a track, and its badge is what
+                 says whose computer has it. -->
+            <div class="section-label tracks-label">
+              <b>{$t("Discover")}</b>
+              <span>{discoverTotal} {$t("live on the network")}</span>
+              <button class="discover-play" onclick={playDiscover} disabled={status.streamOnly}>{$t("Play all")}</button>
+            </div>
+            <section class="track-list" role="list" aria-label={$t("Discover")} aria-busy={discoverLoading}>
+              {#each discoverTracks as track (track.fileId)}
+                {@render trackRow(track)}
+              {/each}
+              {#if discoverTracks.length < discoverTotal}
+                <button class="load-more" onclick={() => void loadDiscover()} disabled={discoverLoading}>{discoverLoading ? 'Loading…' : `Load more · ${discoverTracks.length} of ${discoverTotal}`}</button>
+              {/if}
+            </section>
+          {/if}
         {/if}
   
         {@render trackList(
