@@ -1990,14 +1990,19 @@ async fn network_search_audiobooks(
     state.network.search_audiobooks(&query).await
 }
 
-/// Covers to draw for `keys`: a published `30427` where somebody made one, and
-/// otherwise the art this computer resolved for itself.
+/// Covers to draw for `keys`: a published `30427` where somebody made one, the art
+/// this computer resolved for itself otherwise, and — where it has one — the copy
+/// of that picture already on this disk.
 #[tauri::command]
 async fn cover_art(
     keys: Vec<String>,
     state: State<'_, AppState>,
-) -> Result<Vec<network::AlbumCover>, String> {
-    state.network.best_known_covers(keys).await
+) -> Result<Vec<cover_publish::DrawnCover>, String> {
+    let covers = state.network.best_known_covers(keys).await?;
+    // The local copy is added here rather than in the network layer: what a claim
+    // asserts and what is on this machine are different facts, and the cache is
+    // this app's, not the network's.
+    Ok(state.covers.with_local_pictures(covers))
 }
 
 #[tauri::command]

@@ -113,6 +113,10 @@ export async function mockNative(page, { app = 'napstrfy', nativeLocale = 'en-GB
       metadata: { currentWindow: { label: 'main' }, currentWebview: { label: 'main' } },
       transformCallback: () => 1,
       unregisterCallback: () => {},
+      // The asset protocol, which is how a window draws a picture this computer
+      // already holds. The shape is the one the real side produces on Windows.
+      convertFileSrc: (path, protocol = 'asset') =>
+        `http://${protocol}.localhost/${encodeURIComponent(path)}`,
       invoke: async (cmd, args = {}) => {
         window.calls.push({ cmd, args });
         // An unreachable computer fails every request to it, exactly as the

@@ -53,6 +53,81 @@ async function openCovers(page, { status = {}, gaps = [], queue = [], log = [] }
   await expect(page.locator('.cover-summary')).toBeVisible();
 }
 
+test('a picture this computer holds is drawn from the disk, not asked of the publisher', async ({ page }) => {
+  const drawn = await openArtwork(page);
+  const tile = page.locator('.result-grid .cover-art img').first();
+  await expect(tile).toBeVisible();
+  await expect(tile).toHaveAttribute('src', /^http:\/\/asset\.localhost\//);
+  await expect(tile).toHaveAttribute('src', /thumb\.jpg/);
+  // And the bytes really came from this computer, which is the whole point: the
+  // address the claim named is not asked for at all while a copy is held.
+  expect(drawn.length).toBeGreaterThan(0);
+});
+
+test('a copy that cannot be read falls back to the address the claim named', async ({ page }) => {
+  await openArtwork(page, { localFails: true });
+  const tile = page.locator('.result-grid .cover-art img').first();
+  // Evicted, or the directory emptied under a running window. The publisher's
+  // address is the fallback, so the tile is not simply left blank.
+  await expect(tile).toHaveAttribute('src', /^https:\/\/coverartarchive\.org\//);
+});
+
+/**
+ * The covers the window asks about, each with a copy on this computer *and* the
+ * address a claim named — which is both of the things a real answer carries.
+ *
+ * The asset protocol is intercepted rather than served, because what is being
+ * pinned is which address the tile asks for, not that a picture arrived.
+ */
+async function openArtwork(page, { localFails = false } = {}) {
+  await mockNative(page);
+  await page.route('**/fixture.wav', (route) => route.fulfill({ contentType: 'audio/wav', body: '' }));
+  await page.addInitScript(() => {
+    const invoke = window.__TAURI_INTERNALS__.invoke;
+    window.__TAURI_INTERNALS__.invoke = async (cmd, args = {}) => {
+      if (cmd === 'cover_art') {
+        return args.keys.map((key) => ({
+          key,
+          art: 'https://coverartarchive.org/release/aaaaaaaa/1-1200.jpg',
+          thumb: 'https://coverartarchive.org/release/aaaaaaaa/1-250.jpg',
+          localArt: '/tmp/napstr-art/full.jpg',
+          localThumb: '/tmp/napstr-art/thumb.jpg',
+          mbid: '',
+          year: '',
+          genre: '',
+          collection: '',
+          source: 'musicbrainz',
+          coverFileId: '',
+          mime: 'image/jpeg',
+          author: '',
+          eventId: '',
+          createdAt: 0,
+          seeder: false
+        }));
+      }
+      return invoke(cmd, args);
+    };
+  });
+  const drawn = [];
+  await page.route('http://asset.localhost/**', (route) => {
+    drawn.push(route.request().url());
+    return localFails
+      ? route.abort()
+      : route.fulfill({ contentType: 'image/png', body: PIXEL });
+  });
+  await page.goto('http://127.0.0.1:15173');
+  // The results pane draws a picture per album as thumbnails, and the boot's own
+  // search fills it, so this is a tile the window would show a person.
+  await page.locator('button.view-toggle', { hasText: '▦' }).click();
+  return drawn;
+}
+
+/** A 1x1 PNG: a tile only proves it drew something when the bytes are real. */
+const PIXEL = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+  'base64'
+);
+
 const busy = {
   queue: Array.from({ length: 12 }, (_, index) => ({
     key: key(index),

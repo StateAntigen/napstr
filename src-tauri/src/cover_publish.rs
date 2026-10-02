@@ -168,6 +168,25 @@ const SETTING_SECOND_SOURCE_STARTED: &str = "cover_second_source_started";
 /// Emitted on every meaningful step, so the window shows the worker live.
 pub const COVER_STATUS_EVENT: &str = "napstr-cover-status";
 
+/// A cover as the window draws it: what the network says, plus the copy of the
+/// same picture this computer already holds.
+///
+/// The two are kept apart rather than folded into [`crate::cover::AlbumCover`],
+/// because a claim says nothing about this disk. What a kind `30427` asserts and
+/// what has been fetched here are different facts, and only the app layer joins
+/// them — nothing that publishes, mirrors or hands a cover to a phone can pick
+/// up a local path by accident.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DrawnCover {
+    #[serde(flatten)]
+    pub cover: crate::cover::AlbumCover,
+    /// Absolute path of the full-size picture on this computer, or empty.
+    pub local_art: String,
+    /// The same for the smaller rendition.
+    pub local_thumb: String,
+}
+
 /// One album the worker can act on, and where it came from.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -776,6 +795,40 @@ impl CoverPublisher {
         let mut pending = pending_albums(&connection, self.preferences())?;
         pending.truncate(limit.clamp(1, MAX_PREVIEW));
         Ok(pending)
+    }
+
+    /// Name the copy of each cover's pictures this computer already holds.
+    ///
+    /// The window draws its own art, and it used to have nothing to draw but the
+    /// publisher's address: a picture whose address had rotted, or whose host was
+    /// unreachable for the minute, left a blank tile while the very same bytes sat
+    /// in this cache — fetched here, and already on their way to a phone. A copy
+    /// on this disk is the best one available, so it is named first and the
+    /// address stays as the fallback for everything this computer does not hold.
+    ///
+    /// Best effort by design. Nothing here is worth failing a page over, so an
+    /// album with no local copy simply keeps the address it already had.
+    pub fn with_local_pictures(&self, covers: Vec<crate::cover::AlbumCover>) -> Vec<DrawnCover> {
+        let connection = crate::open_connection(&self.db_path).ok();
+        covers
+            .into_iter()
+            .map(|cover| {
+                let held = |rendition| match connection.as_ref() {
+                    Some(connection) => crate::art_cache::held_path(
+                        connection,
+                        self.art.root(),
+                        &cover.key,
+                        rendition,
+                    ),
+                    None => String::new(),
+                };
+                DrawnCover {
+                    local_art: held(ArtRendition::Full),
+                    local_thumb: held(ArtRendition::Thumb),
+                    cover,
+                }
+            })
+            .collect()
     }
 
     /// Record the albums a window is showing, then wake the worker.

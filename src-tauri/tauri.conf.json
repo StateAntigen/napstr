@@ -26,9 +26,9 @@
     "security": {
       "assetProtocol": {
         "enable": true,
-        "scope": []
+        "scope": ["$APPCACHE/art/**", "$APPLOCALDATA/art/**"]
       },
-      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' asset: https: data:; media-src 'self' asset: http://asset.localhost; connect-src 'self' ipc: http://ipc.localhost https://api.github.com"
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' asset: http://asset.localhost https: data:; media-src 'self' asset: http://asset.localhost; connect-src 'self' ipc: http://ipc.localhost https://api.github.com"
     }
   },
   "bundle": {

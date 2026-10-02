@@ -259,6 +259,30 @@ pub fn store(
     })
 }
 
+/// The path of the rendition this computer holds for `key`, or an empty string.
+///
+/// This is what a window draws from, so it is deliberately forgiving: a picture
+/// that is not held, a row whose file was deleted behind the cache's back, and a
+/// database that cannot be read at all each answer "nothing here", because a
+/// missing local copy is not an error — it only means the address is used
+/// instead.
+///
+/// A path is only named for the rendition asked about. Half a match is not a
+/// match: a thumbnail is not a substitute for the full picture or the other way
+/// round, and the caller decides what an absent one means.
+pub fn held_path(
+    connection: &Connection,
+    root: &Path,
+    key: &str,
+    rendition: ArtRendition,
+) -> String {
+    lookup(connection, root, key, rendition)
+        .ok()
+        .flatten()
+        .map(|held| held.path.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
 /// The bytes held for one album's rendition, if they are still there.
 ///
 /// A row whose file has been deleted behind the cache's back — someone emptied
@@ -616,6 +640,49 @@ mod tests {
         let mut bytes = vec![0xFF, 0xD8, 0xFF];
         bytes.extend_from_slice(tail);
         bytes
+    }
+
+    #[test]
+    fn the_path_of_what_is_held_is_named_without_asking_anybody() {
+        let root = scratch("held-path");
+        let connection = database();
+        let bytes = jpeg(b"a cover");
+        let stored = store(
+            &connection,
+            &root,
+            "drones|drones",
+            ArtRendition::Full,
+            &bytes,
+            "musicbrainz",
+        )
+        .unwrap();
+        assert_eq!(
+            held_path(&connection, &root, "drones|drones", ArtRendition::Full),
+            stored.path.to_string_lossy()
+        );
+        // The other rendition is a different question, and what is not held is
+        // nothing rather than a guess at a path.
+        assert_eq!(
+            held_path(&connection, &root, "drones|drones", ArtRendition::Thumb),
+            ""
+        );
+        assert_eq!(
+            held_path(&connection, &root, "nobody|nothing", ArtRendition::Full),
+            ""
+        );
+        // A row whose file somebody deleted behind the cache's back answers the
+        // same way, because a window handed that path could not draw it — and the
+        // stale row is forgotten as it is found.
+        std::fs::remove_file(&stored.path).unwrap();
+        assert_eq!(
+            held_path(&connection, &root, "drones|drones", ArtRendition::Full),
+            ""
+        );
+        let rows: i64 = connection
+            .query_row("SELECT COUNT(*) FROM art_cache", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

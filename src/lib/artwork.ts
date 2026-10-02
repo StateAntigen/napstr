@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core';
+import { convertFileSrc, invoke } from '@tauri-apps/api/core';
 
 /**
  * Album art for the desktop window.
@@ -18,6 +18,14 @@ export type AlbumCover = {
   art: string;
   /** Smaller rendition of the same image, when the publisher supplied one. */
   thumb: string;
+  /**
+   * Absolute path of the full-size picture on this computer, empty when it holds
+   * none. Set by the host, which owns the artwork cache: the window draws this
+   * copy instead of asking the publisher for the same bytes again.
+   */
+  localArt: string;
+  /** The same, for the smaller rendition. */
+  localThumb: string;
   mbid: string;
   year: string;
   genre: string;
@@ -74,9 +82,36 @@ export function isPublished(cover: AlbumCover): boolean {
   return Boolean(cover.author);
 }
 
-/** The URL to draw: `thumb` in dense grids, `art` where there is room. */
-export function artUrl(cover: AlbumCover | null, preferThumb: boolean): string {
+/**
+ * True when this rendition is drawn from a copy on this computer.
+ *
+ * A picture held here can be evicted while the page is open, which is the one
+ * case where the address is still worth trying, so the component asks this after
+ * an image fails.
+ */
+export function drawsFromDisk(cover: AlbumCover | null, preferThumb: boolean): boolean {
+  if (!cover) return false;
+  return Boolean(preferThumb ? cover.localThumb : cover.localArt);
+}
+
+/**
+ * The URL to draw: `thumb` in dense grids, `art` where there is room.
+ *
+ * A copy on this computer is preferred to the publisher's address, because it is
+ * the same bytes: it draws instantly, it works with no network at all, and the
+ * address is often the weaker of the two — measured on a real installation, 320
+ * of 342 albums had a published claim while the archive serving 91% of those
+ * addresses was unreachable for a quarter of an hour at a time. `allowLocal` is
+ * false only for a caller that has to be given a real address.
+ */
+export function artUrl(
+  cover: AlbumCover | null,
+  preferThumb: boolean,
+  allowLocal = true
+): string {
   if (!cover) return '';
+  const local = (preferThumb ? cover.localThumb : cover.localArt) || '';
+  if (allowLocal && local) return convertFileSrc(local);
   return preferThumb ? cover.thumb || cover.art : cover.art || cover.thumb;
 }
 
@@ -174,7 +209,11 @@ async function resolveCovers(
     try {
       const found = await invoke<AlbumCover[]>('cover_art', { keys: slice });
       for (const cover of found) {
-        if (cover.art || cover.thumb || cover.coverFileId) covers.set(cover.key, cover);
+        // A copy on this computer is as drawable as an address is: what matters
+        // is that there is something to put on the screen.
+        if (cover.art || cover.thumb || cover.coverFileId || cover.localArt || cover.localThumb) {
+          covers.set(cover.key, cover);
+        }
       }
     } catch {
       // Offline, or a host that cannot answer right now. Nothing was learned.
