@@ -157,9 +157,19 @@ test('a row of the list starts the list as the queue from that row', async ({ pa
     track('d', 'Legs', false),
     track('e', 'Tush', false)
   ];
-  const mine = { ...inLibrary, fileId: id('f'), filename: 'Cheap Sunglasses.mp3', title: 'Cheap Sunglasses', format: 'MP3', mime: 'audio/mpeg' };
-  await openApp(page, { library: [mine], discovered: list, preload: 2 });
-  await expect(page.locator('.track-row')).toHaveCount(1);
+  // Three tracks of this phone's own, because the run uses each of them once: with
+  // only one, its place is taken by the first row and nothing of ours is left for
+  // the rows further down - which is the whole reason the runway is bounded.
+  const mine = ['f', 'g', 'h'].map((letter, index) => ({
+    ...inLibrary,
+    fileId: id(letter),
+    filename: `Mine ${index + 1}.mp3`,
+    title: `Mine ${index + 1}`,
+    format: 'MP3',
+    mime: 'audio/mpeg'
+  }));
+  await openApp(page, { library: mine, discovered: list, preload: 2 });
+  await expect(page.locator('.track-row')).toHaveCount(3);
   await openSearchTab(page);
   await page.locator('section[aria-label="Discover"] .track-row').nth(2).locator('.track-open').click();
 
@@ -167,9 +177,43 @@ test('a row of the list starts the list as the queue from that row', async ({ pa
   // and the two asks are its own file and the one after it: the list from that row,
   // rather than the whole thing from the top.
   await expect.poll(() => files(page, 'remote_download')).toEqual([list[2].fileId, list[3].fileId]);
-  // The track of ours after it is the one being taken over Iroh while the fetch
-  // runs, which is what says the run arrived at the row that was tapped.
-  await expect.poll(() => files(page, 'prefetch_remote_audio')).toContain(mine.fileId);
+  // And one of ours really is in the run, being taken over Iroh after the row that
+  // was tapped - which is what says the runway is filled that far down.
+  const prefetched = await expect
+    .poll(() => files(page, 'prefetch_remote_audio'))
+    .not.toHaveLength(0)
+    .then(() => files(page, 'prefetch_remote_audio'));
+  expect(prefetched.some((fileId) => mine.some((item) => item.fileId === fileId))).toBe(true);
+});
+
+test('the list stays the queue when a track fetched for it lands', async ({ page }) => {
+  // The row the list leads with is a file this phone *already holds* - which the
+  // computer does not know, because its discover list leaves out only what the
+  // computer itself has. So the fetch lands on a file that is both in the queue
+  // and on this phone, which is the case that used to name one file twice in a
+  // keyed list and lose the whole queue, drawer and all.
+  await openApp(page, {
+    library: [inLibrary],
+    discovered: [track('a', 'Doubleback', false), track('c', 'Sharp Dressed Man', false)],
+    arrives: inLibrary.fileId,
+    preload: 0
+  });
+  await expect(page.locator('.track-row')).toHaveCount(1);
+  await openSearchTab(page);
+  await page.locator('.discover-play').click();
+  await expect.poll(() => audioPaused(page)).toBe(false);
+
+  // The run is the queue - the two new files, once each - rather than the library
+  // this phone happened to be showing.
+  await page.locator('.now-open').click();
+  await expect(page.locator('.now-sheet')).toBeVisible();
+  await page.locator('[aria-label="Open the playlist"]').click();
+  const rows = page.locator('.queue-row');
+  await expect(rows).toHaveCount(2);
+  await expect(rows.nth(0)).toContainText('Doubleback');
+  await expect(rows.nth(1)).toContainText('Sharp Dressed Man');
+  // And the row of the one playing is marked as the one playing.
+  await expect(page.locator('.queue-row.playing')).toHaveCount(1);
 });
 
 test('the list fills to a hundred rows out of pages of thirty', async ({ page }) => {

@@ -41,10 +41,10 @@ const profiles = (metered = {}) => ({
   metered: { formats: ['MP3', 'OGG', 'OPUS'], maxBitrateKbps: 0, ...metered }
 });
 
-async function openApp(page, { library = [losslessSong, plainSong], metered = true, cached = [], quality = null, preload = null } = {}) {
+async function openApp(page, { library = [losslessSong, plainSong], metered = true, cached = [], quality = null, preload = null, holdPrefetch = false } = {}) {
   await mockNative(page, { platform: 'android' });
   await page.route('**/fixture.wav', serveAudio);
-  await page.addInitScript(({ library, metered, cached, quality, preload }) => {
+  await page.addInitScript(({ library, metered, cached, quality, preload, holdPrefetch }) => {
     // The bridge the Android webview adds. `metered` is read on every ask, so a
     // test can move the phone onto another connection mid-run if it wants to.
     window.NapstrfyNetwork = {
@@ -54,12 +54,32 @@ async function openApp(page, { library = [losslessSong, plainSong], metered = tr
     window.cachedLibrary = cached;
     if (quality) window.localStorage.setItem('napstrfy-quality', JSON.stringify(quality));
     if (preload !== null) window.localStorage.setItem('napstrfy-preload-depth', String(preload));
+    // A warm-up the test holds open, and the count of how many are in flight at
+    // once: the point is that this never rises above one.
+    let release = () => {};
+    if (holdPrefetch) {
+      window.prefetching = 0;
+      window.maxPrefetching = 0;
+      window.releasePrefetch = () => release();
+    }
     const invoke = window.__TAURI_INTERNALS__.invoke;
     window.__TAURI_INTERNALS__.invoke = async (cmd, args = {}) => {
       if (cmd === 'remote_library' && !args.query) return { tracks: library, total: library.length };
+      if (cmd === 'prefetch_remote_audio' && holdPrefetch) {
+        // Asked of the mock first, so the call is recorded as every other one is,
+        // and then held: the count of calls is what the test reads.
+        const answered = invoke(cmd, args);
+        window.prefetching += 1;
+        window.maxPrefetching = Math.max(window.maxPrefetching, window.prefetching);
+        await new Promise((resolve) => {
+          release = resolve;
+        });
+        window.prefetching -= 1;
+        return answered;
+      }
       return invoke(cmd, args);
     };
-  }, { library, metered, cached, quality, preload });
+  }, { library, metered, cached, quality, preload, holdPrefetch });
   await page.goto('http://127.0.0.1:15174');
   await expect(page.locator('.track-row strong')).toHaveText(library.map((item) => item.title));
 }
@@ -178,6 +198,24 @@ test('the pre-load fetches as many tracks ahead as the setting says', async ({ p
   // more: the fourth is a page of listening the phone has not committed to yet.
   const asked = await expect.poll(() => callsTo(page, 'prefetch_remote_audio')).toBe(3).then(() => preloading(page));
   expect(asked).toEqual([id('e'), id('f'), id('g')]);
+});
+
+test('the pre-load takes the files it warms one at a time', async ({ page }) => {
+  // Two tracks of this phone's own ahead of the one playing, both uncached, and
+  // the tunnel handing over neither until the test says so: what is being pinned
+  // is that the second is not asked for while the first is still arriving. Taking
+  // several at once is what leaves a status poll or a download with nothing to
+  // answer it, and the app reads that as the computer having gone.
+  const library = [plainSong, track('e', { title: 'Second' }), track('f', { title: 'Third' })];
+  await openApp(page, { library, preload: 2, holdPrefetch: true });
+  await play(page, 'Small and fine');
+  await expect.poll(() => callsTo(page, 'prefetch_remote_audio')).toBe(1);
+  expect(await page.evaluate(() => window.maxPrefetching)).toBe(1);
+
+  // Released: the waiting one is taken, still without ever overlapping.
+  await page.evaluate(() => window.releasePrefetch?.());
+  await expect.poll(() => callsTo(page, 'prefetch_remote_audio')).toBe(2);
+  expect(await page.evaluate(() => window.maxPrefetching)).toBe(1);
 });
 
 test('a pre-load of zero fetches only what is played', async ({ page }) => {

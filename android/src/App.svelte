@@ -1500,6 +1500,9 @@
     if (discoverTracks.length === 0) return;
     const first = discoverTracks[Math.min(Math.max(start, 0), discoverTracks.length - 1)];
     playerQueue = withOwnRunway(discoverTracks);
+    // The queue is this phone's own list rather than the library, and the flag is
+    // what the computer caches the audio by - so it says which of the two this is.
+    playerQueueLibraryVisible = true;
     playerIndex = playerQueue.findIndex((item) => item.fileId === first.fileId);
     resetRandomOrder();
     // The queue was built here, so it is kept: a track that has to be fetched must
@@ -1521,16 +1524,31 @@
    * The list with one owned track after each of its own, so every network file has
    * something to be fetched behind.
    *
-   * Nothing is invented when there is nothing to spare: a library with no tracks in
-   * it leaves the list as it is, and the waits are the waits.
+   * Each track of ours is used at most once, and never one the run already names.
+   * The queue is keyed by file and Svelte refuses to draw a list that names one
+   * twice - so a run longer than this phone's library, which is the ordinary case,
+   * did not merely run out of fillers: it lost the whole queue, and the drawer
+   * could not be opened at all.
+   *
+   * Nothing is invented when there is nothing to spare: a library with no tracks
+   * left over leaves the rest of the run network-to-network, and the waits are the
+   * waits.
    */
   function withOwnRunway(discovery: RemoteTrack[]): RemoteTrack[] {
-    const owned = tracks.filter((track) => track.local);
-    if (owned.length === 0) return [...discovery];
+    const taken = new Set(discovery.map((track) => track.fileId));
+    const owned = tracks.filter((track) => track.local && !taken.has(track.fileId));
+    // Shuffled, so a long run is not filled by the same handful of records - and
+    // properly, rather than by sorting on a coin toss.
+    for (let index = owned.length - 1; index > 0; index -= 1) {
+      const swap = Math.floor(Math.random() * (index + 1));
+      [owned[index], owned[swap]] = [owned[swap], owned[index]];
+    }
     const mixed: RemoteTrack[] = [];
+    let next = 0;
     discovery.forEach((track, index) => {
       mixed.push(track);
-      if (index + 1 < discovery.length) mixed.push(owned[index % owned.length]);
+      if (index + 1 < discovery.length && next < owned.length) mixed.push(owned[next]);
+      if (next < owned.length) next += 1;
     });
     return mixed;
   }
@@ -2811,15 +2829,29 @@
     if (playbackTarget === 'desktop') return playOnDesktop(track);
     if (!track.local) {
       playingWhenReady.add(track.fileId);
-      await requestDownload(track);
+      // Asked for, not waited on: the computer's answer is only "queued", and this
+      // handler must stay free to warm the queue and to notice it landing.
+      void requestDownload(track);
       // The wait for the bytes is not a freeze on the queue: what follows is warmed
       // exactly as it would be behind a track that was already here.
       warmUpcoming(track.fileId, playerQueueLibraryVisible);
       return;
     }
     const inQueue = playerQueue.some((item) => item.fileId === track.fileId);
-    if (keepQueue && inQueue) {
-      playerIndex = playerQueue.findIndex((item) => item.fileId === track.fileId);
+    if (keepQueue) {
+      // A file that arrived for a playlist somebody chose keeps that playlist,
+      // whether or not it turns out to be named in it: the list is what "next"
+      // means, and replacing it here is how a run of the network's own list became
+      // this phone's library the moment its first track landed.
+      if (inQueue) {
+        playerIndex = playerQueue.findIndex((item) => item.fileId === track.fileId);
+      } else {
+        // Unknown to the list it was fetched for, so it plays now and that list
+        // carries on after it rather than being thrown away for this one file.
+        const at = Math.max(0, playerIndex + 1);
+        playerQueue = [...playerQueue.slice(0, at), track, ...playerQueue.slice(at)];
+        playerIndex = at;
+      }
     } else {
       const queue = tracks.filter((item) => item.local);
       playerQueue = queue;
@@ -2954,11 +2986,52 @@
       if (cachedFileIds.has(upcoming.fileId) || warmed.has(upcoming.fileId)) continue;
       warmed.add(upcoming.fileId);
       if (upcoming.local) {
-        void invoke('prefetch_remote_audio', { afterFileId, track: upcoming, libraryVisible });
+        // Taken over the tunnel, one after another: each of these is a whole audio
+        // file arriving on the same connection the app asks its own questions on.
+        queuePrefetch(upcoming, afterFileId, libraryVisible);
         continue;
       }
       if (pending.size >= MAX_ACQUISITIONS_IN_FLIGHT) continue;
       void requestDownload(upcoming);
+    }
+  }
+
+  /** Warm-ups waiting for the tunnel, in the order they should be taken. */
+  const prefetchWanted: { track: RemoteTrack; afterFileId: string; libraryVisible: boolean }[] = [];
+  let prefetchRunning = false;
+
+  function queuePrefetch(track: RemoteTrack, afterFileId: string, libraryVisible: boolean) {
+    if (prefetchWanted.some((item) => item.track.fileId === track.fileId)) return;
+    prefetchWanted.push({ track, afterFileId, libraryVisible });
+    void drainPrefetch();
+  }
+
+  /**
+   * Take the waiting files over the tunnel one at a time.
+   *
+   * `prefetch_remote_audio` is the computer sending a whole audio file this way. A
+   * queue of five of them at once leaves nothing for the requests the app depends
+   * on - the status poll, the download a tap is waiting on, the transfers it is
+   * watching - and those then time out, which reads as the computer having gone
+   * away. One at a time costs nothing here: the point of warming is that the file
+   * is ready before its turn, and the turn is minutes off either way.
+   */
+  async function drainPrefetch() {
+    if (prefetchRunning) return;
+    prefetchRunning = true;
+    try {
+      while (prefetchWanted.length > 0) {
+        const next = prefetchWanted.shift();
+        if (!next || cachedFileIds.has(next.track.fileId)) continue;
+        try {
+          await invoke('prefetch_remote_audio', next);
+        } catch {
+          // A warm-up that will not happen is not worth a message: whatever needed
+          // the file asks for it when its turn comes, exactly as it would have.
+        }
+      }
+    } finally {
+      prefetchRunning = false;
     }
   }
 
@@ -3009,7 +3082,9 @@
       // player waits - visibly, because the bar and the row badge say how far along
       // the fetch is - and starts the moment the bytes land.
       playingWhenReady.add(track.fileId);
-      await requestDownload(track);
+      // Asked for, not waited on: the computer's answer is only "queued", and this
+      // handler must stay free to warm the queue and to notice it landing.
+      void requestDownload(track);
       // The fetch is the wait, but the queue is not frozen by it: what follows is
       // warmed exactly as it would be behind a track that was already here.
       warmUpcoming(track.fileId, libraryVisible);
@@ -3634,7 +3709,12 @@
 
   function nowPlayingAvailable() {
     if (playbackTarget === 'desktop') return remoteAvailable();
-    return activeMedia === 'music' && playerQueueLibraryVisible && !!current;
+    // Asked of what is playing rather than of where the queue came from. That flag
+    // answers a different question - whether the queue is this phone's own library,
+    // which is a hint the computer caches audio by - and reading it here made a
+    // queue taken over from the computer, or one built from the network's own list,
+    // impossible to open at all.
+    return activeMedia === 'music' && (playerQueue.length > 0 || !!current);
   }
 
   function openNowPlaying() {
@@ -4307,7 +4387,12 @@
     // poll; it is resolved here, and the one playing is always in it even when
     // the computer no longer holds a member or two.
     const queue = await tracksByIds(handed.queue ?? []);
-    const order = queue.some((item) => item.fileId === track.fileId) ? queue : [track];
+    // Deduplicated by file: the queue is drawn as a keyed list, so one file named
+    // twice is a list Svelte will not draw at all - and the answer comes from the
+    // other device, where the same track can legitimately appear once per copy.
+    const seen = new Set<string>();
+    const unique = queue.filter((item) => !seen.has(item.fileId) && seen.add(item.fileId));
+    const order = unique.some((item) => item.fileId === track.fileId) ? unique : [track];
     playerQueue = order;
     playerQueueLibraryVisible = false;
     playerIndex = Math.max(0, order.findIndex((item) => item.fileId === track.fileId));
