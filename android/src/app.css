@@ -390,6 +390,12 @@ svg .filled { fill: currentColor; stroke: none; }
 .artist-card strong, .artist-card small { display: block; overflow: hidden; text-align: center; text-overflow: ellipsis; white-space: nowrap; }
 .artist-card strong { margin-top: 8px; font-size: 13px; font-weight: 600; }.artist-card small { margin-top: 3px; color: #92929b; font-size: 11px; }
 .tracks-label { padding: 2px 20px 8px; }
+/* The button that starts the network's list, in the row that labels it. The row
+   spreads its children apart, so this one holds the two pieces of the label
+   together on the left and gives the button the space that is left. */
+.discover-label { justify-content: flex-start; gap: 10px; }
+.discover-play { margin-left: auto; align-self: center; padding: 7px 13px; color: #0b0b0f; background: #c9c2ff; border: 0; border-radius: 16px; font-size: 12px; font-weight: 700; letter-spacing: .03em; }
+.discover-play:disabled { color: #6a6a75; background: #26262e; }
 
 /* The playlist lives in its own view: the drawer itself never scrolls. */
 .queue-view { position: fixed; z-index: 40; inset: 0; display: flex; flex-direction: column; background: #0b0b0e; animation: queue-in .24s ease-out; }
@@ -537,6 +543,15 @@ svg .filled { fill: currentColor; stroke: none; }
 .quality-chip { min-height: 34px; padding: 6px 13px; color: #b9b9c4; background: #16161c; border: 1px solid #26262e; border-radius: 17px; font-size: 12px; font-weight: 700; letter-spacing: .04em; }
 .quality-chip.on { color: #0b0b0f; background: #c9c2ff; border-color: #c9c2ff; }
 .quality-hint { margin: 10px 0 2px; color: #85858f; font-size: 11px; line-height: 1.45; }
+
+/* How many tracks ahead: the same chip as a quality panel's, in a panel of its
+   own so the buttons line up with the rows above and below rather than sitting
+   flush against the edge of the sheet. The number is a fixed width, so the row
+   reads as a scale from none to five instead of five buttons of five widths. */
+.preload-panel { padding: 4px 18px 10px; background: #08080b; }
+.preload-chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0; }
+.preload-chip { min-width: 46px; min-height: 34px; padding: 6px 12px; color: #b9b9c4; background: #16161c; border: 1px solid #26262e; border-radius: 17px; font-size: 12px; font-weight: 700; letter-spacing: .04em; text-align: center; }
+.preload-chip.on { color: #0b0b0f; background: #c9c2ff; border-color: #c9c2ff; }
 
 /* A track's conversation: public messages fetched by the computer, in the same
    shape the desktop's own chat panel draws them. */

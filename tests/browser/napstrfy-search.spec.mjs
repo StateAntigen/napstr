@@ -123,12 +123,16 @@ for (const action of ['new search', 'clear', 'liked']) {
       await finish(page, 'remote_search', 'new', [track('d', false)]);
     } else if (action === 'clear') await page.locator('.clear-search').click();
     else await page.locator('.chips button').first().click();
-    const expected = action === 'new search' ? ['Track c', 'Track d'] : action === 'clear' ? ['Search'] : [];
+    // Clearing the words empties the tab as well as the search: an empty search tab
+    // shows the network's own list and nothing of the library, which only appears
+    // once something has been searched for.
+    const expected = action === 'new search' ? ['Track c', 'Track d'] : [];
     await expect(page.locator('.track-row strong')).toHaveText(expected);
     await finish(page, 'remote_library', 'old', [track('b')]);
     await finish(page, 'remote_search', 'old', [], 'Stale search failed');
     await expect(page.locator('.track-row strong')).toHaveText(expected);
     await expect(page.locator('.error-banner')).toHaveCount(0);
-    await expect(page.locator('.track-list')).toHaveAttribute('aria-busy', 'false');
+    if (action === 'clear') await expect(page.locator('.track-list')).toHaveCount(0);
+    else await expect(page.locator('.track-list')).toHaveAttribute('aria-busy', 'false');
   });
 }

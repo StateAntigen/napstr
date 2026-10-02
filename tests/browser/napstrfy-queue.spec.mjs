@@ -27,20 +27,63 @@ const second = track('b', 'Gimme All Your Lovin');
 /** Nothing plays this: it is the search result the menu is used on. */
 const found = track('c', 'Sharp Dressed Man');
 
-async function openApp(page, { library = [first, second], results = [found] } = {}) {
+/**
+ * Files this phone does not have anywhere: the network has them, and getting one
+ * means the computer fetching it over Tor before this phone can play it at all.
+ */
+const elsewhere = (letter, title) => ({
+  ...track(letter, title),
+  format: 'MP3',
+  mime: 'audio/mpeg',
+  local: false,
+  sources: [{ pubkey: letter === 'c' ? id('1') : id('2'), displayName: '' }]
+});
+const away = elsewhere('c', 'Sharp Dressed Man');
+const furtherAway = elsewhere('d', 'Legs');
+
+async function openApp(page, { library = [first, second], results = [found], fetching = null } = {}) {
   await mockNative(page, { platform: 'android' });
   await page.route('**/fixture.wav', serveAudio);
-  await page.addInitScript(({ library, results }) => {
+  await page.addInitScript(({ library, results, fetching }) => {
     window.remoteLibrary = library;
+    // The answers a search gives, which a spec rewrites while the app is running
+    // when it wants a file to change hands - the mock reads them at every call.
+    window.searchResults = results;
+    // The one download the computer is running, in the same mutable shape: the
+    // fetch a queued track is waiting for is moved along by the test that made it.
+    window.fetching = fetching;
     const invoke = window.__TAURI_INTERNALS__.invoke;
     window.__TAURI_INTERNALS__.invoke = async (cmd, args = {}) => {
       // A search answers at once: what is being looked at is the menu a result
       // offers, not the search itself.
-      if (cmd === 'remote_search') return results;
-      if (cmd === 'remote_library' && args.query) return { tracks: results, total: results.length };
+      if (cmd === 'remote_search') return window.searchResults;
+      if (cmd === 'remote_library' && args.query) {
+        return { tracks: window.searchResults, total: window.searchResults.length };
+      }
+      if (cmd === 'remote_download') {
+        // Recorded here as well as in `calls`, because the transfer list below is
+        // derived from it: a real host lists what it is fetching, and a mock that
+        // answered with somebody else's row would make the phone believe a file had
+        // already arrived.
+        window.asked = [...(window.asked ?? []), args.fileId];
+        return invoke(cmd, args);
+      }
+      if (cmd === 'remote_transfers') {
+        return (window.asked ?? [])
+          .filter((fileId) => !(window.arrived ?? []).includes(fileId))
+          .map((fileId) => ({
+            fileId,
+            filename: 'Sharp Dressed Man.wav',
+            size: 1234567,
+            progress: window.fetching?.progress ?? 12,
+            status: window.fetching?.status ?? 'Downloading',
+            speed: '',
+            destination: ''
+          }));
+      }
       return invoke(cmd, args);
     };
-  }, { library, results });
+  }, { library, results, fetching });
   await page.goto('http://127.0.0.1:15174');
 }
 
@@ -67,16 +110,24 @@ async function openQueue(page) {
 }
 
 /** Add a search result from its own ⋮ menu. */
-async function addFoundTrack(page) {
+async function addFoundTrack(page, result = found) {
   await page.locator('.bottom-nav button[data-tab="search"]').click();
   const input = page.getByRole('textbox', { name: 'Search tracks', exact: true });
   await input.fill('zz top');
   await input.press('Enter');
-  const row = page.locator('.track-row', { hasText: found.title });
+  const row = page.locator('.track-row', { hasText: result.title });
   await expect(row).toBeVisible();
   await row.locator('.track-more').click();
   await page.getByRole('button', { name: 'Add to queue' }).click();
 }
+
+/** The files the phone has asked the computer to fetch, in the order it asked. */
+const downloads = (page) =>
+  page.evaluate(() =>
+    window.calls
+      .filter((call) => call.cmd === 'remote_download')
+      .map((call) => call.args.fileId)
+  );
 
 test('a search result goes on the end of the playlist from its own menu', async ({ page }) => {
   await openApp(page);
@@ -127,4 +178,53 @@ test('the row is not offered while the computer is the one playing', async ({ pa
 
   await page.locator('.track-more').nth(1).click();
   await expect(page.getByRole('button', { name: /Add to queue/ })).toBeDisabled();
+});
+
+test('a queued track nobody here holds is fetched while it is still songs away', async ({ page }) => {
+  await openApp(page, { results: [away, furtherAway] });
+  await playFirst(page);
+  await addFoundTrack(page, away);
+  await addFoundTrack(page, furtherAway);
+
+  // The playlist is the library that was playing and then the two network files,
+  // so the first is two songs away and the second three. A phone cannot reach the
+  // network itself: the computer fetches what nobody here holds, two at a time and
+  // in the order it is asked, so being asked now is what gets these here before
+  // their turn rather than after it has arrived.
+  await expect.poll(() => downloads(page)).toEqual([away.fileId, furtherAway.fileId]);
+  // Who holds each one travels with the ask, because the computer has never seen
+  // either file and that list is the whole of what it knows about getting it.
+  const asked = await page.evaluate(() =>
+    window.calls.filter((call) => call.cmd === 'remote_download').map((call) => call.args.sourcePubkeys)
+  );
+  expect(asked).toEqual([[id('1')], [id('2')]]);
+});
+
+test('a turn that has not arrived says how far along it is, then plays', async ({ page }) => {
+  // One file, in the library and in the search, with nothing of the phone's own
+  // anywhere: adding it to an empty playlist starts it, so this is a turn arriving
+  // with nothing to play.
+  await openApp(page, {
+    library: [{ ...away }],
+    results: [{ ...away }],
+    fetching: { fileId: away.fileId, progress: 12, status: 'Downloading' }
+  });
+  await addFoundTrack(page, away);
+
+  // Not an error and not silence: the bar names what is being fetched and says how
+  // far along it is, which is the one thing the player can honestly report while
+  // the computer is getting it.
+  await expect(page.locator('.now-copy small')).toContainText('Fetching');
+  await expect(page.locator('.now-copy small')).toContainText('12%');
+  expect(await audioPaused(page)).toBe(true);
+
+  // It lands: the computer stops listing it, and the file is this phone's now, so
+  // the phone plays it - the wait was the download, not the decision.
+  await page.evaluate(() => {
+    window.arrived = [window.asked[0]];
+    window.searchResults = window.searchResults.map((item) => ({ ...item, local: true }));
+    window.remoteLibrary = window.remoteLibrary.map((item) => ({ ...item, local: true }));
+  });
+  await expect.poll(() => audioPaused(page)).toBe(false);
+  await expect(page.locator('.now-copy small')).toContainText('ZZ Top');
 });

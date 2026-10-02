@@ -86,12 +86,24 @@
   /** Mirrors `MAX_PLAY_QUEUE` on the host: one request carries the whole list. */
   const MAX_DESKTOP_QUEUE = 200;
   /**
+   * How many network acquisitions the computer may have running for this phone at
+   * once, which is its own `MAX_ACTIVE_DOWNLOADS`. Asking for more would queue the
+   * track about to play behind the ones after it.
+   */
+  const MAX_ACQUISITIONS_IN_FLIGHT = 2;
+  /**
    * Rows per discover page. The computer's own cap is the same number, and it is
    * the protocol's rather than this file's to invent: a discover row names every
    * seeder it has, so a page of them is the fattest answer either side sends and
    * has to fit in one control frame.
    */
   const DISCOVER_PAGE = 30;
+  /**
+   * Rows the discover list fills to. A hundred is more than one frame carries, so
+   * the list is filled in pages of `DISCOVER_PAGE` until it is this long - the
+   * limit is the frame's, not the list's.
+   */
+  const DISCOVER_LIST_SIZE = 100;
   /** Mirrors `MAX_PLAYLIST_PAGE` on the host: the most members one answer carries. */
   const PLAYLIST_PAGE = 100;
   /** Mirrors `MAX_PLAYLIST_MEMBERS`: the spec's limit on a playlist's members. */
@@ -1430,6 +1442,8 @@
   let discoverLoading = $state(false);
   /** Asked once per session: an empty list is an answer, not a reason to ask again. */
   let discoverAsked = false;
+  /** How long the list is to be filled to, which the button below it raises. */
+  let discoverWanted = $state(DISCOVER_LIST_SIZE);
 
   /**
    * One page of that list, from the computer that keeps the mirror.
@@ -1439,19 +1453,29 @@
    * arrive with `local: false`, which is what makes playing one a fetch rather
    * than a read - the computer goes and gets it from the seeders the row names.
    */
-  async function loadDiscover() {
+  async function loadDiscover(wanted = discoverWanted) {
     if (discoverLoading || !status.connected || status.streamOnly) return;
     discoverAsked = true;
     discoverLoading = true;
+    discoverWanted = wanted;
     try {
-      const page = await invoke<{ tracks: RemoteTrack[]; total: number }>('remote_discover', {
-        mode: 'mostSeeded',
-        seed: networkDiscoverSeed,
-        offset: discoverTracks.length,
-        limit: DISCOVER_PAGE
-      });
-      discoverTracks = [...discoverTracks, ...page.tracks];
-      discoverTotal = page.total;
+      // One page is what fits in a control frame, so a long list is this many
+      // pages of it rather than one fat answer. The loop stops when the computer
+      // says there is nothing after the page it just sent.
+      while (discoverTracks.length < wanted) {
+        const page = await invoke<{ tracks: RemoteTrack[]; total: number }>('remote_discover', {
+          mode: 'mostSeeded',
+          seed: networkDiscoverSeed,
+          offset: discoverTracks.length,
+          limit: DISCOVER_PAGE
+        });
+        discoverTotal = page.total;
+        if (page.tracks.length === 0) break;
+        discoverTracks = [...discoverTracks, ...page.tracks];
+        // Every row the computer has is here, so asking again would only ask for
+        // another empty page.
+        if (discoverTracks.length >= discoverTotal) break;
+      }
     } catch {
       // A list of suggestions, not a page of the app: a computer that will not
       // answer leaves the search tab exactly as it was.
@@ -1460,13 +1484,55 @@
     }
   }
 
+  /**
+   * Start the network's list as the queue, from `start`.
+   *
+   * A tap on a row does what Play all does, only from that row: the list is what
+   * the phone is listening to, with a track of this phone's own between each pair.
+   *
+   * Not a mixing whim: a network file has to be *acquired* by the computer before
+   * this phone can play it, and that takes minutes over Tor. A track of ours
+   * between each pair is the runway - about four minutes of listening while the
+   * next one is fetched - and the pre-load depth is what starts the asks early
+   * enough to use it.
+   */
+  function runDiscover(start: number) {
+    if (discoverTracks.length === 0) return;
+    const first = discoverTracks[Math.min(Math.max(start, 0), discoverTracks.length - 1)];
+    playerQueue = withOwnRunway(discoverTracks);
+    playerIndex = playerQueue.findIndex((item) => item.fileId === first.fileId);
+    resetRandomOrder();
+    // The queue was built here, so it is kept: a track that has to be fetched must
+    // not lose the list it is part of when its bytes land.
+    void activateTrack(first, true);
+  }
+
   /** Play the list from its first row, which is the one the computer ranked highest. */
   function playDiscover() {
-    if (discoverTracks.length === 0) return;
-    playerQueue = discoverTracks;
-    playerIndex = 0;
-    resetRandomOrder();
-    void activateTrack(discoverTracks[0]);
+    runDiscover(0);
+  }
+
+  /** A row of the list is somebody choosing where in the list to start listening. */
+  function openDiscoverRow(track: RemoteTrack) {
+    runDiscover(discoverTracks.findIndex((item) => item.fileId === track.fileId));
+  }
+
+  /**
+   * The list with one owned track after each of its own, so every network file has
+   * something to be fetched behind.
+   *
+   * Nothing is invented when there is nothing to spare: a library with no tracks in
+   * it leaves the list as it is, and the waits are the waits.
+   */
+  function withOwnRunway(discovery: RemoteTrack[]): RemoteTrack[] {
+    const owned = tracks.filter((track) => track.local);
+    if (owned.length === 0) return [...discovery];
+    const mixed: RemoteTrack[] = [];
+    discovery.forEach((track, index) => {
+      mixed.push(track);
+      if (index + 1 < discovery.length) mixed.push(owned[index % owned.length]);
+    });
+    return mixed;
   }
 
   // Asked when the search tab is opened on nothing, which is where the network's
@@ -2731,19 +2797,35 @@
    */
   const playingWhenReady = new Set<string>();
 
-  async function activateTrack(track: RemoteTrack) {
+  /**
+   * Start a track on this phone.
+   *
+   * A tap on a library row means "this one, and the rest of the library after it",
+   * so it takes over the playlist. `keepQueue` is the other case: a file that is
+   * already part of a playlist somebody chose - a queued track whose turn came, or
+   * one of a discovery run - which must not lose that list by arriving.
+   */
+  async function activateTrack(track: RemoteTrack, keepQueue = false) {
     activeMedia = 'music';
     selected = track;
     if (playbackTarget === 'desktop') return playOnDesktop(track);
     if (!track.local) {
       playingWhenReady.add(track.fileId);
       await requestDownload(track);
+      // The wait for the bytes is not a freeze on the queue: what follows is warmed
+      // exactly as it would be behind a track that was already here.
+      warmUpcoming(track.fileId, playerQueueLibraryVisible);
       return;
     }
-    const queue = tracks.filter((item) => item.local);
-    playerQueue = queue;
-    playerQueueLibraryVisible = true;
-    playerIndex = queue.findIndex((item) => item.fileId === track.fileId);
+    const inQueue = playerQueue.some((item) => item.fileId === track.fileId);
+    if (keepQueue && inQueue) {
+      playerIndex = playerQueue.findIndex((item) => item.fileId === track.fileId);
+    } else {
+      const queue = tracks.filter((item) => item.local);
+      playerQueue = queue;
+      playerQueueLibraryVisible = true;
+      playerIndex = queue.findIndex((item) => item.fileId === track.fileId);
+    }
     resetRandomOrder();
     await playTrack(track);
   }
@@ -2847,6 +2929,55 @@
   }
 
   /**
+   * Fetch the tracks this one will be followed by, in the order they will play: the
+   * one after it first, then the one after that, up to what Settings says.
+   *
+   * There are two kinds of "not here yet" and they cost different things. A file a
+   * computer of ours holds is one this phone can take over Iroh in seconds; a file
+   * nobody holds has to be fetched *from the network* by the computer first, over
+   * Tor, which takes minutes. So the second kind is asked for early and in play
+   * order, and only while the computer still has a slot free - more asks than it
+   * can run would put the track about to play behind the ones after it.
+   *
+   * `afterFileId` is what the track will follow, which is what the computer needs to
+   * hold it ready behind the playing one.
+   */
+  function warmUpcoming(afterFileId: string, libraryVisible: boolean) {
+    const warmed = new Set<string>([afterFileId]);
+    for (let step = 1; step <= preloadDepth; step += 1) {
+      const upcoming = upcomingTrack(step);
+      // One this connection would hold back is not asked for, which is the same rule
+      // the track being played went through.
+      if (!upcoming || holdReason(upcoming)) continue;
+      // A short queue that loops comes round to the same file, and one file is one
+      // download: asking twice for it only makes the computer say so twice.
+      if (cachedFileIds.has(upcoming.fileId) || warmed.has(upcoming.fileId)) continue;
+      warmed.add(upcoming.fileId);
+      if (upcoming.local) {
+        void invoke('prefetch_remote_audio', { afterFileId, track: upcoming, libraryVisible });
+        continue;
+      }
+      if (pending.size >= MAX_ACQUISITIONS_IN_FLIGHT) continue;
+      void requestDownload(upcoming);
+    }
+  }
+
+  /**
+   * How far along the fetch of the track the player is waiting for is, or `null`
+   * when it is not waiting for one.
+   *
+   * This phone cannot reach the network itself: a queued file nobody here holds is
+   * fetched by the computer over Tor, which takes minutes. Silence with a number
+   * beside it is the honest thing to show for that.
+   */
+  function fetchPercent(): number | null {
+    const track = shownTrack;
+    if (!track || !pending.has(track.fileId)) return null;
+    const transfer = transfers.find((item) => item.fileId === track.fileId);
+    return Math.min(Math.max(Math.round(transfer?.progress ?? 0), 0), 99);
+  }
+
+  /**
    * What the audio cache must keep whatever its budget says: the track playing, and
    * the ones the pre-load has already fetched on its behalf.
    */
@@ -2872,6 +3003,18 @@
     error = '';
     current = track;
     activeMedia = 'music';
+    if (!track.local) {
+      // Nobody here holds it, so it cannot play yet: the computer fetches it from
+      // the network first, over Tor, which takes minutes rather than seconds. The
+      // player waits - visibly, because the bar and the row badge say how far along
+      // the fetch is - and starts the moment the bytes land.
+      playingWhenReady.add(track.fileId);
+      await requestDownload(track);
+      // The fetch is the wait, but the queue is not frozen by it: what follows is
+      // warmed exactly as it would be behind a track that was already here.
+      warmUpcoming(track.fileId, libraryVisible);
+      return;
+    }
     try {
       audio?.pause();
       const cached = await invoke<CachedAudio>('cache_remote_audio', { track, libraryVisible });
@@ -2892,28 +3035,7 @@
       // The add sheet offers back what has been played, so the track that just
       // started is the newest thing on that list.
       rememberPlayedTrack(cached.track);
-      // The tracks this one will be followed by, in the order they will play,
-      // fetched before they are reached: the one after it first, then the one after
-      // that, up to what Settings says. On this phone keeping warm *is* the computer
-      // fetching the audio, so the depth is also how far ahead of the network the
-      // queue runs.
-      const warmed = new Set<string>([cached.track.fileId]);
-      for (let step = 1; step <= preloadDepth; step += 1) {
-        const upcoming = upcomingTrack(step);
-        // A file no computer holds cannot be prefetched - there is nothing to ask
-        // - and one this connection would hold back is not asked for either, which
-        // is the same rule the track being played went through.
-        if (!upcoming?.local || holdReason(upcoming)) continue;
-        // A short queue that loops comes round to the same file, and one file is one
-        // download: asking twice for it only makes the computer say so twice.
-        if (cachedFileIds.has(upcoming.fileId) || warmed.has(upcoming.fileId)) continue;
-        warmed.add(upcoming.fileId);
-        void invoke('prefetch_remote_audio', {
-          afterFileId: cached.track.fileId,
-          track: upcoming,
-          libraryVisible
-        });
-      }
+      warmUpcoming(cached.track.fileId, libraryVisible);
       const next = upcomingTrack(1);
       // The same track's artwork is asked about and fetched now, so the player
       // has a cover the moment it starts instead of after a round trip. Its
@@ -2984,7 +3106,10 @@
           const nextAudiobooks = new Map(pendingAudiobooks);
           nextAudiobooks.delete(pendingFileId);
           pendingAudiobooks = nextAudiobooks;
-          playingWhenReady.delete(pendingFileId);
+          // A fetch that failed is not one to play later, and if it was the track
+          // the player was waiting on, the busy state goes with it.
+          const awaited = playingWhenReady.delete(pendingFileId);
+          if (awaited && !playing) caching = false;
           error = `${transfer.filename}: ${transfer.status}`;
           continue;
         }
@@ -3021,8 +3146,13 @@
         notice = `${title(local)} is ready to play`;
         void refreshCachedIds();
         // Asked to play, fetched first: this is where "play a file nobody here
-        // holds" finishes, rather than leaving the tap one short of a sound.
-        if (playingWhenReady.delete(pendingFileId)) void activateTrack(local);
+        // holds" finishes. The busy state is released before the handover, because
+        // the player refuses to start while it believes it is already fetching, and
+        // the playlist is kept - the file arrived for a place in it.
+        if (playingWhenReady.delete(pendingFileId)) {
+          if (!playing) caching = false;
+          void activateTrack(local, true);
+        }
       }
     } catch { /* the next foreground poll retries */ }
   }
@@ -3607,6 +3737,10 @@
     // here would have made the queue unreachable from the menu that filled it.
     playerQueue = [...playerQueue, track];
     notice = msg("Added to the queue: {p0}", { p0: title(track) });
+    // Fetched now rather than when its turn comes: a file nobody here holds takes
+    // minutes to arrive, and the songs between here and there are the minutes it
+    // has to arrive in.
+    if (current) warmUpcoming(current.fileId, playerQueueLibraryVisible);
   }
 
   /** Play a row of the playlist on whichever player it belongs to. */
@@ -5408,9 +5542,9 @@
   </section>
 {/snippet}
 
-{#snippet trackRow(track: RemoteTrack)}
+{#snippet trackRow(track: RemoteTrack, open: (item: RemoteTrack) => void = (item) => void activateTrack(item))}
   <div class:selected={selected?.fileId === track.fileId} class:remote={!track.local} class:liked={isTrackLiked(track)} class="track-row" role="listitem">
-    <button class="track-open" disabled={status.streamOnly && !track.local} onclick={() => activateTrack(track)}>
+    <button class="track-open" disabled={status.streamOnly && !track.local} onclick={() => open(track)}>
       <TrackArtwork {track} lookup />
       <span class="track-copy">
         <strong>{title(track)}</strong>
@@ -5619,28 +5753,32 @@
             <!-- What the network has, above the library it is not. The rows are
                  the same rows: a discover track is a track, and its badge is what
                  says whose computer has it. -->
-            <div class="section-label tracks-label">
+            <div class="section-label tracks-label discover-label">
               <b>{$t("Discover")}</b>
               <span>{discoverTotal} {$t("live on the network")}</span>
               <button class="discover-play" onclick={playDiscover} disabled={status.streamOnly}>{$t("Play all")}</button>
             </div>
             <section class="track-list" role="list" aria-label={$t("Discover")} aria-busy={discoverLoading}>
               {#each discoverTracks as track (track.fileId)}
-                {@render trackRow(track)}
+                {@render trackRow(track, openDiscoverRow)}
               {/each}
               {#if discoverTracks.length < discoverTotal}
-                <button class="load-more" onclick={() => void loadDiscover()} disabled={discoverLoading}>{discoverLoading ? 'Loading…' : `Load more · ${discoverTracks.length} of ${discoverTotal}`}</button>
+                <button class="load-more" onclick={() => void loadDiscover(discoverWanted + DISCOVER_LIST_SIZE)} disabled={discoverLoading}>{discoverLoading ? 'Loading…' : `Load more · ${discoverTracks.length} of ${discoverTotal}`}</button>
               {/if}
             </section>
           {/if}
         {/if}
   
-        {@render trackList(
-          'No tracks found',
-          query.trim() ? 'Try different words or clear the search.' : 'Search your Napstr library and the network.',
-          !showingLikedMusic && Boolean(query.trim())
-        )}
-      {:else if activeTab === 'music'}
+        {#if query.trim() || showingLikedMusic}
+          <!-- An empty search tab lists nothing: what belongs there is the network's
+               own list above, and the library is an answer to a search rather than a
+               page standing there before one has been made. -->
+          {@render trackList(
+            'No tracks found',
+            query.trim() ? 'Try different words or clear the search.' : 'Search your Napstr library and the network.',
+            !showingLikedMusic && Boolean(query.trim())
+          )}
+        {/if}      {:else if activeTab === 'music'}
         <section class="library-heading">
           {#if showingLikedMusic}
             <!-- The liked page is a page of its own and still says so; the
@@ -6200,7 +6338,7 @@
                 </div>
               {/key}
             </div>
-            <small>{nowArtist}</small>
+            <small>{#if fetchPercent() !== null}{$t("Fetching…")} {fetchPercent()}%{:else}{nowArtist}{/if}</small>
           </div>
         </button>
         <button class="now-play" onclick={togglePlayer} disabled={barEmpty || (playbackTarget !== 'desktop' && caching)} aria-label={barPlaying ? 'Pause' : 'Play'}>
@@ -6551,10 +6689,12 @@
            asked for, which is the opposite of the quality rows above it. -->
       <div class="settings-section">
         <p>{$t("Pre-load")}</p>
-        <div class="quality-chips" role="group" aria-label={$t("Tracks ahead")}>
-          {#each PRELOAD_DEPTHS as depth (depth)}
-            <button class:active={preloadDepth === depth} aria-pressed={preloadDepth === depth} onclick={() => choosePreloadDepth(depth)} aria-label={`${$t("Tracks ahead")}: ${depth}`}>{depth}</button>
-          {/each}
+        <div class="preload-panel">
+          <div class="preload-chips" role="group" aria-label={$t("Tracks ahead")}>
+            {#each PRELOAD_DEPTHS as depth (depth)}
+              <button class="preload-chip" class:on={preloadDepth === depth} aria-pressed={preloadDepth === depth} onclick={() => choosePreloadDepth(depth)} aria-label={`${$t("Tracks ahead")}: ${depth}`}>{depth}</button>
+            {/each}
+          </div>
         </div>
         <p class="settings-note">
           {$t("How many tracks after this one are fetched before they are reached, so a tap does not wait on a download. 0 fetches only what is played.")}
