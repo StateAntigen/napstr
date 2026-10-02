@@ -20,6 +20,7 @@
   import SeekIcon from './lib/SeekIcon.svelte';
   import { rateLimitedTask, safePosition, validDuration } from './lib/playback';
   import { AUDIO_FORMATS, BITRATE_CHOICES, activeProfile, fitsProfile, readQuality, writeQuality, type QualityProfile } from './lib/quality';
+  import { PRELOAD_DEPTHS, readPreloadDepth, storePreloadDepth } from './lib/preload';
   import { meteredNow, watchNetwork } from './lib/network';
   import appIcon from '../src-tauri/icons/icon.png';
   import { artworkHue, coverFor, coverKey, invalidateCoverNegatives, loadFullCover, preloadArtwork, type AlbumCover } from './lib/artwork';
@@ -1278,7 +1279,10 @@
     cacheReconciliationPending = true;
     try {
       const complete = await invoke<boolean>('reconcile_audio_cache', {
-        protectedFileIds: playing && activeMedia === 'music' && current ? [current.fileId] : []
+        // What is playing and what has been fetched behind it, which the cache's
+        // own budget pass must never evict: the buffered window is the whole point
+        // of pre-loading.
+        protectedFileIds: protectedForCache()
       });
       if (complete) cacheReconciliationKey = key;
     } catch (nextError) {
@@ -2817,6 +2821,45 @@
     writeQuality(quality);
   }
 
+  /** How many tracks ahead the queue is fetched. Read once; the setting owns it. */
+  let preloadDepth = $state(readPreloadDepth());
+
+  function choosePreloadDepth(depth: number) {
+    preloadDepth = depth;
+    storePreloadDepth(depth);
+  }
+
+  /**
+   * The track `step` places after the one playing, in the order the player will
+   * take them — which is the shuffled order when shuffle is on, because that is
+   * the order the next tap follows.
+   */
+  function upcomingTrack(step: number): RemoteTrack | undefined {
+    if (playerQueue.length === 0) return undefined;
+    if (shuffle) {
+      // A random order only knows one step ahead, so anything deeper than the
+      // first is not known until it is taken.
+      return step === 1 && randomUpcoming >= 0 ? playerQueue[randomUpcoming] : undefined;
+    }
+    const index = playerIndex + step;
+    if (index < playerQueue.length) return playerQueue[index];
+    return loopMode === 'off' ? undefined : playerQueue[index % playerQueue.length];
+  }
+
+  /**
+   * What the audio cache must keep whatever its budget says: the track playing, and
+   * the ones the pre-load has already fetched on its behalf.
+   */
+  function protectedForCache(): string[] {
+    if (!playing || activeMedia !== 'music' || !current) return [];
+    const keep = [current.fileId];
+    for (let step = 1; step <= preloadDepth; step += 1) {
+      const upcoming = upcomingTrack(step);
+      if (upcoming) keep.push(upcoming.fileId);
+    }
+    return keep;
+  }
+
   async function playTrack(track: RemoteTrack, libraryVisible = playerQueueLibraryVisible) {
     if (caching) return;
     const held = holdReason(track);
@@ -2849,19 +2892,29 @@
       // The add sheet offers back what has been played, so the track that just
       // started is the newest thing on that list.
       rememberPlayedTrack(cached.track);
-      const nextIndex = shuffle
-        ? randomUpcoming
-        : playerQueue.length > 1
-          ? (playerIndex + 1 < playerQueue.length ? playerIndex + 1 : loopMode === 'off' ? -1 : 0)
-          : -1;
-      const next = nextIndex >= 0 ? playerQueue[nextIndex] : undefined;
-      if (next?.local && !holdReason(next)) {
+      // The tracks this one will be followed by, in the order they will play,
+      // fetched before they are reached: the one after it first, then the one after
+      // that, up to what Settings says. On this phone keeping warm *is* the computer
+      // fetching the audio, so the depth is also how far ahead of the network the
+      // queue runs.
+      const warmed = new Set<string>([cached.track.fileId]);
+      for (let step = 1; step <= preloadDepth; step += 1) {
+        const upcoming = upcomingTrack(step);
+        // A file no computer holds cannot be prefetched - there is nothing to ask
+        // - and one this connection would hold back is not asked for either, which
+        // is the same rule the track being played went through.
+        if (!upcoming?.local || holdReason(upcoming)) continue;
+        // A short queue that loops comes round to the same file, and one file is one
+        // download: asking twice for it only makes the computer say so twice.
+        if (cachedFileIds.has(upcoming.fileId) || warmed.has(upcoming.fileId)) continue;
+        warmed.add(upcoming.fileId);
         void invoke('prefetch_remote_audio', {
           afterFileId: cached.track.fileId,
-          track: next,
+          track: upcoming,
           libraryVisible
         });
       }
+      const next = upcomingTrack(1);
       // The same track's artwork is asked about and fetched now, so the player
       // has a cover the moment it starts instead of after a round trip. Its
       // full-size picture is fetched as well only when something that draws one
@@ -6491,6 +6544,20 @@
         {#if qualityEditor === 'metered'}{@render qualityPanel('metered')}{/if}
         <p class="settings-note">
           {$t("This phone only asks for files that fit this connection. A track it holds back asks once when you tap it, and your answer lasts until the connection changes.")}
+        </p>
+      </div>
+
+      <!-- Its own section because it is about what happens while nothing is being
+           asked for, which is the opposite of the quality rows above it. -->
+      <div class="settings-section">
+        <p>{$t("Pre-load")}</p>
+        <div class="quality-chips" role="group" aria-label={$t("Tracks ahead")}>
+          {#each PRELOAD_DEPTHS as depth (depth)}
+            <button class:active={preloadDepth === depth} aria-pressed={preloadDepth === depth} onclick={() => choosePreloadDepth(depth)} aria-label={`${$t("Tracks ahead")}: ${depth}`}>{depth}</button>
+          {/each}
+        </div>
+        <p class="settings-note">
+          {$t("How many tracks after this one are fetched before they are reached, so a tap does not wait on a download. 0 fetches only what is played.")}
         </p>
       </div>
 

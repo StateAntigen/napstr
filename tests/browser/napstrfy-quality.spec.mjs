@@ -41,10 +41,10 @@ const profiles = (metered = {}) => ({
   metered: { formats: ['MP3', 'OGG', 'OPUS'], maxBitrateKbps: 0, ...metered }
 });
 
-async function openApp(page, { library = [losslessSong, plainSong], metered = true, cached = [], quality = null } = {}) {
+async function openApp(page, { library = [losslessSong, plainSong], metered = true, cached = [], quality = null, preload = null } = {}) {
   await mockNative(page, { platform: 'android' });
   await page.route('**/fixture.wav', serveAudio);
-  await page.addInitScript(({ library, metered, cached, quality }) => {
+  await page.addInitScript(({ library, metered, cached, quality, preload }) => {
     // The bridge the Android webview adds. `metered` is read on every ask, so a
     // test can move the phone onto another connection mid-run if it wants to.
     window.NapstrfyNetwork = {
@@ -53,18 +53,26 @@ async function openApp(page, { library = [losslessSong, plainSong], metered = tr
     };
     window.cachedLibrary = cached;
     if (quality) window.localStorage.setItem('napstrfy-quality', JSON.stringify(quality));
+    if (preload !== null) window.localStorage.setItem('napstrfy-preload-depth', String(preload));
     const invoke = window.__TAURI_INTERNALS__.invoke;
     window.__TAURI_INTERNALS__.invoke = async (cmd, args = {}) => {
       if (cmd === 'remote_library' && !args.query) return { tracks: library, total: library.length };
       return invoke(cmd, args);
     };
-  }, { library, metered, cached, quality });
+  }, { library, metered, cached, quality, preload });
   await page.goto('http://127.0.0.1:15174');
   await expect(page.locator('.track-row strong')).toHaveText(library.map((item) => item.title));
 }
 
 const play = (page, title) => page.locator('.track-row').filter({ hasText: title }).locator('.track-open').click();
 const callsTo = (page, cmd) => page.evaluate((name) => window.calls.filter((call) => call.cmd === name).length, cmd);
+/** The files the phone asked to have fetched ahead of time, in the order it asked. */
+const preloading = (page) =>
+  page.evaluate(() =>
+    window.calls
+      .filter((call) => call.cmd === 'prefetch_remote_audio')
+      .map((call) => call.args.track.fileId)
+  );
 
 /**
  * Waits until the phone is ready for another track.
@@ -151,6 +159,33 @@ test('Napstrfy does not warm ahead into a track it would hold back', async ({ pa
   await expect.poll(() => callsTo(page, 'cache_remote_audio')).toBe(1);
   // The warm-ahead is asked for once the file being played has landed, so give
   // that moment room to pass before saying it never came.
+  await page.waitForTimeout(500);
+  expect(await callsTo(page, 'prefetch_remote_audio')).toBe(0);
+});
+
+test('the pre-load fetches as many tracks ahead as the setting says', async ({ page }) => {
+  const library = [
+    plainSong,
+    track('e', { title: 'Second' }),
+    track('f', { title: 'Third' }),
+    track('g', { title: 'Fourth' }),
+    track('h', { title: 'Fifth' })
+  ];
+  await openApp(page, { library, preload: 3 });
+  await play(page, 'Small and fine');
+
+  // Three ahead of the one playing, in the order they will be reached and not one
+  // more: the fourth is a page of listening the phone has not committed to yet.
+  const asked = await expect.poll(() => callsTo(page, 'prefetch_remote_audio')).toBe(3).then(() => preloading(page));
+  expect(asked).toEqual([id('e'), id('f'), id('g')]);
+});
+
+test('a pre-load of zero fetches only what is played', async ({ page }) => {
+  await openApp(page, { library: [plainSong, track('e', { title: 'Second' })], preload: 0 });
+  await play(page, 'Small and fine');
+  await expect.poll(() => callsTo(page, 'cache_remote_audio')).toBe(1);
+  // Zero is a choice and not a broken state: the same moment that would have
+  // warmed the next track asks for nothing.
   await page.waitForTimeout(500);
   expect(await callsTo(page, 'prefetch_remote_audio')).toBe(0);
 });

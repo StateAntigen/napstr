@@ -434,7 +434,7 @@ struct MediaServer {
     art_root: PathBuf,
     entries: RwLock<HashMap<String, Arc<MediaEntry>>>,
     prepare_lock: Mutex<()>,
-    scheduled_prefetches: Mutex<HashSet<(String, String)>>,
+    scheduled_prefetches: Mutex<HashSet<String>>,
 }
 
 impl MediaServer {
@@ -2825,7 +2825,7 @@ impl RemoteClient {
 
         let directory = self.app_data.join("audio");
         let mut deferred = false;
-        for item in cached {
+        for item in cached.iter() {
             let file_id = &item.track.file_id;
             if available.contains(file_id) {
                 continue;
@@ -2840,8 +2840,71 @@ impl RemoteClient {
             remove_if_present(&directory.join(format!(".{file_id}.part")))?;
             remove_if_present(&directory.join(format!("{file_id}.json")))?;
         }
+        // And the store has a bound. Without one, what a phone keeps is not "what
+        // it has played" but "what has never been removed": the only eviction was
+        // this loop, which drops files the computer no longer holds. Three tracks
+        // pre-loaded deep on a two-hundred track queue grows this directory for as
+        // long as the queue runs.
+        evict_beyond_budget(&directory, &cached, &protected_file_ids, AUDIO_CACHE_BUDGET_BYTES)?;
         Ok(!deferred)
     }
+}
+
+/// How much audio this phone keeps beyond what it is playing and about to play.
+///
+/// Two gigabytes is roughly a long album's worth of lossless or several hundred
+/// tracks of lossy audio: enough that the cap is never what a person runs into in
+/// a session, and small enough to matter on a phone that is also holding the
+/// system's own storage.
+const AUDIO_CACHE_BUDGET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Drop the least recently used audio until the store is inside its budget.
+///
+/// Least recently used is the sidecar's own timestamp, because `cache_audio`
+/// rewrites it every time a track is played or found already here — so what goes is
+/// what has not been listened to for longest, rather than what arrived first.
+/// Anything the phone names as protected is never a candidate whatever it weighs:
+/// that is what it is playing and what it has queued behind it.
+fn evict_beyond_budget(
+    directory: &Path,
+    cached: &[CachedRemoteAudio],
+    protected_file_ids: &HashSet<String>,
+    budget: u64,
+) -> Result<usize, String> {
+    let mut held = Vec::new();
+    let mut total = 0u64;
+    for item in cached {
+        let file_id = item.track.file_id.clone();
+        let extension = safe_extension(&item.track.format)?;
+        let audio = directory.join(format!("{file_id}.{extension}"));
+        let size = fs::metadata(&audio).map(|data| data.len()).unwrap_or(0);
+        total = total.saturating_add(size);
+        if protected_file_ids.contains(&file_id) {
+            continue;
+        }
+        // An entry with no usable timestamp sorts first, so something this cannot
+        // order is what goes rather than something it keeps for ever.
+        let used = fs::metadata(directory.join(format!("{file_id}.json")))
+            .and_then(|data| data.modified())
+            .ok();
+        held.push((used, file_id, extension, size));
+    }
+    if total <= budget {
+        return Ok(0);
+    }
+    held.sort_by_key(|(used, ..)| *used);
+    let mut evicted = 0;
+    for (_, file_id, extension, size) in held {
+        if total <= budget {
+            break;
+        }
+        remove_if_present(&directory.join(format!("{file_id}.{extension}")))?;
+        remove_if_present(&directory.join(format!(".{file_id}.part")))?;
+        remove_if_present(&directory.join(format!("{file_id}.json")))?;
+        total = total.saturating_sub(size);
+        evicted += 1;
+    }
+    Ok(evicted)
 }
 
 fn cached_entries_in(app_data: &Path) -> Result<Vec<CachedRemoteAudio>, String> {
@@ -3910,7 +3973,10 @@ async fn prefetch_remote_audio(
 ) -> Result<(), String> {
     validate_file_id(&after_file_id)?;
     validate_cache_track(&track)?;
-    let key = (after_file_id.clone(), track.file_id.clone());
+    // Keyed by the file being fetched rather than by what is playing: warming
+    // several tracks ahead means the same target can be asked for from two
+    // different current tracks, and it is still one download.
+    let key = track.file_id.clone();
     if !state
         .media
         .scheduled_prefetches
@@ -5033,6 +5099,85 @@ mod tests {
         fs::write(audio.join(format!("{file_id}.mp3")), b"short").unwrap();
         assert!(cached_entries_in(&root).unwrap().is_empty());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Three cached tracks in a directory of its own, written oldest first so the
+    /// sidecar timestamps are the order they were last listened to in.
+    fn staged_audio_cache(name: &str) -> (PathBuf, Vec<CachedRemoteAudio>) {
+        let root = std::env::temp_dir().join(format!("napstrfy-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let directory = root.join("audio");
+        fs::create_dir_all(&directory).unwrap();
+        let mut cached = Vec::new();
+        for file_id in ["oldest", "middle", "newest"] {
+            let track = RemoteTrack {
+                file_id: file_id.to_string(),
+                filename: format!("{file_id}.mp3"),
+                title: file_id.to_string(),
+                artist: "Napstr".into(),
+                album: String::new(),
+                format: "MP3".into(),
+                mime: "audio/mpeg".into(),
+                size: 100,
+                tags: String::new(),
+                local: true,
+                sources: Vec::new(),
+                bitrate_kbps: 128,
+                sample_rate_hz: 44_100,
+                channels: 2,
+                lossless: false,
+                duration_ms: 0,
+            };
+            fs::write(directory.join(format!("{file_id}.mp3")), vec![0u8; 100]).unwrap();
+            save_json(
+                &directory.join(format!("{file_id}.json")),
+                &CachedRemoteAudio {
+                    track: track.clone(),
+                    library_visible: true,
+                },
+            )
+            .unwrap();
+            // Apart in time, because the eviction order *is* the timestamp.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            cached.push(CachedRemoteAudio {
+                track,
+                library_visible: true,
+            });
+        }
+        (directory, cached)
+    }
+
+    #[test]
+    fn the_audio_cache_drops_what_has_not_been_listened_to_for_longest() {
+        let (directory, cached) = staged_audio_cache("budget");
+        // 300 bytes held, a 250 byte budget: one track goes, and it is the oldest.
+        assert_eq!(
+            evict_beyond_budget(&directory, &cached, &HashSet::new(), 250).unwrap(),
+            1
+        );
+        assert!(!directory.join("oldest.mp3").exists());
+        // The sidecar goes with it: a row without its bytes is a cache that lies.
+        assert!(!directory.join("oldest.json").exists());
+        assert!(directory.join("middle.mp3").exists());
+        assert!(directory.join("newest.mp3").exists());
+        fs::remove_dir_all(directory.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn the_audio_cache_never_evicts_what_the_phone_protects() {
+        let (directory, cached) = staged_audio_cache("protected");
+        // A budget nothing could fit in: the protected track still survives — it is
+        // what the phone is playing or about to play, which is the whole point of
+        // pre-loading — and the rest go oldest first.
+        let protected = HashSet::from(["middle".to_string()]);
+        assert_eq!(
+            evict_beyond_budget(&directory, &cached, &protected, 1).unwrap(),
+            2
+        );
+        assert!(directory.join("middle.mp3").exists());
+        assert!(!directory.join("oldest.mp3").exists());
+        assert!(!directory.join("newest.mp3").exists());
+        fs::remove_dir_all(directory.parent().unwrap()).unwrap();
     }
 
     #[test]
