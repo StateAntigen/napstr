@@ -72,6 +72,15 @@ pub(crate) fn initialise_schema(connection: &Connection) -> Result<(), String> {
              );
              CREATE INDEX IF NOT EXISTS catalogue_seeder_pubkey ON catalogue_seeder(pubkey);
              CREATE INDEX IF NOT EXISTS catalogue_seeder_expiry ON catalogue_seeder(expires_at);
+             -- What the backfill has asked the network about and heard nothing for,
+             -- so a question that keeps being answered with silence cannot hold the
+             -- queue still on the first page of files.
+             CREATE TABLE IF NOT EXISTS catalogue_asked (
+               file_id TEXT PRIMARY KEY,
+               asked_at INTEGER NOT NULL,
+               next_ask INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS catalogue_asked_next ON catalogue_asked(next_ask);
              -- External content: the index holds the words, `remote_catalogue`
              -- holds the rows, and the triggers below keep the two in step.
              CREATE VIRTUAL TABLE IF NOT EXISTS remote_catalogue_fts USING fts5(
@@ -478,10 +487,24 @@ fn partial_search(
 /// asking about.
 ///
 /// This is what keeps a backfill polite: a file somebody is holding is asked about
-/// once, and a file already described is not asked about again — so the question
-/// that is left is only about what is new. Asked as one query rather than as a
-/// lookup per live file, because the live set is the size of the network and what
-/// is wanted from it is small.
+/// once, a file already described is not asked about again, and a file the network
+/// has already said nothing about is left alone for a while. Asked as one query
+/// rather than as a lookup per live file, because the live set is the size of the
+/// network and what is wanted from it is small.
+///
+/// Two of those exclusions are load-bearing rather than tidy:
+///
+/// * **Silence is remembered.** Without it the backfill asked the same fifteen
+///   hundred files every minute and never reached the rest: nothing about a
+///   question that is answered with silence ever changes, and the live set is
+///   bigger than one page. Measured on a real installation: 4,885 files were
+///   never described, four fifths of them by holders that had never announced
+///   them at all, and the count did not move all day.
+/// * **A file this computer holds without having published is never asked about.**
+///   The same rule `network::unpublished_holds` applies to a batch a phone named:
+///   the question names the bytes, and asking would say this computer has them,
+///   which is what not publishing them kept quiet. Reads the main schema's `files`
+///   and `published_catalogue`, which is where that state lives.
 pub(crate) fn undescribed_live_files(
     connection: &Connection,
     now: i64,
@@ -492,6 +515,12 @@ pub(crate) fn undescribed_live_files(
             "SELECT DISTINCT s.file_id FROM catalogue_seeder s
               WHERE s.expires_at > ?1
                 AND NOT EXISTS (SELECT 1 FROM remote_catalogue c WHERE c.file_id = s.file_id)
+                AND NOT EXISTS (SELECT 1 FROM catalogue_asked a
+                                 WHERE a.file_id = s.file_id AND a.next_ask > ?1)
+                AND NOT EXISTS (SELECT 1 FROM files h
+                                 WHERE h.file_id = s.file_id
+                                   AND NOT EXISTS (SELECT 1 FROM published_catalogue p
+                                                    WHERE p.file_id = h.file_id))
               LIMIT ?2",
         )
         .map_err(|error| error.to_string())?;
@@ -504,15 +533,143 @@ pub(crate) fn undescribed_live_files(
         .map_err(|error| error.to_string())
 }
 
+/// Which of these files the catalogue still cannot describe.
+///
+/// Asked of a backfill once it has written what it fetched: what is left is what
+/// the network answered with silence, which is what the cool-off is recorded
+/// against. A file whose announcement came back but was refused counts as silent
+/// too, and rightly so — nothing usable was learned, and asking again in six hours
+/// is a reasonable thing to do about that.
+pub(crate) fn still_undescribed(
+    connection: &Connection,
+    file_ids: &[String],
+) -> Result<Vec<String>, String> {
+    let mut missing = Vec::new();
+    let mut seen = HashSet::new();
+    {
+        let mut statement = connection
+            .prepare("SELECT 1 FROM remote_catalogue WHERE file_id=?1 LIMIT 1")
+            .map_err(|error| error.to_string())?;
+        for file_id in file_ids {
+            let file_id = file_id.trim().to_lowercase();
+            if !is_hash(&file_id) || !seen.insert(file_id.clone()) {
+                continue;
+            }
+            let described = statement
+                .exists(params![file_id])
+                .map_err(|error| error.to_string())?;
+            if !described {
+                missing.push(file_id);
+            }
+        }
+    }
+    Ok(missing)
+}
+
+/// How long a file the network said nothing about is left alone.
+///
+/// Silence is not a verdict the way "no art for this record" is: a seeder can
+/// start announcing a file it was already holding, and a relay that was down can
+/// come back. So the file is asked about again eventually — just not every minute,
+/// which is what made the queue stand still.
+const ASK_AGAIN_AFTER_SECONDS: i64 = 6 * 60 * 60;
+
+/// How long to leave a page alone after the fetch itself failed.
+///
+/// A relay that will not answer is not a reason to ask it again about the same
+/// page on the next pass, which is a minute later. Ten minutes is the lifetime of
+/// a heartbeat, so a blip costs about one heartbeat's worth of delay; a relay that
+/// is unwell gets one question per heartbeat instead of sixty.
+pub(crate) const ASK_AGAIN_AFTER_FAILURE_SECONDS: i64 = 10 * 60;
+
+/// Remember that these files were asked about and nothing usable came back.
+///
+/// Runs inside whatever transaction the caller has open, like the seeder writes.
+/// Returns how many were recorded.
+pub(crate) fn remember_asked(
+    connection: &Connection,
+    file_ids: &[String],
+    now: i64,
+) -> Result<usize, String> {
+    remember_asked_for(connection, file_ids, now, ASK_AGAIN_AFTER_SECONDS)
+}
+
+/// The same, with the wait stated: `cool_off_seconds` until it is asked about again.
+pub(crate) fn remember_asked_for(
+    connection: &Connection,
+    file_ids: &[String],
+    now: i64,
+    cool_off_seconds: i64,
+) -> Result<usize, String> {
+    let mut written = 0;
+    let mut seen = HashSet::new();
+    {
+        let mut statement = connection
+            .prepare(
+                "INSERT INTO catalogue_asked(file_id,asked_at,next_ask) VALUES (?1,?2,?3)
+                 ON CONFLICT(file_id) DO UPDATE SET
+                   asked_at=excluded.asked_at, next_ask=excluded.next_ask",
+            )
+            .map_err(|error| error.to_string())?;
+        for file_id in file_ids {
+            let file_id = file_id.trim().to_lowercase();
+            if !is_hash(&file_id) || !seen.insert(file_id.clone()) {
+                continue;
+            }
+            statement
+                .execute(params![file_id, now, now + cool_off_seconds])
+                .map_err(|error| error.to_string())?;
+            written += 1;
+        }
+    }
+    Ok(written)
+}
+
+/// Forget what was asked about files nobody is holding any more.
+///
+/// The table would otherwise keep an entry for every file the network ever
+/// mentioned, which is a table that only grows to remember something that can no
+/// longer be asked about. A file still being held keeps its place until the
+/// cool-off has passed, so a seeder that was quiet for a while is asked again.
+///
+/// The liveness test is against `now` rather than "does a heartbeat row exist",
+/// so this is right wherever it is called: the worker prunes expired heartbeats in
+/// the same transaction, but a rule that is only true because of the order it runs
+/// in is a rule waiting to be broken.
+pub(crate) fn forget_asked_that_are_gone(
+    connection: &Connection,
+    now: i64,
+) -> Result<usize, String> {
+    connection
+        .execute(
+            "DELETE FROM catalogue_asked
+              WHERE next_ask <= ?1
+                AND NOT EXISTS (SELECT 1 FROM catalogue_seeder s
+                                 WHERE s.file_id = catalogue_asked.file_id
+                                   AND s.expires_at > ?1)",
+            params![now],
+        )
+        .map_err(|error| error.to_string())
+}
+
 /// Forget a file entirely, because somebody asked not to see it again.
 pub(crate) fn forget_file(connection: &Connection, file_id: &str) -> Result<(), String> {
     if !is_hash(file_id) {
         return Ok(());
     }
+    let file_id = file_id.trim().to_lowercase();
     connection
         .execute(
             "DELETE FROM catalogue_seeder WHERE file_id=?1",
-            params![file_id.trim().to_lowercase()],
+            params![file_id],
+        )
+        .map_err(|error| error.to_string())?;
+    // The question it was asked about goes too: a file somebody blocked is not one
+    // to ask after again, whatever the cool-off says.
+    connection
+        .execute(
+            "DELETE FROM catalogue_asked WHERE file_id=?1",
+            params![file_id],
         )
         .map_err(|error| error.to_string())?;
     Ok(())
@@ -556,8 +713,16 @@ pub(crate) fn prune(connection: &Connection, now: i64) -> Result<usize, String> 
 mod tests {
     use super::*;
 
+    /// The catalogue's own tables, plus the two the backfill's question reads:
+    /// `files` and `published_catalogue` belong to the main schema, which is what
+    /// decides whether a file this computer holds is one it has published.
     fn database() -> Connection {
         let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE files (file_id TEXT PRIMARY KEY);",
+            )
+            .unwrap();
         crate::network::initialise_network_schema(&connection).unwrap();
         connection
     }
@@ -847,6 +1012,131 @@ mod tests {
             search(&connection, "midnight", 10, now).unwrap().len(),
             1,
             "the rebuilt index answers again"
+        );
+    }
+
+    #[test]
+    fn a_file_the_network_said_nothing_about_is_left_alone_for_a_while() {
+        // The starvation this exists to stop: a question that keeps being answered
+        // with silence used to ask itself again every minute, so the backfill never
+        // reached anything past the first page of files.
+        let connection = database();
+        let now = 1_700_000_000;
+        announce(&connection, &hex_id(1), 9, "Ghost", "One");
+        holding(&connection, &hex_id(1), 9, now);
+        holding(&connection, &hex_id(2), 9, now);
+
+        let asked = undescribed_live_files(&connection, now, 10).unwrap();
+        assert_eq!(asked, vec![hex_id(2)], "the one nobody has described");
+        // Nothing came back for it, so silence is recorded and the next question
+        // does not include it.
+        assert_eq!(remember_asked(&connection, &asked, now).unwrap(), 1);
+        assert!(undescribed_live_files(&connection, now, 10).unwrap().is_empty());
+        assert_eq!(
+            still_undescribed(&connection, &asked).unwrap(),
+            asked,
+            "and it is what the silence is recorded against"
+        );
+
+        // Long enough later it is worth asking again: a seeder can start announcing
+        // a file it was already holding, and a relay that was down can come back.
+        // The heartbeat has to be live for that to be a question at all, so it is
+        // refreshed the way a seeder that is still there would refresh it.
+        let later = now + ASK_AGAIN_AFTER_SECONDS + 1;
+        holding(&connection, &hex_id(2), 9, later);
+        assert_eq!(
+            undescribed_live_files(&connection, later, 10).unwrap(),
+            vec![hex_id(2)]
+        );
+    }
+
+    #[test]
+    fn a_fetch_that_failed_is_tried_again_within_the_hour_rather_than_every_minute() {
+        // Silence from a relay that answered is worth six hours of not asking; a
+        // fetch that failed outright is worth one heartbeat's worth of waiting, so
+        // an outage recovers without the pass retrying the same page every minute.
+        let connection = database();
+        let now = 1_700_000_000;
+        holding(&connection, &hex_id(2), 9, now);
+        assert_eq!(
+            remember_asked_for(
+                &connection,
+                &[hex_id(2)],
+                now,
+                ASK_AGAIN_AFTER_FAILURE_SECONDS
+            )
+            .unwrap(),
+            1
+        );
+        // The seeder is still there, refreshing its heartbeat as it does.
+        holding(&connection, &hex_id(2), 9, now + 60);
+        assert!(undescribed_live_files(&connection, now + 60, 10)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            undescribed_live_files(&connection, now + ASK_AGAIN_AFTER_FAILURE_SECONDS + 1, 10)
+                .unwrap(),
+            vec![hex_id(2)]
+        );
+    }
+
+    #[test]
+    fn what_was_asked_about_is_forgotten_once_nobody_holds_it() {
+        let connection = database();
+        let now = 1_700_000_000;
+        holding(&connection, &hex_id(2), 9, now);
+        assert_eq!(remember_asked(&connection, &[hex_id(2)], now).unwrap(), 1);
+
+        // A heartbeat lasts ten minutes and the cool-off lasts six hours, so the
+        // two are only ever both true of the same file if the seeder is still
+        // there — which is what refreshing the beat says.
+        let later = now + ASK_AGAIN_AFTER_SECONDS + 1;
+        holding(&connection, &hex_id(2), 9, later);
+        assert_eq!(
+            undescribed_live_files(&connection, later, 10).unwrap(),
+            vec![hex_id(2)],
+            "still being held, so the cool-off is the only thing that held it back"
+        );
+        assert_eq!(
+            forget_asked_that_are_gone(&connection, later).unwrap(),
+            0,
+            "and the question is kept while it is still worth asking"
+        );
+        assert_eq!(rows(&connection, "SELECT COUNT(*) FROM catalogue_asked"), 1);
+
+        // Once the heartbeat has run out nothing can be asked about it at all, so
+        // keeping the question would only be a table that grows.
+        let gone = later + 601;
+        assert_eq!(forget_asked_that_are_gone(&connection, gone).unwrap(), 1);
+        assert_eq!(rows(&connection, "SELECT COUNT(*) FROM catalogue_asked"), 0);
+    }
+
+    #[test]
+    fn a_file_this_computer_holds_without_publishing_is_never_asked_about() {
+        // The rule `network::unpublished_holds` applies to a batch a phone named,
+        // here so the backfill cannot ask a relay about a file this computer has
+        // chosen not to publish: the question names the bytes.
+        let connection = database();
+        let now = 1_700_000_000;
+        holding(&connection, &hex_id(3), 9, now);
+        connection
+            .execute("INSERT INTO files(file_id) VALUES(?1)", params![hex_id(3)])
+            .unwrap();
+        assert!(
+            undescribed_live_files(&connection, now, 10).unwrap().is_empty(),
+            "a file held here and not published is not a fair question"
+        );
+
+        connection
+            .execute(
+                "INSERT INTO published_catalogue(file_id,published_at) VALUES(?1,'now')",
+                params![hex_id(3)],
+            )
+            .unwrap();
+        assert_eq!(
+            undescribed_live_files(&connection, now, 10).unwrap(),
+            vec![hex_id(3)],
+            "once it is published, asking about it says nothing new"
         );
     }
 

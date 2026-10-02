@@ -1441,6 +1441,7 @@ impl NetworkService {
                 )?;
             }
             super::catalogue::prune(&transaction, now)?;
+            super::catalogue::forget_asked_that_are_gone(&transaction, now)?;
             let undescribed = super::catalogue::undescribed_live_files(
                 &transaction,
                 now,
@@ -1452,10 +1453,27 @@ impl NetworkService {
         if undescribed.is_empty() {
             return Ok(());
         }
-        let (events, _) = fetch_catalogue_identifiers(client, &undescribed, None).await?;
-        if events.is_empty() {
-            return Ok(());
-        }
+        let (events, _) = match fetch_catalogue_identifiers(client, &undescribed, None).await {
+            Ok(fetched) => fetched,
+            Err(error) => {
+                // Nothing came back at all, which is silence of a different kind:
+                // leaving no mark would mean asking the same page again on the next
+                // pass, a minute later, for as long as the relay is unwell. Ten
+                // minutes keeps that bounded and still retries promptly.
+                let mut connection = super::open_connection(&self.db_path)?;
+                let transaction = connection
+                    .transaction()
+                    .map_err(|error| error.to_string())?;
+                super::catalogue::remember_asked_for(
+                    &transaction,
+                    &undescribed,
+                    now,
+                    super::catalogue::ASK_AGAIN_AFTER_FAILURE_SECONDS,
+                )?;
+                transaction.commit().map_err(|error| error.to_string())?;
+                return Err(error);
+            }
+        };
         let mut connection = super::open_connection(&self.db_path)?;
         let blocked_files = load_blocked_values(&connection, "blocked_files", "file_id")?;
         let blocked_pubkeys = load_blocked_values(&connection, "blocked_pubkeys", "pubkey")?;
@@ -1510,6 +1528,14 @@ impl NetworkService {
                 },
             )?;
         }
+        // Whatever is still not described was answered with silence, and is left
+        // alone for a while. Without this the question asks itself again every
+        // minute: nothing about a question that keeps being answered with silence
+        // ever changes, so the backfill never reached anything past its first page
+        // of files — measured on a real installation, four fifths of the live set
+        // was never described and the count did not move all day.
+        let silent = super::catalogue::still_undescribed(&transaction, &undescribed)?;
+        super::catalogue::remember_asked(&transaction, &silent, now)?;
         transaction.commit().map_err(|error| error.to_string())?;
         Ok(())
     }
