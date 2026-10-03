@@ -1284,6 +1284,55 @@
     cachedFileIds = new Set(cachedFileIds).add(fileId);
   }
 
+  /**
+   * Replace every copy of a track with the record of it this computer now holds.
+   *
+   * A queue, a search result and the network's own list each remember the row they
+   * were built from, and that row says `local: false` - which was true when it was
+   * made and is a lie the moment the bytes land. Every copy has to be told, because
+   * everything downstream of the old one is wrong in the same direction: the badge
+   * says the file is on somebody else's computer, the pre-load will not warm a file
+   * nobody here is thought to hold, and asking for its turn tries to fetch it from
+   * the network a second time - which the computer refuses, because it is holding
+   * it, and the player then waits for a download that will never start.
+   */
+  function adoptLocalTrack(local: RemoteTrack) {
+    const swap = (item: RemoteTrack) => (item.fileId === local.fileId ? local : item);
+    tracks = tracks.map(swap);
+    playerQueue = playerQueue.map(swap);
+    discoverTracks = discoverTracks.map(swap);
+    likedMusic = likedMusic.map(swap);
+    if (selected?.fileId === local.fileId) selected = local;
+  }
+
+  /**
+   * Take a file this computer already holds over Iroh, and play it if its turn was
+   * what asked for it at all.
+   *
+   * This is the way out of asking for a download that will never happen: the row in
+   * hand was made before the computer had the file, so the record is read again,
+   * every copy of the old one is replaced, and the wait ends here rather than in a
+   * loop of asks.
+   */
+  async function adoptHeldTrack(track: RemoteTrack, libraryVisible: boolean) {
+    try {
+      const rows = await invoke<RemoteTrack[]>('remote_library_by_ids', { fileIds: [track.fileId] });
+      const local = rows.find((item) => item.fileId === track.fileId && item.local);
+      if (!local) return;
+      adoptLocalTrack(local);
+      if (playingWhenReady.delete(local.fileId)) {
+        if (!playing) caching = false;
+        void activateTrack(local, true);
+        return;
+      }
+      // Not a turn anybody is waiting on: taken over before it is needed, which is
+      // the whole point of the pre-load.
+      queuePrefetch(local, local.fileId, libraryVisible);
+    } catch {
+      // Whatever the reason, the next play asks again.
+    }
+  }
+
   async function reconcileAudioCache() {
     if (!status.connected || cacheReconciliationPending) return;
     const key = `${status.endpointId}:${status.libraryRevision}`;
@@ -2830,8 +2879,12 @@
     if (!track.local) {
       playingWhenReady.add(track.fileId);
       // Asked for, not waited on: the computer's answer is only "queued", and this
-      // handler must stay free to warm the queue and to notice it landing.
-      void requestDownload(track);
+      // handler must stay free to warm the queue and to notice it landing. A file
+      // the computer turns out to be holding already is taken over Iroh instead -
+      // waiting for a download it will never start is what left the player stuck.
+      void requestDownload(track).then((outcome) => {
+        if (outcome === 'held') void adoptHeldTrack(track, playerQueueLibraryVisible);
+      });
       // The wait for the bytes is not a freeze on the queue: what follows is warmed
       // exactly as it would be behind a track that was already here.
       warmUpcoming(track.fileId, playerQueueLibraryVisible);
@@ -3083,8 +3136,11 @@
       // the fetch is - and starts the moment the bytes land.
       playingWhenReady.add(track.fileId);
       // Asked for, not waited on: the computer's answer is only "queued", and this
-      // handler must stay free to warm the queue and to notice it landing.
-      void requestDownload(track);
+      // handler must stay free to warm the queue and to notice it landing. A file
+      // the computer turns out to be holding already is taken over Iroh instead.
+      void requestDownload(track).then((outcome) => {
+        if (outcome === 'held') void adoptHeldTrack(track, libraryVisible);
+      });
       // The fetch is the wait, but the queue is not frozen by it: what follows is
       // warmed exactly as it would be behind a track that was already here.
       warmUpcoming(track.fileId, libraryVisible);
@@ -3135,16 +3191,24 @@
     return `${title} [${book.audiobookId.slice(0, 8)}]`;
   }
 
+  /**
+   * Ask the computer to fetch a file from the network.
+   *
+   * Answers with what happened, because the caller has to tell three cases apart:
+   * a download is on its way, the computer is *already* holding the file (this
+   * phone's copy of the row is simply out of date), or it refused for some other
+   * reason.
+   */
   async function requestDownload(
     track: RemoteTrack,
     destinationFolder: string | null = null,
     audiobookId: string | null = null
-  ) {
+  ): Promise<'queued' | 'held' | 'refused'> {
     if (status.streamOnly) {
       error = 'This pairing is read only. It cannot ask Napstr to download songs.';
-      return;
+      return 'refused';
     }
-    if (pending.has(track.fileId)) return;
+    if (pending.has(track.fileId)) return 'queued';
     pending = new Map(pending).set(track.fileId, track.filename);
     if (audiobookId) pendingAudiobooks = new Map(pendingAudiobooks).set(track.fileId, audiobookId);
     error = '';
@@ -3156,6 +3220,7 @@
       });
       notice = `Napstr is downloading ${title(track)} over Tor`;
       await refreshTransfers();
+      return 'queued';
     } catch (nextError) {
       const next = new Map(pending);
       next.delete(track.fileId);
@@ -3163,7 +3228,12 @@
       const nextAudiobooks = new Map(pendingAudiobooks);
       nextAudiobooks.delete(track.fileId);
       pendingAudiobooks = nextAudiobooks;
-      error = String(nextError);
+      const message = String(nextError);
+      // The computer is holding it, so this is not a failure: the row in hand is
+      // stale and the file has only to be taken over Iroh.
+      if (/already on this computer/i.test(message)) return 'held';
+      error = message;
+      return 'refused';
     }
   }
 
@@ -3171,6 +3241,18 @@
     if (!status.connected || status.streamOnly || pending.size === 0) return;
     try {
       transfers = await invoke<RemoteTransfer[]>('remote_transfers');
+      // One exact question for everything being waited on, rather than a filename
+      // search per file: by id the answer either has the file or does not, and the
+      // row it gives is the one that says the computer holds it.
+      const wanted = [...pending.keys()].filter((fileId) => !pendingAudiobooks.has(fileId));
+      let known: RemoteTrack[] = [];
+      if (wanted.length > 0) {
+        try {
+          known = await invoke<RemoteTrack[]>('remote_library_by_ids', { fileIds: wanted });
+        } catch {
+          // The next poll asks again; a transfer that has landed is not lost by it.
+        }
+      }
       for (const fileId of [...pending]) {
         const [pendingFileId, pendingFilename] = fileId;
         const transfer = transfers.find((item) => item.fileId === pendingFileId);
@@ -3189,8 +3271,6 @@
           continue;
         }
         if (transfer && transfer.progress < 100 && !/complete|verified/i.test(transfer.status)) continue;
-        const original = tracks.find((item) => item.fileId === pendingFileId)
-          ?? selectedAudiobook?.chapters.find((item) => item.fileId === pendingFileId);
         const audiobookId = pendingAudiobooks.get(pendingFileId);
         let local: RemoteTrack | undefined;
         if (audiobookId) {
@@ -3198,20 +3278,20 @@
           local = refreshed.chapters.find((item) => item.fileId === pendingFileId && item.local);
           if (selectedAudiobook?.audiobookId === audiobookId) selectedAudiobook = refreshed;
         } else {
-          const page = await invoke<LibraryPage>('remote_library', { query: original?.filename || transfer?.filename || pendingFilename, offset: 0, limit: 20 });
-          local = page.tracks.find((item) => item.fileId === pendingFileId);
+          local = known.find((item) => item.fileId === pendingFileId);
         }
         if (!local) continue;
-        tracks = tracks.map((item) => item.fileId === pendingFileId ? local : item);
+        // Every copy of the row the queue and the lists were built from, not only
+        // the library's: a queue entry that still says the file is elsewhere asks
+        // for it again when its turn comes.
+        adoptLocalTrack(local);
         if (selectedAudiobook) selectedAudiobook = {
           ...selectedAudiobook,
           chapters: selectedAudiobook.chapters.map((chapter) => chapter.fileId === pendingFileId ? local : chapter)
         };
         if (likedMusic.some((item) => item.fileId === pendingFileId)) {
-          likedMusic = likedMusic.map((item) => item.fileId === pendingFileId ? local : item);
           saveLikes(likedMusicKey, likedMusic);
         }
-        if (selected?.fileId === pendingFileId) selected = local;
         const next = new Map(pending);
         next.delete(pendingFileId);
         pending = next;

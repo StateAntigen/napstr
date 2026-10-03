@@ -41,10 +41,10 @@ const elsewhere = (letter, title) => ({
 const away = elsewhere('c', 'Sharp Dressed Man');
 const furtherAway = elsewhere('d', 'Legs');
 
-async function openApp(page, { library = [first, second], results = [found], fetching = null } = {}) {
+async function openApp(page, { library = [first, second], results = [found], fetching = null, holds = null } = {}) {
   await mockNative(page, { platform: 'android' });
   await page.route('**/fixture.wav', serveAudio);
-  await page.addInitScript(({ library, results, fetching }) => {
+  await page.addInitScript(({ library, results, fetching, holds }) => {
     window.remoteLibrary = library;
     // The answers a search gives, which a spec rewrites while the app is running
     // when it wants a file to change hands - the mock reads them at every call.
@@ -52,21 +52,23 @@ async function openApp(page, { library = [first, second], results = [found], fet
     // The one download the computer is running, in the same mutable shape: the
     // fetch a queued track is waiting for is moved along by the test that made it.
     window.fetching = fetching;
+    // A file the computer already holds, as its own record of it: asking to
+    // download one is refused, exactly as the real computer refuses it.
+    window.holds = holds;
     const invoke = window.__TAURI_INTERNALS__.invoke;
     window.__TAURI_INTERNALS__.invoke = async (cmd, args = {}) => {
+      if (cmd === 'remote_download' && window.holds) {
+        // Asked of the mock first, so the call is recorded as every other one is,
+        // and then refused the way the computer refuses it.
+        await invoke(cmd, args).catch(() => {});
+        throw 'this audio is already on this computer; play it locally';
+      }
+      if (cmd === 'remote_library_by_ids' && window.holds) return window.holds;
       // A search answers at once: what is being looked at is the menu a result
       // offers, not the search itself.
       if (cmd === 'remote_search') return window.searchResults;
       if (cmd === 'remote_library' && args.query) {
         return { tracks: window.searchResults, total: window.searchResults.length };
-      }
-      if (cmd === 'remote_download') {
-        // Recorded here as well as in `calls`, because the transfer list below is
-        // derived from it: a real host lists what it is fetching, and a mock that
-        // answered with somebody else's row would make the phone believe a file had
-        // already arrived.
-        window.asked = [...(window.asked ?? []), args.fileId];
-        return invoke(cmd, args);
       }
       if (cmd === 'remote_transfers') {
         return (window.asked ?? [])
@@ -81,9 +83,17 @@ async function openApp(page, { library = [first, second], results = [found], fet
             destination: ''
           }));
       }
+      if (cmd === 'remote_download') {
+        // Recorded here as well as in `calls`, because the transfer list below is
+        // derived from it: a real host lists what it is fetching, and a mock that
+        // answered with somebody else's row would make the phone believe a file had
+        // already arrived.
+        window.asked = [...(window.asked ?? []), args.fileId];
+        return invoke(cmd, args);
+      }
       return invoke(cmd, args);
     };
-  }, { library, results, fetching });
+  }, { library, results, fetching, holds });
   await page.goto('http://127.0.0.1:15174');
 }
 
@@ -163,6 +173,24 @@ test('a track already in the playlist is not queued twice', async ({ page }) => 
   await expect(page.locator('.toast')).toContainText('Gimme All Your Lovin');
   await openQueue(page);
   await expect(queueRows(page)).toHaveCount(2);
+});
+
+test('a queued track the computer already holds plays instead of asking again', async ({ page }) => {
+  // The row was made when nobody here had the file and the computer does now, so
+  // asking to download it is refused with "already on this computer". Waiting for
+  // the download that refusal describes is a player stuck for ever - which is what
+  // a turn of a queued network track did instead of playing it.
+  const held = { ...away, local: true, sources: [] };
+  await openApp(page, { library: [held], results: [{ ...away }], holds: [held] });
+  await addFoundTrack(page, away);
+
+  await expect.poll(() => audioPaused(page)).toBe(false);
+  // The refusal is not something to report: the file is taken over Iroh and plays.
+  await expect(page.locator('.error-banner')).toHaveCount(0);
+  const asked = await page.evaluate(() =>
+    window.calls.filter((call) => call.cmd === 'remote_download').length
+  );
+  expect(asked).toBe(1);
 });
 
 test('the row is not offered while the computer is the one playing', async ({ page }) => {
