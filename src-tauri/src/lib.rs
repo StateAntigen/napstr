@@ -1296,6 +1296,175 @@ fn run_index_job(
     result
 }
 
+/// Whether the index already holds this path at this size and time.
+///
+/// The walk asks the same question of every file it meets, and it is worth asking
+/// here for a different reason: a single write produces two or three watcher events,
+/// so without it a saved tag or a finished download would be hashed three times.
+fn index_entry_is_current(
+    connection: &Connection,
+    path: &Path,
+    size: u64,
+    modified: i64,
+) -> Result<bool, String> {
+    if modified == 0 {
+        return Ok(false);
+    }
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM files WHERE path=?1 AND size=?2 AND modified_ns=?3)",
+            params![path.to_string_lossy(), size as i64, modified],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())
+}
+
+/// Index exactly these paths, and return the rows that changed.
+///
+/// This is the walk's per-file work, aimed: a stat and, if the file is new or has
+/// moved, one hash. What it avoids is the stat for every *other* file in the
+/// library - which on a network share is where a full walk spends its time, and
+/// what made a downloaded track wait a minute to become visible to a phone.
+///
+/// A path that is no longer there loses its row, because a row for a file that has
+/// gone is a row that lies about what this computer can serve. That counts as a
+/// change, so the catalogue is published again and the withdrawal travels.
+fn index_given_paths(
+    connection: &mut Connection,
+    folder: &Path,
+    paths: &[PathBuf],
+    report: &mut IndexReport,
+) -> Result<Vec<SharedFile>, String> {
+    let mut verified: Vec<VerifiedIndexFile> = Vec::new();
+    let mut vanished = Vec::new();
+    for path in paths {
+        if !supported_audio_path(path) {
+            continue;
+        }
+        match fs::metadata(path) {
+            Ok(metadata) if metadata.is_file() => {
+                let modified = modified_ns(&metadata);
+                if index_entry_is_current(connection, path, metadata.len(), modified)? {
+                    continue;
+                }
+                match validate_and_hash_index_file(path, modified) {
+                    Ok(file) => verified.push(file),
+                    Err(error) => {
+                        record_index_error(report, format!("{}: {error}", path.display()));
+                    }
+                }
+            }
+            _ => vanished.push(path.to_string_lossy().into_owned()),
+        }
+    }
+    // The walk's own batch commit writes the rows, and reads the `napstr_seen` table
+    // the walk keeps for its final sweep of files that have gone. This is a sweep of
+    // its own, so the table has to exist for the batch to write through it.
+    connection
+        .execute(
+            "CREATE TEMP TABLE IF NOT EXISTS napstr_seen(file_id TEXT PRIMARY KEY)",
+            [],
+        )
+        .map_err(|error| error.to_string())?;
+    let mut changed = commit_index_batch(connection, folder, &mut verified, report)?;
+    for path in vanished {
+        let removed = connection
+            .execute("DELETE FROM files WHERE path=?1", [&path])
+            .map_err(|error| error.to_string())?;
+        if removed > 0 {
+            report.changed_files += removed;
+        }
+    }
+    changed.sort_by(|left, right| left.file_id.cmp(&right.file_id));
+    Ok(changed)
+}
+
+/// What one burst of folder changes asks for.
+#[derive(Debug, PartialEq, Eq)]
+enum IndexScope {
+    /// A handful of files changed, and these are they.
+    Paths(Vec<PathBuf>),
+    /// Too much changed to name - a folder moved, a tree copied, or a burst so
+    /// large that walking the library is cheaper than asking about each path.
+    WholeFolder,
+}
+
+/// Rows one burst may name before the whole folder is walked instead.
+const INDEX_MAX_PATHS_PER_BURST: usize = 200;
+
+/// Whether a burst can be answered by name, and with what.
+///
+/// Anything that is not an audio file this index would hold ends the question: a
+/// folder has changed, and only a walk can say what is under it now. That rule is
+/// also why there is no `is_dir` call here - each one is a stat, this runs on a
+/// network share, and a folder is never named `track.mp3`.
+fn index_scope(events: &[notify::Event]) -> IndexScope {
+    let mut paths = Vec::new();
+    for event in events {
+        if matches!(event.kind, EventKind::Access(_)) {
+            continue;
+        }
+        for path in &event.paths {
+            if !supported_audio_path(path) {
+                return IndexScope::WholeFolder;
+            }
+            paths.push(path.clone());
+        }
+        if paths.len() > INDEX_MAX_PATHS_PER_BURST {
+            return IndexScope::WholeFolder;
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    if paths.is_empty() {
+        return IndexScope::WholeFolder;
+    }
+    IndexScope::Paths(paths)
+}
+
+/// Index what a burst of folder changes named, now.
+///
+/// The event already says where the change is, so the library is not asked. This is
+/// what makes a downloaded track appear in this computer's index - and so on a
+/// paired phone - in the moment the bytes land rather than at the end of a walk.
+fn run_path_index_job(
+    db_path: &Path,
+    folder: &Path,
+    paths: &[PathBuf],
+    app_handle: &tauri::AppHandle,
+    network: &Arc<network::NetworkService>,
+    covers: &Arc<cover_publish::CoverPublisher>,
+) -> Result<IndexReport, String> {
+    let mut connection = open_connection(db_path)?;
+    let mut report = IndexReport {
+        file_count: 0,
+        total_bytes: 0,
+        errors: Vec::new(),
+        error_count: 0,
+        changed_files: 0,
+    };
+    let changed = index_given_paths(&mut connection, folder, paths, &mut report)?;
+    if !changed.is_empty() {
+        let file_ids: Vec<String> = changed.iter().map(|file| file.file_id.clone()).collect();
+        let _ = app_handle.emit(
+            INDEX_BATCH_EVENT,
+            IndexBatch {
+                files: changed,
+                file_count: report.file_count,
+                total_bytes: report.total_bytes,
+            },
+        );
+        network.queue_catalogue_files(file_ids);
+    }
+    if report.changed_files > 0 {
+        let _ = app_handle.emit(LIBRARY_CHANGED_EVENT, report.clone());
+        network.queue_catalogue_publish(false);
+        // New music means albums the cover worker has never seen.
+        covers.nudge();
+    }
+    Ok(report)
+}
+
 fn start_folder_watcher(
     folder: PathBuf,
     db_path: PathBuf,
@@ -1321,17 +1490,45 @@ fn start_folder_watcher(
                 if matches!(event.kind, EventKind::Access(_)) {
                     continue;
                 }
+                // Everything that arrives while the disk is still busy is one
+                // change, whatever it looks like: a download writes its temporary
+                // file, renames it and closes it, and three events about one track
+                // are three jobs nobody asked for.
                 std::thread::sleep(std::time::Duration::from_millis(750));
-                while event_rx.try_recv().is_ok() {}
-                let _ = run_index_job(
-                    &db_path,
-                    &folder,
-                    &scan_lock,
-                    &scan_cancel,
-                    &app_handle,
-                    &network,
-                    &covers,
-                );
+                let mut burst = vec![event];
+                while let Ok(next) = event_rx.try_recv() {
+                    if let Ok(next) = next {
+                        burst.push(next);
+                    }
+                }
+                if burst.is_empty() {
+                    continue;
+                }
+                // One file is one stat and one hash; everything the library is not
+                // asked about is a stat saved, and over a share that is the whole
+                // cost of the walk.
+                let outcome = match index_scope(&burst) {
+                    IndexScope::Paths(paths) => run_path_index_job(
+                        &db_path,
+                        &folder,
+                        &paths,
+                        &app_handle,
+                        &network,
+                        &covers,
+                    ),
+                    IndexScope::WholeFolder => run_index_job(
+                        &db_path,
+                        &folder,
+                        &scan_lock,
+                        &scan_cancel,
+                        &app_handle,
+                        &network,
+                        &covers,
+                    ),
+                };
+                if let Err(error) = outcome {
+                    eprintln!("The Napstr folder changed but could not be indexed: {error}");
+                }
             }
         })
         .map_err(|error| error.to_string())?;
@@ -2906,6 +3103,112 @@ mod tests {
         assert!(again[0].lossless);
         drop(connection);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A named path is indexed without the library being walked.
+    ///
+    /// This is the state a finished download leaves: the file is on disk and the
+    /// index has never been told. What it must not do is ask about every other file
+    /// in the library, which on a share is the whole cost of the walk - and the
+    /// phone waiting for the row is what made a download look stuck.
+    #[test]
+    fn a_named_path_is_indexed_without_walking_the_library() {
+        let directory = test_directory("named-path-index-test");
+        let child = directory.join("artist/album");
+        fs::create_dir_all(&child).unwrap();
+        let audio = child.join("track.wav");
+        let mut bytes = b"RIFF".to_vec();
+        bytes.extend_from_slice(&40u32.to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt \x10\0\0\0\x01\0\x01\0\x44\xac\0\0\x88\x58\x01\0\x02\0\x10\0data\x04\0\0\0song");
+        fs::write(&audio, bytes).unwrap();
+        let db_path = directory.join("napstr.sqlite3");
+        initialise_database(&db_path, &directory).unwrap();
+        let mut connection = open_connection(&db_path).unwrap();
+        let blank = || IndexReport {
+            file_count: 0,
+            total_bytes: 0,
+            errors: Vec::new(),
+            error_count: 0,
+            changed_files: 0,
+        };
+        assert_eq!(load_files(&connection, None).unwrap().len(), 0);
+
+        let mut report = blank();
+        let changed = index_given_paths(
+            &mut connection,
+            &directory,
+            std::slice::from_ref(&audio),
+            &mut report,
+        )
+        .unwrap();
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].folder, "artist/album");
+        assert_eq!(report.changed_files, 1);
+        assert_eq!(load_files(&connection, None).unwrap().len(), 1);
+
+        // A second event about a file that has not moved is not a second hash, and
+        // not a change: one write is two or three events.
+        let mut repeated = blank();
+        let again = index_given_paths(
+            &mut connection,
+            &directory,
+            std::slice::from_ref(&audio),
+            &mut repeated,
+        )
+        .unwrap();
+        assert!(again.is_empty());
+        assert_eq!(repeated.changed_files, 0);
+
+        // A path that has gone takes its row with it, counted as a change so the
+        // catalogue is published again and the withdrawal travels.
+        fs::remove_file(&audio).unwrap();
+        let mut gone = blank();
+        index_given_paths(
+            &mut connection,
+            &directory,
+            std::slice::from_ref(&audio),
+            &mut gone,
+        )
+        .unwrap();
+        assert_eq!(gone.changed_files, 1);
+        assert_eq!(load_files(&connection, None).unwrap().len(), 0);
+        drop(connection);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A burst of files is answered by name, and anything else by walking.
+    #[test]
+    fn a_burst_of_files_is_indexed_by_name_and_nothing_else() {
+        let modify = || {
+            notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
+                .add_path(PathBuf::from("/music/artist/track.mp3"))
+        };
+        match index_scope(&[modify()]) {
+            IndexScope::Paths(paths) => {
+                assert_eq!(paths, vec![PathBuf::from("/music/artist/track.mp3")])
+            }
+            IndexScope::WholeFolder => panic!("one audio file is a path, not a walk"),
+        }
+        // The same file named twice - which is what one write looks like - is one.
+        match index_scope(&[modify(), modify()]) {
+            IndexScope::Paths(paths) => assert_eq!(paths.len(), 1),
+            IndexScope::WholeFolder => panic!("two events about one file are one path"),
+        }
+        // A picture is not this index's business, and means a folder has changed.
+        let image = notify::Event::new(EventKind::Create(notify::event::CreateKind::File))
+            .add_path(PathBuf::from("/music/artist/cover.jpg"));
+        assert_eq!(index_scope(&[image]), IndexScope::WholeFolder);
+        let folder = notify::Event::new(EventKind::Create(notify::event::CreateKind::Folder))
+            .add_path(PathBuf::from("/music/artist/album"));
+        assert_eq!(index_scope(&[folder]), IndexScope::WholeFolder);
+        // And a burst too large to ask about one at a time is a walk.
+        let many = (0..=INDEX_MAX_PATHS_PER_BURST)
+            .map(|index| {
+                notify::Event::new(EventKind::Create(notify::event::CreateKind::File))
+                    .add_path(PathBuf::from(format!("/music/track-{index}.mp3")))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(index_scope(&many), IndexScope::WholeFolder);
     }
 
     #[test]
