@@ -104,6 +104,25 @@
    * limit is the frame's, not the list's.
    */
   const DISCOVER_LIST_SIZE = 100;
+  /**
+   * The file types the network's list is allowed to offer, for now.
+   *
+   * The list is drawn from everything alive out there, and most of it is not what
+   * this phone holds: a fetch of a large lossless file is minutes of somebody
+   * else's bandwidth for music that then has to come over Iroh as well. A constant
+   * rather than a setting, because this is "for now" and a setting is a promise to
+   * keep it.
+   */
+  const DISCOVER_FORMATS = ['MP3'];
+  /**
+   * Rows asked for at most while filling the list.
+   *
+   * The format filter is applied as pages arrive, so a list of nothing but MP3 has
+   * to look further down the network's list than the length it is filling to. Six
+   * pages is the same order of asking as before, with room for the filter to
+   * matter, and it stops the asking even when almost nothing out there matches.
+   */
+  const DISCOVER_FETCH_LIMIT = DISCOVER_PAGE * 6;
   /** Mirrors `MAX_PLAYLIST_PAGE` on the host: the most members one answer carries. */
   const PLAYLIST_PAGE = 100;
   /** Mirrors `MAX_PLAYLIST_MEMBERS`: the spec's limit on a playlist's members. */
@@ -1494,6 +1513,21 @@
   /** How long the list is to be filled to, which the button below it raises. */
   let discoverWanted = $state(DISCOVER_LIST_SIZE);
 
+  /** Whether the network's list may offer this file. */
+  function isDiscoverable(track: RemoteTrack) {
+    return DISCOVER_FORMATS.includes((track.format ?? '').toUpperCase());
+  }
+
+  /**
+   * The list as the screen draws it.
+   *
+   * Filtered rather than asked for filtered: the computer's own list is the
+   * network's, and what a particular phone wants to see of it is the phone's
+   * business. The label above the list still says how many the network has, which
+   * is what it claims to say.
+   */
+  let discoverRows = $derived(discoverTracks.filter(isDiscoverable));
+
   /**
    * One page of that list, from the computer that keeps the mirror.
    *
@@ -1510,8 +1544,10 @@
     try {
       // One page is what fits in a control frame, so a long list is this many
       // pages of it rather than one fat answer. The loop stops when the computer
-      // says there is nothing after the page it just sent.
-      while (discoverTracks.length < wanted) {
+      // says there is nothing after the page it just sent, and again once it has
+      // been asked for as many rows as it is worth asking for - the format filter
+      // means a page can be mostly rows this phone will not draw.
+      while (shownDiscoverRows() < wanted && discoverTracks.length < DISCOVER_FETCH_LIMIT) {
         const page = await invoke<{ tracks: RemoteTrack[]; total: number }>('remote_discover', {
           mode: 'mostSeeded',
           seed: networkDiscoverSeed,
@@ -1533,6 +1569,11 @@
     }
   }
 
+  /** How many rows of the network's list this screen would draw right now. */
+  function shownDiscoverRows(): number {
+    return discoverTracks.filter(isDiscoverable).length;
+  }
+
   /**
    * Start the network's list as the queue, from `start`.
    *
@@ -1544,29 +1585,50 @@
    * between each pair is the runway - about four minutes of listening while the
    * next one is fetched - and the pre-load depth is what starts the asks early
    * enough to use it.
+   *
+   * `leadOwned` puts one of those tracks in front as well, because Play all is a
+   * press that expects to make a sound: without it the first thing heard is the
+   * first thing fetched, which is minutes away. Tapping a row does not, because a
+   * tap on a row means that row.
    */
-  function runDiscover(start: number) {
-    if (discoverTracks.length === 0) return;
-    const first = discoverTracks[Math.min(Math.max(start, 0), discoverTracks.length - 1)];
-    playerQueue = withOwnRunway(discoverTracks);
+  function runDiscover(start: number, leadOwned = false) {
+    const list = discoverRows;
+    if (list.length === 0) return;
+    const first = list[Math.min(Math.max(start, 0), list.length - 1)];
+    const lead = leadOwned ? randomOwnedTrack(list) : null;
+    playerQueue = [...(lead ? [lead] : []), ...withOwnRunway(list, lead ? [lead] : [])];
     // The queue is this phone's own list rather than the library, and the flag is
     // what the computer caches the audio by - so it says which of the two this is.
     playerQueueLibraryVisible = true;
-    playerIndex = playerQueue.findIndex((item) => item.fileId === first.fileId);
+    playerIndex = playerQueue.findIndex((item) => item.fileId === (lead ?? first).fileId);
     resetRandomOrder();
     // The queue was built here, so it is kept: a track that has to be fetched must
     // not lose the list it is part of when its bytes land.
-    void activateTrack(first, true);
+    void activateTrack(playerQueue[Math.max(0, playerIndex)], true);
   }
 
   /** Play the list from its first row, which is the one the computer ranked highest. */
   function playDiscover() {
-    runDiscover(0);
+    runDiscover(0, true);
   }
 
   /** A row of the list is somebody choosing where in the list to start listening. */
   function openDiscoverRow(track: RemoteTrack) {
-    runDiscover(discoverTracks.findIndex((item) => item.fileId === track.fileId));
+    runDiscover(discoverRows.findIndex((item) => item.fileId === track.fileId));
+  }
+
+  /**
+   * A track of this phone's own that this run does not already name, or nothing.
+   *
+   * Random so that a run does not always open with the same record, and taken from
+   * what is actually here: a file the computer holds but this phone does not would
+   * be a fetch, which is the thing being avoided.
+   */
+  function randomOwnedTrack(run: RemoteTrack[]): RemoteTrack | null {
+    const named = new Set(run.map((track) => track.fileId));
+    const spare = tracks.filter((track) => track.local && !named.has(track.fileId));
+    if (spare.length === 0) return null;
+    return spare[Math.floor(Math.random() * spare.length)];
   }
 
   /**
@@ -1579,12 +1641,15 @@
    * did not merely run out of fillers: it lost the whole queue, and the drawer
    * could not be opened at all.
    *
+   * `exclude` is a track already placed elsewhere - the one a Play all put in front
+   * of the run - so it is not placed twice.
+   *
    * Nothing is invented when there is nothing to spare: a library with no tracks
    * left over leaves the rest of the run network-to-network, and the waits are the
    * waits.
    */
-  function withOwnRunway(discovery: RemoteTrack[]): RemoteTrack[] {
-    const taken = new Set(discovery.map((track) => track.fileId));
+  function withOwnRunway(discovery: RemoteTrack[], exclude: RemoteTrack[] = []): RemoteTrack[] {
+    const taken = new Set([...discovery, ...exclude].map((track) => track.fileId));
     const owned = tracks.filter((track) => track.local && !taken.has(track.fileId));
     // Shuffled, so a long run is not filled by the same handful of records - and
     // properly, rather than by sorting on a coin toss.
@@ -5924,11 +5989,11 @@
               <button class="discover-play" onclick={playDiscover} disabled={status.streamOnly}>{$t("Play all")}</button>
             </div>
             <section class="track-list" role="list" aria-label={$t("Discover")} aria-busy={discoverLoading}>
-              {#each discoverTracks as track (track.fileId)}
+              {#each discoverRows as track (track.fileId)}
                 {@render trackRow(track, openDiscoverRow)}
               {/each}
-              {#if discoverTracks.length < discoverTotal}
-                <button class="load-more" onclick={() => void loadDiscover(discoverWanted + DISCOVER_LIST_SIZE)} disabled={discoverLoading}>{discoverLoading ? 'Loading…' : `Load more · ${discoverTracks.length} of ${discoverTotal}`}</button>
+              {#if shownDiscoverRows() < discoverTotal}
+                <button class="load-more" onclick={() => void loadDiscover(discoverWanted + DISCOVER_LIST_SIZE)} disabled={discoverLoading}>{discoverLoading ? 'Loading…' : `Load more · ${shownDiscoverRows()} of ${discoverTotal}`}</button>
               {/if}
             </section>
           {/if}

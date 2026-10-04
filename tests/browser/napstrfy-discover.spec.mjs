@@ -9,12 +9,12 @@ import { mockNative, serveAudio } from './helpers/native.mjs';
 const id = (letter) => letter.repeat(64);
 const track = (letter, title, local) => ({
   fileId: id(letter),
-  filename: `${title}.wav`,
+  filename: `${title}.mp3`,
   title,
   artist: 'ZZ Top',
   album: '',
-  format: 'WAV',
-  mime: 'audio/wav',
+  format: 'MP3',
+  mime: 'audio/mpeg',
   size: 1234567,
   tags: '',
   local,
@@ -102,20 +102,55 @@ test('playing a row nobody here holds asks the computer to fetch it, from the ro
   expect(downloads[0].sourcePubkeys).toEqual([id('1'), id('2')]);
 });
 
-test('play all asks for the first row, and it starts as soon as the computer has it', async ({ page }) => {
-  // The row the list leads with is the fixture track's own file id, so the
-  // computer's finished transfer is that file's: the fetch lands and it plays.
-  // Nothing is warmed ahead here, so the ask the tap makes is the only one.
-  const wanted = track('a', 'Doubleback', false);
-  await openApp(page, { library: [inLibrary], discovered: [wanted, live[1]], arrives: wanted.fileId, preload: 0 });
+test('play all leads with a track of this phone’s own, and asks for the first row', async ({ page }) => {
+  // The library holds one track that this run does not name, so that is the lead -
+  // and there is nothing of ours left to warm behind the first row. One deep, so
+  // the ask proved here is the first row of the list and nothing else.
+  const mine = {
+    ...inLibrary,
+    fileId: id('e'),
+    filename: 'Cheap Sunglasses.mp3',
+    title: 'Cheap Sunglasses'
+  };
+  const wanted = track('b', 'Doubleback', false);
+  // Only one track of this phone's own, and the run does not name it - so the lead
+  // is that track and there is nothing else of ours for the runway. The file the
+  // computer says this phone already holds is avoided on purpose: a cached file is
+  // skipped by the pre-load, so a row with that id would prove nothing here.
+  await openApp(page, { library: [mine], discovered: [wanted, live[1]], preload: 1 });
+  await expect(page.locator('.track-row')).toHaveCount(1);
   await openSearchTab(page);
   await page.locator('.discover-play').click();
 
-  const downloads = await expect.poll(() => calls(page, 'remote_download')).toHaveLength(1).then(() => calls(page, 'remote_download'));
-  expect(downloads[0].fileId).toBe(wanted.fileId);
-  // A tap on something nobody here holds means play, and the download is only how:
-  // so the row starts when its bytes arrive rather than leaving the tap one short.
+  // It makes a sound at once, rather than after the first row has been fetched.
   await expect.poll(() => audioPaused(page)).toBe(false);
+  // One deep, so the first row of the list is the whole of what is asked for.
+  await expect.poll(() => files(page, 'remote_download')).toEqual([wanted.fileId]);
+
+  // And the queue is that track, then the row the computer ranked first.
+  await page.locator('.now-open').click();
+  await expect(page.locator('.now-sheet')).toBeVisible();
+  await page.locator('[aria-label="Open the playlist"]').click();
+  await expect(page.locator('.queue-row').nth(0)).toContainText('Cheap Sunglasses');
+  await expect(page.locator('.queue-row').nth(1)).toContainText('Doubleback');
+});
+
+test('the list draws only the file types it is asked for', async ({ page }) => {
+  // One format for now: anything larger is a fetch this phone would rather not pay
+  // for. The row is left out of the drawing rather than out of the answer - the
+  // label above still says how many the network has, because that is what it says.
+  await openApp(page, {
+    discovered: [
+      track('b', 'Gimme All Your Lovin', false),
+      { ...track('d', 'Legs', false), format: 'FLAC', mime: 'audio/flac' }
+    ]
+  });
+  await openSearchTab(page);
+
+  const rows = page.locator('section[aria-label="Discover"] .track-row');
+  await expect(rows).toHaveCount(1);
+  await expect(rows.first()).toContainText('Gimme All Your Lovin');
+  await expect(page.locator('.section-label', { hasText: 'Discover' })).toContainText('2 live on the network');
 });
 
 test('a run of the network list leaves a track of ours between each pair', async ({ page }) => {
@@ -130,13 +165,21 @@ test('a run of the network list leaves a track of ours between each pair', async
     track('d', 'Legs', false),
     track('e', 'Tush', false)
   ];
-  const mine = { ...inLibrary, fileId: id('f'), filename: 'Cheap Sunglasses.mp3', title: 'Cheap Sunglasses', format: 'MP3', mime: 'audio/mpeg' };
-  await openApp(page, { library: [mine], discovered: list, preload: 5 });
+  // Three tracks of this phone's own, because a Play all takes one of them as its
+  // lead and the run then uses each of the rest once: with a single track the lead
+  // is all there is, and nothing of ours is left for the rows further down.
+  const mine = ['f', 'g', 'h'].map((letter, index) => ({
+    ...inLibrary,
+    fileId: id(letter),
+    filename: `Mine ${index + 1}.mp3`,
+    title: `Mine ${index + 1}`
+  }));
+  await openApp(page, { library: mine, discovered: list, preload: 5 });
   // The library has to be here before the run starts, and the music tab is where it
-  // is listed: the track of ours that goes between the new ones is one this phone
-  // holds, so a run started before the library arrived would have nothing to put
-  // there.
-  await expect(page.locator('.track-row')).toHaveCount(1);
+  // is listed: the tracks of ours that go in front of and between the new ones are
+  // ones this phone holds, so a run started before they arrived would have nothing
+  // to put there.
+  await expect(page.locator('.track-row')).toHaveCount(3);
   await openSearchTab(page);
   await page.locator('.discover-play').click();
 
@@ -147,7 +190,11 @@ test('a run of the network list leaves a track of ours between each pair', async
   // And the track of ours is genuinely in the run - it is the one being taken over
   // Iroh before its turn, which is what says the queue holds it between the new
   // ones rather than after them.
-  await expect.poll(() => files(page, 'prefetch_remote_audio')).toContain(mine.fileId);
+  const prefetched = await expect
+    .poll(() => files(page, 'prefetch_remote_audio'))
+    .not.toHaveLength(0)
+    .then(() => files(page, 'prefetch_remote_audio'));
+  expect(prefetched.some((fileId) => mine.some((item) => item.fileId === fileId))).toBe(true);
 });
 
 test('a row of the list starts the list as the queue from that row', async ({ page }) => {
