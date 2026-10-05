@@ -774,6 +774,15 @@ increasing local-library revision. A companion MAY poll it and should reload
 library pages only when it changes. The revision check carries no catalogue
 rows and does not affect active audio streams.
 
+A `transfers` row carries `id`, `fileId`, `filename`, `size`, `progress`,
+`status`, and `speed`. `status` is display text rather than a stable
+enumeration, with one exception a companion MUST rely on: a download the desktop
+has given up on ends with a status beginning `Failed:`. The row for a file is
+written before `downloadRequested` answers, so a companion treats a `Failed:` row
+as the end of that wait, releases whatever it was holding for the file, and MUST
+NOT wait for the row to reappear — a request that no seeder accepted is
+deliberately not asked for again.
+
 It also contains `pubkey`: the desktop's own Nostr public key in lowercase hex,
 which is what lets a companion tell that desktop's own playlists from public
 ones somebody else published. It is a public key, so nothing secret travels with

@@ -62,6 +62,16 @@ const DOWNLOAD_REQUESTED: &str = "Requesting Tor seeders";
 // same way, which is why the text no longer claims a reconnection happened.
 const DOWNLOAD_RESTART_PENDING: &str = "Waiting to try again";
 const DOWNLOAD_RESTART_REQUESTED: &str = "Restarting · requesting fresh Tor seeders";
+/// A recovery request that no seeder ever accepted, and which is deliberately
+/// not asked for again.
+///
+/// It is a verdict rather than a removal. A paired phone waits on this exact
+/// file, and a status it can read is the only thing that tells it to stop: a row
+/// that simply disappears is a wait with no end. The phone holds one of its two
+/// fetch slots for every entry it is waiting on, so a file the computer has given
+/// up on in silence stops every other track from being asked for as well, on both
+/// ends showing nothing happening.
+const DOWNLOAD_ABANDONED: &str = "Failed: no seeder accepted the request";
 const DOWNLOAD_OFFER_TIMEOUT: Duration = Duration::from_secs(120);
 /// How many extra attempts one file gets after a seeder failed to serve it.
 ///
@@ -3940,6 +3950,9 @@ impl NetworkService {
 
     async fn dispatch_queued_downloads(&self, generation: u64) -> Result<(), String> {
         let _guard = self.download_restart_lock.lock().await;
+        // A request whose file has already arrived is not a download any more, and its
+        // row would otherwise sit in the list as a failure that never clears.
+        retire_downloads_for_local_files(&super::open_connection(&self.db_path)?)?;
         if self.transfers.is_paused() {
             return Ok(());
         }
@@ -5106,23 +5119,33 @@ fn sort_by_seeder_history(connection: &Connection, sources: &mut [String]) -> Re
     Ok(())
 }
 
-// Only remove recovery requests that never started a transfer. An accepted
-// offer, a cancellation, or a transport failure must not be mistaken for a
-// missing song. Deleting both rows also makes late offers harmless.
-fn remove_unavailable_restart(connection: &Connection, request_id: &str) -> Result<bool, String> {
+// Only end recovery requests that never started a transfer. An accepted offer, a
+// cancellation, or a transport failure must not be mistaken for a missing song.
+//
+// The row is ended rather than deleted, because the phone waiting on this file
+// reads its status and a deleted row reads as nothing at all. The sources still
+// go, which is what keeps a late offer harmless: an offer is only accepted from a
+// seeder this request asked, and after this there are none.
+fn abandon_unavailable_restart(connection: &Connection, request_id: &str) -> Result<bool, String> {
     let transaction = connection
         .unchecked_transaction()
         .map_err(|error| error.to_string())?;
-    let removed = transaction
+    let ended = transaction
         .execute(
-            "DELETE FROM network_downloads WHERE request_id=?1 AND status=?2
-         AND NOT EXISTS (SELECT 1 FROM download_sources WHERE request_id=?1
+            "UPDATE network_downloads SET status=?1,speed='—',updated_at=?2
+         WHERE request_id=?3 AND status=?4
+         AND NOT EXISTS (SELECT 1 FROM download_sources WHERE request_id=?3
            AND status NOT IN ('Requested','Pending restart')
            AND status NOT LIKE 'Refused:%' AND status NOT LIKE 'Failed:%')",
-            params![request_id, DOWNLOAD_RESTART_REQUESTED],
+            params![
+                DOWNLOAD_ABANDONED,
+                Utc::now().to_rfc3339(),
+                request_id,
+                DOWNLOAD_RESTART_REQUESTED
+            ],
         )
         .map_err(|error| error.to_string())?;
-    if removed > 0 {
+    if ended > 0 {
         transaction
             .execute(
                 "DELETE FROM download_sources WHERE request_id=?1",
@@ -5131,7 +5154,7 @@ fn remove_unavailable_restart(connection: &Connection, request_id: &str) -> Resu
             .map_err(|error| error.to_string())?;
     }
     transaction.commit().map_err(|error| error.to_string())?;
-    Ok(removed > 0)
+    Ok(ended > 0)
 }
 
 fn record_download_refusal(
@@ -5166,7 +5189,7 @@ fn record_download_refusal(
             |row| row.get(0),
         )
         .map_err(|error| error.to_string())?;
-    if !pending && !remove_unavailable_restart(connection, request_id)? {
+    if !pending && !abandon_unavailable_restart(connection, request_id)? {
         connection.execute(
             "UPDATE network_downloads SET status='All seeders refused',updated_at=?1 WHERE request_id=?2",
             params![Utc::now().to_rfc3339(), request_id],
@@ -5253,7 +5276,7 @@ fn expire_download_request(connection: &Connection, request_id: &str) -> Result<
         "UPDATE download_sources SET status='Failed: no response',updated_at=?1 WHERE request_id=?2 AND status='Requested'",
         params![Utc::now().to_rfc3339(), request_id],
     ).map_err(|error| error.to_string())?;
-    if remove_unavailable_restart(connection, request_id)? {
+    if abandon_unavailable_restart(connection, request_id)? {
         return Ok(true);
     }
     // A window in which every candidate was silent is where this ends, and it is
@@ -5494,6 +5517,32 @@ pub fn load_network_transfers(connection: &Connection) -> Result<Vec<super::Tran
         })
         .map_err(|error| error.to_string())?;
     rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+/// Retire downloads whose file this computer already holds.
+///
+/// Two requests for one file are ordinary - a phone's queue beside this window's own
+/// button, or a retry that raced the transfer already working - and the request that
+/// loses is not a failure: the file is here, which is what was asked for. Left as a
+/// row it reads as a download that failed and never clears, in this window's list and
+/// to any phone that asks about it. Found on a real installation: a file that had
+/// arrived was still listed as `All seeders refused`, because the second request's
+/// seeders refused it for already serving the first.
+fn retire_downloads_for_local_files(connection: &Connection) -> Result<usize, String> {
+    connection
+        .execute(
+            "DELETE FROM download_sources WHERE request_id IN
+               (SELECT d.request_id FROM network_downloads d
+                 JOIN files f ON f.file_id = d.file_id)",
+            [],
+        )
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute(
+            "DELETE FROM network_downloads WHERE file_id IN (SELECT file_id FROM files)",
+            [],
+        )
         .map_err(|error| error.to_string())
 }
 
@@ -6533,14 +6582,14 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_restarts_are_removed_without_removing_active_or_terminal_downloads() {
+    fn an_unavailable_restart_ends_with_a_verdict_a_phone_can_read() {
         let directory =
             std::env::temp_dir().join(format!("napstr-restart-expiry-{}", Uuid::new_v4()));
         let db = directory.join("napstr.sqlite3");
         crate::initialise_database(&db, &directory).unwrap();
         let connection = super::super::open_connection(&db).unwrap();
         let source = Keys::generate().public_key().to_hex();
-        for (id, status, source_status, should_remove) in [
+        for (id, status, source_status, should_end) in [
             ("silent", DOWNLOAD_RESTART_REQUESTED, "Requested", true),
             (
                 "refused",
@@ -6571,7 +6620,7 @@ mod tests {
             ),
             ("new", "Racing responsive Tor seeders", "Requested", false),
         ] {
-            insert_interrupted_download(&connection, id, status, &source);
+            let file_id = insert_interrupted_download(&connection, id, status, &source);
             connection
                 .execute(
                     "UPDATE download_sources SET status=?1 WHERE request_id=?2",
@@ -6579,10 +6628,12 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(
-                remove_unavailable_restart(&connection, id).unwrap(),
-                should_remove,
+                abandon_unavailable_restart(&connection, id).unwrap(),
+                should_end,
                 "{id}"
             );
+            // The sources go for a request that ended, and that is what keeps a late
+            // offer out: an offer is only accepted from a seeder this request asked.
             let count: i64 = connection
                 .query_row(
                     "SELECT count(*) FROM download_sources WHERE request_id=?1",
@@ -6590,9 +6641,104 @@ mod tests {
                     |row| row.get(0),
                 )
                 .unwrap();
-            assert_eq!(count, if should_remove { 0 } else { 1 }, "{id}");
+            assert_eq!(count, if should_end { 0 } else { 1 }, "{id}");
+            // The row itself stays. A phone waiting on this file has nothing else to
+            // go on, and a deleted row reads as "not started yet": the phone holds one
+            // of its two fetch slots for it, so a silent removal stops every other
+            // track from being asked for while both ends show nothing happening.
+            let ended: String = connection
+                .query_row(
+                    "SELECT status FROM network_downloads WHERE request_id=?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .unwrap_or_else(|error| panic!("{id}: the download row was removed ({error})"));
+            assert_eq!(
+                ended.as_str(),
+                if should_end { DOWNLOAD_ABANDONED } else { status },
+                "{id}"
+            );
+            // And it reaches the phone through the very list the companion asks for,
+            // where its text has to read as a failure rather than as progress.
+            let reported = load_network_transfers(&connection)
+                .unwrap()
+                .into_iter()
+                .find(|transfer| transfer.file_id == file_id)
+                .unwrap_or_else(|| panic!("{id}: the transfer list does not carry it"));
+            if should_end {
+                assert!(
+                    reported.status.starts_with("Failed:"),
+                    "{id}: {} does not read as a failure",
+                    reported.status
+                );
+            }
         }
-        assert!(!remove_unavailable_restart(&connection, "already-removed").unwrap());
+        assert!(!abandon_unavailable_restart(&connection, "already-removed").unwrap());
+        drop(connection);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_download_whose_file_already_arrived_is_retired_rather_than_reported_failed() {
+        let directory =
+            std::env::temp_dir().join(format!("napstr-local-retire-{}", Uuid::new_v4()));
+        let db = directory.join("napstr.sqlite3");
+        crate::initialise_database(&db, &directory).unwrap();
+        let connection = super::super::open_connection(&db).unwrap();
+        let source = Keys::generate().public_key().to_hex();
+        // The losing half of a race: this request asked for a file that another one
+        // was already fetching, so every seeder refused it for already serving the
+        // other. The file itself arrived, which is the whole of what was wanted.
+        let file_id =
+            insert_interrupted_download(&connection, "race", "All seeders refused", &source);
+        connection
+            .execute(
+                "UPDATE download_sources SET status='Refused: an offer for this requester and file is already active' WHERE request_id='race'",
+                [],
+            )
+            .unwrap();
+        // A download for a file that is not here yet, which must be left alone.
+        let _on_its_way = insert_interrupted_download(
+            &connection,
+            "on-its-way",
+            "Downloading over Tor",
+            &Keys::generate().public_key().to_hex(),
+        );
+        connection
+            .execute(
+                "INSERT INTO files(file_id,filename,path,size,format,indexed_at) VALUES(?1,'arrived.mp3','arrived.mp3',1000,'MP3','now')",
+                [&file_id],
+            )
+            .unwrap();
+
+        assert_eq!(retire_downloads_for_local_files(&connection).unwrap(), 1);
+
+        let remaining = connection
+            .prepare("SELECT request_id FROM network_downloads ORDER BY rowid")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(remaining, vec!["on-its-way".to_string()]);
+        // Its sources go with it, so nothing is left to answer a late offer with.
+        let retired_sources: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM download_sources WHERE request_id='race'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retired_sources, 0);
+        // And the download still running keeps its own.
+        let kept: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM download_sources WHERE request_id='on-its-way'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 1);
         drop(connection);
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -6639,12 +6785,16 @@ mod tests {
             1
         );
         record_download_refusal(&connection, "retry", &file_id, &other, "missing").unwrap();
+        // Ending the request is a verdict rather than a deletion. This row is what
+        // the phone that asked for the file reads, and it says the file is not
+        // coming; a row that vanished would leave it waiting for ever, holding the
+        // fetch slot the next track needs.
         assert_eq!(
             connection
-                .query_row("SELECT count(*) FROM network_downloads", [], |row| row
-                    .get::<_, i64>(0))
+                .query_row("SELECT status FROM network_downloads", [], |row| row
+                    .get::<_, String>(0))
                 .unwrap(),
-            0
+            DOWNLOAD_ABANDONED
         );
         assert_eq!(
             connection
