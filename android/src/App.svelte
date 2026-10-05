@@ -92,6 +92,16 @@
    */
   const MAX_ACQUISITIONS_IN_FLIGHT = 2;
   /**
+   * How many transfer polls a file being waited on may go unaccounted for before
+   * the wait is treated as a download the computer has ended.
+   *
+   * One would be enough: the computer writes the row before it answers the ask, so
+   * a file it accepted is never missing from its own list. The rest is slack for a
+   * dropped poll, because the cost of giving up too early is a track dropped from
+   * the playlist that was in fact on its way.
+   */
+  const PENDING_MISSING_POLLS = 3;
+  /**
    * Rows per discover page. The computer's own cap is the same number, and it is
    * the protocol's rather than this file's to invent: a discover row names every
    * seeder it has, so a page of them is the fattest answer either side sends and
@@ -372,6 +382,17 @@
   let volume = $state(0.85);
   let pending = $state(new Map<string, string>());
   let pendingAudiobooks = $state(new Map<string, string>());
+  /**
+   * How many polls a file being waited on has gone unaccounted for, by file.
+   *
+   * The computer can end a download without a word that reaches here: an abandoned
+   * retry, a request whose every seeder turned out to be blocked, a desk that gave
+   * up while this page was not asking. Its row then stops appearing in the list,
+   * which is indistinguishable from a download that has not begun - so it is
+   * counted, and after a few polls it is treated as what it is. Not reactive:
+   * nothing draws it.
+   */
+  const pendingMissing = new Map<string, number>();
   let transfers = $state<RemoteTransfer[]>([]);
   let audiobookQuery = $state('');
   let audiobooks = $state<RemoteAudiobookSummary[]>([]);
@@ -1216,6 +1237,32 @@
     const [pulled] = queue.splice(index, 1);
     queue.splice(position, 0, pulled);
     playerQueue = queue;
+  }
+
+  /**
+   * Take a track out of the playlist for good.
+   *
+   * This is the other half of the skip. A track that has not arrived *yet* is
+   * passed over and keeps its place, because its turn is still coming; a download
+   * the computer has given up on is not coming at all, and an entry left in the
+   * list is a turn nobody can take - the player stops on it every time round, and
+   * the fetch slot it holds is one no other track can have.
+   */
+  function dropFromQueue(fileId: string): boolean {
+    const index = playerQueue.findIndex((item) => item.fileId === fileId);
+    if (index < 0) return false;
+    playerQueue = playerQueue.filter((item) => item.fileId !== fileId);
+    // The place it held goes back to the entry before it, so "next" from there is
+    // the entry that followed the one that is gone.
+    if (index < playerIndex) playerIndex -= 1;
+    else if (index === playerIndex) playerIndex = index - 1;
+    if (playerQueue.length === 0) {
+      playerIndex = -1;
+      resetRandomOrder();
+      return true;
+    }
+    resetRandomOrder();
+    return true;
   }
 
   /** A random entry that can play now, other than `excluded`, or -1. */
@@ -3442,8 +3489,36 @@
     }
   }
 
+  function abandonDownload(fileId: string, filename: string, reason: string) {
+    const next = new Map(pending);
+    next.delete(fileId);
+    pending = next;
+    const nextAudiobooks = new Map(pendingAudiobooks);
+    nextAudiobooks.delete(fileId);
+    pendingAudiobooks = nextAudiobooks;
+    pendingMissing.delete(fileId);
+    // A fetch that failed is not one to play later, and if it was the track the
+    // player was waiting on, the busy state goes with it.
+    const awaited = playingWhenReady.delete(fileId);
+    if (awaited && !playing) caching = false;
+    error = `${filename}: ${reason}`;
+    // Out of the playlist, because a turn that can never be taken is a turn the
+    // player keeps stopping on - and the entry is holding one of the two fetch
+    // slots this phone has, so nothing behind it in the queue is ever asked for.
+    if (dropFromQueue(fileId)) {
+      notice = msg("Removed {p0} from the queue — that download failed", { p0: filename });
+    }
+    if (awaited && current?.fileId === fileId) void moveTrack(1);
+  }
+
   async function refreshTransfers() {
-    if (!status.connected || status.streamOnly || pending.size === 0) return;
+    // Deliberately not gated on `status.connected`: that flag comes from the status
+    // question, and a host busy indexing a library can miss one. The download the
+    // person is watching has landed by then, and the only thing that says so is this
+    // poll - a wait that a missed status answer turned into fifteen seconds of
+    // nothing left rows on "on its way" for half a minute after the file was here.
+    // Asking anyway costs one failed call, which the catch below already expects.
+    if (status.streamOnly || pending.size === 0) return;
     try {
       transfers = await invoke<RemoteTransfer[]>('remote_transfers');
       // One exact question for everything being waited on, rather than a filename
@@ -3451,33 +3526,24 @@
       // row it gives is the one that says the computer holds it.
       const wanted = [...pending.keys()].filter((fileId) => !pendingAudiobooks.has(fileId));
       let known: RemoteTrack[] = [];
+      // A question this phone did not get an answer to is not evidence of anything,
+      // so it must not count towards a download being gone.
+      let lookupFailed = false;
       if (wanted.length > 0) {
         try {
           known = await invoke<RemoteTrack[]>('remote_library_by_ids', { fileIds: wanted });
         } catch {
           // The next poll asks again; a transfer that has landed is not lost by it.
+          lookupFailed = true;
         }
       }
+      let abandoned = false;
       for (const fileId of [...pending]) {
         const [pendingFileId, pendingFilename] = fileId;
         const transfer = transfers.find((item) => item.fileId === pendingFileId);
         if (transfer && /failed|cancel/i.test(transfer.status)) {
-          const next = new Map(pending);
-          next.delete(pendingFileId);
-          pending = next;
-          const nextAudiobooks = new Map(pendingAudiobooks);
-          nextAudiobooks.delete(pendingFileId);
-          pendingAudiobooks = nextAudiobooks;
-          // A fetch that failed is not one to play later, and if it was the track
-          // the player was waiting on, the busy state goes with it.
-          const awaited = playingWhenReady.delete(pendingFileId);
-          if (awaited && !playing) caching = false;
-          error = `${transfer.filename}: ${transfer.status}`;
-          // The player was waiting on this one, so a failure is not a reason to sit
-          // on a track that is never coming: the queue moves on to the nearest entry
-          // that can play. The failed one keeps its place, so its turn comes round
-          // again if it does turn up later.
-          if (awaited && current?.fileId === pendingFileId) void moveTrack(1);
+          abandonDownload(pendingFileId, transfer.filename, transfer.status);
+          abandoned = true;
           continue;
         }
         if (transfer && transfer.progress < 100 && !/complete|verified/i.test(transfer.status)) continue;
@@ -3490,7 +3556,22 @@
         } else {
           local = known.find((item) => item.fileId === pendingFileId);
         }
-        if (!local) continue;
+        if (!local) {
+          // Nothing is being fetched and the computer does not hold it. The row is
+          // written before the ask is answered, so this is a download that has been
+          // ended without this phone being told, rather than one that has not started.
+          // It is counted rather than believed at once, because a poll can be dropped.
+          if (lookupFailed) continue;
+          const missed = (pendingMissing.get(pendingFileId) ?? 0) + 1;
+          if (missed < PENDING_MISSING_POLLS) {
+            pendingMissing.set(pendingFileId, missed);
+            continue;
+          }
+          abandonDownload(pendingFileId, pendingFilename, 'the download is no longer running');
+          abandoned = true;
+          continue;
+        }
+        pendingMissing.delete(pendingFileId);
         // Every copy of the row the queue and the lists were built from, not only
         // the library's: a queue entry that still says the file is elsewhere asks
         // for it again when its turn comes.
@@ -3519,6 +3600,9 @@
           void activateTrack(local, true);
         }
       }
+      // A slot has been freed, so the window is filled again: the tracks behind the
+      // dead one were never asked for, because this phone only asks for what fits.
+      if (abandoned && current) warmUpcoming(current.fileId, playerQueueLibraryVisible);
     } catch { /* the next foreground poll retries */ }
   }
 

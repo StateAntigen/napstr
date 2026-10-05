@@ -52,6 +52,9 @@ async function openApp(page, { library = [first, second], results = [found], fet
     // The one download the computer is running, in the same mutable shape: the
     // fetch a queued track is waiting for is moved along by the test that made it.
     window.fetching = fetching;
+    // A verdict for one file rather than for all of them, which is what a computer
+    // that has given up on a single download looks like from here.
+    window.statuses = {};
     // A file the computer already holds, as its own record of it: asking to
     // download one is refused, exactly as the real computer refuses it.
     window.holds = holds;
@@ -81,7 +84,7 @@ async function openApp(page, { library = [first, second], results = [found], fet
             filename: 'Sharp Dressed Man.wav',
             size: 1234567,
             progress: window.fetching?.progress ?? 12,
-            status: window.fetching?.status ?? 'Downloading',
+            status: window.statuses?.[fileId] ?? window.fetching?.status ?? 'Downloading',
             speed: '',
             destination: ''
           }));
@@ -265,6 +268,51 @@ test('a queued track nobody here holds is fetched while it is still songs away',
     window.calls.filter((call) => call.cmd === 'remote_download').map((call) => call.args.sourcePubkeys)
   );
   expect(asked).toEqual([[id('1')], [id('2')]]);
+});
+
+test('a download the computer gives up on leaves the queue, so the next one is asked for', async ({ page }) => {
+  // Two of these three files are never going to arrive, and this phone asks for two
+  // at a time. While it waits on a pair the computer has silently given up on, the
+  // third is never asked for at all: both ends show a queue that is not moving, and
+  // the only thing that changes it is being told the two are not coming.
+  const stuck = elsewhere('e', 'Rough Boy');
+  const alsoStuck = elsewhere('f', 'Velcro Fly');
+  const later = elsewhere('g', 'Sleeping Bag');
+  await openApp(page, { results: [stuck, alsoStuck, later] });
+  await playFirst(page);
+  await addFoundTrack(page, stuck);
+  await addFoundTrack(page, alsoStuck);
+  await addFoundTrack(page, later);
+  await expect.poll(() => downloads(page)).toEqual([stuck.fileId, alsoStuck.fileId]);
+  // The drawer is the only place the queue is drawn, and it is opened before the
+  // verdicts arrive: a screen opened after the stall is a screen that cannot be
+  // reached, because the bar is showing a fetch that never ends.
+  await openQueue(page);
+  await expect(queueRows(page)).toHaveCount(5);
+
+  // The computer gives up on both: the rows it was waiting on end as failures, and
+  // that is the whole of what reaches this phone - there is no callback for it, and
+  // a row that simply stopped appearing would read as "not started yet".
+  await page.evaluate((fileIds) => {
+    window.statuses = Object.fromEntries(
+      fileIds.map((fileId) => [fileId, 'Failed: no seeder accepted the request'])
+    );
+  }, [stuck.fileId, alsoStuck.fileId]);
+
+  // The dead entries are gone rather than sitting in the playlist as turns nobody can
+  // take: the player would stop on each of them every time round.
+  await expect
+    .poll(async () => (await queueRows(page).allTextContents()).join('\n'), { timeout: 15_000 })
+    .not.toContain('Rough Boy');
+  await expect(queueRows(page)).toHaveCount(3);
+  const titles = (await queueRows(page).allTextContents()).join('\n');
+  expect(titles).not.toContain('Velcro Fly');
+
+  // The slots those two were holding are free, so the file behind them - which
+  // nothing had asked for while the pair was stalled - is asked for now. This is
+  // the part a person notices: with the dead entries left in place, no later track
+  // is ever asked for at all and the queue simply stops.
+  await expect.poll(() => downloads(page), { timeout: 15_000 }).toContain(later.fileId);
 });
 
 test('a turn that has not arrived says how far along it is, then plays', async ({ page }) => {

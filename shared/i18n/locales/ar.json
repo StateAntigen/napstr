@@ -508,6 +508,7 @@
   "Remove from Liked Songs": "Remove from Liked Songs",
   "Remove transfer: {p0}": "إزالة التحويل: {p0}",
   "Remove {p0}? It will need a new QR code before it can connect again.": "إزالة {p0}؟ سيحتاج إلى رمز QR جديد قبل أن يتمكن من الاتصال مرة أخرى.",
+  "Removed {p0} from the queue — that download failed": "Removed {p0} from the queue — that download failed",
   "Repeat": "Repeat",
   "Repeat track": "تكرار المقطع",
   "Reply": "رد",
