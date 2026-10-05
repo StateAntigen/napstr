@@ -102,6 +102,25 @@ export type NostrIdentity = {
 };
 
 /**
+ * What moved when this phone's own likes and playlists were carried from one
+ * computer to another.
+ *
+ * Reported rather than summed up quietly, because a move is the one moment a
+ * person is deciding which computer their lists live on, and a playlist that
+ * could not come along is something they have to hear about.
+ */
+export type CarryReport = {
+  /** Liked files the computer now holds for this phone's key. */
+  likes: number;
+  /** Playlists written onto it. */
+  playlists: number;
+  /** Playlists it already had a revision of at least as new as, left alone. */
+  skipped: number;
+  /** Playlists that could not be carried, each with the reason. */
+  failed: string[];
+};
+
+/**
  * One computer this phone may talk to.
  *
  * There may be more than one: one of them is home - the one this phone signs,

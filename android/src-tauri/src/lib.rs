@@ -1,4 +1,5 @@
 mod art_store;
+mod diag;
 mod identity;
 mod public_http;
 use public_http::{podcast_http_client, safe_public_https_url};
@@ -6,12 +7,13 @@ use public_http::{podcast_http_client, safe_public_https_url};
 use futures_util::StreamExt;
 use iroh::{endpoint::presets, Endpoint, EndpointAddr, EndpointId, SecretKey};
 use napstr_remote_protocol::{
-    ArtRendition, ClientRequest, DeviceRights, DiscoverMode, PairingTicket, PlaybackCommand, RemoteAlbumCover,
-    RemoteAudiobook, RemoteAudiobookSummary, RemoteDiscussionActivity, RemoteDiscussionMessage,
-    RemotePlaybackState, RemotePlaylist, RemotePlaylistCoordinate, RemotePlaylistSummary,
-    RemoteTrack, RemoteTransfer, ServerResponse, ALPN, MAX_ART_KEY_CHARS, MAX_CONTROL_FRAME_BYTES,
-    MAX_COVER_KEYS, MAX_PAGE_SIZE, MAX_PLAYLIST_MEMBERS, MAX_PLAYLIST_PAGE, MAX_PLAY_QUEUE,
-    MAX_QR_SVG_BYTES, MAX_REPORT_NOTE_CHARS, MAX_TRACKS_BY_ID, REPORT_REASONS, shuffle_key,
+    ArtRendition, ClientRequest, DeviceRights, DiscoverMode, PairingTicket, PlaybackCommand,
+    RemoteAlbumCover, RemoteAudiobook, RemoteAudiobookSummary, RemoteDiscussionActivity,
+    RemoteDiscussionMessage, RemotePlaybackState, RemotePlaylist, RemotePlaylistCoordinate,
+    RemotePlaylistSummary, RemoteTrack, RemoteTransfer, ServerResponse, SignedEvent, ALPN,
+    AUTHENTICATION_KIND, MAX_ART_KEY_CHARS, MAX_CONTROL_FRAME_BYTES, MAX_COVER_KEYS, MAX_PAGE_SIZE,
+    MAX_PLAYLIST_MEMBERS, MAX_PLAYLIST_PAGE, MAX_PLAY_QUEUE, MAX_QR_SVG_BYTES,
+    MAX_REPORT_NOTE_CHARS, MAX_TRACKS_BY_ID, NOT_PROVED_MESSAGE, REPORT_REASONS, shuffle_key,
 };
 use quick_xml::{events::Event, Reader};
 use qrcode::{render::svg, QrCode};
@@ -1565,6 +1567,17 @@ struct RemoteClient {
     /// Kept here so two questions in the same second do not open two tunnels to
     /// the same computer.
     connecting: tokio::sync::RwLock<std::collections::HashSet<String>>,
+    /// This phone's own Nostr identity, which is what signs the proof that a
+    /// computer keeps a key's things under.
+    identity: Arc<identity::DeviceIdentity>,
+    /// The computers this phone has already proved its key to, for as long as
+    /// they are connected.
+    ///
+    /// A proof is remembered on the computer's side, so this only saves the
+    /// round trip of asking again - which is why it is dropped when a connection
+    /// is: a computer that restarted, or was reinstalled, has to be told again,
+    /// and the cheapest moment to notice is the moment the tunnel is built.
+    proved: tokio::sync::RwLock<std::collections::HashSet<String>>,
     start_lock: tokio::sync::Mutex<()>,
 }
 
@@ -1860,14 +1873,49 @@ impl RemoteClient {
         for (_, connection) in self.connections.write().await.drain() {
             connection.close(0u32.into(), b"pairing changed");
         }
+        // A connection is what a proof was kept for. The next tunnel proves the
+        // key again, which costs one round trip and is what makes a computer
+        // that was reinstalled in the meantime work without a restart here.
+        self.forget_proofs().await;
     }
 
-    fn new(app_data: PathBuf) -> Arc<Self> {
+    fn new(app_data: PathBuf, identity: Arc<identity::DeviceIdentity>) -> Arc<Self> {
         let hosts = load_hosts(
             &app_data.join(PAIRED_HOSTS_FILE),
             &app_data.join(LEGACY_PAIRED_FILE),
         );
         let home = load_home(&app_data.join(HOME_HOST_FILE));
+        // The first lines of every run, and the ones that answer the questions a
+        // cold start raises: which computers this phone thinks it has, which one
+        // it acts through, and - the one that matters when a tunnel will not
+        // open - the addresses it will dial for each of them. An address is
+        // written down at pairing time and a computer's own addresses change
+        // when it restarts, so a stale one is exactly how a phone ends up
+        // reporting a computer that is plainly there as unreachable.
+        diag::note(&format!(
+            "Napstrfy starting; app data {}, {} paired computer(s), home {:?}",
+            app_data.display(),
+            hosts.len(),
+            home.as_deref().map(|id| &id[..8.min(id.len())])
+        ));
+        for host in &hosts {
+            let addresses = decode_endpoint_addr(host)
+                .map(|address| {
+                    address
+                        .addrs
+                        .iter()
+                        .take(4)
+                        .map(|addr| format!("{addr:?}"))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_else(|error| vec![format!("unreadable: {error}")]);
+            diag::note(&format!(
+                "  {:.8}… \"{}\" at [{}]",
+                host.endpoint_id,
+                host.desktop_name,
+                addresses.join(", ")
+            ));
+        }
         Arc::new(Self {
             app_data,
             endpoint: tokio::sync::RwLock::new(None),
@@ -1877,6 +1925,8 @@ impl RemoteClient {
             mixed: tokio::sync::RwLock::new(None),
             origins: tokio::sync::RwLock::new(HashMap::new()),
             connecting: tokio::sync::RwLock::new(std::collections::HashSet::new()),
+            identity,
+            proved: tokio::sync::RwLock::new(std::collections::HashSet::new()),
             start_lock: tokio::sync::Mutex::new(()),
         })
     }
@@ -1971,14 +2021,50 @@ impl RemoteClient {
         if let Some(connection) = self.connections.read().await.get(&host.endpoint_id).cloned() {
             return Ok(connection);
         }
+        let started = std::time::Instant::now();
         let address = decode_endpoint_addr(host)?;
-        let connection = tokio::time::timeout(
+        // The address this phone holds is the one written down at pairing time,
+        // and a computer's own addresses change when it restarts - so how many
+        // are in it, and whether dialling them works, is the difference between
+        // a fast start and a minute of "Connecting".
+        let dialled = address.addrs.len();
+        diag::note(&format!(
+            "opening a tunnel to {} ({:.8}…) at {dialled} known address(es)",
+            host.desktop_name,
+            host.endpoint_id
+        ));
+        let connection = match tokio::time::timeout(
             Duration::from_secs(25),
             self.endpoint().await?.connect(address, ALPN),
         )
         .await
-        .map_err(|_| "Napstr did not answer over Iroh")?
-        .map_err(|error| format!("Could not reach Napstr: {error}"))?;
+        {
+            Ok(Ok(connection)) => {
+                diag::note(&format!(
+                    "tunnel to {} is up after {}",
+                    host.desktop_name,
+                    diag::millis(started)
+                ));
+                connection
+            }
+            Ok(Err(error)) => {
+                let message = format!("Could not reach Napstr: {error}");
+                diag::note(&format!(
+                    "tunnel to {} failed after {}: {message}",
+                    host.desktop_name,
+                    diag::millis(started)
+                ));
+                return Err(message);
+            }
+            Err(_) => {
+                diag::note(&format!(
+                    "tunnel to {} timed out after {} - Napstr did not answer over Iroh",
+                    host.desktop_name,
+                    diag::millis(started)
+                ));
+                return Err("Napstr did not answer over Iroh".into());
+            }
+        };
         self.connections
             .write()
             .await
@@ -2604,6 +2690,275 @@ impl RemoteClient {
         Err(last_error)
     }
 
+    /// Prove this phone's key to one computer, once per connection.
+    ///
+    /// A computer keeps what belongs to a key, and a key nobody has signed for
+    /// is just a string somebody typed - so every request that is filed under
+    /// this phone's own key comes through here first. The exchange is the one
+    /// NIP-42 describes: the computer makes up a nonce, this phone signs it, and
+    /// the computer checks the signature before it believes the key. It costs a
+    /// fraction of a second and happens once per computer per connection, which
+    /// is what makes it affordable to do it lazily, on the first request that
+    /// needs it, rather than at start-up.
+    async fn prove_key(&self, host: &SavedHost) -> Result<String, String> {
+        if let Some(key) = self.proved.read().await.get(&host.endpoint_id).cloned() {
+            return Ok(key);
+        }
+        let challenge = match self
+            .exchange_with(host, ClientRequest::IdentityChallenge)
+            .await?
+            .0
+        {
+            ServerResponse::IdentityChallenge { challenge } => challenge,
+            response => return Err(unexpected_response(&response)),
+        };
+        let event = self.sign_challenge(&challenge)?;
+        let key = match self
+            .exchange_with(host, ClientRequest::AuthenticateDevice { event })
+            .await?
+            .0
+        {
+            ServerResponse::DeviceIdentity { pubkey } => pubkey,
+            response => return Err(unexpected_response(&response)),
+        };
+        self.proved
+            .write()
+            .await
+            .insert(host.endpoint_id.clone());
+        Ok(key)
+    }
+
+    /// The nonce, signed with the key this phone holds.
+    ///
+    /// The event is a Nostr event rather than a shape of this protocol's own,
+    /// because it is exactly the event a relay would ask for: a computer checks
+    /// it with the same verifier, so there is one implementation of "is this
+    /// signature real" in the world rather than two.
+    fn sign_challenge(&self, challenge: &str) -> Result<SignedEvent, String> {
+        use nostr::JsonUtil;
+        let keys = self.identity.keys()?;
+        let event = nostr::EventBuilder::new(nostr::Kind::from(AUTHENTICATION_KIND), "")
+            .tags([
+                nostr::Tag::parse(["relay", "napstr"]).map_err(|error| error.to_string())?,
+                nostr::Tag::parse(["challenge", challenge]).map_err(|error| error.to_string())?,
+            ])
+            .sign_with_keys(&keys)
+            .map_err(|error| error.to_string())?;
+        serde_json::from_str(&event.as_json()).map_err(|error| error.to_string())
+    }
+
+    /// Forget that this phone proved its key, here or anywhere.
+    ///
+    /// Called when the identity changes and when a connection ends: the proof
+    /// was for a key and a session, and neither of those is true any more.
+    async fn forget_proofs(&self) {
+        self.proved.write().await.clear();
+    }
+
+    /// Forget the proof held for one computer, which is what a refusal about an
+    /// unproved key means: the computer has forgotten, so this phone should.
+    async fn forget_proof(&self, endpoint_id: &str) {
+        self.proved.write().await.remove(endpoint_id);
+    }
+
+    /// One request that a computer files under this phone's key.
+    ///
+    /// The proof comes first, and a computer that still answers "not proved" is
+    /// proved to once more before the request is sent again. That answer has one
+    /// cause worth handling here - its record of the proof is gone, because it
+    /// was reinstalled or its database was reset - and one fix, which is this.
+    /// Anything else the computer says is the caller's to report.
+    async fn request_under_this_key(
+        &self,
+        source: Option<&str>,
+        request: ClientRequest,
+    ) -> Result<ServerResponse, String> {
+        let host = self.host_named(source).await?;
+        self.prove_key(&host).await?;
+        let (response, _) = self.exchange_with(&host, request.clone()).await?;
+        if is_not_proved(&response) {
+            self.forget_proof(&host.endpoint_id).await;
+            self.prove_key(&host).await?;
+            let (response, _) = self.exchange_with(&host, request).await?;
+            return Ok(response);
+        }
+        Ok(response)
+    }
+
+    /// What this phone's key keeps on one computer, as the list of liked files.
+    async fn likes_on(&self, source: Option<&str>) -> Result<Vec<String>, String> {
+        match self
+            .request_under_this_key(source, ClientRequest::Likes)
+            .await?
+        {
+            ServerResponse::Likes { file_ids } => Ok(file_ids),
+            ServerResponse::Error { message } => Err(message),
+            response => Err(unexpected_response(&response)),
+        }
+    }
+
+    /// Replace what this phone's key keeps on one computer, and answer with what
+    /// was stored.
+    async fn set_likes_on(
+        &self,
+        source: Option<&str>,
+        file_ids: Vec<String>,
+    ) -> Result<Vec<String>, String> {
+        match self
+            .request_under_this_key(source, ClientRequest::SetLikes { file_ids })
+            .await?
+        {
+            ServerResponse::Likes { file_ids } => Ok(file_ids),
+            ServerResponse::Error { message } => Err(message),
+            response => Err(unexpected_response(&response)),
+        }
+    }
+
+    /// Every playlist this phone's key has on one computer, as summaries.
+    async fn own_playlists_on(
+        &self,
+        source: Option<&str>,
+    ) -> Result<Vec<RemotePlaylistSummary>, String> {
+        let mut playlists = Vec::new();
+        loop {
+            let offset = playlists.len();
+            let answer = self
+                .request_under_this_key(
+                    source,
+                    ClientRequest::Playlists {
+                        offset,
+                        limit: MAX_PAGE_SIZE,
+                        own_only: true,
+                    },
+                )
+                .await?;
+            let (page, total) = match answer {
+                ServerResponse::Playlists { playlists, total } => (playlists, total),
+                ServerResponse::Error { message } => return Err(message),
+                response => return Err(unexpected_response(&response)),
+            };
+            let empty = page.is_empty();
+            playlists.extend(page);
+            if empty || playlists.len() >= total {
+                return Ok(playlists);
+            }
+        }
+    }
+
+    /// One playlist, every member of it, from one computer.
+    async fn whole_playlist_on(
+        &self,
+        source: Option<&str>,
+        playlist_id: &str,
+    ) -> Result<RemotePlaylist, String> {
+        let mut whole: Option<RemotePlaylist> = None;
+        loop {
+            let offset = whole.as_ref().map(|held| held.tracks.len()).unwrap_or(0);
+            let answer = self
+                .request_under_this_key(
+                    source,
+                    ClientRequest::Playlist {
+                        author: String::new(),
+                        playlist_id: playlist_id.to_string(),
+                        offset,
+                        limit: MAX_PLAYLIST_PAGE,
+                    },
+                )
+                .await?;
+            let page = match answer {
+                ServerResponse::Playlist { playlist } => playlist,
+                ServerResponse::Error { message } => return Err(message),
+                response => return Err(unexpected_response(&response)),
+            };
+            let done = page.tracks.is_empty() || page.tracks.len() >= page.total;
+            match whole.as_mut() {
+                Some(held) => held.tracks.extend(page.tracks),
+                None => whole = Some(page),
+            }
+            if done {
+                return whole.ok_or_else(|| "That playlist is not on this computer".to_string());
+            }
+            if whole.as_ref().map(|held| held.tracks.len()).unwrap_or(0) >= MAX_PLAYLIST_MEMBERS {
+                // A playlist the computer says is longer than one is allowed to
+                // be: what has arrived is still what it holds, and asking for
+                // more would loop for ever.
+                return whole.ok_or_else(|| "That playlist is not on this computer".to_string());
+            }
+        }
+    }
+
+    /// Carry what this phone's key keeps from one computer to another.
+    ///
+    /// What this is for: the phone's lists live on the computer it acts through,
+    /// and a person who moves to a different one should not have to remember
+    /// what was where. Both are asked as the same key, so what moves is this
+    /// person's rather than this computer's.
+    ///
+    /// Likes are merged and never lost: a like is a set of file ids, and the
+    /// answer to "did I like this" is the same whichever computer is asked. The
+    /// newer of two lists goes first, and the other's own entries follow, so a
+    /// person who liked something while the other computer was home does not
+    /// lose it by moving back.
+    ///
+    /// Playlists are documents rather than sets, so each one is taken from the
+    /// side that edited it most recently, and one the destination already holds a
+    /// newer revision of is left alone rather than overwritten.
+    async fn carry_own_data(
+        &self,
+        from: &str,
+        to: &str,
+        likes: Vec<String>,
+    ) -> Result<CarryReport, String> {
+        let elsewhere = self.likes_on(Some(from)).await?;
+        let kept = self.set_likes_on(Some(to), merge_likes(likes, elsewhere)).await?;
+
+        let leaving = self.own_playlists_on(Some(from)).await?;
+        let staying = self.own_playlists_on(Some(to)).await?;
+        let mut carried = 0usize;
+        let mut skipped = 0usize;
+        let mut failed = Vec::new();
+        for summary in leaving {
+            let already_there = staying
+                .iter()
+                .find(|held| held.playlist_id == summary.playlist_id)
+                .is_some_and(|held| held.updated_at >= summary.updated_at);
+            if already_there {
+                skipped += 1;
+                continue;
+            }
+            let mut whole = match self
+                .whole_playlist_on(Some(from), &summary.playlist_id)
+                .await
+            {
+                Ok(whole) => whole,
+                Err(error) => {
+                    failed.push(format!("{}: {error}", summary.title));
+                    continue;
+                }
+            };
+            // Nothing here was published by this phone, so nothing here may
+            // claim it was: the flag is about a relay's copy of a coordinate,
+            // and this is a copy between two computers.
+            whole.published = false;
+            let answer = self
+                .request_under_this_key(Some(to), ClientRequest::SavePlaylist { playlist: whole })
+                .await?;
+            match answer {
+                ServerResponse::Playlist { .. } => carried += 1,
+                ServerResponse::Error { message } => {
+                    failed.push(format!("{}: {message}", summary.title))
+                }
+                response => failed.push(format!("{}: {}", summary.title, unexpected_response(&response))),
+            }
+        }
+        Ok(CarryReport {
+            likes: kept.len(),
+            playlists: carried,
+            skipped,
+            failed,
+        })
+    }
+
     /// One request to one computer, tried once.
     async fn exchange_attempt(
         &self,
@@ -2633,6 +2988,8 @@ impl RemoteClient {
         request: ClientRequest,
         may_close: bool,
     ) -> Result<(ServerResponse, iroh::endpoint::RecvStream), String> {
+        let kind = diag::request_kind(&request);
+        let asked_at = std::time::Instant::now();
         let (result, failure) = match self.connection(host).await {
             Ok(connection) => match tokio::time::timeout(
                 Duration::from_secs(30),
@@ -2654,6 +3011,19 @@ impl RemoteClient {
         match result {
             Ok(response) => Ok(response),
             Err(error) => {
+                // The one line that turns "the phone says offline" into an
+                // answer: which question, to which computer, how long it waited,
+                // and what came back instead.
+                diag::note(&format!(
+                    "{kind} to {} failed after {} ({}): {error}",
+                    host.desktop_name,
+                    diag::millis(asked_at),
+                    match failure {
+                        Some(AttemptFailure::Transport) => "the connection broke",
+                        Some(AttemptFailure::Timeout) => "the computer did not answer",
+                        None => "nothing was sent",
+                    }
+                ));
                 match failure {
                     Some(failure) if attempt_drops_tunnel(may_close, failure) => {
                         self.close_connection(&host.endpoint_id).await;
@@ -2751,12 +3121,25 @@ impl RemoteClient {
             // that is asleep fails its attempt, and after that "offline" is the
             // honest word rather than an app that claims to be busy for ever.
             let trying = self.connecting.read().await.contains(&host.endpoint_id);
+            diag::note(&format!(
+                "status: {} has no tunnel here ({}), answering {}",
+                host.desktop_name,
+                if trying { "one is being opened" } else { "none is being opened" },
+                if trying { "connecting" } else { "offline" }
+            ));
             return host.status(false, trying, String::new());
         }
+        let asked_at = std::time::Instant::now();
         match tokio::time::timeout(Duration::from_secs(8), self.request(ClientRequest::Status))
             .await
         {
-            Err(_) => host.status(false, false, "Napstr did not answer yet".into()),
+            Err(_) => {
+                diag::note(&format!(
+                    "status: {} did not answer within 8s (tunnel exists but the answer did not come)",
+                    host.desktop_name
+                ));
+                host.status(false, false, "Napstr did not answer yet".into())
+            }
             Ok(Ok(ServerResponse::Status {
                 library_revision,
                 cover_revision,
@@ -2765,6 +3148,11 @@ impl RemoteClient {
                 pubkey,
             })) => {
                 let grant = rights.unwrap_or_else(|| legacy_grant(stream_only));
+                diag::note(&format!(
+                    "status: {} answered in {} (library revision {library_revision})",
+                    host.desktop_name,
+                    diag::millis(asked_at)
+                ));
                 // An empty key is "this computer has not said", which leaves the
                 // one learned earlier standing: a host that is not on the
                 // network yet has no keys loaded, and that must not turn this
@@ -2819,6 +3207,10 @@ impl RemoteClient {
                 return;
             }
         }
+        diag::note(&format!(
+            "no tunnel to {} yet, opening one in the background",
+            host.desktop_name
+        ));
         let client = Arc::clone(self);
         let target = host.clone();
         tokio::spawn(async move {
@@ -3212,11 +3604,61 @@ fn export_nostr_identity(state: State<'_, AppState>) -> Result<String, String> {
 /// The caller warns first: a phone that restores a different key leaves behind
 /// every playlist its old key signed, and cannot edit them again.
 #[tauri::command]
-fn import_nostr_identity(
+async fn import_nostr_identity(
     secret: String,
     state: State<'_, AppState>,
 ) -> Result<identity::NostrIdentity, String> {
-    state.identity.adopt(&secret)
+    let identity = state.identity.adopt(&secret)?;
+    // A computer was told about the old key. The new one has to be proved to it
+    // before anything filed under it can be read, and holding a stale proof here
+    // would mean asking and being refused instead.
+    state.remote.forget_proofs().await;
+    Ok(identity)
+}
+
+/// The file ids this phone's key liked, as its home computer (or a named one)
+/// keeps them.
+///
+/// The phone holds its own copy and draws it first, so this is the slower half
+/// of a pair rather than the only one: what it is for is the computer being the
+/// second place the list lives, and the place it is read back from when the same
+/// key arrives on a phone that has never seen it.
+#[tauri::command]
+async fn remote_likes(
+    source: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    state.remote.likes_on(source.as_deref()).await
+}
+
+/// Replace that list, and answer with what the computer stored.
+#[tauri::command]
+async fn remote_set_likes(
+    source: Option<String>,
+    file_ids: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    state
+        .remote
+        .set_likes_on(source.as_deref(), file_ids)
+        .await
+}
+
+/// Move this phone's key's likes and playlists from one computer to another.
+///
+/// Called when someone changes which computer this phone acts through: the
+/// lists are filed under the phone's key on whichever computer it is talking to,
+/// so the one being left is where they were, and this is the explicit step that
+/// brings them along. `likes` is the phone's own copy, so a like made while
+/// nothing was reachable is not lost on the way.
+#[tauri::command]
+async fn carry_own_data(
+    from: String,
+    to: String,
+    likes: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<CarryReport, String> {
+    state.remote.carry_own_data(&from, &to, likes).await
 }
 
 /// Forget one computer, leaving the others this phone may read.
@@ -3411,9 +3853,10 @@ async fn remote_library_by_ids(
 
 /// Playlists this computer can see, newest first and without their members.
 ///
-/// `own_only` asks for this computer's own playlists alone, which is what the
+/// `own_only` asks for this phone's own playlists alone, which is what the
 /// picker beside a track wants: a public playlist somebody else published is one
-/// to play, not a list to add a track to.
+/// to play, not a list to add a track to. "Own" is this phone's key, so that
+/// question - and only that question - needs the key proved first.
 #[tauri::command]
 async fn remote_playlists(
     offset: usize,
@@ -3421,15 +3864,17 @@ async fn remote_playlists(
     own_only: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<PlaylistPage, String> {
-    match state
-        .remote
-        .request(ClientRequest::Playlists {
-            offset,
-            limit,
-            own_only: own_only.unwrap_or(false),
-        })
-        .await?
-    {
+    let request = ClientRequest::Playlists {
+        offset,
+        limit,
+        own_only: own_only.unwrap_or(false),
+    };
+    let response = if own_only.unwrap_or(false) {
+        state.remote.request_under_this_key(None, request).await?
+    } else {
+        state.remote.request(request).await?
+    };
+    match response {
         ServerResponse::Playlists { playlists, total } => Ok(PlaylistPage { playlists, total }),
         response => Err(unexpected_response(&response)),
     }
@@ -3528,7 +3973,9 @@ async fn remote_new_playlist_id(state: State<'_, AppState>) -> Result<String, St
 ///
 /// The whole playlist travels, because a revision is the whole list. What comes
 /// back is what the computer stored - author and edit time stamped there - so
-/// this phone keeps the same copy the computer will answer with later.
+/// this phone keeps the same copy the computer will answer with later. The
+/// author it is stamped with is this phone's own key, which is why the key is
+/// proved first.
 #[tauri::command]
 async fn remote_save_playlist(
     playlist: RemotePlaylist,
@@ -3536,9 +3983,10 @@ async fn remote_save_playlist(
 ) -> Result<RemotePlaylist, String> {
     match state
         .remote
-        .request(bounded_playlist_request(ClientRequest::SavePlaylist {
-            playlist,
-        })?)
+        .request_under_this_key(
+            None,
+            bounded_playlist_request(ClientRequest::SavePlaylist { playlist })?,
+        )
         .await?
     {
         ServerResponse::Playlist { playlist } => Ok(playlist),
@@ -3580,10 +4028,13 @@ async fn remote_delete_playlist(
 ) -> Result<(), String> {
     match state
         .remote
-        .request(ClientRequest::DeletePlaylist {
-            author,
-            playlist_id,
-        })
+        .request_under_this_key(
+            None,
+            ClientRequest::DeletePlaylist {
+                author,
+                playlist_id,
+            },
+        )
         .await?
     {
         ServerResponse::PlaylistRemoved => Ok(()),
@@ -4299,7 +4750,16 @@ async fn read_response(receive: &mut iroh::endpoint::RecvStream) -> Result<Serve
         .read_exact(&mut payload)
         .await
         .map_err(|error| format!("Could not read Napstr's response: {error}"))?;
-    serde_json::from_slice(&payload).map_err(|_| "Napstr returned an invalid response".into())
+    serde_json::from_slice(&payload).map_err(|error| {
+        // The one failure that says "the two sides disagree about the wire", and
+        // the one that used to say nothing at all: what serde objected to, and
+        // enough of the answer to see it. Without this, a phone that refuses
+        // every answer is indistinguishable from a computer that is not there.
+        let sample: String = String::from_utf8_lossy(&payload[..payload.len().min(160)]).into();
+        let message = format!("Napstr returned an invalid response: {error}; it said: {sample}");
+        diag::note(&message);
+        "Napstr returned an invalid response".to_string()
+    })
 }
 
 fn decode_endpoint_addr(host: &SavedHost) -> Result<EndpointAddr, String> {
@@ -4514,6 +4974,50 @@ fn unexpected_response(response: &ServerResponse) -> String {
     }
 }
 
+/// Whether a computer is saying that it does not know which key is this phone's.
+///
+/// Compared exactly, against the sentence both sides share: this is an
+/// instruction to prove the key rather than a failure to report, and the day the
+/// two sides stop agreeing on the words is the day it silently becomes the
+/// latter.
+fn is_not_proved(response: &ServerResponse) -> bool {
+    matches!(response, ServerResponse::Error { message } if message == NOT_PROVED_MESSAGE)
+}
+
+/// Two copies of one list of liked files, as one list.
+///
+/// A like is a state rather than an event - "did I like this" has the same
+/// answer whichever computer is asked - so merging two computers' copies is a
+/// union and nothing is ever lost by moving between them. `mine` is this
+/// phone's own copy and comes first because it is the one a person has just
+/// been using; what only the other computer had follows it.
+fn merge_likes(mine: Vec<String>, theirs: Vec<String>) -> Vec<String> {
+    let mut merged = mine;
+    for file_id in theirs {
+        if !merged.contains(&file_id) {
+            merged.push(file_id);
+        }
+    }
+    merged
+}
+
+/// What moved when this phone's own things were carried to another computer.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CarryReport {
+    /// Liked files the computer being moved to now holds for this key.
+    likes: usize,
+    /// Playlists written onto it.
+    playlists: usize,
+    /// Playlists it already had a revision of at least as new as the one being
+    /// carried, which were left alone.
+    skipped: usize,
+    /// Playlists that could not be carried, each with what went wrong. Reported
+    /// rather than counted, because the reason is usually something a person can
+    /// act on.
+    failed: Vec<String>,
+}
+
 fn save_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
@@ -4618,15 +5122,16 @@ pub fn run() {
             let podcasts = PodcastStore::new(&app_data)?;
             // Made or read once, here: everything that signs holds this, and the
             // file it comes from is what makes the identity outlive an install.
-            let identity = identity::DeviceIdentity::load_or_create(&app_data)?;
+            // The client holds it too, because proving a key is signing.
+            let identity = Arc::new(identity::DeviceIdentity::load_or_create(&app_data)?);
             // One path, decided once: the server serves from it and the command
             // that fetches writes into it.
             let art_root = app_data.join(art_store::ART_DIRECTORY);
             app.manage(AppState {
-                remote: RemoteClient::new(app_data),
+                remote: RemoteClient::new(app_data, Arc::clone(&identity)),
                 media: MediaServer::start(art_root.clone())?,
                 podcasts,
-                identity: Arc::new(identity),
+                identity,
                 art_root,
             });
             Ok(())
@@ -4649,6 +5154,9 @@ pub fn run() {
             remote_playlists,
             remote_playlist,
             remote_playlists_containing,
+            remote_likes,
+            remote_set_likes,
+            carry_own_data,
             remote_new_playlist_id,
             remote_save_playlist,
             remote_publish_playlist,
@@ -4701,6 +5209,103 @@ mod tests {
         // A slow answer is not a broken connection, so the retry has somewhere to
         // go instead of paying for a fresh connect.
         assert!(!attempt_drops_tunnel(true, AttemptFailure::Timeout));
+    }
+
+    /// A client of its own, with an identity of its own, in a directory of its
+    /// own - the state the app builds at start-up, without a window.
+    fn client_with_an_identity(name: &str) -> (PathBuf, Arc<RemoteClient>, Arc<identity::DeviceIdentity>) {
+        let root = std::env::temp_dir().join(format!("napstrfy-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let identity = Arc::new(identity::DeviceIdentity::load_or_create(&root).unwrap());
+        let remote = RemoteClient::new(root.clone(), Arc::clone(&identity));
+        (root, remote, identity)
+    }
+
+    /// The seam between this phone's proof and a computer's check.
+    ///
+    /// The phone signs with its own key and a computer verifies with the same
+    /// code a relay would use, and the only thing that makes that work is that
+    /// what goes over the wire is a Nostr event rather than a shape of this
+    /// protocol's own. So this signs a nonce and then verifies it exactly as the
+    /// computer does - the id recomputed, the signature checked, the nonce read
+    /// out of the tag.
+    #[test]
+    fn a_signed_challenge_is_a_nostr_authentication_a_computer_can_verify() {
+        use nostr::JsonUtil;
+        let (root, remote, identity) = client_with_an_identity("challenge");
+        let nonce = "a".repeat(64);
+
+        let signed = remote.sign_challenge(&nonce).unwrap();
+        assert_eq!(signed.kind, AUTHENTICATION_KIND);
+        assert_eq!(signed.content, "");
+        let answered = signed
+            .tags
+            .iter()
+            .find(|tag| tag.first().is_some_and(|name| name == "challenge"))
+            .and_then(|tag| tag.get(1))
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(answered, nonce, "the nonce must be the one that was asked for");
+
+        // The whole point of the shape: the computer can hand exactly this JSON
+        // to the verifier a relay uses, with no translation in between.
+        let event = nostr::Event::from_json(&serde_json::to_string(&signed).unwrap()).unwrap();
+        event.verify().unwrap();
+        let ours = identity.describe().unwrap().pubkey;
+        assert_eq!(event.pubkey.to_hex(), ours);
+        // And the key it names is the key that signed, which is what makes it a
+        // proof rather than a claim.
+        assert_eq!(signed.pubkey, ours);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A like is a set, so carrying a list between two computers loses nothing.
+    ///
+    /// The order is the phone's own, with what only the other computer had
+    /// appended: the phone is the side a person just used, so its order is the
+    /// more recent of the two, and a like that exists in either place survives
+    /// the move.
+    #[test]
+    fn a_carried_likes_list_keeps_every_like_from_both() {
+        let mine = vec!["a".to_string(), "b".to_string()];
+        let theirs = vec!["b".to_string(), "c".to_string()];
+
+        assert_eq!(
+            merge_likes(mine.clone(), theirs),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+        // Nothing to merge is not a reason to change anything.
+        assert_eq!(
+            merge_likes(mine.clone(), Vec::new()),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert_eq!(
+            merge_likes(Vec::new(), mine.clone()),
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    /// A computer saying it does not know this phone's key is an instruction, and
+    /// every other refusal is not.
+    ///
+    /// The two are told apart by the sentence both sides share, so this is the
+    /// test that fails the day one of them is reworded - which is the day the
+    /// retry would silently stop happening and a person would be shown an error
+    /// instead.
+    #[test]
+    fn only_the_unproved_refusal_is_read_as_an_instruction() {
+        assert!(is_not_proved(&ServerResponse::Error {
+            message: NOT_PROVED_MESSAGE.to_string(),
+        }));
+        assert!(!is_not_proved(&ServerResponse::Error {
+            message: format!("{NOT_PROVED_MESSAGE} "),
+        }));
+        assert!(!is_not_proved(&ServerResponse::Error {
+            message: "That playlist belongs to somebody else".into(),
+        }));
+        assert!(!is_not_proved(&ServerResponse::Pong));
     }
 
     fn host(endpoint: &str, rights: DeviceRights, name: &str) -> SavedHost {
@@ -5301,7 +5906,10 @@ mod tests {
                     .connect(desktop_endpoint.addr(), ALPN)
                     .await
                     .unwrap();
-                let remote = RemoteClient::new(root.clone());
+                let remote = RemoteClient::new(
+                    root.clone(),
+                    Arc::new(identity::DeviceIdentity::load_or_create(&root).unwrap()),
+                );
                 {
                     let endpoint_id = desktop_endpoint.id().to_string();
                     remote.hosts.write().await.push(SavedHost {

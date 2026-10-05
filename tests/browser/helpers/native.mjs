@@ -74,6 +74,21 @@ export async function mockNative(page, { app = 'napstrfy', nativeLocale = 'en-GB
     // host implements.
     const playlistRows = () => window.playlistStore ?? [];
     const ownPlaylistAuthor = () => window.playlistAuthor ?? 'c'.repeat(64);
+    // The key a phone's own things are filed under is the phone's, not the
+    // computer's, so the stand-in reads it from the identity it hands out.
+    const phonePubkey = () => (window.nostrIdentity ?? { pubkey: 'c'.repeat(64) }).pubkey;
+    // What a computer holds for this phone's key: liked file ids, kept the way
+    // the host keeps them - 64 hex characters, once each, in the order given.
+    const hostLikes = () => window.hostLikes ?? [];
+    const storeHostLikes = (fileIds) => {
+      const wanted = [];
+      for (const fileId of fileIds ?? []) {
+        const clean = String(fileId ?? '').trim().toLowerCase();
+        if (clean.length === 64 && /^[0-9a-f]+$/.test(clean) && !wanted.includes(clean)) wanted.push(clean);
+      }
+      window.hostLikes = wanted;
+      return wanted;
+    };
     const findPlaylist = (author, playlistId) =>
       playlistRows().find((row) => row.playlistId === playlistId && (!author || row.author === author)) ?? null;
     const savePlaylistRow = (row) => {
@@ -341,11 +356,12 @@ export async function mockNative(page, { app = 'napstrfy', nativeLocale = 'en-GB
           // command at a time; only the shapes differ.
           case 'remote_new_playlist_id': return window.nextPlaylistId ?? '11111111-1111-4111-8111-111111111111';
           case 'remote_playlists': {
-            // `ownOnly` is the picker's question: the computer's own playlists,
-            // because a public one somebody else published is not a list to add
-            // a track to.
+            // `ownOnly` is the picker's question: the playlists filed under this
+            // phone's own key, because neither a public playlist somebody else
+            // published nor the computer's own is a list this phone may add a
+            // track to - editing one of those makes a copy.
             const rows = args.ownOnly
-              ? playlistSummaries().filter((row) => !row.author || row.author === desktopPubkey())
+              ? playlistSummaries().filter((row) => !row.author || row.author === phonePubkey())
               : playlistSummaries();
             return { playlists: rows, total: rows.length };
           }
@@ -364,7 +380,22 @@ export async function mockNative(page, { app = 'napstrfy', nativeLocale = 'en-GB
               .filter((row) => (row.tracks ?? []).some((member) => member.fileId === args.fileId))
               .map((row) => ({ author: row.author ?? ownPlaylistAuthor(), playlistId: row.playlistId }));
           case 'remote_save_playlist':
-            return filePlaylistRevision(args.playlist);
+            // A phone's save is filed under the phone's own key, which is what
+            // makes two phones' playlists two separate sets.
+            return savePlaylistRow({ ...args.playlist, author: phonePubkey(), updatedAt: 1787000000 });
+          case 'remote_likes': return hostLikes();
+          case 'remote_set_likes': return storeHostLikes(args.fileIds);
+          case 'carry_own_data': {
+            // The computer being left is the one thing that can make this fail,
+            // and the failure has to be visible rather than silent: nothing is
+            // lost, but a page that said "moved" would be lying.
+            if (window.carryFails) throw 'the computer being left is not answering';
+            const moved = storeHostLikes([...hostLikes(), ...(args.likes ?? [])]);
+            const mine = playlistSummaries().filter((row) => !row.author || row.author === phonePubkey());
+            window.carriedTo = args.to;
+            window.carriedFrom = args.from;
+            return { likes: moved.length, playlists: mine.length, skipped: 0, failed: [] };
+          }
           case 'remote_publish_playlist':
             return filePlaylistRevision(args.playlist, { published: true });
           case 'remote_delete_playlist': dropPlaylistRow(args.author, args.playlistId); return null;

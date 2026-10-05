@@ -26,7 +26,7 @@
   import { artworkHue, coverFor, coverKey, invalidateCoverNegatives, loadFullCover, preloadArtwork, type AlbumCover } from './lib/artwork';
   import { reportReasons } from './lib/types';
   import { hostHue } from './lib/hosts';
-  import type { AudiobookLibraryPage, CachedAudio, CompanionStatus, CoverReport, LibraryPage, NostrIdentity, PlaybackCommand, PlaylistPage, PodcastDownload, PodcastEpisode, PodcastFeed, ReadOnlyTicketOffer, RemoteAudiobook, RemoteAudiobookSummary, RemoteDiscussionMessage, RemoteHost, RemotePlaybackState, RemotePlaylist, RemotePlaylistCoordinate, RemotePlaylistSummary, RemotePlaylistTrack, RemoteRepeat, RemoteTrack, RemoteTransfer, ReportReason } from './lib/types';
+  import type { AudiobookLibraryPage, CachedAudio, CarryReport, CompanionStatus, CoverReport, LibraryPage, NostrIdentity, PlaybackCommand, PlaylistPage, PodcastDownload, PodcastEpisode, PodcastFeed, ReadOnlyTicketOffer, RemoteAudiobook, RemoteAudiobookSummary, RemoteDiscussionMessage, RemoteHost, RemotePlaybackState, RemotePlaylist, RemotePlaylistCoordinate, RemotePlaylistSummary, RemotePlaylistTrack, RemoteRepeat, RemoteTrack, RemoteTransfer, ReportReason } from './lib/types';
 
   const musicChips = ['Rock', 'Soundtrack', 'Punk', 'Folk', 'Upbeat'];
   const musicHistoryKey = 'napstrfy-played-albums';
@@ -73,6 +73,27 @@
   type PlayedTrack = { fileId: string; title: string; artist: string; album: string };
   const podcastGenres = ['Comedy', 'News', 'True Crime', 'Society & Culture', 'Technology', 'History', 'Business', 'Science', 'Arts', 'Sports', 'Education', 'Music'];
   const likedMusicKey = 'napstrfy-liked-music';
+  /**
+   * Liked files this phone has no record of yet.
+   *
+   * A like is a set, and the set is what the computer keeps under this phone's
+   * key - so an id that arrives from there before the library can describe it is
+   * still a like, and is written down here rather than thrown away. A file the
+   * computer has not indexed yet, or one that has left the network, is a
+   * temporary reason; the set is not.
+   */
+  const likedOrphansKey = 'napstrfy-liked-orphans';
+  /**
+   * What this phone and its computer last agreed on.
+   *
+   * The two lists are merged when they meet, and the only thing that tells "the
+   * other side liked something new" apart from "this side unliked something" is
+   * what they agreed on last time: an id the computer holds that this phone
+   * never had is new, and an id it holds that this phone had and dropped is a
+   * removal. Without it, merging would put back everything a person removed
+   * while they were offline.
+   */
+  const likedSyncedKey = 'napstrfy-likes-synced';
   const playedTracksKey = 'napstrfy-played-tracks';
   /** Tracks one "recently played" list holds before the oldest falls off. */
   const PLAYED_TRACKS_KEPT = 100;
@@ -139,6 +160,14 @@
   const MAX_PLAYLIST_MEMBERS = 500;
   /** Mirrors `MAX_TRACKS_BY_ID`: the most file ids one resolve can carry. */
   const MAX_TRACKS_BY_ID = 100;
+  /**
+   * Liked ids one pass tries to turn into records.
+   *
+   * A bound rather than the whole list, because this runs when the library
+   * changes: hundreds of unknown ids are answered a hundred at a time, and the
+   * rest are resolved by the next pass rather than holding up this one.
+   */
+  const MAX_LIKED_RESOLVE = MAX_TRACKS_BY_ID;
   /**
    * The glyphs on a playlist's tool row.
    *
@@ -367,6 +396,8 @@
 
   /** Choose which computer this phone acts through. */
   async function setHomeComputer(computer: RemoteHost) {
+    const leaving = homeComputer();
+    const moving = leaving && leaving.endpointId !== computer.endpointId ? leaving : null;
     try {
       await invoke('set_mobile_home_host', { endpointId: computer.endpointId });
       await refreshKnownHosts();
@@ -374,8 +405,53 @@
       // Which computer is home decides whose row answers for a file two of them
       // hold, and what the status line names.
       await loadLibrary();
+      // What this phone's key keeps is filed on the computer it acts through, so
+      // a change of home is exactly when the lists have to come along.
+      if (moving) await carryOwnDataTo(moving, computer);
     } catch (nextError) {
       notice = String(nextError);
+    }
+  }
+
+  /**
+   * Bring this phone's own likes and playlists from the computer being left to
+   * the one it now acts through.
+   *
+   * Asked for rather than automatic: both computers have to answer, and what
+   * moves is this phone's own key's things on each of them. Nothing is deleted
+   * from the one being left - it keeps its copy, which is what a person moving
+   * back and forth needs, and what a failed move leaves behind rather than
+   * losing.
+   *
+   * The phone's own liked list travels with the request, so a like made while
+   * nothing was reachable is part of the union that lands on the new computer
+   * rather than something only this phone knows about.
+   */
+  async function carryOwnDataTo(from: RemoteHost, to: RemoteHost) {
+    const name = to.desktopName || 'that computer';
+    try {
+      const report = await invoke<CarryReport>('carry_own_data', {
+        from: from.endpointId,
+        to: to.endpointId,
+        likes: likedFileIds()
+      });
+      // The new computer's answer is the merged list, so it is read back rather
+      // than assumed: a like that only the other computer had is drawn here too.
+      await mergeLikesFromHome();
+      await refreshPlaylists();
+      const playlists = report.playlists === 1 ? '1 playlist' : `${report.playlists} playlists`;
+      const likes = report.likes === 1 ? '1 liked song' : `${report.likes} liked songs`;
+      notice =
+        report.playlists > 0
+          ? `Moved ${likes} and ${playlists} to ${name}.`
+          : `Moved ${likes} to ${name}.`;
+      if (report.failed.length > 0) {
+        error = `Some playlists could not be moved: ${report.failed.join('; ')}`;
+      }
+    } catch (nextError) {
+      // Nothing was lost: the lists are still on the computer being left, and on
+      // this phone. Saying so is the difference between a failure and a fright.
+      error = `Could not bring your likes and playlists to ${name}: ${nextError}. Nothing was lost - they are still on ${from.desktopName || 'the other computer'}.`;
     }
   }
 
@@ -397,6 +473,39 @@
     void tracks.length;
     void status.libraryRevision;
     void refreshFileHosts();
+  });
+
+  /**
+   * Whether this session has already put its liked list together with the
+   * computer's.
+   *
+   * Once per session rather than on every connect: the two are merged and the
+   * result is pushed back, so a second pass would ask a question whose answer it
+   * has just written. A like made while the computer was away is what the next
+   * change, or the next launch, sends.
+   */
+  let likesSyncedOnce = false;
+
+  // The liked list has two homes, and this is where the phone's copy and the
+  // computer's meet. Everything the phone holds is kept, everything the
+  // computer holds is added, and the union goes back - which is what makes a
+  // like made on another phone with the same key, or while nothing was
+  // reachable, arrive here instead of being overwritten by whichever side spoke
+  // last.
+  $effect(() => {
+    if (!status.connected || likesSyncedOnce) return;
+    likesSyncedOnce = true;
+    void mergeLikesFromHome();
+  });
+
+  // An id the library could not describe yet is asked about again when the
+  // library moves: the reason it could not be described is usually that the
+  // computer had not indexed the file, and that reason ends by itself.
+  // Untracked, because resolving one writes the very list it read - which as a
+  // dependency would mean an effect that asks again on every resolution.
+  $effect(() => {
+    void status.libraryRevision;
+    untrack(() => void resolveLikedOrphans());
   });
   let statusLoading = $state(true);
   let statusPending = $state(false);
@@ -437,6 +546,8 @@
   let query = $state('');
   let tracks = $state<RemoteTrack[]>([]);
   let likedMusic = $state<RemoteTrack[]>([]);
+  /** Liked file ids with no record on this phone yet. See `likedOrphansKey`. */
+  let likedOrphans = $state<string[]>([]);
   let showingLikedMusic = $state(false);
   let total = $state(0);
   let loading = $state(false);
@@ -1150,11 +1261,134 @@
     return likedMusic.some((item) => item.fileId === track.fileId);
   }
 
+  /**
+   * Every file this phone's key has liked, as ids.
+   *
+   * The liked page draws records rather than ids, because a record is what
+   * renders a row with no computer in reach. But a like is a *set*, and the
+   * computer keeps the set under this phone's key so that the same person's
+   * other phone can see it - so what is pushed to the computer, and what two
+   * copies are merged by, is this list. An id with no record here is still a
+   * like: it is one this phone has not been able to draw yet, and dropping it
+   * on the way through would lose it for good.
+   */
+  function likedFileIds(): string[] {
+    return [...likedMusic.map((item) => item.fileId), ...likedOrphans];
+  }
+
+  /** Write the liked ids this phone cannot draw yet, beside the ones it can. */
+  function saveLikedOrphans() {
+    saveLikes(likedOrphansKey, likedOrphans);
+  }
+
+  /** What the two copies last agreed on, as a set. */
+  function likedSnapshot(): Set<string> {
+    try {
+      const saved = JSON.parse(window.localStorage.getItem(likedSyncedKey) || '[]') as unknown;
+      if (Array.isArray(saved)) return new Set(saved.filter((id): id is string => typeof id === 'string'));
+    } catch {
+      // An unreadable snapshot reads as "nothing agreed yet", which merges the
+      // computer's list in. That is the safe direction: it adds likes rather
+      // than quietly forgetting them.
+    }
+    return new Set();
+  }
+
+  /**
+   * Tell the home computer what this phone's key has liked.
+   *
+   * Fire and forget, on purpose: the phone's own copy has already been written
+   * by the time this runs, so a computer that is asleep or unreachable costs the
+   * second copy rather than the like. The next change, or the next connect,
+   * sends the whole list again and the two agree.
+   */
+  async function pushLikesToHome() {
+    if (!status.paired) return;
+    try {
+      const stored = await invoke<string[]>('remote_set_likes', { fileIds: likedFileIds() });
+      // What the computer holds is what the two now agree on. Written only on
+      // success: a push that did not land must not leave this phone believing
+      // the other side has seen the change.
+      saveLikes(likedSyncedKey, stored);
+    } catch {
+      // Nothing to report: the list this phone drew is the list a person meant,
+      // and it goes again on the next like or the next connect.
+    }
+  }
+
+  /**
+   * Put this phone's liked list together with the computer's, once.
+   *
+   * Two lists under one key, and two different reasons they can differ:
+   *
+   * - The computer has an id this phone has never had, and which the two did not
+   *   agree on last time. That is somebody else liking something - the same key
+   *   on another phone - or a list coming back after a reinstall, and it is added
+   *   here.
+   * - The computer has an id the two *did* agree on and this phone no longer
+   *   has. That is a like removed on this phone while it could not be told, and
+   *   it is not added back. Merging by union alone would resurrect it, which is
+   *   the one way a merge can lose a person's decision.
+   *
+   * Then the computer is brought up to date, so both hold the same set.
+   */
+  async function mergeLikesFromHome() {
+    if (!status.paired) return;
+    let theirs: string[] = [];
+    try {
+      theirs = await invoke<string[]>('remote_likes');
+    } catch {
+      return;
+    }
+    const agreed = likedSnapshot();
+    const held = new Set(likedFileIds());
+    const addedElsewhere = theirs.filter((fileId) => !held.has(fileId) && !agreed.has(fileId));
+    if (addedElsewhere.length > 0) {
+      likedOrphans = [...likedOrphans, ...addedElsewhere.filter((fileId) => !likedOrphans.includes(fileId))];
+      saveLikedOrphans();
+      await resolveLikedOrphans();
+    }
+    const now = likedFileIds();
+    if (theirs.length === now.length && theirs.every((fileId) => now.includes(fileId))) {
+      // Already the same list, which is the ordinary case. Nothing to send.
+      saveLikes(likedSyncedKey, theirs);
+      return;
+    }
+    await pushLikesToHome();
+  }
+
+  /**
+   * Turn liked ids this phone cannot draw yet into records.
+   *
+   * An id the library does not answer for is kept rather than dropped: a
+   * computer that has not indexed the file yet, or a file that has left the
+   * network, is a temporary reason, and the set is what a computer keeps. The
+   * list is retried whenever the library changes.
+   */
+  async function resolveLikedOrphans() {
+    if (likedOrphans.length === 0 || !anyoneReachable) return;
+    const asked = likedOrphans.slice(0, MAX_LIKED_RESOLVE);
+    const answered = await tracksByIds(asked);
+    if (answered.length === 0) return;
+    const found = new Set(answered.map((track) => track.fileId));
+    likedMusic = [...likedMusic, ...answered.filter((track) => !isTrackLiked(track))];
+    saveLikes(likedMusicKey, likedMusic);
+    likedOrphans = likedOrphans.filter((fileId) => !found.has(fileId));
+    saveLikedOrphans();
+    if (showingLikedMusic) {
+      tracks = [...likedMusic];
+      total = tracks.length;
+    }
+  }
+
   function toggleTrackLike(track: RemoteTrack) {
     likedMusic = isTrackLiked(track)
       ? likedMusic.filter((item) => item.fileId !== track.fileId)
       : [track, ...likedMusic.filter((item) => item.fileId !== track.fileId)].slice(0, 1000);
+    likedOrphans = likedOrphans.filter((fileId) => fileId !== track.fileId);
     saveLikes(likedMusicKey, likedMusic);
+    saveLikedOrphans();
+    void pushLikesToHome();
     if (showingLikedMusic) {
       tracks = [...likedMusic];
       total = tracks.length;
@@ -2069,19 +2303,24 @@
   }
 
   /**
-   * Whether a playlist is this computer's own, and therefore this phone's to
+   * Whether a playlist is this phone's own, and therefore this phone's to
    * change.
    *
-   * Two things make one its own: an author that is the key the computer
-   * reported, and no author at all, which is a playlist only that computer has
-   * ever written down. An empty key is "the computer has not said who it is",
-   * and the answer to that is no: the actions that would be wrong to offer are
-   * the writes, and reading and playing a playlist needs no permission at all.
+   * Two things make one its own: an author that is this phone's own key - the
+   * key it proved to the computer, which is the key a save is filed under - and
+   * no author at all, which is a playlist nobody has claimed yet. The key
+   * compared against is deliberately *not* `status.pubkey`: that is the
+   * computer's key, and a playlist under it belongs to the computer rather than
+   * to this phone, which is why editing one of those is a copy.
+   *
+   * An empty key of our own is "this phone has not said who it is", and the
+   * answer to that is no: the actions that would be wrong to offer are the
+   * writes, and reading and playing a playlist needs no permission at all.
    */
   function playlistIsMine(author: string) {
     if (!author) return true;
-    if (!status.pubkey) return false;
-    return author === status.pubkey;
+    if (!nostrIdentity.pubkey) return false;
+    return author === nostrIdentity.pubkey;
   }
 
   /** This computer's own playlists, in the order the computer lists them. */
@@ -6088,6 +6327,12 @@
       const saved = JSON.parse(window.localStorage.getItem(likedMusicKey) || '[]') as unknown;
       if (Array.isArray(saved)) likedMusic = saved.filter(isStoredTrack).slice(0, 1000);
     } catch { likedMusic = []; }
+    try {
+      const saved = JSON.parse(window.localStorage.getItem(likedOrphansKey) || '[]') as unknown;
+      if (Array.isArray(saved)) {
+        likedOrphans = saved.filter((fileId): fileId is string => typeof fileId === 'string').slice(0, 1000);
+      }
+    } catch { likedOrphans = []; }
     try {
       const saved = JSON.parse(window.localStorage.getItem(likedPodcastsKey) || '[]') as unknown;
       if (Array.isArray(saved)) {

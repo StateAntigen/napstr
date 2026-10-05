@@ -9,6 +9,17 @@ pub const MAX_PAGE_SIZE: usize = 200;
 /// NIP-42's client authentication, which is the question "do you hold this
 /// key?" and needs no kind of its own.
 pub const AUTHENTICATION_KIND: u16 = 22242;
+/// What a computer answers when a device asks for something filed under its own
+/// key without having proved one.
+///
+/// A shared constant rather than a sentence written once on each side, because
+/// a companion reads this answer as an instruction rather than a failure: the
+/// fix is to ask for a challenge and sign it, and the one thing that has to be
+/// true for the companion to act on it is that both sides mean the same words.
+/// A copy that drifted by a word would turn a retry into an error a person has
+/// to read.
+pub const NOT_PROVED_MESSAGE: &str =
+    "This phone has not said which key is its own yet: ask for a challenge and sign it";
 /// Longest likes list one device may keep.
 ///
 /// Bounded by the control frame rather than by taste: a like is a 64-character
@@ -636,8 +647,19 @@ impl RemotePlaylist {
 /// which is exactly the split this names.
 ///
 /// `Default` is no rights at all: a response that says nothing grants nothing.
+///
+/// A grant is a set of *bits*, and this is the one place where that has to be
+/// true on the wire as well as in the database: a computer one version behind
+/// sends the rights it knows, and a reader that insisted on every field it has
+/// heard of would refuse the whole answer. That is not a hypothetical - it is
+/// what happened, and it looked exactly like a computer that was not there: the
+/// tunnel opened in a tenth of a second and every status answer was thrown away
+/// unparsed, so the phone retried for ever and said "offline". A right that is
+/// missing therefore reads as a right that is not granted, and the older meaning
+/// is preserved where it belongs, in [`Self::may_download`]: a grant from before
+/// `download` existed carries `privileged`, which has always meant it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 pub struct DeviceRights {
     /// Read this computer's index: its library, searches within it, playlists,
     /// audiobooks, album art, and the comments on a track.
@@ -1284,6 +1306,30 @@ mod tests {
             "{MAX_LIKES} likes is {} bytes answered, over the {MAX_CONTROL_FRAME_BYTES} byte limit",
             answered.len()
         );
+    }
+
+    /// What a host one version behind can say, and what it must mean.
+    ///
+    /// This is the bug that cost a morning: the newest phone in the world
+    /// against a computer that had not heard of `download`, whose every status
+    /// answer was refused as malformed. A grant is bits, so a reader has to
+    /// accept the bits it is given - and an older grant, which said `privileged`,
+    /// still means a phone that may download.
+    #[test]
+    fn a_grant_from_a_computer_that_predates_a_right_still_reads() {
+        let four_bits = r#"{"browse":true,"fetch":true,"control":true,"privileged":true}"#;
+        let parsed: DeviceRights = serde_json::from_str(four_bits).unwrap();
+        assert!(parsed.download == false, "the bit nobody sent is not granted");
+        assert!(parsed.may_download(), "but `privileged` has always meant it");
+        assert!(parsed.grants(DeviceRights::CONTROL));
+        assert!(parsed.is_full());
+
+        // And an answer that says nothing at all grants nothing, rather than
+        // being refused: a field added later must not break an older reader.
+        let nothing: DeviceRights = serde_json::from_str("{}").unwrap();
+        assert_eq!(nothing.bits(), 0);
+        assert!(nothing.is_read_only());
+        assert!(!nothing.may_download());
     }
 
     /// The bytes a phone needs to decide about data, as the host writes them.

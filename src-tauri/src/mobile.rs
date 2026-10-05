@@ -1395,8 +1395,7 @@ impl MobileService {
     /// and replace their list.
     fn proved_key(&self, remote_id: &str) -> Result<String, String> {
         crate::device_account::proved_key(&self.db_path, remote_id)?.ok_or_else(|| {
-            "This phone has not said which key is its own yet: ask for a challenge and sign it"
-                .to_string()
+            napstr_remote_protocol::NOT_PROVED_MESSAGE.to_string()
         })
     }
 
