@@ -200,6 +200,25 @@ export async function mockNative(page, { app = 'napstrfy', nativeLocale = 'en-GB
           case 'play_audio': return { fileId: track.fileId, currentTime: 0, duration: 60, playing: true, ended: false, error: '' };
           case 'client_platform': return platform;
           case 'companion_status': return status();
+          // This phone's own key. The companion makes one on first launch and it
+          // is always there, so the host every other spec talks to has one too -
+          // and a spec that wants a particular key sets `window.nostrIdentity`.
+          case 'nostr_identity':
+            return window.nostrIdentity ?? { pubkey: 'c'.repeat(64), npub: `npub1${'c'.repeat(58)}` };
+          case 'export_nostr_identity':
+            return window.nostrSecret ?? `nsec1${'c'.repeat(58)}`;
+          case 'import_nostr_identity': {
+            // The companion refuses anything that is not a key rather than
+            // adopting it, so the stand-in does too: what a spec sees is the
+            // answer, not its own optimism.
+            const secret = String(args.secret ?? '').trim();
+            if (!/^(nsec1[0-9a-z]+|[0-9a-f]{64})$/.test(secret)) {
+              throw 'That is not a Nostr secret key: paste an nsec1… value or 64 hex characters';
+            }
+            window.nostrSecret = secret;
+            window.nostrIdentity = { pubkey: 'd'.repeat(64), npub: `npub1${'d'.repeat(58)}` };
+            return window.nostrIdentity;
+          }
           case 'cached_library': {
             // What this phone holds itself, which is what a playlist played
             // offline is queued from.

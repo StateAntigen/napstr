@@ -5132,7 +5132,14 @@
   /** This phone's public key, which is all a screen ever needs to show. */
   async function loadNostrIdentity() {
     try {
-      nostrIdentity = await invoke<NostrIdentity>('nostr_identity');
+      const answered = await invoke<NostrIdentity>('nostr_identity');
+      // The shape is checked rather than trusted. This is a local command and the
+      // companion always answers with one, so anything else is a bug somewhere
+      // else - and a missing field must cost the identity's own rows rather than
+      // every other setting in the same sheet.
+      if (answered && typeof answered.pubkey === 'string' && typeof answered.npub === 'string') {
+        nostrIdentity = answered;
+      }
     } catch {
       // Nothing to report: an identity that cannot be read is an identity whose
       // rows simply do not appear, and the pairing and playback are unaffected.
