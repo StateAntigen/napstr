@@ -31,12 +31,18 @@ const live = [track('b', 'Gimme All Your Lovin', false), track('c', 'Sharp Dress
  * `arrives` names a file the computer is to have finished fetching, which is the
  * moment a row that was asked to play stops being a download and becomes sound.
  */
-async function openApp(page, { library = [inLibrary], discovered = live, arrives = null, preload = null } = {}) {
+async function openApp(page, { library = [inLibrary], discovered = live, arrives = null, preload = null, streamOnly = false, mayDownload = null } = {}) {
   await mockNative(page, { platform: 'android' });
   await page.route('**/fixture.wav', serveAudio);
-  await page.addInitScript(({ library, discovered, arrives, preload }) => {
+  await page.addInitScript(({ library, discovered, arrives, preload, streamOnly, mayDownload }) => {
     window.remoteLibrary = library;
     window.discoverTracks = discovered;
+    // What the pairing allows, said the way the app is told it: the older
+    // `streamOnly` is the signature, and reaching the network is its own answer
+    // beside it. `mayDownload: true` with `streamOnly: true` is the pairing this
+    // right exists for - a phone lent the network that may sign nothing.
+    window.streamOnly = streamOnly;
+    if (mayDownload !== null) window.mayDownload = mayDownload;
     if (preload !== null) window.localStorage.setItem('napstrfy-preload-depth', String(preload));
     const invoke = window.__TAURI_INTERNALS__.invoke;
     window.__TAURI_INTERNALS__.invoke = async (cmd, args = {}) => {
@@ -45,7 +51,7 @@ async function openApp(page, { library = [inLibrary], discovered = live, arrives
       }
       return invoke(cmd, args);
     };
-  }, { library, discovered, arrives, preload });
+  }, { library, discovered, arrives, preload, streamOnly, mayDownload });
   await page.goto('http://127.0.0.1:15174');
 }
 
@@ -100,6 +106,38 @@ test('playing a row nobody here holds asks the computer to fetch it, from the ro
   // The seeders travel with the ask: the computer has never seen this file, so who
   // is holding it is the whole of what it knows about getting it.
   expect(downloads[0].sourcePubkeys).toEqual([id('1'), id('2')]);
+});
+
+/**
+ * The pairing the new right was separated for.
+ *
+ * Downloads and signatures used to be one thing, so a phone that could fill
+ * itself with music could also publish under its owner's name. This is the
+ * combination that is supposed to be possible now: the network, and nothing
+ * said in anybody's name.
+ */
+test('a phone lent the network but not the signature may fetch a row and may publish nothing', async ({ page }) => {
+  await openApp(page, { preload: 0, streamOnly: true, mayDownload: true });
+  await openSearchTab(page);
+
+  // The list is offered, because reaching the network is what this pairing may do.
+  const section = page.locator('section[aria-label="Discover"]');
+  await expect(section).toBeVisible();
+  await expect(section.locator('.track-row')).toHaveCount(2);
+
+  // And playing a row it does not hold is allowed: the ask is the proof.
+  await section.locator('.track-open').first().click();
+  const downloads = await expect.poll(() => calls(page, 'remote_download')).toHaveLength(1).then(() => calls(page, 'remote_download'));
+  expect(downloads[0].fileId).toBe(live[0].fileId);
+});
+
+/** The other half of the same split: no network right is no list at all. */
+test('a phone that may not reach the network is shown no list to play from', async ({ page }) => {
+  await openApp(page, { preload: 0, streamOnly: true, mayDownload: false });
+  await openSearchTab(page);
+
+  await expect(page.locator('section[aria-label="Discover"]')).toHaveCount(0);
+  await expect.poll(() => calls(page, 'remote_download')).toHaveLength(0);
 });
 
 test('play all leads with a track of this phone’s own, and asks for the first row', async ({ page }) => {

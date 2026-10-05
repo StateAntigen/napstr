@@ -102,7 +102,25 @@ The Napstrfy page offers two independent, one-use QR codes:
 - **Full access** keeps the usual library search, Tor download requests, and verified offline audio cache.
 - **Read only** lets a phone browse, play, and cache music and audiobooks already on this Napstr. Playback uses the same verified offline audio cache, seeking, and next-track prefetching as full access. Napstr rejects requests to download new songs on the host and access its transfer history. Update both apps to get this playback behaviour.
 
-Each code expires after five minutes. Generating a replacement affects only that code's access mode. Each paired phone shows its access level; pairing the same phone again changes its access. Removing a phone rejects subsequent requests and stops active audio transfers at the next chunk check. Audio already cached on the phone remains available offline. Read-only access protects the host from download requests; it does not restrict copying audio.
+A code says what a phone may do *to begin with*. Every right can be changed afterwards from the paired-phone list on the Napstrfy page, one tick at a time:
+
+- **Read the library** — the index: library pages, searches within it, playlists, audiobooks, album art, comments.
+- **Play and keep audio** — be handed this computer's audio and cache it.
+- **Control playback** — drive the player on this computer.
+- **Download from the network** — reach the network *through* this computer: relay searches, the catalogue mirror behind the Discover list, and asking it to fetch a file. Nothing here is said in anyone's name.
+- **Sign and publish as you** — edit and publish playlists, post comments and file reports, and lend access on. This is the signature, and it is the one right that acts as the owner.
+
+`Sign and publish` includes downloads, because asking this computer to fetch a song was always part of what "act as you" meant, and a phone paired before the two were separated keeps working. The useful new combination is the one that goes the other way: a phone may be lent the network without being able to publish anything.
+
+Each code expires after five minutes. Generating a replacement affects only that code's access mode. Each paired phone shows what it may do; pairing the same phone again changes its access. Removing a phone rejects subsequent requests and stops active audio transfers at the next chunk check. Audio already cached on the phone remains available offline. Read-only access protects the host from download requests; it does not restrict copying audio.
+
+## Several computers at once
+
+A phone may be paired with more than one Napstr. One of them is its **home computer**: the one whose player, download queue and status the app is drawn from, and the one it signs through. The others are libraries to read and play from, and their music appears in the same list.
+
+The home computer is chosen in Napstrfy's Settings, which is what makes it useful to own two: a desktop and a laptop that both let the phone act as their owner are both valid homes, and only the person holding the phone knows which one is home. Without a choice it is the first computer paired that lets the phone act as its owner.
+
+When one of them is unreachable the rest still work. The status line says how many answered (`1/2 Online`), the library and search read from whichever computers are there, and the settings list marks each one with whether it may download for this phone.
 
 Podcasts are independent of Napstr: Napstrfy searches a public podcast directory and streams or downloads episodes directly from their publishers.
 

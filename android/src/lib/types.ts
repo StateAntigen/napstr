@@ -89,23 +89,45 @@ export type AudiobookLibraryPage = {
 /**
  * One computer this phone may talk to.
  *
- * There may be more than one now: exactly one of them may let this phone act as
- * its owner, and the others are libraries to read from.
+ * There may be more than one: one of them is home - the one this phone signs,
+ * downloads and browses as - and the others are libraries to read from.
  */
 export type RemoteHost = {
   endpointId: string;
   desktopName: string;
-  rights: { browse: boolean; fetch: boolean; control: boolean; privileged: boolean };
-  /** The computer this phone acts through, whose status and writes it carries. */
-  primary: boolean;
+  rights: {
+    browse: boolean;
+    fetch: boolean;
+    control: boolean;
+    /** Reach the network through this computer: search, browse, and download. */
+    download: boolean;
+    /** Sign and publish in the owner's name. */
+    privileged: boolean;
+  };
+  /**
+   * The home computer: the one whose status, player and download queue the app
+   * is drawn from. Chosen in Settings when a phone holds more than one.
+   */
+  home: boolean;
   /** Whether this phone reads from it. A computer left out keeps its pairing. */
   included: boolean;
   /** Whether it answered just now. */
   online: boolean;
+  /** Whether it may reach the network for this phone. */
+  mayDownload: boolean;
 };
 
 export type CompanionStatus = {
   streamOnly: boolean;
+  /**
+   * Whether the home computer may reach the network for this phone.
+   *
+   * Beside `streamOnly` because they are two different questions: a phone lent
+   * the network but not the owner's name is "read only" and may still download.
+   */
+  mayDownload: boolean;
+  /** Whether the home computer may drive its own player for this phone. */
+  mayControl: boolean;
   paired: boolean;
   connected: boolean;
   /**

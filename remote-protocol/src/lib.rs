@@ -587,6 +587,14 @@ impl RemotePlaylist {
 /// acting as its owner. A second computer's phone needs the first two and must
 /// never have the third, so each right is named rather than implied.
 ///
+/// `download` was split out of `privileged` for the same reason. Reaching the
+/// network through this computer - asking it to search the relays, showing what
+/// its catalogue mirror holds, and telling it to fetch a file - is a real thing
+/// to want on its own: a phone that may fill itself with music must not, by that
+/// fact alone, be able to sign and publish in its owner's name. In time the
+/// phone will hold its own key and hand signed events over for broadcasting,
+/// which is exactly the split this names.
+///
 /// `Default` is no rights at all: a response that says nothing grants nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -598,8 +606,12 @@ pub struct DeviceRights {
     pub fetch: bool,
     /// Drive what this computer plays.
     pub control: bool,
+    /// Reach the network through this computer: search the relays, read what its
+    /// catalogue mirror holds, and ask it to fetch a file. Not a signature and
+    /// not a publication - nothing here is said in anyone's name.
+    pub download: bool,
     /// Act as this computer's owner: edit and publish playlists, post comments,
-    /// file reports, ask for downloads, search the relays, and lend access on.
+    /// file reports, and lend access on. Signing is the line this draws.
     pub privileged: bool,
 }
 
@@ -608,7 +620,14 @@ impl DeviceRights {
     pub const FETCH: u32 = 2;
     pub const CONTROL: u32 = 4;
     pub const PRIVILEGED: u32 = 8;
-    /// Everything, which is what the owner's own devices get.
+    pub const DOWNLOAD: u32 = 16;
+    /// Everything an older companion could name, which is what the owner's own
+    /// devices were given before `download` existed.
+    ///
+    /// `DOWNLOAD` is deliberately not in it: every grant already written has
+    /// these four bits, and reading the new bit literally would take downloads
+    /// away from every phone that is already paired. [`Self::may_download`] is
+    /// where the new right is weighed against the old one.
     pub const FULL: u32 = Self::BROWSE | Self::FETCH | Self::CONTROL | Self::PRIVILEGED;
 
     /// What a lent phone gets, and all one can ever get: browse and play.
@@ -617,6 +636,18 @@ impl DeviceRights {
             browse: true,
             fetch: true,
             control: false,
+            download: false,
+            privileged: false,
+        }
+    }
+
+    /// Browse, play, and reach the network - but not act as this computer.
+    pub const fn download_only() -> Self {
+        Self {
+            browse: true,
+            fetch: true,
+            control: false,
+            download: true,
             privileged: false,
         }
     }
@@ -627,6 +658,7 @@ impl DeviceRights {
             browse: true,
             fetch: true,
             control: true,
+            download: true,
             privileged: true,
         }
     }
@@ -637,6 +669,7 @@ impl DeviceRights {
         (if self.browse { Self::BROWSE } else { 0 })
             | (if self.fetch { Self::FETCH } else { 0 })
             | (if self.control { Self::CONTROL } else { 0 })
+            | (if self.download { Self::DOWNLOAD } else { 0 })
             | (if self.privileged { Self::PRIVILEGED } else { 0 })
     }
 
@@ -645,8 +678,18 @@ impl DeviceRights {
             browse: bits & Self::BROWSE != 0,
             fetch: bits & Self::FETCH != 0,
             control: bits & Self::CONTROL != 0,
+            download: bits & Self::DOWNLOAD != 0,
             privileged: bits & Self::PRIVILEGED != 0,
         }
+    }
+
+    /// Whether this device may reach the network through this computer.
+    ///
+    /// Asking for downloads used to be one of the things `privileged` meant, so
+    /// a grant that has it keeps them: the right is named here as the smaller
+    /// grant that is enough on its own.
+    pub const fn may_download(self) -> bool {
+        self.download || self.privileged
     }
 
     /// Whether this device has one particular right.
@@ -1312,7 +1355,7 @@ mod tests {
             library_revision: 42,
             cover_revision: 9,
             stream_only: true,
-            rights: Some(DeviceRights::read_only()),
+            rights: Some(DeviceRights::download_only()),
             pubkey: "c".repeat(64),
         };
         let json = serde_json::to_string(&response).unwrap();
@@ -1321,8 +1364,11 @@ mod tests {
             response
         );
         // The legacy summary still says what an older companion needs, and the
-        // grant travels beside it.
+        // grant travels beside it - including the right that is the whole point
+        // of it being a separate answer: this device may download, and the old
+        // boolean still calls it read-only, because it may not sign.
         assert!(json.contains(r#""streamOnly":true"#), "wrote {json}");
+        assert!(json.contains(r#""download":true"#), "wrote {json}");
         assert!(json.contains(r#""privileged":false"#), "wrote {json}");
     }
 
@@ -1334,17 +1380,20 @@ mod tests {
         for rights in [
             DeviceRights::default(),
             DeviceRights::read_only(),
+            DeviceRights::download_only(),
             DeviceRights::full(),
             DeviceRights {
                 browse: true,
                 fetch: false,
                 control: false,
+                download: false,
                 privileged: false,
             },
             DeviceRights {
                 browse: false,
                 fetch: false,
                 control: true,
+                download: false,
                 privileged: false,
             },
         ] {
@@ -1352,24 +1401,36 @@ mod tests {
         }
         assert_eq!(DeviceRights::default().bits(), 0);
         assert_eq!(DeviceRights::read_only().bits(), 3);
-        assert_eq!(DeviceRights::full().bits(), DeviceRights::FULL);
-        // A bit this build does not know cannot survive the round trip: four
+        assert_eq!(DeviceRights::download_only().bits(), 19);
+        assert_eq!(DeviceRights::full().bits(), DeviceRights::FULL | DeviceRights::DOWNLOAD);
+        // A bit this build does not know cannot survive the round trip: five
         // named rights are all the type can hold, so an unknown bit is dropped
         // when the row is written back. That narrows a grant rather than
         // widening one, which is the way round to fail - and the only writer is
         // a person choosing rights in the desktop's own list, which cannot set
         // a right it cannot name.
-        assert_eq!(DeviceRights::from_bits(0b1_0000), DeviceRights::default());
-        assert_eq!(DeviceRights::from_bits(0b1_0000).bits(), 0);
+        assert_eq!(DeviceRights::from_bits(0b10_0000), DeviceRights::default());
+        assert_eq!(DeviceRights::from_bits(0b10_0000).bits(), 0);
         assert!(DeviceRights::read_only().grants(DeviceRights::FETCH));
         assert!(!DeviceRights::read_only().grants(DeviceRights::PRIVILEGED));
         assert!(DeviceRights::read_only().is_read_only());
         assert!(!DeviceRights::full().is_read_only());
+        // The right to download without signing is its own thing, and the grant
+        // that signs is still allowed to download: a phone paired before this
+        // right existed has four bits, and one of them meant downloads.
+        assert!(DeviceRights::download_only().may_download());
+        assert!(!DeviceRights::download_only().grants(DeviceRights::PRIVILEGED));
+        assert!(DeviceRights::full().may_download());
+        assert!(DeviceRights::from_bits(DeviceRights::FULL).may_download());
+        assert!(!DeviceRights::read_only().may_download());
+        assert!(!DeviceRights::default().may_download());
         // The mask is a trap, so it is pinned here: one right set is not every
         // right set, however the question is worded.
         assert!(DeviceRights::read_only().grants(DeviceRights::FULL));
         assert!(!DeviceRights::read_only().is_full());
         assert!(DeviceRights::full().is_full());
+        // An older build's idea of everything is still everything here.
+        assert!(DeviceRights::from_bits(DeviceRights::FULL).is_full());
         assert!(!DeviceRights::default().is_full());
     }
 

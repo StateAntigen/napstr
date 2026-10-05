@@ -127,7 +127,7 @@ test('Napstrfy does not offer a lent phone the box it may not use', async ({ pag
   await expect(page.locator('.discussion-message')).toHaveCount(1);
   // ...and it may not post, so there is no composer and no way to try.
   await expect(page.locator('.discussion-compose')).toHaveCount(0);
-  await expect(page.locator('.discussion-view .settings-note')).toContainText('read only');
+  await expect(page.locator('.discussion-view .settings-note')).toContainText('cannot sign or publish anything in your name');
   expect(await callsTo(page, 'remote_send_track_discussion')).toBe(0);
 });
 

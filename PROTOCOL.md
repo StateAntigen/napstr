@@ -727,6 +727,26 @@ and download requests are executed by the desktop's normal Nostr and Tor
 services; the phone never receives the desktop Nostr secret key, Tor onion
 capabilities, or filesystem paths.
 
+Which request needs which right:
+
+- `browse` — `library`, `libraryByIds`, `search`, `discover`, `audiobooks`,
+  `audiobookLibrary`, `audiobook`, `available`, `playlists`, `playlist`,
+  `playlistsContaining`, `albumCovers`, `fetchArt`, the two `trackDiscussion`
+  reads, and `playbackState`. The parts of those answers that come from the
+  network rather than this computer's own index — the relay half of `search`,
+  the catalogue behind `discover`, an audiobook this computer does not hold —
+  additionally need `download`.
+- `download` — `requestDownload` and `transfers`, which are the two requests
+  that are the network rather than a read of it.
+- `fetch` — `fetchAudio`.
+- `control` — `playback`.
+- `privileged` — `newPlaylistId`, `savePlaylist`, `deletePlaylist`,
+  `publishPlaylist`, `withdrawPlaylist`, `sendTrackDiscussion`, `reportCover`,
+  and `readOnlyTicket`. These are the requests that write something down in the
+  owner's name.
+- `status` and `ping` — nothing, because a device granted nothing must still be
+  able to learn that it was granted nothing.
+
 `available` accepts at most 200 SHA-256 file IDs and returns the subset still
 present in the desktop's indexed Napstr folder. Napstrfy uses this bounded check
 after reconnecting to reconcile its verified offline audio cache. A companion
@@ -769,6 +789,37 @@ Responses have `type` values `paired`, `library`, `libraryByIds`, `search`,
 `local`, and a `sources` array whose entries contain only `pubkey` and
 `displayName`.
 
+Then `status` carries `rights`, the grant this computer holds for the device
+asking, and `streamOnly` beside it.
+
+```json
+{"type":"status","libraryRevision":42,"coverRevision":9,"streamOnly":false,
+ "rights":{"browse":true,"fetch":true,"control":true,"download":true,"privileged":true},
+ "pubkey":"<64 lowercase hex>"}
+```
+
+`browse` is reading this computer's index, `fetch` is being handed its audio,
+`control` is driving its player, `download` is reaching the network through it —
+relay searches, its catalogue mirror, and asking it to fetch a file — and
+`privileged` is signing and publishing in this computer's owner's name. A
+companion that is told neither `rights` nor `streamOnly` — a desktop that predates
+the field — MUST read `streamOnly` as the whole answer; a desktop that sends
+`rights` is the authority, and `streamOnly` beside it is only what an older
+companion needs. `rights` is a report and not a permission: every request is
+weighed against the grant the desktop stores, so a companion MUST NOT treat what
+it is told as an entitlement.
+
+`download` is implied by `privileged`, because asking this computer to fetch a
+file was one of the things that right always meant, and every grant written
+before the two were separated has only the older bits. A companion MUST NOT
+infer it the other way: a grant with `download` and without `privileged` may fill
+itself with music and may sign nothing.
+
+A phone paired with several desktops names one of them its home computer — the
+one whose player, download queue and status the app is drawn from. That is a
+choice of the companion and is not part of this protocol: every request either
+names its desktop or is answered by the one this companion acts through.
+
 The lightweight `status` response contains `libraryRevision`, a monotonically
 increasing local-library revision. A companion MAY poll it and should reload
 library pages only when it changes. The revision check carries no catalogue
@@ -801,8 +852,8 @@ because an album with no art a moment ago may have art now. A desktop that has
 no cover support reports `0`, which a companion MUST read as "never
 invalidated" rather than as a revision of zero.
 
-`playback` drives the desktop's own player, and only a pairing with write access
-may send it. Its `command.type` values are `play`, `pause`, `toggle`, `stop`,
+`playback` drives the desktop's own player, and only a pairing with the `control`
+right may send it. Its `command.type` values are `play`, `pause`, `toggle`, `stop`,
 `handoff`, `next`, `previous`, `seek` (`positionMs`), `volume` (`percent`, 0 to
 100), `repeat` (`mode` of `off`, `all` or `one`), `shuffle` (`enabled`), and
 `playTrack`. Both `playback` and `playbackState` answer with a `playback`

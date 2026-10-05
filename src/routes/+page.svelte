@@ -108,7 +108,7 @@
   type TrackDiscussionActivity = { fileId: string; authors: number; messages: number; lastAt: number };
   type IndexProgress = { scanning: boolean; processedFiles: number; indexedFiles: number; message: string };
   type IndexBatch = { files: NativeFile[]; fileCount: number; totalBytes: number };
-  type DeviceRights = { browse: boolean; fetch: boolean; control: boolean; privileged: boolean };
+  type DeviceRights = { browse: boolean; fetch: boolean; control: boolean; download: boolean; privileged: boolean };
   type MobileDevice = { endpointId: string; name: string; pairedAt: string; lastSeen: string; rights: DeviceRights };
   type MobileStatus = { running: boolean; online: boolean; endpointId: string; error: string; devices: MobileDevice[] };
   type MobilePairingOffer = { ticket: string; qrSvg: string; expiresAt: number; endpointId: string };
@@ -2224,16 +2224,26 @@
    * afterwards from the list below, so a misjudged code is no longer a reason to
    * pair again.
    */
-  const READ_ONLY_RIGHTS: DeviceRights = { browse: true, fetch: true, control: false, privileged: false };
-  const FULL_RIGHTS: DeviceRights = { browse: true, fetch: true, control: true, privileged: true };
+  const READ_ONLY_RIGHTS: DeviceRights = { browse: true, fetch: true, control: false, download: false, privileged: false };
+  const FULL_RIGHTS: DeviceRights = { browse: true, fetch: true, control: true, download: true, privileged: true };
 
-  /** The four rights, in the order they build on each other. */
+  /**
+   * The five rights, in the order they build on each other.
+   *
+   * `download` sits between driving the computer and acting as its owner: it is
+   * reaching the network through this computer - searching the relays, reading
+   * its catalogue mirror, and telling it to fetch a file - which changes nothing
+   * anybody can see under the user's name. `privileged` is the signature, and a
+   * grant that has it still has downloads, because that is what it meant before
+   * the two were separated.
+   */
   function deviceRightChoices(): { key: keyof DeviceRights; label: string }[] {
     return [
       { key: 'browse', label: $t("Read the library") },
       { key: 'fetch', label: $t("Play and keep audio") },
       { key: 'control', label: $t("Control playback") },
-      { key: 'privileged', label: $t("Act as you") }
+      { key: 'download', label: $t("Download from the network") },
+      { key: 'privileged', label: $t("Sign and publish as you") }
     ];
   }
 

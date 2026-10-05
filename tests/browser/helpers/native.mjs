@@ -14,16 +14,33 @@ export async function mockNative(page, { app = 'napstrfy', nativeLocale = 'en-GB
     // ones somebody else published. A stranger's playlist is one seeded with
     // any other author.
     const desktopPubkey = () => window.playlistAuthor ?? 'c'.repeat(64);
+    // The computers this phone holds, and whether each of them answered.
+    //
+    // The list is what a ping produced, so a computer that is asleep is one the
+    // list says nothing about: `window.desktopReachable = false` is the older way
+    // a spec says the acting computer is away, and `window.hostsOffline` names
+    // individual ones - which is the whole point of a phone that holds two.
+    const hostRows = () => window.remoteHosts ?? [];
+    const homeRow = () => hostRows().find((host) => host.home) ?? hostRows()[0];
+    const hostOnline = (host) =>
+      window.desktopReachable !== false &&
+      host.online !== false &&
+      !(window.hostsOffline ?? []).includes(host.endpointId);
     const status = () => ({
       paired,
       // A phone can be paired and still not reach the computer, which is the
       // state a playlist has to survive: `window.desktopReachable = false` is
       // how a spec asks for it, and every `remote_*` call answers the way the
       // real channel would - with a failure.
-      connected: paired && window.desktopReachable !== false,
+      connected: paired && window.desktopReachable !== false && (!homeRow() || hostOnline(homeRow())),
       connecting: false,
-      desktopName: 'Music computer',
+      desktopName: homeRow()?.desktopName ?? 'Music computer',
       streamOnly: Boolean(window.streamOnly),
+      // The rights beside the older flag. A spec that lends only some of them
+      // names them: `window.mayDownload = true` with `window.streamOnly = true`
+      // is the pairing that may fill itself with music and sign nothing.
+      mayDownload: Boolean(window.mayDownload ?? !window.streamOnly),
+      mayControl: Boolean(window.mayControl ?? !window.streamOnly),
       endpointId: 'endpoint',
       libraryRevision: 1,
       coverRevision: 0,
@@ -152,8 +169,18 @@ export async function mockNative(page, { app = 'napstrfy', nativeLocale = 'en-GB
             return (args.fileIds ?? []).map((fileId) => known[fileId]).filter(Boolean);
           }
           case 'mobile_status': return { running: true, online: true, endpointId: 'endpoint', error: '', devices: window.mobileDevices ?? [] };
-          case 'remote_hosts': return window.remoteHosts ?? [];
+          case 'remote_hosts': return hostRows().map((host) => ({ ...host, online: hostOnline(host) }));
           case 'remote_file_hosts': return window.fileHosts ?? {};
+          case 'set_mobile_home_host': {
+            // Exactly one computer is home, and the list the window reads back is
+            // the answer rather than its own optimism about the write.
+            const hosts = hostRows();
+            if (!hosts.some((host) => host.endpointId === args.endpointId)) {
+              throw new Error('That computer is not paired with this phone');
+            }
+            for (const host of hosts) host.home = host.endpointId === args.endpointId;
+            return null;
+          }
           case 'set_mobile_host_included': {
             // The phone decides nothing here: the flag is written down where it
             // is read from, and the list the window reads back is the answer.
@@ -184,11 +211,19 @@ export async function mockNative(page, { app = 'napstrfy', nativeLocale = 'en-GB
             // add sheet's list does as it is scrolled. A source is one computer's
             // library; no source is every computer's, as one list, each file once
             // - which is what the phone now asks for and what the host unions.
-            const hosts = (window.remoteHosts ?? []).filter((host) => host.included !== false);
+            //
+            // Only the computers that answered are in it, the acting one
+            // included: a question asked of every computer is answered by the
+            // ones that are here, and the rows of one that is asleep are not
+            // invented for it. `window.remoteLibrary` is the acting computer's
+            // own library, which is what the fixture convention means by it.
+            const hosts = hostRows().filter((host) => host.included !== false);
+            const home = homeRow();
             const named = args.source ? window.remoteLibraryByHost?.[args.source] : null;
+            const actedFor = !home || hostOnline(home) ? (window.remoteLibrary ?? [track]) : [];
             const union = named ?? [
-              ...(window.remoteLibrary ?? [track]),
-              ...hosts.flatMap((host) => window.remoteLibraryByHost?.[host.endpointId] ?? [])
+              ...actedFor,
+              ...hosts.filter(hostOnline).flatMap((host) => window.remoteLibraryByHost?.[host.endpointId] ?? [])
             ];
             const seen = new Set();
             const rows = union.filter((row) => !seen.has(row.fileId) && seen.add(row.fileId));
@@ -341,10 +376,11 @@ export async function mockNative(page, { app = 'napstrfy', nativeLocale = 'en-GB
             held.push({
               endpointId: id,
               desktopName: name,
-              rights: { browse: true, fetch: true, control: true, privileged: true },
-              primary: held.length === 0,
+              rights: { browse: true, fetch: true, control: true, download: true, privileged: true },
+              home: held.length === 0,
               included: true,
-              online: true
+              online: true,
+              mayDownload: true
             });
             window.remoteHosts = held;
             return name;

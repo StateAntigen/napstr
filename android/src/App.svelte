@@ -206,7 +206,7 @@
     return () => query.removeEventListener('change', listener);
   });
   const pinned = $derived(!mobile && platform !== '' && wideWindow);
-  let status = $state<CompanionStatus>({ streamOnly: false, paired: false, connected: false, connecting: false, desktopName: '', endpointId: '', libraryRevision: 0, coverRevision: 0, pubkey: '', error: '' });
+  let status = $state<CompanionStatus>({ streamOnly: false, mayDownload: false, mayControl: false, paired: false, connected: false, connecting: false, desktopName: '', endpointId: '', libraryRevision: 0, coverRevision: 0, pubkey: '', error: '' });
   /**
    * The computers this phone may talk to, and how to reach each of them.
    *
@@ -223,6 +223,15 @@
    */
   let fileHosts = $state<Record<string, string>>({});
   /**
+   * Whether a library has been asked for at least once this launch.
+   *
+   * The boot path asks only when the acting computer answered, and on a phone
+   * whose own computer is asleep that is the wrong question - so the host list
+   * asks as soon as any computer answers, and this is what keeps the two from
+   * asking twice.
+   */
+  let libraryAskedOnce = false;
+  /**
    * Whether the pairing screen is open over a phone that already holds a
    * computer. A phone acts through exactly one computer, so this is how a second
    * one - a friend's, usually - joins the ones it may read.
@@ -232,6 +241,13 @@
   async function refreshKnownHosts() {
     try {
       knownHosts = await invoke<RemoteHost[]>('remote_hosts');
+      // A phone whose own computer is asleep still has whichever others answered,
+      // and the first library of a session has to be asked for when one of them
+      // does. The boot chain cannot do it: at boot nothing has answered yet, and
+      // the answer that matters may be a friend's.
+      if (!libraryAskedOnce && status.paired && knownHosts.some((host) => host.online)) {
+        void loadLibrary();
+      }
     } catch {
       // Nothing to report: with no answer the phone keeps the one computer it
       // knows about, which is every phone that has ever been paired once.
@@ -246,28 +262,85 @@
     }
   }
 
+  /**
+   * Whether one computer answered just now.
+   *
+   * The home computer's answer is the status question's rather than the list's.
+   * Both are asked about the same machine, but the status is asked every fifteen
+   * seconds and the list every thirty, so when the two disagree it is the list
+   * that is out of date - which is exactly the window in which a connection that
+   * has just dropped would still be drawn as connected. The list is where the
+   * computers *other* than the home one are counted, which is what it is for.
+   */
+  const computerOnline = (computer: RemoteHost) => (computer.home ? status.connected : computer.online);
   /** The computers that answered just now, and the ones that did not. */
-  const onlineComputers = () => knownHosts.filter((host) => host.online);
-  const awayComputers = () => knownHosts.filter((host) => !host.online);
-  const everyoneOnline = () => knownHosts.length > 0 && awayComputers().length === 0;
+  const onlineComputers = () => knownHosts.filter(computerOnline);
+  const awayComputers = () => knownHosts.filter((computer) => !computerOnline(computer));
+  /** The computer this phone acts through, as the list names it. */
+  const homeComputer = () => knownHosts.find((computer) => computer.home) ?? knownHosts[0];
+  /**
+   * Whether nothing at all answered.
+   *
+   * The list is what says so once it has been read; before that the acting
+   * computer's own state is the only answer there is. This used to be
+   * `!everyoneOnline()`, which is the opposite mistake in both directions: one
+   * friend asleep made the whole line look offline, and a phone whose own
+   * computer was away never counted at all.
+   */
+  const nothingOnline = () =>
+    knownHosts.length > 0 ? onlineComputers().length === 0 : !status.connected;
+  /** Whether any computer at all can be asked, so a read may be tried. */
+  let anyoneReachable = $derived(status.connected || onlineComputers().length > 0);
+  /**
+   * What this phone may ask for, split the way the grants are.
+   *
+   * Three separate questions, and they were one flag before the right to reach
+   * the network was separated from the right to sign. A phone may be lent the
+   * network without the owner's name, or the computer's player without either -
+   * so the app offers what its computer actually allows instead of reading
+   * "read only" as "nothing". Signing is the third question, and it is the
+   * `streamOnly` flag itself: that is what every write on these screens asks.
+   */
+  let mayDownload = $derived(status.mayDownload);
+  let mayControl = $derived(status.mayControl);
 
   /**
-   * What the status line says: which computer is being read, or how many of them
-   * are here once there is more than one to count.
+   * What the status line says: how many computers are here, or which one is.
+   *
+   * What the computers answered is the whole picture once there is more than one
+   * of them to count. The acting computer's own state is what is left to say when
+   * none of them answered, and the two are not the same question: a phone holding
+   * two computers, whose own is asleep, is still a phone with a friend's library
+   * on it - and calling that "Offline" was the label describing the wrong
+   * computer. It also meant "1/2 Online" could never be drawn, because the count
+   * was only reached when the acting computer was connected.
    */
   function statusLabel(): Message | string {
+    if (knownHosts.length > 0 && onlineComputers().length > 0) {
+      if (awayComputers().length > 0) {
+        return msg("{p0}/{p1} Online", {
+          p0: String(onlineComputers().length),
+          p1: String(knownHosts.length)
+        });
+      }
+      return homeComputer()?.desktopName || status.desktopName || 'Napstr';
+    }
     // Two different things to look at: “connecting” is this app doing something and
     // asking to be waited for, “offline” is nothing happening at all. A cold start
     // used to spend its first seconds being told the second.
     if (statusPending || status.connecting) return $t("Connecting…");
     if (!status.connected) return $t("Offline");
-    if (knownHosts.length > 1 && !everyoneOnline()) {
-      return msg("{p0}/{p1} Online", {
-        p0: String(onlineComputers().length),
-        p1: String(knownHosts.length)
-      });
-    }
     return status.desktopName || 'Napstr';
+  }
+
+  /** What the chip says when it is held down: which computers are here. */
+  function statusTitle(): string {
+    if (nothingOnline()) return 'Reconnect to Napstr';
+    const missing = awayComputers().filter((computer) => computer.included);
+    if (missing.length > 0) {
+      return `${missing.map((computer) => computer.desktopName || 'A computer').join(', ')} unreachable`;
+    }
+    return `Connected to ${homeComputer()?.desktopName || status.desktopName || 'Napstr'}`;
   }
 
   /** The letter on a computer's dot, so that a colour can be read as a name. */
@@ -292,8 +365,26 @@
     }
   }
 
+  /** Choose which computer this phone acts through. */
+  async function setHomeComputer(computer: RemoteHost) {
+    try {
+      await invoke('set_mobile_home_host', { endpointId: computer.endpointId });
+      await refreshKnownHosts();
+      await refreshStatus();
+      // Which computer is home decides whose row answers for a file two of them
+      // hold, and what the status line names.
+      await loadLibrary();
+    } catch (nextError) {
+      notice = String(nextError);
+    }
+  }
+
   $effect(() => {
-    if (!status.connected) return;
+    // Asked whatever the acting computer is doing: this is the one call that can
+    // say a friend answered while the phone's own computer is asleep, and gating
+    // it on `status.connected` was what kept the count off the screen. The call
+    // pings each computer and gives up on it quickly, so it is cheap while
+    // everything is away.
     void refreshKnownHosts();
     // The status line is a picture of who is reachable now, so it is asked again
     // on a slow timer rather than only when something else changes.
@@ -773,7 +864,7 @@
    */
   let shownCanSeek = $derived(
     playbackTarget === 'desktop'
-      ? !status.streamOnly && remoteState?.active === true
+      ? mayControl && remoteState?.active === true
       : !caching && verifiedDuration > 0
   );
   /** The playlist the drawer would open: this phone's, or the copy of theirs. */
@@ -1300,7 +1391,7 @@
   /** Repeat on whichever player the drawer is showing. */
   function cycleShownRepeat() {
     if (playbackTarget === 'desktop') {
-      if (status.streamOnly) return;
+      if (!mayControl) return;
       void sendPlayback({ type: 'repeat', mode: nextRemoteRepeat(remoteState?.repeat ?? 'off') });
       return;
     }
@@ -1310,7 +1401,7 @@
   /** Shuffle on whichever player the drawer is showing. */
   function toggleShownShuffle() {
     if (playbackTarget === 'desktop') {
-      if (status.streamOnly) return;
+      if (!mayControl) return;
       void sendPlayback({ type: 'shuffle', enabled: remoteState?.shuffle !== true });
       return;
     }
@@ -1371,9 +1462,9 @@
 
   async function loadCachedLibrary() {
     try {
-      const offline = await invoke<LibraryPage & { paired: boolean; desktopName: string; streamOnly: boolean }>('cached_library');
+      const offline = await invoke<LibraryPage & { paired: boolean; desktopName: string; streamOnly: boolean; mayDownload: boolean }>('cached_library');
       if (offline.paired) {
-        status = { ...status, paired: true, desktopName: offline.desktopName, streamOnly: offline.streamOnly };
+        status = { ...status, paired: true, desktopName: offline.desktopName, streamOnly: offline.streamOnly, mayDownload: offline.mayDownload };
       }
       tracks = offline.tracks;
       total = offline.total;
@@ -1577,12 +1668,13 @@
   async function forgetDesktop() {
     if (!window.confirm('Disconnect this phone from Napstr? You will need to scan a new QR code.')) return;
     await invoke('forget_desktop');
-    status = { streamOnly: false, paired: false, connected: false, connecting: false, desktopName: '', endpointId: '', libraryRevision: 0, coverRevision: 0, pubkey: '', error: '' };
+    status = { streamOnly: false, mayDownload: false, mayControl: false, paired: false, connected: false, connecting: false, desktopName: '', endpointId: '', libraryRevision: 0, coverRevision: 0, pubkey: '', error: '' };
     tracks = [];
     current = null;
     audio?.pause();
     knownHosts = [];
     fileHosts = {};
+    libraryAskedOnce = false;
   }
 
   /**
@@ -1665,7 +1757,9 @@
    * than a read - the computer goes and gets it from the seeders the row names.
    */
   async function loadDiscover(wanted = discoverWanted) {
-    if (discoverLoading || !status.connected || status.streamOnly) return;
+    // The home computer's own mirror of the network, so it needs the computer
+    // that holds it as well as the right to read it.
+    if (discoverLoading || !status.connected || !mayDownload) return;
     discoverAsked = true;
     discoverLoading = true;
     discoverWanted = wanted;
@@ -1806,6 +1900,7 @@
 
   async function loadLibrary(append = false) {
     if (!status.paired || loading || loadingMore) return;
+    libraryAskedOnce = true;
     const viewVersion = ++musicViewVersion;
     showingLikedMusic = false;
     searchingNetwork = false;
@@ -1892,7 +1987,7 @@
     const searchQuery = query.trim();
     loading = true;
     loadingMore = false;
-    searchingNetwork = !status.streamOnly;
+    searchingNetwork = mayDownload;
     tracks = [];
     total = 0;
     selected = null;
@@ -3456,8 +3551,8 @@
     destinationFolder: string | null = null,
     audiobookId: string | null = null
   ): Promise<'queued' | 'held' | 'refused'> {
-    if (status.streamOnly) {
-      error = 'This pairing is read only. It cannot ask Napstr to download songs.';
+    if (!mayDownload) {
+      error = 'This pairing may not download from the network.';
       return 'refused';
     }
     if (pending.has(track.fileId)) return 'queued';
@@ -3518,7 +3613,7 @@
     // poll - a wait that a missed status answer turned into fifteen seconds of
     // nothing left rows on "on its way" for half a minute after the file was here.
     // Asking anyway costs one failed call, which the catch below already expects.
-    if (status.streamOnly || pending.size === 0) return;
+    if (!mayDownload || pending.size === 0) return;
     try {
       transfers = await invoke<RemoteTransfer[]>('remote_transfers');
       // One exact question for everything being waited on, rather than a filename
@@ -3609,7 +3704,7 @@
   function togglePlayer() {
     // The bar's button belongs to whichever player the bar is showing.
     if (playbackTarget === 'desktop') {
-      if (remoteBusy || status.streamOnly) return;
+      if (remoteBusy || !mayControl) return;
       // Nothing loaded over there: the computer decides what "play" means, and
       // the host asks its own window to pick up where it left off.
       void sendPlayback(remoteState?.active ? { type: 'toggle' } : { type: 'play' });
@@ -4320,7 +4415,7 @@
   /** Seek on whichever player the drawer is showing. */
   async function seekShown(seconds: number) {
     if (playbackTarget === 'desktop') {
-      if (status.streamOnly) return;
+      if (!mayControl) return;
       const limit = (remoteState?.durationMs ?? 0) / 1000;
       const target = limit > 0 ? Math.min(Math.max(0, seconds), limit) : Math.max(0, seconds);
       await sendPlayback({ type: 'seek', positionMs: Math.round(target * 1000) });
@@ -4508,7 +4603,7 @@
 
   /** Whether the computer could actually take playback over right now. */
   function desktopTargetAvailable() {
-    return remoteAvailable() && !status.streamOnly;
+    return remoteAvailable() && mayControl;
   }
 
   /** The computer's current track, as something the bar can draw. */
@@ -5511,7 +5606,7 @@
   /** Move one track on whichever player the drawer is showing. */
   async function moveTrackBy(direction: -1 | 1) {
     if (playbackTarget === 'desktop') {
-      if (status.streamOnly || !shownCanSkip) return;
+      if (!mayControl || !shownCanSkip) return;
       await sendPlayback({ type: direction === 1 ? 'next' : 'previous' });
       return;
     }
@@ -5909,7 +6004,7 @@
     } catch { podcastHistory = []; }
     void loadCachedLibrary()
       .then(() => refreshStatus(true, false))
-      .then(() => { if (status.connected) void loadLibrary(); });
+      .then(() => { if (anyoneReachable) void loadLibrary(); });
     void refreshPodcastDownloads();
     // Fifteen seconds is right for a connection that is up, and far too slow for one
     // that is being opened - which is the whole of a cold start. The tunnel lands in a
@@ -6034,7 +6129,7 @@
 
 {#snippet trackRow(track: RemoteTrack, open: (item: RemoteTrack) => void = (item) => void activateTrack(item))}
   <div class:selected={selected?.fileId === track.fileId} class:remote={!track.local} class:liked={isTrackLiked(track)} class="track-row" role="listitem">
-    <button class="track-open" disabled={status.streamOnly && !track.local} onclick={() => open(track)}>
+    <button class="track-open" disabled={!mayDownload && !track.local} onclick={() => open(track)}>
       <TrackArtwork {track} lookup />
       <span class="track-copy">
         <strong>{title(track)}</strong>
@@ -6105,7 +6200,7 @@
         ? 'Not paired'
         : !status.connected
           ? 'Not reachable'
-          : status.streamOnly
+          : !mayControl
             ? 'Read-only pairing'
             : pendingHandoff
               ? 'Fetching a track…'
@@ -6131,7 +6226,7 @@
     <p class="eyebrow">{$t("NAPSTR COMPANION")}</p>
     {#if addingComputer}
       <h1>{$t("Another computer.")}</h1>
-      <p class="pair-copy">{$t("This phone acts through one computer; the others are libraries to read and play from. A code from someone else's Napstr is read-only.")}</p>
+      <p class="pair-copy">{$t("This phone has one home computer that signs and downloads for it; the others are libraries to read and play from. What a code may do is set by the computer that issued it.")}</p>
     {:else}
       <h1>{$t("Your music.")}<br />{$t("Wherever you are.")}</h1>
       <p class="pair-copy">{$t("Pair securely with Napstr on your computer. Discovery and Tor downloads stay there; your music reaches this phone over encrypted Iroh.")}</p>
@@ -6162,7 +6257,7 @@
         <!-- One dot per computer, in that computer's own colour. The ones that
              are here are clustered on the left and the ones that are not sit a
              little to their right, so the line itself says who is missing. -->
-        <button class="status-chip" class:offline={!everyoneOnline()} onclick={reconnect} title={status.connected ? `Connected to ${status.desktopName || 'Napstr'}` : 'Reconnect to Napstr'}>
+        <button class="status-chip" class:offline={nothingOnline()} onclick={reconnect} title={statusTitle()}>
           <span class="status-dots" aria-hidden="true">
             {#each onlineComputers() as computer (computer.endpointId)}
               <i class="on" style={`--host-hue:${hostHue(computer.endpointId)}`}></i>
@@ -6192,7 +6287,7 @@
       {#if activeTab === 'search'}
         <section class="search-area">
           <form onsubmit={(event) => { event.preventDefault(); event.currentTarget.querySelector('input')?.blur(); void searchTracks(); }}>
-            <span>⌕</span><input bind:value={query} placeholder={status.streamOnly ? "Search Napstr’s music" : "Search your music and Nostr"} aria-label={$t("Search tracks")} />
+            <span>⌕</span><input bind:value={query} placeholder={mayDownload ? "Search your music and Nostr" : "Search Napstr’s music"} aria-label={$t("Search tracks")} />
             {#if loading || searchingNetwork}<i class="search-spinner" role="status" aria-label={$t("Searching")}></i>{/if}
             {#if query}<button type="button" class="clear-search" onclick={() => searchTracks('')}>×</button>{/if}
           </form>
@@ -6246,7 +6341,7 @@
             <div class="section-label tracks-label discover-label">
               <b>{$t("Discover")}</b>
               <span>{discoverTotal} {$t("live on the network")}</span>
-              <button class="discover-play" onclick={playDiscover} disabled={status.streamOnly}>{$t("Play all")}</button>
+              <button class="discover-play" onclick={playDiscover} disabled={!mayDownload}>{$t("Play all")}</button>
             </div>
             <section class="track-list" role="list" aria-label={$t("Discover")} aria-busy={discoverLoading}>
               {#each discoverRows as track (track.fileId)}
@@ -6427,8 +6522,8 @@
           </section>
           <section class="audiobook-chapter-list" aria-busy={audiobookLoading}>
             {#each selectedAudiobook.chapters as chapter, index (chapter.fileId)}
-              <button class="audiobook-chapter" disabled={status.streamOnly && !chapter.local} onclick={() => activateAudiobookChapter(selectedAudiobook!, chapter)}>
-                <span>{chapter.local ? '▶' : status.streamOnly ? '—' : '⇩'}</span>
+              <button class="audiobook-chapter" disabled={!mayDownload && !chapter.local} onclick={() => activateAudiobookChapter(selectedAudiobook!, chapter)}>
+                <span>{chapter.local ? '▶' : mayDownload ? '⇩' : '—'}</span>
                 <span><strong>{chapter.title || chapter.filename}</strong><small>{$t("Chapter")} {index + 1} · {readableSize(chapter.size)}</small></span>
               </button>
             {/each}
@@ -6945,8 +7040,8 @@
             <div class="now-sheet-copy">
               <h1>{$t("Nothing is playing there")}</h1>
               <p>
-                {status.streamOnly
-                  ? 'This pairing is read only, so it cannot start anything.'
+                {!mayControl
+                  ? 'This phone may not control the computer’s player.'
                   : 'Napstr will pick up from wherever the computer left off.'}
               </p>
             </div>
@@ -6964,7 +7059,7 @@
             <button class="skip-button" onclick={() => void nudgeShown(-15)} disabled={!shownCanSeek} aria-label={$t("Back 15 seconds")} title={$t("Back 15 seconds")}>
               <SeekIcon />
             </button>
-            <button class="play-main" class:square={shownPlaying} onclick={togglePlayer} disabled={playbackTarget === 'desktop' ? remoteBusy || status.streamOnly : caching} aria-label={shownPlaying ? 'Pause' : 'Play'}>
+            <button class="play-main" class:square={shownPlaying} onclick={togglePlayer} disabled={playbackTarget === 'desktop' ? remoteBusy || !mayControl : caching} aria-label={shownPlaying ? 'Pause' : 'Play'}>
               {#if playbackTarget === 'desktop' ? remoteBusy : caching}<span class="icon-busy"></span>{:else if shownPlaying}<span class="icon-pause"></span>{:else}<span class="icon-play"></span>{/if}
             </button>
             <button class="skip-button" onclick={() => void nudgeShown(15)} disabled={!shownCanSeek} aria-label={$t("Forward 15 seconds")} title={$t("Forward 15 seconds")}>
@@ -6983,7 +7078,7 @@
                 step="1"
                 value={remoteVolumePercent()}
                 oninput={(event) => setRemoteVolume(Number(event.currentTarget.value))}
-                disabled={status.streamOnly}
+                disabled={!mayControl}
                 aria-label={$t("Volume on the computer")}
               />
             </label>
@@ -7090,11 +7185,13 @@
       </button>
     </header>
     <div class="settings-scroll">
-      {#if status.streamOnly}<p class="settings-note">{$t("This pairing is read only: it can browse and play, but cannot ask Napstr to download or publish.")}</p>{/if}
+      {#if status.streamOnly}<p class="settings-note">{$t("This pairing cannot sign or publish anything in your name.")}</p>{/if}
+      {#if status.paired && !status.mayDownload}<p class="settings-note">{$t("This pairing cannot ask Napstr to download from the network.")}</p>{/if}
 
       {#if status.paired}
         <div class="settings-section">
           <p>{$t("Computers")}</p>
+          <p class="settings-note">{$t("Your home computer is the one this phone signs, downloads and browses through. The others are libraries to read and play from.")}</p>
           {#each knownHosts as computer (computer.endpointId)}
             <div class="settings-row computer-row" class:left-out={!computer.included}>
               <span class="computer-id">
@@ -7105,7 +7202,7 @@
                 >{hostInitial(computer)}</i>
                 <span>
                   <strong>{computer.desktopName || computer.endpointId.slice(0, 8)}</strong>
-                  <small>{computer.primary ? $t("This phone acts through this one") : $t("A library this phone reads")}</small>
+                  <small>{computer.home ? $t("This phone's home computer") : $t("A library this phone reads")}</small>
                   <small class="computer-state">
                     {computer.included
                       ? computer.online
@@ -7113,8 +7210,18 @@
                         : $t("Not reachable")
                       : $t("Left out")}
                   </small>
+                  {#if computer.online && computer.mayDownload}
+                    <small class="computer-state">{$t("Downloads through this one")}</small>
+                  {/if}
                 </span>
               </span>
+              {#if !computer.home}
+                <button
+                  class="settings-action"
+                  onclick={() => void setHomeComputer(computer)}
+                  aria-label={$t("Make {p0} the home computer", { p0: computer.desktopName || computer.endpointId.slice(0, 8) })}
+                >{$t("Make home")}</button>
+              {/if}
               <label class="computer-include">
                 <input
                   type="checkbox"
@@ -7578,7 +7685,7 @@
       {#if discussionError}<p class="discussion-error">{discussionError}</p>{/if}
     </div>
     {#if status.streamOnly}
-      <p class="settings-note">{$t("This pairing is read only: it can browse and play, but cannot ask Napstr to download or publish.")}</p>
+      <p class="settings-note">{$t("This pairing cannot sign or publish anything in your name, so it cannot join a conversation.")}</p>
     {:else}
       <form class="discussion-compose" onsubmit={(event) => { event.preventDefault(); void sendDiscussion(); }}>
         {#if discussionReply}

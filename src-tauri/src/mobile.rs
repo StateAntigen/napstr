@@ -455,7 +455,7 @@ impl MobileService {
         }) {
             books.insert(book.audiobook_id.clone(), book);
         }
-        let remote = if rights.privileged {
+        let remote = if rights.may_download() {
             self.network.search_audiobooks(query).await?
         } else {
             Vec::new()
@@ -601,9 +601,9 @@ impl MobileService {
                 limit,
             } => {
                 // The catalogue is the network's, not this computer's, so it is
-                // lent on the same terms as a network search: the owner's own
-                // device gets it, a device lent the index does not.
-                let (hits, total) = if rights.privileged {
+                // lent on the same terms as a network search: it takes the right
+                // to reach the network, which is not the right to sign.
+                let (hits, total) = if rights.may_download() {
                     let connection = open_connection(&self.db_path)?;
                     crate::catalogue::discover(
                         &connection,
@@ -662,7 +662,7 @@ impl MobileService {
                 }
                 let (mut tracks, _, audiobook_chapter_ids) =
                     self.music_library(query, 0, MAX_PAGE_SIZE, None)?;
-                let remote = if rights.privileged {
+                let remote = if rights.may_download() {
                     self.network.search(query).await?
                 } else {
                     Vec::new()
@@ -793,9 +793,9 @@ impl MobileService {
                     return write_response(send, &ServerResponse::Audiobook { audiobook }).await;
                 }
                 // An audiobook this computer does not hold locally has to be read
-                // out of the relays in the user's own name, which is acting
-                // through this computer rather than reading it.
-                if !rights.privileged {
+                // out of the relays in the user's own name, which is reaching out
+                // to the network rather than reading this computer.
+                if !rights.may_download() {
                     return Err("This audiobook is not in Napstr's local library".into());
                 }
                 let mut audiobook = self
@@ -1518,11 +1518,14 @@ fn check_request_permission(rights: DeviceRights, request: &ClientRequest) -> Re
             "This phone has read-only access, so it cannot post comments.",
         ),
         // Asking this computer to fetch something, or to account for what it is
-        // fetching, is acting through it rather than reading it.
+        // fetching, is reaching the network through it - and that is now its own
+        // right. A phone may be given downloads without being able to sign
+        // anything in its owner's name, which is what `privileged` still means
+        // everywhere else in here.
         ClientRequest::RequestDownload { .. } | ClientRequest::Transfers => require(
             rights,
-            DeviceRights::PRIVILEGED,
-            "This phone has read-only access. Downloads on the Napstr host are not permitted.",
+            DeviceRights::DOWNLOAD,
+            "This phone may not ask Napstr to download from the network.",
         ),
         // Pairing is answered before this is reached, and a code is not a grant,
         // so there is nothing here to weigh.
@@ -2179,6 +2182,55 @@ mod tests {
         .is_ok());
     }
 
+    /// The right to reach the network is not the right to sign.
+    ///
+    /// This is the whole reason `download` exists: a phone lent the network may
+    /// fill itself with music, and may not say a word in its owner's name. The
+    /// other direction is kept too, because a grant written before this right
+    /// existed has no such bit and did mean downloads.
+    #[test]
+    fn downloading_and_signing_are_separate_grants() {
+        let fetch_one = ClientRequest::RequestDownload {
+            file_id: "a".repeat(64),
+            source_pubkeys: vec![],
+            destination_folder: None,
+        };
+        let publish = ClientRequest::NewPlaylistId;
+        let comment = ClientRequest::SendTrackDiscussion {
+            file_id: "a".repeat(64),
+            content: "Nice track".into(),
+            reply_to: None,
+        };
+
+        // Lent the network without the owner's name: downloads yes, signing no.
+        let lent_the_network = DeviceRights::download_only();
+        assert!(check_request_permission(lent_the_network, &fetch_one).is_ok());
+        assert!(check_request_permission(lent_the_network, &ClientRequest::Transfers).is_ok());
+        assert!(check_request_permission(lent_the_network, &publish).is_err());
+        assert!(check_request_permission(lent_the_network, &comment).is_err());
+        // And it is still "read only" by the old boolean, which is what an older
+        // companion is told: it may not act as anyone.
+        assert!(lent_the_network.is_read_only());
+
+        // The grant that may act as the owner keeps downloads, because asking for
+        // one always was one of the things that meant. This is also the case that
+        // matters most: every grant written before this right existed has four
+        // bits, and reading the fifth literally would take downloads away from
+        // every phone that is already paired.
+        let four_bits_from_an_older_build = DeviceRights::from_bits(DeviceRights::FULL);
+        assert!(!four_bits_from_an_older_build.download);
+        assert!(four_bits_from_an_older_build.may_download());
+        assert!(check_request_permission(four_bits_from_an_older_build, &fetch_one).is_ok());
+        assert!(check_request_permission(four_bits_from_an_older_build, &publish).is_ok());
+
+        // The other direction is the one the split is for: the right to sign does
+        // not follow from the right to download, which is asserted at the top of
+        // this test. All that is left to pin here is that such a grant is not
+        // `full` - the short circuit the check starts with - so what decides for
+        // it is the match, and the match is where the right is asked for.
+        assert!(!DeviceRights::download_only().is_full());
+    }
+
     /// The three rights that are not "may read" are separable, which is the whole
     /// point of naming them: a device can be lent the index without the audio,
     /// or the audio without the owner's identity, and each refusal says which
@@ -2209,6 +2261,7 @@ mod tests {
             browse: true,
             fetch: false,
             control: false,
+            download: false,
             privileged: false,
         };
         assert!(check_request_permission(index_only, &library).is_ok());
@@ -2227,6 +2280,7 @@ mod tests {
             browse: true,
             fetch: true,
             control: true,
+            download: false,
             privileged: false,
         };
         assert!(check_request_permission(remote, &control).is_ok());

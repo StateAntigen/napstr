@@ -35,20 +35,23 @@ const track = (fileId, title) => ({
 const mine = track(id('a'), 'My Song');
 const theirs = track(id('b'), 'Ada Ripped This');
 
-const full = { browse: true, fetch: true, control: true, privileged: true };
-const readable = { browse: true, fetch: true, control: false, privileged: false };
+const full = { browse: true, fetch: true, control: true, download: true, privileged: true };
+const readable = { browse: true, fetch: true, control: false, download: false, privileged: false };
 
-const myComputer = { endpointId: 'endpoint', desktopName: 'My Napstr', rights: full, primary: true, included: true, online: true };
-const friend = { endpointId: id('f'), desktopName: "Ada's Napstr", rights: readable, primary: false, included: true, online: true };
+const myComputer = { endpointId: 'endpoint', desktopName: 'My Napstr', rights: full, home: true, included: true, online: true, mayDownload: true };
+const friend = { endpointId: id('f'), desktopName: "Ada's Napstr", rights: readable, home: false, included: true, online: true, mayDownload: false };
 
-async function openApp(page, { known = [myComputer, friend], library = [mine], libraries = {}, fileHosts = {} } = {}) {
+async function openApp(page, { known = [myComputer, friend], library = [mine], libraries = {}, fileHosts = {}, offline = [] } = {}) {
   await mockNative(page, { platform: 'android' });
   await page.route('**/fixture.wav', serveAudio);
-  await page.addInitScript(({ known, library, libraries, fileHosts }) => {
+  await page.addInitScript(({ known, library, libraries, fileHosts, offline }) => {
     window.remoteHosts = known;
     window.remoteLibrary = library;
     window.remoteLibraryByHost = libraries;
     window.fileHosts = fileHosts;
+    // Which of them answered just now, which is a different question from what
+    // they hold: a computer can be paired, hold a library and be asleep.
+    window.hostsOffline = offline;
     // The hardware back button, the way Android drives it: the page is handed a
     // press only while it advertises a destination, and a press it is not given
     // leaves the app.
@@ -58,7 +61,7 @@ async function openApp(page, { known = [myComputer, friend], library = [mine], l
       setBackAvailable: (available) => { window.backAvailable = available; },
       setDrawerOpen: (open) => { window.backAvailable = open; }
     };
-  }, { known, library, libraries, fileHosts });
+  }, { known, library, libraries, fileHosts, offline });
   await page.goto('http://127.0.0.1:15174');
 }
 
@@ -130,7 +133,7 @@ test('Napstrfy lists the computers it may read, and forgets one without the rest
   // The computer this phone acts through is named as such, so the two are not
   // just two names.
   await expect(rows.first()).toContainText('My Napstr');
-  await expect(rows.first()).toContainText('This phone acts through this one');
+  await expect(rows.first()).toContainText("This phone's home computer");
   await expect(rows.last()).toContainText("Ada's Napstr");
 
   await page.getByRole('button', { name: "Forget Ada's Napstr" }).click();
@@ -162,7 +165,7 @@ test('Napstrfy adds a computer from settings, and the choice appears', async ({ 
   // should hear it. It covers the app rather than sitting inside it.
   await expect(page.getByText('Another computer.')).toBeVisible();
   await expect(page.locator('.app-shell')).toHaveCount(0);
-  await expect(page.locator('.pair-copy')).toContainText("A code from someone else's Napstr is read-only");
+  await expect(page.locator('.pair-copy')).toContainText('one home computer that signs and downloads for it');
 
   // The same way in as the first pairing: a code, pasted.
   await page.locator('.manual-pair summary').click();
@@ -220,6 +223,56 @@ test('Napstrfy counts the computers that answered in the status line', async ({ 
   await expect(chip.locator('.status-dots i.on')).toHaveCount(1);
   await expect(chip.locator('.status-dots i.away')).toHaveCount(1);
   await expect(chip).toContainText('1/2 Online');
+});
+
+/**
+ * The case the label used to get wrong.
+ *
+ * The status line was drawn from the computer the phone acts through, and only
+ * counted the others once that one was connected - so a phone whose own computer
+ * was asleep said "Offline" while a friend's computer sat there answering, and
+ * "1/2 Online" could not be reached at all. It is also the reason the library
+ * looked empty: the app was told there was nothing to draw.
+ */
+test('a phone whose own computer is asleep still reads the one that answered', async ({ page }) => {
+  await openApp(page, {
+    known: [{ ...myComputer, online: false }, friend],
+    libraries: { [friend.endpointId]: [theirs] },
+    offline: [myComputer.endpointId]
+  });
+
+  const chip = page.locator('.status-chip');
+  await expect(chip).toContainText('1/2 Online');
+  await expect(chip).not.toHaveClass(/offline/);
+  await expect(chip.locator('.status-dots i.on')).toHaveCount(1);
+
+  // And the music that computer holds is on screen: the question is asked of
+  // every computer either way, and one that is not there is a library with
+  // nothing in it rather than a reason to draw none of them.
+  await expect(page.locator('.track-row strong')).toHaveText(['Ada Ripped This']);
+});
+
+test('Napstrfy lets the home computer be chosen, and keeps the choice', async ({ page }) => {
+  await openApp(page);
+  await openSettings(page);
+
+  const rows = page.locator('.computer-row');
+  await expect(rows.first()).toContainText("This phone's home computer");
+  await expect(rows.last()).toContainText('A library this phone reads');
+  // Only one row offers the choice, because the home one already is.
+  const choose = page.locator('.computer-row button:has-text("Make home")');
+  await expect(choose).toHaveCount(1);
+
+  await rows.last().getByRole('button', { name: "Make Ada's Napstr the home computer" }).click();
+
+  // The choice is the phone's to keep, so the call is the assertion - and the
+  // list on screen follows it rather than guessing.
+  await expect
+    .poll(() => page.evaluate(() => window.calls.filter((call) => call.cmd === 'set_mobile_home_host').map((call) => call.args.endpointId)))
+    .toEqual([id('f')]);
+  await expect(rows.last()).toContainText("This phone's home computer");
+  await expect(rows.first()).toContainText('A library this phone reads');
+  await expect(choose).toHaveCount(1);
 });
 
 test('a cold start says it is connecting rather than offline, then connects once', async ({ page }) => {

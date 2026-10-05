@@ -14,7 +14,12 @@ async function openSearch(page, streamOnly = false) {
       else request.resolve(cmd === 'remote_library' ? { tracks, total: tracks.length } : tracks);
     };
     window.__TAURI_INTERNALS__.invoke = async (cmd, args = {}) => {
-      if (cmd === 'companion_status' || cmd === 'cached_library') return { ...await invoke(cmd, args), streamOnly };
+      // A lent pairing, which is every right off rather than one flag: the older
+      // `streamOnly` is what it may not sign with, and the network and the
+      // player are their own answers beside it.
+      if (cmd === 'companion_status' || cmd === 'cached_library') {
+        return { ...await invoke(cmd, args), streamOnly, mayDownload: !streamOnly, mayControl: !streamOnly };
+      }
       if ((cmd === 'remote_library' && args.query) || cmd === 'remote_search') {
         window.searchRequests.push({ cmd, ...args });
         return new Promise((resolve, reject) => pending.set(`${cmd}:${args.query}`, { resolve, reject }));

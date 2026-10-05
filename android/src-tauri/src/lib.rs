@@ -80,8 +80,11 @@ impl SavedHost {
     /// what was saved, so an outage changes the flags and nothing about who the
     /// computer is or which playlists are its own.
     fn status(&self, connected: bool, connecting: bool, error: String) -> CompanionStatus {
+        let grant = self.grant();
         CompanionStatus {
-            stream_only: self.grant().is_read_only(),
+            stream_only: grant.is_read_only(),
+            may_download: grant.may_download(),
+            may_control: grant.control,
             paired: true,
             connected,
             connecting,
@@ -102,6 +105,12 @@ impl SavedHost {
 /// paired since keep its pairing.
 const PAIRED_HOSTS_FILE: &str = "paired-hosts.json";
 const LEGACY_PAIRED_FILE: &str = "paired-desktop.json";
+/// Which computer this phone acts through, when someone has chosen one.
+///
+/// Its own file rather than a field on a host: the choice is about the phone,
+/// not about the computer, and it has to survive the grants beside it being
+/// re-learned on every status answer.
+const HOME_HOST_FILE: &str = "home-host.json";
 
 /// The computers this phone may talk to.
 ///
@@ -140,14 +149,46 @@ fn upsert_host(hosts: &mut Vec<SavedHost>, host: SavedHost) {
     }
 }
 
+/// The computer someone chose for this phone to act through.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SavedHome {
+    endpoint_id: String,
+}
+
+/// The chosen computer, or nothing when nobody has chosen one.
+///
+/// A file that cannot be read is not a failure: the choice is a preference, and
+/// losing it falls back to the same computer the phone would have acted through
+/// before anyone could choose.
+fn load_home(path: &Path) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
+    let saved: SavedHome = serde_json::from_slice(&bytes).ok()?;
+    let endpoint_id = saved.endpoint_id.trim().to_string();
+    (!endpoint_id.is_empty()).then_some(endpoint_id)
+}
+
 /// The computer this phone acts through.
 ///
-/// The one that lets it act as its owner, when any of them do: that pairing is
-/// what this phone signs with, and it is the computer whose library and status
-/// the rest of the app is drawn from. With none of them privileged - a phone
+/// Called its home computer, because that is what it is to the person holding
+/// the phone: the one at home that signs, downloads and holds the library, among
+/// the others this phone may read from. Someone with two of their own - a
+/// desktop and a laptop - chooses which one that is in Settings, and the choice
+/// is kept here.
+///
+/// Without a choice it is the one that lets the phone act as its owner: that
+/// pairing is what the phone signs with. With none of them privileged - a phone
 /// lent browse-and-play, or one paired only with a friend - it is the first it
 /// was paired with, which is the single computer it has ever had.
-fn primary_host(hosts: &[SavedHost]) -> Option<SavedHost> {
+fn home_host(hosts: &[SavedHost], home: Option<&str>) -> Option<SavedHost> {
+    if let Some(endpoint_id) = home {
+        if let Some(chosen) = hosts
+            .iter()
+            .find(|host| host.endpoint_id == endpoint_id)
+        {
+            return Some(chosen.clone());
+        }
+    }
     hosts
         .iter()
         .find(|host| host.grant().privileged)
@@ -168,6 +209,20 @@ fn legacy_grant(stream_only: bool) -> DeviceRights {
 #[serde(rename_all = "camelCase")]
 struct CompanionStatus {
     stream_only: bool,
+    /// Whether the computer this phone acts through may reach the network for it
+    /// - the right that is not a signature.
+    ///
+    /// Beside `stream_only` rather than folded into it, because they are two
+    /// different questions: a phone lent the network but not the owner's name is
+    /// "read only" and may still download, and one lent the owner's name may do
+    /// both. What the app offers follows this one, not the older flag.
+    may_download: bool,
+    /// Whether the home computer may drive its own player for this phone.
+    ///
+    /// Its own answer for the same reason: controlling playback is neither a
+    /// signature nor a download, and a phone lent the player should be offered
+    /// the controls rather than told it is read-only.
+    may_control: bool,
     paired: bool,
     connected: bool,
     /// A tunnel to the computer is being opened right now.
@@ -212,6 +267,9 @@ struct PlaylistPage {
 #[serde(rename_all = "camelCase")]
 struct OfflineLibrary {
     stream_only: bool,
+    /// The other half of what the pairing allows, so the offline screen offers
+    /// the same things the app does once a computer answers.
+    may_download: bool,
     tracks: Vec<RemoteTrack>,
     total: usize,
     paired: bool,
@@ -1480,6 +1538,13 @@ struct RemoteClient {
         tokio::sync::RwLock<std::collections::HashMap<String, iroh::endpoint::Connection>>,
     /// Every computer this phone may talk to, in the order they were paired.
     hosts: tokio::sync::RwLock<Vec<SavedHost>>,
+    /// The computer someone chose this phone to act through, when anyone has.
+    ///
+    /// A choice rather than a rule derived from the grants: someone with two of
+    /// their own - a desktop and a laptop, both privileged - is the person who
+    /// knows which one is home, and being able to say so is what lets the other
+    /// be read from without taking over the phone the moment the first is asleep.
+    home: tokio::sync::RwLock<Option<String>>,
     /// The rows of the shuffled mix collected so far, for the seed they belong
     /// to. Empty until a shuffle is asked for.
     mixed: tokio::sync::RwLock<Option<MixedLibrary>>,
@@ -1536,6 +1601,9 @@ struct MixedHost {
     total: Option<usize>,
     /// It could not be reached, so this mix has what it gave and no more.
     failed: bool,
+    /// What it said when it could not be asked, for the one case where it is
+    /// worth telling the person: none of the computers answered at all.
+    reason: Option<String>,
 }
 
 /// The mix of everything this phone may read, collected a page at a time.
@@ -1578,14 +1646,14 @@ fn included_by_default() -> bool {
 /// A computer left out in Settings is not asked at all, which is the whole of
 /// what leaving one out means: it is still paired, and this phone still acts
 /// through it if it is the one that may.
-fn readable_hosts(hosts: &[SavedHost]) -> Result<Vec<SavedHost>, String> {
+fn readable_hosts(hosts: &[SavedHost], home: Option<&str>) -> Result<Vec<SavedHost>, String> {
     if hosts.is_empty() {
         return Err("Pair Napstrfy with Napstr first".into());
     }
     if !hosts.iter().any(|host| host.included) {
         return Err("Every computer is left out in Settings".into());
     }
-    let primary = primary_host(hosts).map(|host| host.endpoint_id);
+    let home = home_host(hosts, home).map(|host| host.endpoint_id);
     let mut readable = hosts
         .iter()
         .filter(|host| host.included && host.grant().browse)
@@ -1595,8 +1663,50 @@ fn readable_hosts(hosts: &[SavedHost]) -> Result<Vec<SavedHost>, String> {
         return Err("This phone may not read these computers' libraries".into());
     }
     // Stable, so the computers after the first keep the order they were paired in.
-    readable.sort_by_key(|host| primary.as_deref() != Some(host.endpoint_id.as_str()));
+    readable.sort_by_key(|host| home.as_deref() != Some(host.endpoint_id.as_str()));
     Ok(readable)
+}
+
+/// Why a question that was asked of every computer failed, or nothing at all
+/// when at least one of them answered.
+///
+/// A computer out of reach is not an empty library, so one that cannot be asked
+/// must not hide the music the others hold. Only when none of them answered is
+/// there something to tell the person - and then the home computer's reason is
+/// the one that matters, because that is the one they think of as theirs, and
+/// failing with the reason a friend's computer gave would name the wrong
+/// machine.
+///
+/// `reasons` is what each unreachable computer said, in the order they were
+/// asked.
+fn none_answered(answered: usize, reasons: &[(String, String)], home: Option<&str>) -> Option<String> {
+    if answered > 0 {
+        return None;
+    }
+    home.and_then(|home| {
+        reasons
+            .iter()
+            .find(|(endpoint_id, _)| endpoint_id == home)
+            .map(|(_, reason)| reason.clone())
+    })
+    .or_else(|| reasons.first().map(|(_, reason)| reason.clone()))
+    .or_else(|| Some("Napstr is unavailable".into()))
+}
+
+/// What each computer that could not be reached said, in the order asked.
+fn mixed_reasons(hosts: &[MixedHost]) -> Vec<(String, String)> {
+    hosts
+        .iter()
+        .filter(|host| host.failed)
+        .map(|host| {
+            (
+                host.endpoint_id.clone(),
+                host.reason
+                    .clone()
+                    .unwrap_or_else(|| "Napstr did not answer".into()),
+            )
+        })
+        .collect()
 }
 
 /// What several computers answered to one search, one row per file.
@@ -1678,8 +1788,8 @@ fn next_mix_request(held: usize, total: Option<usize>, need: usize) -> Option<(u
 /// may be asked.
 ///
 /// The computer that answered with the file is asked first, because it is the one
-/// known to hold it, then the computer this phone acts through, then the others as
-/// it holds them. Every one of them is a copy of the same file: a file id is a
+/// known to hold it, then the home computer, then the others as it holds them.
+/// Every one of them is a copy of the same file: a file id is a
 /// hash of the file's own bytes, so a copy that differs is not this file and is
 /// refused when its bytes are checked. That is what makes a fallback safe rather
 /// than a guess - and what makes a queue built from several computers play on.
@@ -1687,18 +1797,22 @@ fn next_mix_request(held: usize, total: Option<usize>, need: usize) -> Option<(u
 /// Only computers granted the fetching right are asked. One that may be read but
 /// not taken audio from is not asked for a file at all, which is the same refusal
 /// the computer itself would give, made here where it can name the problem.
-fn fetch_order(origin: Option<&str>, hosts: &[SavedHost]) -> Result<Vec<SavedHost>, String> {
+fn fetch_order(
+    origin: Option<&str>,
+    hosts: &[SavedHost],
+    home: Option<&str>,
+) -> Result<Vec<SavedHost>, String> {
     if hosts.is_empty() {
         return Err("Pair Napstrfy with Napstr first".into());
     }
-    let primary = primary_host(hosts).map(|host| host.endpoint_id);
+    let home = home_host(hosts, home).map(|host| host.endpoint_id);
     let mut may_fetch = hosts
         .iter()
         .filter(|host| host.included && host.grant().fetch)
         .cloned()
         .collect::<Vec<_>>();
     // Stable, so the computers after the first keep the order they were paired in.
-    may_fetch.sort_by_key(|host| primary.as_deref() != Some(host.endpoint_id.as_str()));
+    may_fetch.sort_by_key(|host| home.as_deref() != Some(host.endpoint_id.as_str()));
     let mut order = Vec::new();
     if let Some(origin) = origin {
         if let Some(host) = may_fetch.iter().find(|host| host.endpoint_id == origin) {
@@ -1752,11 +1866,13 @@ impl RemoteClient {
             &app_data.join(PAIRED_HOSTS_FILE),
             &app_data.join(LEGACY_PAIRED_FILE),
         );
+        let home = load_home(&app_data.join(HOME_HOST_FILE));
         Arc::new(Self {
             app_data,
             endpoint: tokio::sync::RwLock::new(None),
             connections: tokio::sync::RwLock::new(std::collections::HashMap::new()),
             hosts: tokio::sync::RwLock::new(hosts),
+            home: tokio::sync::RwLock::new(home),
             mixed: tokio::sync::RwLock::new(None),
             origins: tokio::sync::RwLock::new(HashMap::new()),
             connecting: tokio::sync::RwLock::new(std::collections::HashSet::new()),
@@ -1782,10 +1898,65 @@ impl RemoteClient {
         Ok(endpoint)
     }
 
-    /// The computer this phone acts through.
-    async fn primary(&self) -> Result<SavedHost, String> {
+    /// The computer this phone acts through, which is its home computer when
+    /// someone has chosen one and the same computer it would have used before
+    /// anyone could choose.
+    async fn home(&self) -> Result<SavedHost, String> {
         let hosts = self.hosts.read().await;
-        primary_host(&hosts).ok_or_else(|| "Pair Napstrfy with Napstr first".into())
+        let chosen = self.home.read().await.clone();
+        home_host(&hosts, chosen.as_deref())
+            .ok_or_else(|| "Pair Napstrfy with Napstr first".into())
+    }
+
+    /// The chosen home computer, if it is still one this phone holds.
+    ///
+    /// A name kept for one that has since been forgotten reads as no choice at
+    /// all rather than as an error, so forgetting a computer cannot leave the
+    /// phone unable to say which is home.
+    async fn chosen_home(&self) -> Option<String> {
+        let chosen = self.home.read().await.clone()?;
+        let hosts = self.hosts.read().await;
+        hosts
+            .iter()
+            .any(|host| host.endpoint_id == chosen)
+            .then_some(chosen)
+    }
+
+    /// Choose which computer this phone acts through.
+    ///
+    /// The choice is saved beside the pairings rather than in the host list: it
+    /// is a preference of the phone, and the grants beside it are re-learned
+    /// every time a computer answers.
+    async fn set_home(&self, endpoint_id: Option<&str>) -> Result<(), String> {
+        let path = self.app_data.join(HOME_HOST_FILE);
+        match endpoint_id {
+            Some(endpoint_id) => {
+                if !self
+                    .hosts
+                    .read()
+                    .await
+                    .iter()
+                    .any(|host| host.endpoint_id == endpoint_id)
+                {
+                    return Err("That computer is not paired with this phone".into());
+                }
+                save_json(
+                    &path,
+                    &SavedHome {
+                        endpoint_id: endpoint_id.to_string(),
+                    },
+                )?;
+                *self.home.write().await = Some(endpoint_id.to_string());
+            }
+            None => {
+                *self.home.write().await = None;
+                let _ = remove_if_present(&path);
+            }
+        }
+        // The mix names a file's home computer when two of them hold it, so
+        // which one is home changes the answer it has already collected.
+        *self.mixed.write().await = None;
+        Ok(())
     }
 
     /// Every computer this phone may talk to, for a screen that offers more than
@@ -1913,13 +2084,13 @@ impl RemoteClient {
         &self,
         request: ClientRequest,
     ) -> Result<(ServerResponse, iroh::endpoint::RecvStream), String> {
-        let host = self.primary().await?;
+        let host = self.home().await?;
         self.exchange_with(&host, request).await
     }
 
     /// Ask one computer, named by the endpoint id a screen chose.
     ///
-    /// `None` is the computer this phone acts through, which is what every
+    /// `None` is the home computer, which is what every
     /// caller meant before there could be more than one - so a screen that has
     /// not learned about sources keeps asking exactly whom it asked before.
     ///
@@ -1949,7 +2120,7 @@ impl RemoteClient {
     /// One computer out of the ones this phone holds.
     async fn host_named(&self, source: Option<&str>) -> Result<SavedHost, String> {
         let Some(endpoint_id) = source else {
-            return self.primary().await;
+            return self.home().await;
         };
         self.hosts
             .read()
@@ -1983,16 +2154,17 @@ impl RemoteClient {
     /// gone by waiting for it, and asking them one after another would put every
     /// vanished friend's wait in front of the answer.
     ///
-    /// The computer this phone acts through is the exception to tolerating a
-    /// failure: it is the one that speaks for the phone, so a person whose own
-    /// computer cannot be reached is told that, rather than being shown a
-    /// friend's matches as though all were well. A friend who cannot be reached
-    /// contributes nothing and is not an error - a library that is not there is a
-    /// library with nothing in it, and the rest of the answer is still worth
-    /// having.
+    /// A computer that cannot be reached contributes nothing and is not an
+    /// error: a library that is not there is a library with nothing in it, and
+    /// the rest of the answer is still worth having. That includes the home
+    /// computer, because someone whose own computer is asleep, holding a phone
+    /// paired with a friend's as well, should still be able to search what the
+    /// friend holds. What is an error is every one of them being out of reach,
+    /// and then the home computer's reason is the one that is reported: that is
+    /// the machine the person thinks of as theirs.
     async fn search_everywhere(&self, query: &str) -> Result<Vec<RemoteTrack>, String> {
-        let hosts = readable_hosts(&self.hosts().await)?;
-        let primary = primary_host(&hosts).map(|host| host.endpoint_id);
+        let home = self.chosen_home().await;
+        let hosts = readable_hosts(&self.hosts().await, home.as_deref())?;
         let answers = futures_util::future::join_all(hosts.iter().map(|host| {
             let request = ClientRequest::Search {
                 query: query.to_string(),
@@ -2005,30 +2177,27 @@ impl RemoteClient {
             }
         }))
         .await;
-        let asks_the_primary = |endpoint_id: &str| primary.as_deref() == Some(endpoint_id);
         let mut merged = Vec::new();
+        let mut answered = 0;
+        let mut reasons = Vec::new();
         for (endpoint_id, answer) in answers {
             match answer {
                 Ok(ServerResponse::Search { tracks }) => {
+                    answered += 1;
                     // Remembered before the rows are merged: a result from a
                     // friend is playable because the friend is on record as the
                     // one holding it.
                     self.remember_origins(&endpoint_id, &tracks).await;
                     merged.push(tracks);
                 }
-                Ok(response) => {
-                    if asks_the_primary(&endpoint_id) {
-                        return Err(unexpected_response(&response));
-                    }
-                }
-                Err(error) => {
-                    if asks_the_primary(&endpoint_id) {
-                        return Err(error);
-                    }
-                }
+                Ok(response) => reasons.push((endpoint_id, unexpected_response(&response))),
+                Err(error) => reasons.push((endpoint_id, error)),
             }
         }
-        Ok(merge_search_results(merged))
+        match none_answered(answered, &reasons, home.as_deref()) {
+            Some(error) => Err(error),
+            None => Ok(merge_search_results(merged)),
+        }
     }
 
     /// The rows for particular file ids, from every computer this phone may read.
@@ -2037,14 +2206,14 @@ impl RemoteClient {
     /// hashes, so a member may be held by any of the computers this phone may read
     /// while none of them knows about the others. So they are all asked, and the
     /// answers are put back into the order the ids were given in, which is the
-    /// order the playlist has. A member two computers hold comes from the phone's
-    /// own computer, because that is the one asked first.
+    /// order the playlist has. A member two computers hold comes from the home
+    /// computer, because that is the one asked first.
     async fn library_by_ids_everywhere(
         &self,
         file_ids: &[String],
     ) -> Result<Vec<RemoteTrack>, String> {
-        let hosts = readable_hosts(&self.hosts().await)?;
-        let primary = primary_host(&hosts).map(|host| host.endpoint_id);
+        let home = self.chosen_home().await;
+        let hosts = readable_hosts(&self.hosts().await, home.as_deref())?;
         let request = ClientRequest::LibraryByIds {
             file_ids: file_ids.to_vec(),
         };
@@ -2058,11 +2227,13 @@ impl RemoteClient {
             }
         }))
         .await;
-        let asks_the_primary = |endpoint_id: &str| primary.as_deref() == Some(endpoint_id);
         let mut held: HashMap<String, RemoteTrack> = HashMap::new();
+        let mut answered = 0;
+        let mut reasons = Vec::new();
         for (endpoint_id, answer) in answers {
             match answer {
                 Ok(ServerResponse::LibraryByIds { tracks }) => {
+                    answered += 1;
                     // On record as this computer's, so that playing a member asks
                     // the computer that has it rather than the phone's own.
                     self.remember_origins(&endpoint_id, &tracks).await;
@@ -2070,17 +2241,12 @@ impl RemoteClient {
                         held.entry(track.file_id.clone()).or_insert(track);
                     }
                 }
-                Ok(response) => {
-                    if asks_the_primary(&endpoint_id) {
-                        return Err(unexpected_response(&response));
-                    }
-                }
-                Err(error) => {
-                    if asks_the_primary(&endpoint_id) {
-                        return Err(error);
-                    }
-                }
+                Ok(response) => reasons.push((endpoint_id, unexpected_response(&response))),
+                Err(error) => reasons.push((endpoint_id, error)),
             }
+        }
+        if let Some(error) = none_answered(answered, &reasons, home.as_deref()) {
+            return Err(error);
         }
         Ok(file_ids
             .iter()
@@ -2093,13 +2259,19 @@ impl RemoteClient {
     /// No computer is named, because none of them is the whole library any more.
     /// The phone's own music sits among what its friends hold, each file once - a
     /// file id is a hash of the file's own bytes, so two computers holding the
-    /// same recording hold one file - and the computer this phone acts through
+    /// same recording hold one file - and the home computer
     /// answers for a file more than one of them has.
     ///
     /// A seed orders the page; without one, each computer's own order stands, one
     /// computer after another. A filtered page is asked afresh every time, while
     /// a whole library is collected and kept, because a scroll asks for the same
     /// rows over and over.
+    ///
+    /// A computer that cannot be asked is left out of the page rather than
+    /// failing it. The home computer is no exception: someone whose
+    /// desktop is asleep still has the music of the computers that are awake.
+    /// The error is kept for the one case it means something - none of them
+    /// answered.
     async fn mixed_library(
         &self,
         query: &str,
@@ -2107,14 +2279,13 @@ impl RemoteClient {
         offset: usize,
         limit: usize,
     ) -> Result<(Vec<RemoteTrack>, usize), String> {
-        let hosts = readable_hosts(&self.hosts().await)?;
+        let home = self.chosen_home().await;
+        let hosts = readable_hosts(&self.hosts().await, home.as_deref())?;
         let endpoints = hosts
             .iter()
             .map(|host| host.endpoint_id.clone())
             .collect::<Vec<_>>();
         let need = offset + limit;
-        let primary = primary_host(&hosts).map(|host| host.endpoint_id);
-        let asks_the_primary = |endpoint_id: &str| primary.as_deref() == Some(endpoint_id);
 
         if !query.is_empty() {
             // A filtered page is a question rather than a list: it is asked of
@@ -2127,23 +2298,27 @@ impl RemoteClient {
                     rows: Vec::new(),
                     total: None,
                     failed: false,
+                    reason: None,
                 })
                 .collect::<Vec<_>>();
             let answers = futures_util::future::join_all(
                 hosts
                     .iter()
                     .zip(collected.iter_mut())
-                    .map(|(host, rows)| {
-                        let is_primary = asks_the_primary(&host.endpoint_id);
-                        async move {
-                            self.fill_from(host, is_primary, query, None, need, rows)
-                                .await
-                        }
+                    .map(|(host, rows)| async move {
+                        self.fill_from(host, query, None, need, rows).await
                     }),
             )
             .await;
             for answer in answers {
                 answer?;
+            }
+            if let Some(error) = none_answered(
+                collected.iter().filter(|host| !host.failed).count(),
+                &mixed_reasons(&collected),
+                home.as_deref(),
+            ) {
+                return Err(error);
             }
             return Ok(mixed_page(&collected, None, offset, limit));
         }
@@ -2168,15 +2343,21 @@ impl RemoteClient {
                         rows: Vec::new(),
                         total: None,
                         failed: false,
+                        reason: None,
                     })
                     .collect(),
             });
         }
         let mix = mixed.as_mut().expect("a mix was just built");
-        for index in 0..mix.hosts.len() {
-            let is_primary = asks_the_primary(&mix.hosts[index].endpoint_id);
-            self.fill_from(&hosts[index], is_primary, query, seed, need, &mut mix.hosts[index])
-                .await?;
+        for (host, collected) in hosts.iter().zip(mix.hosts.iter_mut()) {
+            self.fill_from(host, query, seed, need, collected).await?;
+        }
+        if let Some(error) = none_answered(
+            mix.hosts.iter().filter(|host| !host.failed).count(),
+            &mixed_reasons(&mix.hosts),
+            home.as_deref(),
+        ) {
+            return Err(error);
         }
 
         Ok(mixed_page(&mix.hosts, seed, offset, limit))
@@ -2186,13 +2367,13 @@ impl RemoteClient {
     /// protocol needs.
     ///
     /// Answers are capped, so a page deeper than the cap arrives as several
-    /// requests rather than one larger one. A friend who cannot be reached is
-    /// left out of the page and the rest of it still stands; the computer this
-    /// phone acts through is the one whose failure is the person's business.
+    /// requests rather than one larger one. A computer that cannot be reached is
+    /// left out of the page and the rest of it still stands - whoever it is. The
+    /// reason is kept, because when none of them answered it is the only thing
+    /// there is to say.
     async fn fill_from(
         &self,
         host: &SavedHost,
-        is_primary: bool,
         query: &str,
         seed: Option<u64>,
         need: usize,
@@ -2224,21 +2405,17 @@ impl RemoteClient {
                     collected.rows.extend(tracks);
                 }
                 Ok(response) => {
-                    if is_primary {
-                        return Err(unexpected_response(&response));
-                    }
                     collected.failed = true;
+                    collected.reason = Some(unexpected_response(&response));
                     return Ok(());
                 }
                 Err(error) => {
-                    if is_primary {
-                        return Err(error);
-                    }
                     // Left out rather than waited for on every step of a scroll:
                     // the page is as complete as it could be when it was built,
                     // and asking again - a new shuffle, or a filter - tries once
                     // more.
                     collected.failed = true;
+                    collected.reason = Some(error);
                     return Ok(());
                 }
             }
@@ -2247,15 +2424,15 @@ impl RemoteClient {
 
     /// Remember which computer answered with which files.
     ///
-    /// Only rows from another computer are worth keeping: the one this phone acts
-    /// through is asked for a file anyway, and a map of every file it holds would
+    /// Only rows from another computer are worth keeping: the home computer is
+    /// asked for a file anyway, and a map of every file it holds would
     /// be a copy of its library on a phone that has no room for one.
     async fn remember_origins(&self, endpoint_id: &str, rows: &[RemoteTrack]) {
         if self
-            .primary()
+            .home()
             .await
             .map(|host| host.endpoint_id)
-            .is_ok_and(|primary| primary == endpoint_id)
+            .is_ok_and(|home| home == endpoint_id)
         {
             return;
         }
@@ -2278,6 +2455,10 @@ impl RemoteClient {
             let remaining = without_host(hosts.clone(), endpoint_id)?;
             *hosts = remaining.clone();
             save_hosts(&self.app_data.join(PAIRED_HOSTS_FILE), &remaining)?;
+        }
+        // A choice of a computer that is no longer held is not a choice.
+        if self.home.read().await.as_deref() == Some(endpoint_id) {
+            self.set_home(None).await?;
         }
         self.close_connection(endpoint_id).await;
         self.origins
@@ -2306,17 +2487,21 @@ impl RemoteClient {
     ///
     /// Two things it does not do, and both were bugs. It never drops a tunnel,
     /// because a question about a computer is not a verdict on a connection. And
-    /// it does not ask the computer this phone acts through while a tunnel to it
+    /// it does not ask the home computer while a tunnel to it
     /// is already open: the status question that opened it has just answered
     /// this, so asking again spends a round trip per status line learning what is
-    /// already known.
+    /// already known. Every other computer is asked by name, whether or not it is
+    /// the one the app is drawn from - which is the whole point of a phone that
+    /// holds more than one.
     async fn reachable(&self, hosts: &[SavedHost]) -> HashMap<String, bool> {
-        let primary = self.primary().await.ok().map(|host| host.endpoint_id);
-        let primary = primary.as_ref();
+        let home = self.chosen_home().await;
+        // Borrowed for as long as the answers are being collected: the closures
+        // below run one per computer and none of them may take it.
+        let home = home.as_deref();
         let held = self.connections.read().await.clone();
         let held = &held;
         let answers = futures_util::future::join_all(hosts.iter().map(|host| async move {
-            if primary.is_some_and(|id| id == &host.endpoint_id) && held.contains_key(&host.endpoint_id) {
+            if home == Some(host.endpoint_id.as_str()) && held.contains_key(&host.endpoint_id) {
                 return (host.endpoint_id.clone(), true);
             }
             let answered = matches!(
@@ -2376,7 +2561,11 @@ impl RemoteClient {
         file_id: &str,
     ) -> Result<(RemoteTrack, iroh::endpoint::RecvStream), String> {
         let origin = self.origins.read().await.get(file_id).cloned();
-        let hosts = fetch_order(origin.as_deref(), &self.hosts().await)?;
+        let hosts = fetch_order(
+            origin.as_deref(),
+            &self.hosts().await,
+            self.chosen_home().await.as_deref(),
+        )?;
         let last = hosts.len() - 1;
         let mut last_error = None;
         for (index, host) in hosts.into_iter().enumerate() {
@@ -2524,19 +2713,21 @@ impl RemoteClient {
         Ok(Some(FetchedArt { hash, bytes }))
     }
 
-    /// True when the computer this phone acts through may only browse and play,
-    /// which is what keeps the phone from offering controls it would refuse.
-    async fn stream_only(&self) -> bool {
-        self.primary()
-            .await
-            .map(|host| host.grant().is_read_only())
-            .unwrap_or(false)
+    /// What the home computer last told this phone it may do.
+    ///
+    /// `None` is a phone holding no computer at all, which is a different thing
+    /// from a computer that allows nothing: one is a phone with nothing to ask,
+    /// and the other is one that must be told to ask for less.
+    async fn home_grant(&self) -> Option<DeviceRights> {
+        self.home().await.ok().map(|host| host.grant())
     }
 
     async fn status(self: &Arc<Self>) -> CompanionStatus {
-        let Ok(host) = self.primary().await else {
+        let Ok(host) = self.home().await else {
             return CompanionStatus {
                 stream_only: false,
+                may_download: false,
+                may_control: false,
                 paired: false,
                 connected: false,
                 connecting: false,
@@ -2596,6 +2787,8 @@ impl RemoteClient {
                 }
                 CompanionStatus {
                     stream_only: grant.is_read_only(),
+                    may_download: grant.may_download(),
+                    may_control: grant.control,
                     paired: true,
                     connected: true,
                     connecting: false,
@@ -2642,6 +2835,8 @@ impl RemoteClient {
         {
             Ok(Ok(ServerResponse::Pong)) => CompanionStatus {
                 stream_only: host.grant().is_read_only(),
+                may_download: host.grant().may_download(),
+                may_control: host.grant().control,
                 paired: true,
                 connected: true,
                 connecting: false,
@@ -2782,7 +2977,7 @@ impl RemoteClient {
 
     async fn offline_library(&self) -> Result<OfflineLibrary, String> {
         let cached = self.cached_entries().await?;
-        let host = self.primary().await.ok();
+        let host = self.home().await.ok();
         let tracks = cached
             .into_iter()
             .filter(|item| item.library_visible)
@@ -2790,6 +2985,9 @@ impl RemoteClient {
             .collect::<Vec<_>>();
         Ok(OfflineLibrary {
             stream_only: host.as_ref().is_some_and(|host| host.grant().is_read_only()),
+            may_download: host
+                .as_ref()
+                .is_some_and(|host| host.grant().may_download()),
             total: tracks.len(),
             tracks,
             paired: host.is_some(),
@@ -3026,20 +3224,25 @@ struct RemoteHost {
     endpoint_id: String,
     desktop_name: String,
     rights: DeviceRights,
-    /// The computer this phone acts through: the one whose library and status
-    /// the rest of the app is drawn from.
-    primary: bool,
+    /// The home computer: the one this phone acts through, whose library and
+    /// status the rest of the app is drawn from, and the one whose queue a
+    /// download is put in.
+    home: bool,
     /// Whether this phone reads from it. A computer left out keeps its pairing.
     included: bool,
     /// Whether it answered just now. A computer out of reach is still one this
     /// phone holds, and this is what its row says.
     online: bool,
+    /// Whether it may reach the network for this phone - the right that is not a
+    /// signature, and the one the row shows beside its name.
+    may_download: bool,
 }
 
 #[tauri::command]
 async fn remote_hosts(state: State<'_, AppState>) -> Result<Vec<RemoteHost>, String> {
     let hosts = state.remote.hosts().await;
-    let primary = primary_host(&hosts).map(|host| host.endpoint_id);
+    let chosen = state.remote.chosen_home().await;
+    let home = home_host(&hosts, chosen.as_deref()).map(|host| host.endpoint_id);
     // Asked all at once and cut off quickly: this draws a status line, and a
     // computer that is asleep must not hold up the ones that are awake.
     let online = state.remote.reachable(&hosts).await;
@@ -3049,18 +3252,34 @@ async fn remote_hosts(state: State<'_, AppState>) -> Result<Vec<RemoteHost>, Str
             // Read before the fields are moved out: `grant` borrows the whole
             // host, which is not available once one of its fields has gone.
             let grant = host.grant();
-            let is_primary = primary.as_deref() == Some(host.endpoint_id.as_str());
+            let is_home = home.as_deref() == Some(host.endpoint_id.as_str());
             let is_online = online.get(&host.endpoint_id).copied().unwrap_or(false);
             RemoteHost {
-                primary: is_primary,
+                home: is_home,
                 included: host.included,
                 online: is_online,
+                may_download: grant.may_download(),
                 endpoint_id: host.endpoint_id,
                 desktop_name: host.desktop_name,
                 rights: grant,
             }
         })
         .collect())
+}
+
+/// Choose which computer this phone acts through.
+///
+/// The phone acts through one of them, but it is the person who knows which -
+/// someone with a desktop and a laptop has two computers that both let the phone
+/// act as its owner, and the one at home is not a property of either pairing. A
+/// choice that names a computer this phone does not hold is refused rather than
+/// kept, so the answer to "which is home" is never a machine that is not here.
+#[tauri::command]
+async fn set_mobile_home_host(
+    endpoint_id: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state.remote.set_home(endpoint_id.as_deref()).await
 }
 
 #[tauri::command]
@@ -3125,7 +3344,7 @@ async fn remote_library_by_ids(
     }
     let mut tracks = Vec::with_capacity(file_ids.len());
     for batch in file_ids.chunks(MAX_TRACKS_BY_ID) {
-        // A member the phone's own computer does not hold is not a member nobody
+        // A member the home computer does not hold is not a member nobody
         // holds: it may be one a friend's computer holds, so a batch with no
         // computer named is asked of every computer this phone may read.
         match source.as_deref() {
@@ -3604,7 +3823,16 @@ async fn remote_playback(
         }
         _ => {}
     }
-    if state.remote.stream_only().await {
+    // The right that matters is the one to drive the computer, not the older
+    // "read only" flag: a phone may be lent control of the player without being
+    // able to sign anything, and refusing it here would be this app refusing what
+    // the computer allows.
+    if state
+        .remote
+        .home_grant()
+        .await
+        .is_some_and(|grant| !grant.control)
+    {
         return Err("This pairing is read only. It cannot control the computer.".into());
     }
     let response = state
@@ -4373,6 +4601,7 @@ pub fn run() {
             remote_hosts,
             forget_mobile_host,
             set_mobile_host_included,
+            set_mobile_home_host,
             remote_file_hosts,
             remote_library,
             remote_library_by_ids,
@@ -4493,6 +4722,7 @@ mod tests {
             rows,
             total: Some(total),
             failed: false,
+            reason: None,
         }
     }
 
@@ -4548,15 +4778,44 @@ mod tests {
         let own = host("own", DeviceRights::full(), "My Napstr");
 
         assert_eq!(
-            primary_host(&[friend.clone(), own.clone()]).unwrap().endpoint_id,
+            home_host(&[friend.clone(), own.clone()], None)
+                .unwrap()
+                .endpoint_id,
             "own"
         );
         assert_eq!(
-            primary_host(&[own, friend.clone()]).unwrap().endpoint_id,
+            home_host(&[own.clone(), friend.clone()], None)
+                .unwrap()
+                .endpoint_id,
             "own"
         );
-        assert_eq!(primary_host(&[friend]).unwrap().endpoint_id, "friend");
-        assert!(primary_host(&[]).is_none());
+        assert_eq!(home_host(&[friend.clone()], None).unwrap().endpoint_id, "friend");
+        assert!(home_host(&[], None).is_none());
+    }
+
+    /// A computer someone chose is the one the phone acts through, even when
+    /// another of them would have been picked by the rule.
+    ///
+    /// This is the point of choosing: two computers that both let the phone act
+    /// as their owner are both privileged, so no rule can tell which is home -
+    /// only the person with the desktop and the laptop can.
+    #[test]
+    fn a_chosen_home_computer_wins_over_the_rule() {
+        let desktop = host("desktop", DeviceRights::full(), "Studio");
+        let laptop = host("laptop", DeviceRights::full(), "Laptop");
+        let friend = host("friend", DeviceRights::read_only(), "Ada's Napstr");
+        let hosts = vec![desktop.clone(), laptop.clone(), friend.clone()];
+
+        // Without a choice, the rule decides - and both of these are privileged,
+        // so it is the first one that was paired.
+        assert_eq!(home_host(&hosts, None).unwrap().endpoint_id, "desktop");
+        assert_eq!(home_host(&hosts, Some("laptop")).unwrap().endpoint_id, "laptop");
+        // A choice of a computer this phone does not hold falls back to the rule
+        // rather than leaving the phone with no computer to act through.
+        assert_eq!(home_host(&hosts, Some("gone")).unwrap().endpoint_id, "desktop");
+        // And a choice may name a computer that allows only browsing: the phone
+        // acts through it in the sense of asking it things, and may not sign.
+        assert_eq!(home_host(&hosts, Some("friend")).unwrap().endpoint_id, "friend");
     }
 
     /// A computer that has never named its grant is taken at the word of the old
@@ -4584,7 +4843,7 @@ mod tests {
         let own = host("own", DeviceRights::full(), "My Napstr");
         let nothing = host("none", DeviceRights::default(), "A Laptop");
 
-        let asked = readable_hosts(&[friend.clone(), nothing.clone(), own.clone()]).unwrap();
+        let asked = readable_hosts(&[friend.clone(), nothing.clone(), own.clone()], None).unwrap();
         assert_eq!(
             asked
                 .iter()
@@ -4594,9 +4853,9 @@ mod tests {
         );
         // A computer that allows nothing is not a library to read, and a phone
         // with no computer at all is told which of the two it is looking at.
-        assert!(readable_hosts(&[nothing]).is_err());
+        assert!(readable_hosts(&[nothing], None).is_err());
         assert_eq!(
-            readable_hosts(&[]).unwrap_err(),
+            readable_hosts(&[], None).unwrap_err(),
             "Pair Napstrfy with Napstr first"
         );
     }
@@ -4614,7 +4873,7 @@ mod tests {
         ]);
         assert_eq!(merged.len(), 2);
         assert_eq!(places(&merged), "bd");
-        // The phone's own computer answered first, so its row is the one kept.
+        // The home computer answered first, so its row is the one kept.
         assert_eq!(merged[0].artist, "Mine");
         assert!(merged[0].local);
     }
@@ -4699,31 +4958,49 @@ mod tests {
                 .collect()
         }
 
-        // A friend's row is asked of the friend, then of the phone's own computer,
+        // A friend's row is asked of the friend, then of the home computer,
         // which may well hold the same file.
         assert_eq!(
-            ordered(&fetch_order(Some("friend"), &[own.clone(), friend.clone()]).unwrap()),
+            ordered(&fetch_order(Some("friend"), &[own.clone(), friend.clone()], None).unwrap()),
             ["friend", "own"]
         );
-        // A row from the phone's own computer, or from nowhere in particular.
+        // A row from the home computer, or from nowhere in particular.
         assert_eq!(
-            ordered(&fetch_order(None, &[friend.clone(), own.clone()]).unwrap()),
+            ordered(&fetch_order(None, &[friend.clone(), own.clone()], None).unwrap()),
             ["own", "friend"]
         );
         // A computer that may be read but not taken audio from is not asked for a
         // file, however it is named.
         assert_eq!(
-            ordered(&fetch_order(Some("reader"), &[own.clone(), reader.clone()]).unwrap()),
+            ordered(&fetch_order(Some("reader"), &[own.clone(), reader.clone()], None).unwrap()),
             ["own"]
         );
         // A computer this phone no longer holds is not asked at all, and a phone
         // that may take audio from nobody at all is told which of the two it is.
         assert_eq!(
-            ordered(&fetch_order(Some("gone"), &[own]).unwrap()),
+            ordered(&fetch_order(Some("gone"), &[own], None).unwrap()),
             ["own"]
         );
-        assert!(fetch_order(None, &[reader]).is_err());
-        assert!(fetch_order(None, &[]).is_err());
+        assert!(fetch_order(None, &[reader], None).is_err());
+        assert!(fetch_order(None, &[], None).is_err());
+    }
+
+    /// The computer someone chose is asked first for a file, before the one the
+    /// rule would have picked: a file both of them hold comes from home.
+    #[test]
+    fn the_chosen_computer_is_asked_first_for_a_file() {
+        let desktop = host("desktop", DeviceRights::full(), "Studio");
+        let laptop = host("laptop", DeviceRights::full(), "Laptop");
+        let hosts = vec![desktop, laptop];
+
+        let ordered = fetch_order(None, &hosts, Some("laptop")).unwrap();
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|host| host.endpoint_id.as_str())
+                .collect::<Vec<_>>(),
+            ["laptop", "desktop"]
+        );
     }
 
     /// Forgetting one computer is not forgetting the others, and a computer this
@@ -4751,17 +5028,17 @@ mod tests {
         let mut left_out = host("friend", DeviceRights::read_only(), "Ada's Napstr");
         left_out.included = false;
 
-        let asked = readable_hosts(&[own.clone(), left_out.clone()]).unwrap();
+        let asked = readable_hosts(&[own.clone(), left_out.clone()], None).unwrap();
         assert_eq!(asked.len(), 1);
         assert_eq!(asked[0].endpoint_id, "own");
         // Left out of being read, and out of being fetched from, which is the
         // same answer a track that came from it gets.
         assert_eq!(
-            fetch_order(None, &[own, left_out.clone()]).unwrap().len(),
+            fetch_order(None, &[own, left_out.clone()], None).unwrap().len(),
             1
         );
         assert_eq!(
-            readable_hosts(&[left_out]).unwrap_err(),
+            readable_hosts(&[left_out], None).unwrap_err(),
             "Every computer is left out in Settings"
         );
     }
