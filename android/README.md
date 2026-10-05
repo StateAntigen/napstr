@@ -130,6 +130,8 @@ The home computer is chosen in Napstrfy's Settings, which is what makes it usefu
 
 When one of them is unreachable the rest still work. The status line says how many answered (`1/2 Online`), the library and search read from whichever computers are there, and the settings list marks each one with whether it may download for this phone.
 
+A tunnel that hears *nothing at all* is given up on after fifteen seconds and opened again, so a computer that has been asleep costs one question rather than a minute of them. That decision belongs to the transport and not to the app: QUIC heartbeats are answered by the other machine's transport rather than by its application, so silence there means the path is gone, while a computer that is slow to answer is still answering. The request level cannot tell those two apart — a request that went unanswered says nothing about the connection it was asked over — so nothing at that level drops a tunnel. The phone simply stops handing out one the transport has already closed.
+
 Podcasts are independent of Napstr: Napstrfy searches a public podcast directory and streams or downloads episodes directly from their publishers.
 
 The same codebase can later be built for iOS from a Mac using `npm run ios:init` and `npm run ios:dev`.

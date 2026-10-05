@@ -6,7 +6,7 @@ use public_http::{podcast_http_client, safe_public_https_url};
 
 use futures_util::StreamExt;
 use iroh::{
-    endpoint::{presets, TransportAddrUsage},
+    endpoint::{presets, IdleTimeout, QuicTransportConfig, TransportAddrUsage},
     Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr,
 };
 use napstr_remote_protocol::{
@@ -117,6 +117,23 @@ const LEGACY_PAIRED_FILE: &str = "paired-desktop.json";
 /// not about the computer, and it has to survive the grants beside it being
 /// re-learned on every status answer.
 const HOME_HOST_FILE: &str = "home-host.json";
+
+/// How long a tunnel may receive nothing at all before this phone gives up on it.
+///
+/// The transport's own answer, and the only signal available here that can tell a
+/// dead path from a busy computer: QUIC heartbeats are answered by the other
+/// machine's *transport* rather than by its application, so they keep arriving
+/// while it is slow with a large library page, and they stop the moment the path
+/// is gone. Every timeout at the request level is blind to that difference.
+///
+/// Iroh leaves this at QUIC's thirty seconds, which is longer than this phone
+/// waits for anything: with a status question every fifteen seconds, thirty
+/// seconds of silence is two rounds of "offline" that then recover on their own.
+///
+/// Fifteen because it is one poll interval, and because iroh's own comment on the
+/// path timeout beside it puts a real WiFi reconnect or cellular handoff at two
+/// to ten seconds - below this, so a handoff is not mistaken for a dead tunnel.
+const TUNNEL_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The computers this phone may talk to.
 ///
@@ -1934,11 +1951,25 @@ impl RemoteClient {
             return Ok(endpoint);
         }
         let key = load_or_create_key(&self.app_data.join("iroh-identity"))?;
+        let idle: IdleTimeout = TUNNEL_IDLE_TIMEOUT
+            .try_into()
+            .map_err(|_| "The tunnel idle timeout is not one QUIC can carry".to_string())?;
+        // Only the idle timeout is set; everything else is left exactly as iroh
+        // tuned it, including the five-second heartbeats and the per-path
+        // timeouts, which are what make holepunching work.
+        let transport = QuicTransportConfig::builder()
+            .max_idle_timeout(Some(idle))
+            .build();
         let endpoint = Endpoint::builder(presets::N0)
             .secret_key(key)
+            .transport_config(transport)
             .bind()
             .await
             .map_err(|error| format!("Iroh failed to start: {error}"))?;
+        diag::note(&format!(
+            "Iroh is up: a tunnel that hears nothing for {}s is given up on",
+            TUNNEL_IDLE_TIMEOUT.as_secs()
+        ));
         *self.endpoint.write().await = Some(endpoint.clone());
         Ok(endpoint)
     }
@@ -2012,17 +2043,40 @@ impl RemoteClient {
 
     /// A tunnel to one computer, opened if it is not already.
     async fn connection(&self, host: &SavedHost) -> Result<iroh::endpoint::Connection, String> {
-        if let Some(connection) = self.connections.read().await.get(&host.endpoint_id).cloned() {
-            // A tunnel that is already up is still somewhere to learn from, and
-            // it has to be: the two machines usually find their direct path a
-            // moment *after* the tunnel opens, so the moment the tunnel appears
-            // is too early to know what to dial next time. Asking on every use
-            // of a live tunnel costs a lookup until something has really
-            // changed, and it is what makes the address in the file follow a
-            // computer rather than only the day it was paired on.
-            let learned = self.live_addresses(&host.endpoint_id).await;
-            self.remember_addresses(&host.endpoint_id, &learned).await;
-            return Ok(connection);
+        // Held in a binding of its own on purpose: a guard created inside an
+        // `if let` lives until the end of the whole statement, so closing the
+        // dead tunnel below - which takes the write lock - would wait for a read
+        // lock this function is still holding, for ever.
+        let held = self.connections.read().await.get(&host.endpoint_id).cloned();
+        if let Some(connection) = held {
+            if let Some(reason) = connection.close_reason() {
+                // A tunnel the transport has already closed is not one this
+                // phone holds. Handing it back spends the whole of the asking
+                // side's timeout - eight seconds, for a status question - on a
+                // path nothing can travel over, and only reconnects afterwards.
+                //
+                // Only the transport can be sure of this, and that is the point:
+                // a request that went unanswered says nothing about the path, so
+                // nothing at the request level decides whether a tunnel is dead.
+                // This asks the one layer that knows.
+                diag::note(&format!(
+                    "the tunnel to {} is closed ({reason}); opening another",
+                    host.desktop_name
+                ));
+                self.close_connection(&host.endpoint_id).await;
+            } else {
+                // A tunnel that is already up is still somewhere to learn from,
+                // and it has to be: the two machines usually find their direct
+                // path a moment *after* the tunnel opens, so the moment the
+                // tunnel appears is too early to know what to dial next time.
+                // Asking on every use of a live tunnel costs a lookup until
+                // something has really changed, and it is what makes the address
+                // in the file follow a computer rather than only the day it was
+                // paired on.
+                let learned = self.live_addresses(&host.endpoint_id).await;
+                self.remember_addresses(&host.endpoint_id, &learned).await;
+                return Ok(connection);
+            }
         }
         let started = std::time::Instant::now();
         let address = decode_endpoint_addr(host)?;
@@ -5369,6 +5423,130 @@ mod tests {
         // A slow answer is not a broken connection, so the retry has somewhere to
         // go instead of paying for a fresh connect.
         assert!(!attempt_drops_tunnel(true, AttemptFailure::Timeout));
+    }
+
+    /// A tunnel the transport has closed is dialled again, not handed out.
+    ///
+    /// This is the shape of the fault that costs the most, and it was measured on
+    /// the phone on 2026-10-05: a path goes dead, the transport closes the
+    /// connection, and the phone goes on using the connection object it holds -
+    /// so every question waits out its whole timeout first (eight seconds, for a
+    /// status question, twice over, which is what "flicking between connecting
+    /// and offline" is) and only then does anything reconnect.
+    ///
+    /// Two endpoints that need nothing but each other: no relay and no lookup, so
+    /// what is proved here is this phone's own rule and not the network. `Minimal`
+    /// is the preset for that — `Empty` sets nothing at all, not even the crypto
+    /// provider an endpoint cannot bind without.
+    #[test]
+    fn a_tunnel_the_transport_has_closed_is_dialled_again() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let server = Endpoint::builder(presets::Minimal)
+                .alpns(vec![ALPN.to_vec()])
+                .bind()
+                .await
+                .unwrap();
+            let address = server.addr();
+
+            let (root, client, _identity) = client_with_an_identity("closed-tunnel");
+            // The endpoint this client talks over is handed to it rather than
+            // built by it, because the app's own is the N0 preset and this test
+            // must not need a relay or a lookup service.
+            let dialler = Endpoint::builder(presets::Minimal).bind().await.unwrap();
+            *client.endpoint.write().await = Some(dialler.clone());
+
+            let mut saved = host("stale", DeviceRights::full(), "Studio");
+            saved.endpoint_id = address.id.to_string();
+            saved.endpoint_addr = serde_json::to_string(&address).unwrap();
+
+            // A computer answers a handshake by awaiting the connection it is
+            // offered, so something has to be accepting *while* the phone dials:
+            // the two ends of this test would otherwise wait for each other. Two
+            // connections are taken, because the phone dials twice.
+            let (first_tx, first_rx) = tokio::sync::oneshot::channel();
+            let (second_tx, second_rx) = tokio::sync::oneshot::channel();
+            let accepting_server = server.clone();
+            tokio::spawn(async move {
+                for answer in [first_tx, second_tx] {
+                    let Some(offered) = accepting_server.accept().await else {
+                        return;
+                    };
+                    match tokio::time::timeout(Duration::from_secs(20), offered).await {
+                        Ok(Ok(connection)) => {
+                            let _ = answer.send(connection);
+                        }
+                        _ => return,
+                    }
+                }
+            });
+
+            // A tunnel is opened and held, which is where a running phone is.
+            let first = tokio::time::timeout(
+                Duration::from_secs(10),
+                dialler.connect(address.clone(), ALPN),
+            )
+            .await
+            .expect("the first dial must finish")
+            .unwrap();
+            let computer_side = tokio::time::timeout(Duration::from_secs(10), first_rx)
+                .await
+                .expect("the computer's own end of the first connection must arrive")
+                .expect("it to be sent");
+            client
+                .connections
+                .write()
+                .await
+                .insert(saved.endpoint_id.clone(), first.clone());
+
+            // The computer's end goes away, and the phone learns it the way it
+            // really learns it: from the transport, on the next packet.
+            computer_side.close(0u32.into(), b"gone");
+            let mut noticed = false;
+            for _ in 0..200 {
+                if first.close_reason().is_some() {
+                    noticed = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(noticed, "the transport must report the close");
+
+            // What the phone hands out now has to be a tunnel. Before the check
+            // in `connection`, this returned the closed one unchanged.
+            let second = tokio::time::timeout(Duration::from_secs(10), client.connection(&saved))
+                .await
+                .expect("the second dial must finish")
+                .unwrap();
+            assert!(second.close_reason().is_none(), "a live tunnel is handed out");
+            assert_ne!(
+                second.stable_id(),
+                first.stable_id(),
+                "the closed tunnel must not be the one handed out"
+            );
+            assert_eq!(
+                client
+                    .connections
+                    .read()
+                    .await
+                    .get(&saved.endpoint_id)
+                    .map(|held| held.stable_id()),
+                Some(second.stable_id()),
+                "and the one it holds is the live one"
+            );
+            // The computer really has it, so this is a tunnel rather than a
+            // connection object that has not failed yet.
+            let computer_side_again = tokio::time::timeout(Duration::from_secs(10), second_rx)
+                .await
+                .expect("the computer's own end of the second connection must arrive")
+                .expect("it to be sent");
+            assert!(computer_side_again.close_reason().is_none());
+
+            let _ = fs::remove_dir_all(root);
+        });
     }
 
     /// A client of its own, with an identity of its own, in a directory of its
