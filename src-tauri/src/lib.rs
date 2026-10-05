@@ -23,6 +23,7 @@ mod audio;
 mod catalogue;
 mod cover;
 mod cover_publish;
+mod device_account;
 mod mobile;
 mod network;
 mod playback_bridge;

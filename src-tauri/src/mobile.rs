@@ -112,6 +112,9 @@ pub struct MobileService {
     audiobook_cache: Mutex<std::collections::HashMap<String, RemoteAudiobook>>,
     music_library_cache: Mutex<Option<MusicLibraryCache>>,
     last_seen_updates: Mutex<std::collections::HashMap<String, Instant>>,
+    /// The nonce each device was given to sign. What a device keeps here is kept
+    /// under the key it proved, so the proof is the gate to all of it.
+    challenges: crate::device_account::Challenges,
     connection_slots: Arc<tokio::sync::Semaphore>,
     request_slots: Arc<tokio::sync::Semaphore>,
 }
@@ -140,6 +143,7 @@ impl MobileService {
             audiobook_cache: Mutex::new(std::collections::HashMap::new()),
             music_library_cache: Mutex::new(None),
             last_seen_updates: Mutex::new(std::collections::HashMap::new()),
+            challenges: crate::device_account::Challenges::default(),
             connection_slots: Arc::new(tokio::sync::Semaphore::new(16)),
             request_slots: Arc::new(tokio::sync::Semaphore::new(32)),
         }))
@@ -533,6 +537,13 @@ impl MobileService {
     /// back is what was stored, so a phone that keeps the returned copy and the
     /// list the host will answer with cannot disagree about a title or a member.
     ///
+    /// The author is the *device's* key, not this computer's, whenever a device
+    /// is doing the asking: a phone's own playlists are the phone's, which is
+    /// what keeps two phones, and the owner's own window, out of each other's
+    /// lists. It is the caller's job to say whose key, because the one caller
+    /// that files under this computer's key is a *publication* - the computer
+    /// signs that event, so the coordinate has to be the computer's.
+    ///
     /// A playlist the phone opened is somebody else's public playlist as often
     /// as not, now that the host reads them from the relays. Editing one of
     /// those is copying it: it is filed under an id of its own, and the phone
@@ -541,11 +552,12 @@ impl MobileService {
     fn save_playlist(
         &self,
         playlist: napstr_remote_protocol::RemotePlaylist,
+        author: &str,
     ) -> Result<napstr_remote_protocol::RemotePlaylist, String> {
         crate::playlist::file_revision(
             &open_connection(&self.db_path)?,
             playlist,
-            &crate::network::own_pubkey()?,
+            author,
             Utc::now().timestamp(),
         )
     }
@@ -908,11 +920,16 @@ impl MobileService {
                 own_only,
             } => {
                 let connection = open_connection(&self.db_path)?;
-                // The picker asks for this computer's own playlists alone: a
+                // The picker asks for this device's own playlists alone: a
                 // public one somebody else published is a playlist to play, not
-                // a list to add a track to.
+                // a list to add a track to - and neither is the owner's own
+                // list, which a device can only ever copy.
+                //
+                // "Own" is the device's key once it has proved one. That is the
+                // same rule that decides whose key a save is filed under, so a
+                // list that appears here is a list that can be written to.
                 let owned_by = if own_only {
-                    Some(crate::network::own_pubkey()?)
+                    Some(self.proved_key(remote_id)?)
                 } else {
                     None
                 };
@@ -965,7 +982,8 @@ impl MobileService {
                 .await
             }
             ClientRequest::SavePlaylist { playlist } => {
-                let stored = self.save_playlist(playlist)?;
+                let author = self.proved_key(remote_id)?;
+                let stored = self.save_playlist(playlist, &author)?;
                 write_response(send, &ServerResponse::Playlist { playlist: stored }).await
             }
             ClientRequest::PublishPlaylist {
@@ -975,7 +993,15 @@ impl MobileService {
                 // Written down first, so a publication that fails at the relay
                 // leaves the edit here rather than throwing it away: the phone
                 // would otherwise lose whatever the author had just typed.
-                let stored = self.save_playlist(playlist)?;
+                //
+                // Under this computer's own key, because this computer is what
+                // signs a 30425 today - a publication from a phone is the phone
+                // spending the computer's identity, which is what the
+                // `privileged` right means. When a phone signs its own events,
+                // this becomes the device's key and the computer stops being in
+                // the middle of it.
+                let author = crate::network::own_pubkey()?;
+                let stored = self.save_playlist(playlist, &author)?;
                 let published = self.network.publish_playlist(&stored, suggest_tags).await?;
                 write_response(
                     send,
@@ -994,7 +1020,7 @@ impl MobileService {
                 // id", which is the coordinate a phone was shown in the first
                 // place. A withdrawal is a different act and is asked for
                 // separately, because a relay has to be told about it.
-                let author = if author.is_empty() {
+                let wanted = if author.is_empty() {
                     match crate::playlist::page(&connection, "", &playlist_id, 0, 1)? {
                         Some(playlist) => playlist.author,
                         None => return Err("That playlist is not on this computer".into()),
@@ -1002,7 +1028,22 @@ impl MobileService {
                 } else {
                     author
                 };
-                crate::playlist::remove(&connection, &author, &playlist_id)?;
+                // A device removes what it filed and nothing else. The one
+                // exception is the computer's own list, which a device lent the
+                // whole identity may remove - the same right that lets it
+                // publish.
+                let own = self.proved_key(remote_id)?;
+                let wanted = if may_remove_playlist(
+                    &own,
+                    &wanted,
+                    &crate::network::own_pubkey()?,
+                    rights,
+                ) {
+                    wanted
+                } else {
+                    return Err("That playlist belongs to somebody else".into());
+                };
+                crate::playlist::remove(&connection, &wanted, &playlist_id)?;
                 write_response(send, &ServerResponse::PlaylistRemoved).await
             }
             ClientRequest::WithdrawPlaylist { playlist_id } => {
@@ -1286,6 +1327,35 @@ impl MobileService {
                 )
                 .await
             }
+            ClientRequest::IdentityChallenge => {
+                // A nonce, and nothing else: a proof only means something if the
+                // computer chose half of what was signed.
+                let challenge = self.challenges.issue(remote_id);
+                write_response(send, &ServerResponse::IdentityChallenge { challenge }).await
+            }
+            ClientRequest::AuthenticateDevice { event } => {
+                let challenge = self
+                    .challenges
+                    .current(remote_id)
+                    .ok_or("This phone has to ask for a challenge before it can prove its key")?;
+                let pubkey = crate::device_account::verify_authentication(
+                    &event,
+                    &challenge,
+                    Utc::now().timestamp(),
+                )?;
+                crate::device_account::remember_key(&self.db_path, remote_id, &pubkey)?;
+                write_response(send, &ServerResponse::DeviceIdentity { pubkey }).await
+            }
+            ClientRequest::Likes => {
+                let pubkey = self.proved_key(remote_id)?;
+                let file_ids = crate::device_account::likes(&self.db_path, &pubkey)?;
+                write_response(send, &ServerResponse::Likes { file_ids }).await
+            }
+            ClientRequest::SetLikes { file_ids } => {
+                let pubkey = self.proved_key(remote_id)?;
+                let stored = crate::device_account::set_likes(&self.db_path, &pubkey, &file_ids)?;
+                write_response(send, &ServerResponse::Likes { file_ids: stored }).await
+            }
             ClientRequest::Ping => write_response(send, &ServerResponse::Pong).await,
             ClientRequest::Pair { .. } => unreachable!(),
         }
@@ -1315,6 +1385,19 @@ impl MobileService {
     /// grant of nothing is a device that can do nothing.
     fn authorise(&self, remote_id: &str) -> Result<DeviceRights, String> {
         device_rights(&self.db_path, remote_id)
+    }
+
+    /// The key this device proved, or a refusal that says how to prove one.
+    ///
+    /// Everything kept *for* a device is kept under its key, so this is the gate
+    /// in front of all of it - and the reason a key has to be signed for rather
+    /// than named: one paired device naming another's key would otherwise read
+    /// and replace their list.
+    fn proved_key(&self, remote_id: &str) -> Result<String, String> {
+        crate::device_account::proved_key(&self.db_path, remote_id)?.ok_or_else(|| {
+            "This phone has not said which key is its own yet: ask for a challenge and sign it"
+                .to_string()
+        })
     }
 
     fn touch_device(&self, remote_id: &str) {
@@ -1475,7 +1558,17 @@ fn check_request_permission(rights: DeviceRights, request: &ClientRequest) -> Re
         // The channel's own business rather than the library's: a device has to be
         // able to ask where it is and what it may do, or a grant of nothing would
         // look like a computer that is not there at all.
-        ClientRequest::Status | ClientRequest::Ping => Ok(()),
+        //
+        // The identity and what belongs to it are here for the same reason, with a
+        // stronger one: a device's likes are the device's own, not this computer's,
+        // so they are not part of any grant this computer hands out. What guards
+        // them is the proof, not a right.
+        ClientRequest::Status
+        | ClientRequest::Ping
+        | ClientRequest::IdentityChallenge
+        | ClientRequest::AuthenticateDevice { .. }
+        | ClientRequest::Likes
+        | ClientRequest::SetLikes { .. } => Ok(()),
         ClientRequest::FetchAudio { .. } => require(
             rights,
             DeviceRights::FETCH,
@@ -1541,6 +1634,26 @@ fn require(rights: DeviceRights, right: u32, message: &str) -> Result<(), String
     } else {
         Err(message.to_string())
     }
+}
+
+/// Whether a device may remove the playlist filed under `wanted`.
+///
+/// Its own, always: a playlist belongs to the key that wrote it, and a device
+/// that could remove somebody else's could empty the owner's library from a
+/// phone it was lent. The owner's own list is the one exception, and only for a
+/// device holding the whole identity, because removing it is the same kind of
+/// act as publishing it.
+///
+/// A named function rather than four lines inside the request arm, because this
+/// is a rule about who owns what and it should be readable, and testable, in
+/// one place.
+fn may_remove_playlist(
+    device: &str,
+    wanted: &str,
+    computer: &str,
+    rights: DeviceRights,
+) -> bool {
+    wanted == device || (rights.grants(DeviceRights::PRIVILEGED) && wanted == computer)
 }
 
 fn is_sha256_file_id(value: &str) -> bool {
@@ -1732,6 +1845,10 @@ fn initialise_schema(db_path: &Path) -> Result<(), String> {
              );",
         )
         .map_err(|error| error.to_string())?;
+    // The column that remembers which key a device proved, and the table its
+    // likes live in. Both are added here because a database that predates them
+    // has to end up with them before anything reads either.
+    crate::device_account::initialise_schema(db_path)?;
     let has_permission: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM pragma_table_info('mobile_devices') WHERE name='stream_only')",
         [], |row| row.get(0),
@@ -2562,6 +2679,47 @@ mod tests {
     fn device_names_cannot_include_control_characters() {
         assert_eq!(clean_device_name("  My\nPhone\u{202e}  "), "MyPhone");
         assert_eq!(clean_device_name("\n\r"), "Napstrfy phone");
+    }
+
+    /// A device removes its own playlists, and the owner's only with the whole
+    /// identity.
+    ///
+    /// The case that matters is the middle one: a phone that may not sign for
+    /// the owner must not be able to empty the owner's library, and a phone that
+    /// may must still not be able to remove a third author's.
+    #[test]
+    fn a_device_may_only_remove_playlists_it_wrote() {
+        let phone = "a".repeat(64);
+        let owner = "b".repeat(64);
+        let stranger = "c".repeat(64);
+
+        assert!(may_remove_playlist(&phone, &phone, &owner, DeviceRights::read_only()));
+        assert!(may_remove_playlist(
+            &phone,
+            &owner,
+            &owner,
+            DeviceRights::full()
+        ));
+        assert!(!may_remove_playlist(
+            &phone,
+            &owner,
+            &owner,
+            DeviceRights::read_only()
+        ));
+        assert!(!may_remove_playlist(
+            &phone,
+            &stranger,
+            &owner,
+            DeviceRights::full()
+        ));
+        // And nothing a device has not proved can be removed at all, because
+        // the key that would allow it is the argument here.
+        assert!(!may_remove_playlist(
+            &phone,
+            "",
+            &owner,
+            DeviceRights::full()
+        ));
     }
 
     #[test]

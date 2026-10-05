@@ -114,6 +114,14 @@ A code says what a phone may do *to begin with*. Every right can be changed afte
 
 Each code expires after five minutes. Generating a replacement affects only that code's access mode. Each paired phone shows what it may do; pairing the same phone again changes its access. Removing a phone rejects subsequent requests and stops active audio transfers at the next chunk check. Audio already cached on the phone remains available offline. Read-only access protects the host from download requests; it does not restrict copying audio.
 
+## The phone's own key
+
+Napstrfy generates a Nostr key for itself when it is first run and keeps it on the device. It is the phone's identity rather than the computer's: the phone's own playlists and its liked songs are filed under that key, so two phones paired with one computer have two separate sets, and the computer does not own either. Settings shows the public key and offers the secret key for export, which is what lets the same lists come back on a replacement phone.
+
+Nothing under that key can be read or written until the phone has proved the key to the computer, which it does by signing a challenge the computer made up. That is one exchange, remembered afterwards, and it needs no connection to the network — it costs a fraction of a second. If a phone is refused with "not said which key is its own yet", it has not proved one yet; reinstalling the app is not the fix, and restoring an exported key is what keeps the same lists.
+
+A phone's playlists therefore live in the computer's store under the phone's key rather than the computer's, which is why they survive a reinstall but not a lost key.
+
 ## Several computers at once
 
 A phone may be paired with more than one Napstr. One of them is its **home computer**: the one whose player, download queue and status the app is drawn from, and the one it signs through. The others are libraries to read and play from, and their music appears in the same list.

@@ -6,6 +6,16 @@ pub const ALPN: &[u8] = b"/napstr/mobile/1";
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 256 * 1024;
 pub const MAX_PAGE_SIZE: usize = 200;
+/// NIP-42's client authentication, which is the question "do you hold this
+/// key?" and needs no kind of its own.
+pub const AUTHENTICATION_KIND: u16 = 22242;
+/// Longest likes list one device may keep.
+///
+/// Bounded by the control frame rather than by taste: a like is a 64-character
+/// file id, the whole list travels in one frame in both directions, and three
+/// thousand of them come to about 200 KB of the 256 KB a frame holds. The
+/// largest test in this file keeps that honest.
+pub const MAX_LIKES: usize = 3_000;
 /// Album covers per request. Bounded so a full answer always fits in one
 /// control frame even when every URL is at its maximum length.
 pub const MAX_COVER_KEYS: usize = 40;
@@ -38,6 +48,36 @@ pub fn shuffle_key(seed: u64, file_id: &str) -> [u8; 8] {
     let mut key = [0u8; 8];
     key.copy_from_slice(&digest[..8]);
     key
+}
+
+/// An event a device signed itself.
+///
+/// The fields are a Nostr event's, and none of them is trusted: a computer that
+/// receives one recomputes the id from the other six and checks the signature
+/// against the key before it does anything with it. That is also where a device's
+/// identity comes from - the only thing in this protocol that is not the
+/// computer's to decide is which key a device holds, because the device made it.
+///
+/// The field names are NIP-01's and deliberately not this protocol's camelCase,
+/// which is why the attribute the rest of this file carries is missing here. A
+/// signed event is not our format: it is the network's, byte for byte, and a
+/// computer checks one by handing exactly this JSON to the same verifier a relay
+/// would use. Renaming a field here would mean translating it back, and a
+/// translation that is almost right is a signature that does not verify.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedEvent {
+    /// Lowercase hex of the serialized event, as its author computed it.
+    pub id: String,
+    /// The author's public key, lowercase hex.
+    pub pubkey: String,
+    pub created_at: u64,
+    pub kind: u16,
+    #[serde(default)]
+    pub tags: Vec<Vec<String>>,
+    #[serde(default)]
+    pub content: String,
+    /// Schnorr signature over the id, lowercase hex.
+    pub sig: String,
 }
 
 /// Which of an album's two renditions a phone is asking for.
@@ -933,12 +973,30 @@ pub enum ClientRequest {
     /// access can never re-delegate itself and widen.
     ReadOnlyTicket,
     /// NIP-56: ask the host to sign and publish a `1984` report about an album
-    /// cover. The phone holds no Nostr keys, so the host is the only one that
-    /// can speak on the user's behalf.
+    /// cover. A phone with a key of its own does not need a computer to say this
+    /// for it - what it signs is its own - but a pairing that only ever had the
+    /// computer's key has no other way to speak at all, so this stays.
     ReportCover {
         key: String,
         reason: String,
         note: String,
+    },
+    /// A nonce for this device to sign, so the key it claims is a key it holds.
+    ///
+    /// Everything a computer keeps *for* a device - its likes, and playlists
+    /// that are nobody else's business - is kept under that device's own public
+    /// key, and a key nobody has proved is a key anybody could claim, the
+    /// computer's owner's included.
+    IdentityChallenge,
+    /// The nonce, signed.
+    AuthenticateDevice {
+        event: SignedEvent,
+    },
+    /// The file ids this device liked.
+    Likes,
+    /// Replace that list with this one, and answer with what was stored.
+    SetLikes {
+        file_ids: Vec<String>,
     },
     Status,
     Ping,
@@ -1067,6 +1125,20 @@ pub enum ServerResponse {
     CoverReported {
         report: CoverReportResult,
     },
+    /// The nonce this device is to sign. One use, and short-lived.
+    IdentityChallenge {
+        challenge: String,
+    },
+    /// The key this device proved it holds, which is now the name everything
+    /// this computer keeps for it is kept under.
+    DeviceIdentity {
+        pubkey: String,
+    },
+    /// What this device liked. Its own list rather than the computer's: it is
+    /// kept under the device's key, so it belongs to whoever holds that key.
+    Likes {
+        file_ids: Vec<String>,
+    },
     Status {
         library_revision: u64,
         /// Moves whenever what the host would report about album art changes.
@@ -1085,11 +1157,11 @@ pub enum ServerResponse {
         /// This computer's own public key: the author half of every playlist it
         /// wrote down.
         ///
-        /// A companion has no key of its own and no other way to learn this one,
-        /// and without it a playlist's `author` is just an opaque string: a phone
-        /// could not tell its computer's own playlist from a public one somebody
-        /// else published. It compares the two to decide what it may edit and
-        /// what it may only read and copy.
+        /// A companion with a key of its own is not made any the less itself by
+        /// knowing this one - the two keys are unrelated - but this is how it
+        /// tells this computer's own playlists from public ones somebody else
+        /// published. Which playlists are its *own* is not something a computer
+        /// tells it: those are the ones its own key authored.
         #[serde(default)]
         pubkey: String,
     },
@@ -1158,6 +1230,59 @@ mod tests {
             payload.len() <= MAX_CONTROL_FRAME_BYTES,
             "an art header is {} bytes, over the {MAX_CONTROL_FRAME_BYTES} byte frame limit",
             payload.len()
+        );
+    }
+
+    /// What a device signs is a Nostr event, and it says so on the wire.
+    ///
+    /// The field names here are the network's rather than this protocol's, which
+    /// is the one place in this file that is true: a computer checks such an
+    /// event by handing this JSON to the same verifier a relay would use, so a
+    /// `createdAt` anywhere in it would be an event that does not verify.
+    #[test]
+    fn a_signed_event_travels_as_a_nostr_event() {
+        let asked = r#"{"type":"authenticateDevice","event":{"id":"aa","pubkey":"bb",
+            "created_at":1800000000,"kind":22242,"tags":[["challenge","cc"]],
+            "content":"","sig":"dd"}}"#;
+        let ClientRequest::AuthenticateDevice { event } = serde_json::from_str(asked).unwrap()
+        else {
+            panic!("an authentication was read as something else");
+        };
+        assert_eq!(event.created_at, 1_800_000_000);
+        assert_eq!(event.kind, AUTHENTICATION_KIND);
+        assert_eq!(event.tags, vec![vec!["challenge".to_string(), "cc".into()]]);
+        // And back out again with the names it came in with, which is what the
+        // computer's verifier reads.
+        let written = serde_json::to_string(&ClientRequest::AuthenticateDevice { event }).unwrap();
+        for name in ["\"created_at\"", "\"pubkey\"", "\"sig\"", "\"challenge\""] {
+            assert!(written.contains(name), "{name} is missing from {written}");
+        }
+        assert!(!written.contains("createdAt"), "{written}");
+    }
+
+    /// A full likes list crosses the wire, in a frame, both ways.
+    ///
+    /// The largest thing a phone and a computer say to each other that is not
+    /// sized by a page: a person's whole list of liked files, sent to save and
+    /// answered back with what was kept. This is the test that decides
+    /// `MAX_LIKES`, so it is the one to change if that number changes.
+    #[test]
+    fn a_full_likes_list_fits_in_one_control_frame() {
+        let full: Vec<String> = (0..MAX_LIKES).map(|index| format!("{index:064x}")).collect();
+        let asked = serde_json::to_vec(&ClientRequest::SetLikes {
+            file_ids: full.clone(),
+        })
+        .unwrap();
+        assert!(
+            asked.len() <= MAX_CONTROL_FRAME_BYTES,
+            "{MAX_LIKES} likes is {} bytes asked, over the {MAX_CONTROL_FRAME_BYTES} byte limit",
+            asked.len()
+        );
+        let answered = serde_json::to_vec(&ServerResponse::Likes { file_ids: full }).unwrap();
+        assert!(
+            answered.len() <= MAX_CONTROL_FRAME_BYTES,
+            "{MAX_LIKES} likes is {} bytes answered, over the {MAX_CONTROL_FRAME_BYTES} byte limit",
+            answered.len()
         );
     }
 

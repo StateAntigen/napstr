@@ -718,9 +718,19 @@ discriminator. Defined requests are:
 {"type":"playlist","playlistId":"<playlistId>","offset":0,"limit":100}
 {"type":"playback","command":{"type":"playTrack","fileId":"<fileId>","queue":["<fileId>"],"positionMs":0}}
 {"type":"playbackState"}
+{"type":"identityChallenge"}
+{"type":"authenticateDevice","event":{"id":"<event id hex>","pubkey":"<hex>","created_at":1787680200,"kind":22242,"tags":[["challenge","<nonce>"]],"content":"","sig":"<hex>"}}
+{"type":"likes"}
+{"type":"setLikes","fileIds":["<fileId>","<fileId>"]}
 {"type":"status"}
 {"type":"ping"}
 ```
+
+The event in `authenticateDevice` is a Nostr event in the network's own field
+names — `created_at`, not `createdAt` — because it is checked as one: the
+desktop recomputes the id from the other six fields and verifies the signature
+against the key the event names, rather than trusting an id a companion wrote
+down.
 
 Library pages are limited to 200 items and searches to 120 characters. Search
 and download requests are executed by the desktop's normal Nostr and Tor
@@ -745,7 +755,10 @@ Which request needs which right:
   and `readOnlyTicket`. These are the requests that write something down in the
   owner's name.
 - `status` and `ping` — nothing, because a device granted nothing must still be
-  able to learn that it was granted nothing.
+  able to learn that it was granted nothing. `identityChallenge`,
+  `authenticateDevice`, `likes` and `setLikes` likewise, for a stronger reason:
+  what a device keeps under its own key is the device's rather than the owner's,
+  and the proof described below is what guards it, not a grant handed out here.
 
 `available` accepts at most 200 SHA-256 file IDs and returns the subset still
 present in the desktop's indexed Napstr folder. Napstrfy uses this bounded check
@@ -893,6 +906,47 @@ MUST reject excess or truncated bytes, and MUST verify that the complete
 SHA-256 digest equals `track.fileId` before playback. All other responses end
 after their control frame.
 
+## A device's own key
+
+A companion generates a Nostr key for itself and keeps it on the device. It is
+the phone's identity, not the desktop's: two phones paired with one desktop have
+two keys, and neither can read or write what the other keeps. A companion MUST
+let its owner export that key, so the key can be restored onto a replacement
+device, and MUST NOT adopt a different one without saying that the data filed
+under the old one will not appear again.
+
+A key is not a password, so it is *proved* before it is used, with NIP-42's
+exchange. `identityChallenge` mints a nonce for the connection's endpoint, kept
+in memory only and good for five minutes, and `authenticateDevice` sends back a
+kind `22242` event carrying that nonce in a `challenge` tag. The desktop accepts
+it only when the kind is right, the nonce is the one it issued for *this*
+endpoint, `created_at` is within five minutes of its own clock either way, and
+the signature verifies against the public key the event names. The nonce is not
+consumed by a failed attempt: the only thing it protects against is an answer to
+a question the desktop did not ask.
+
+A proof is remembered against the pairing, which is what makes it one round trip
+rather than one per request. It is re-done when a companion restores a different
+key, because that is the only moment the answer could have changed.
+
+Everything a desktop keeps *for* a device is keyed by that key rather than by
+the pairing, so the same person on a new phone, or after a reinstall, finds the
+same list. `likes` answers the file ids the device's key liked, oldest first,
+and `setLikes` replaces that list wholesale and answers with what was stored: a
+like is a state rather than an event, so sending the whole list is what keeps
+two devices that hold one key from interleaving into a list neither of them
+chose. A file id that is not a file id is dropped rather than refused, because
+the rest of the list is still the person's answer; a list longer than 3000
+entries is refused rather than trimmed, because the list travels in one control
+frame and quietly dropping the end of it would delete likes the companion
+believes it saved. A dislike belongs in the same place when one exists, and is a
+state of the same kind.
+
+A device MUST prove a key before it can read or write playlists of its own: a
+key is what a list is filed under, and a device that has not said which key is
+its own has nowhere to file one. See the next section for what that means for a
+list the owner wrote.
+
 ## Playlists over the companion protocol
 
 A playlist is a named, ordered list of file ids, and this protocol carries one as
@@ -910,16 +964,20 @@ own search tags, which are what it is published to be found by; a companion show
 them as the author's and does not add suggestions of its own to them.
 
 Every summary therefore has an `author` and a `displayName`, which is what lets a
-companion tell a desktop's own playlist from a public one somebody else published
-— the key it compares against is the one `status` reports. `ownOnly` on
-`playlists` asks the narrower question: the paired desktop's own rows, and the
-rows with no author at all, which are the ones only that desktop has ever written
-down. It exists because the list of playlists worth reading is longer than the
-list worth editing, and a picker that had to page past a shelf of strangers'
-playlists to reach the handful a person may change would be no picker. It is a
-filter rather than permission: whatever it answers, a companion MUST NOT offer a
-change to a coordinate the desktop does not hold, because only the desktop can
-sign, and it signs its own coordinates alone.
+companion tell its own playlist from one somebody else published — a companion
+compares against **its own** key, the one it proved, and not against the key
+`status` reports: that is the desktop's, and a list filed under it is the
+desktop's own. `ownOnly` on `playlists` asks the narrower question: the rows
+filed under the asking device's key, and the rows with no author at all. It
+exists because the list of playlists worth reading is longer than the list worth
+editing, and a picker that had to page past a shelf of strangers' playlists to
+reach the handful a person may change would be no picker. `savePlaylist` files
+under the asking device's key for the same reason, and a device therefore must
+have proved one first. It is a filter rather than permission: whatever it
+answers, a companion MUST NOT offer a change to a coordinate it does not own,
+because editing somebody else's playlist is copying it — the desktop files a copy
+under a fresh id and answers with it — and only the desktop can sign, and it
+signs its own coordinates alone.
 
 A public playlist is published as a kind `30425` event whose `napstr-playlist`
 marker tag is mandatory in both directions: that kind is co-occupied by other
@@ -928,9 +986,12 @@ is the only side that talks to a relay, and it validates every event before it
 offers one. The format is specified in
 [NIP-NAPSTR-PLAYLIST.md](NIP-NAPSTR-PLAYLIST.md).
 
-A private playlist stays on the two devices that are its owner's: the desktop
-stores it, and a paired companion is served it over the same encrypted Iroh
-channel as everything else. A private playlist MUST NOT be published to a relay
+A private playlist stays on the devices that are its owner's: the desktop stores
+it, and a paired companion is served it over the same encrypted Iroh channel as
+everything else. A playlist a companion writes is filed under the companion's own
+key, so the desktop's copy of it is the companion's rather than the desktop's —
+the same person's other phones do not see it, and the desktop cannot publish it
+as its own. A private playlist MUST NOT be published to a relay
 in any form — not as kind `30425`, and not as NIP-78 application data either. A
 relay always sees a coordinate, an event size and an edit timestamp, even when
 the body is encrypted, and a predictable coordinate would publish the existence
