@@ -869,10 +869,12 @@
   /** How many times a waiting handover has checked, so it can give up. */
   let pendingHandoffAttempts = 0;
   let showSourceOptions = $state(false);
-  /** The track's own code, drawn when that row of the track menu is chosen. */
+  /** The track's own code and the ways of passing it on, chosen from the menu. */
   let showTrackCode = $state(false);
   let trackCodeSvg = $state('');
   let trackCodeError = $state('');
+  /** True while the audio itself is being staged for another app. */
+  let sharingTrack = $state(false);
   /** A read-only code the computer minted for somebody else to scan. */
   let readOnlyTicket = $state<ReadOnlyTicketOffer | null>(null);
   let ticketBusy = $state(false);
@@ -1123,6 +1125,32 @@
 
   function androidBackBridge(): AndroidBackBridge | undefined {
     return (window as Window & { NapstrfyBack?: AndroidBackBridge }).NapstrfyBack;
+  }
+
+  type AndroidShareBridge = {
+    /** Hand a link to whatever the person picks. False when nothing took it. */
+    shareText(text: string, title: string): boolean;
+    /** Hand one audio file, by the path the Rust half staged it at. */
+    shareFile(path: string, mime: string, title: string): boolean;
+    copyText(text: string): boolean;
+  };
+
+  /** A track staged for another app: where it is, what it is, and its name. */
+  type ShareableAudio = {
+    path: string;
+    mime: string;
+    name: string;
+  };
+
+  /**
+   * The native share sheet, which is the one thing a webview cannot do itself.
+   *
+   * Absent on the desktop and in a browser, where the same buttons fall back to
+   * copying the link - a control that silently does nothing is worse than one
+   * that does the smaller useful thing.
+   */
+  function androidShareBridge(): AndroidShareBridge | undefined {
+    return (window as Window & { NapstrfyShare?: AndroidShareBridge }).NapstrfyShare;
   }
 
   /**
@@ -5699,6 +5727,12 @@
   }
 
   async function shareTrack(track: RemoteTrack) {
+    await copyTrackUri(track);
+    closeActions();
+  }
+
+  /** Copy the track's link, which is the whole of sharing on a desktop. */
+  async function copyTrackUri(track: RemoteTrack) {
     const uri = trackUri(track);
     try {
       await navigator.clipboard.writeText(uri);
@@ -5707,7 +5741,63 @@
       // A refused clipboard still leaves the link on screen to copy by hand.
       notice = uri;
     }
-    closeActions();
+  }
+
+  /**
+   * Hand the track's link to another app.
+   *
+   * A link rather than the audio: the other side of a link is another Napstrfy,
+   * or a person, and it costs nothing to send. The file itself is the row below
+   * this one, and needs the file to be here at all.
+   */
+  function shareTrackUri(track: RemoteTrack) {
+    const bridge = androidShareBridge();
+    if (!bridge) {
+      void copyTrackUri(track);
+      return;
+    }
+    if (!bridge.shareText(trackUri(track), trackHeading(track))) {
+      // Nothing on this device takes a link, so the useful thing left is the one
+      // the share sheet would have done: put it where it can be pasted.
+      void copyTrackUri(track);
+    }
+  }
+
+  /**
+   * Hand the audio file itself to another app - an editor, a tagger, a player.
+   *
+   * The Rust half stages it in the one cache directory the app's file provider
+   * exposes and answers with where it is, because the page knows neither the
+   * path nor the mime type. Nothing is shared before the file is here: a row
+   * that downloaded a track to share it would be a surprise, and the honest
+   * answer is that this phone has not got it yet.
+   */
+  async function shareTrackAudio(track: RemoteTrack) {
+    const bridge = androidShareBridge();
+    if (!bridge) {
+      notice = 'Sharing a file to another app is only on the phone';
+      return;
+    }
+    if (sharingTrack) return;
+    sharingTrack = true;
+    try {
+      const audio = await invoke<ShareableAudio>('shareable_audio', { fileId: track.fileId });
+      if (!bridge.shareFile(audio.path, audio.mime, audio.name)) {
+        notice = 'Could not share that file';
+      }
+    } catch (nextError) {
+      notice = String(nextError);
+    } finally {
+      sharingTrack = false;
+    }
+  }
+
+  /** "Artist - Title", for a file name and a share sheet title. */
+  function trackHeading(track: RemoteTrack) {
+    const artist = (track.artist ?? '').trim();
+    const title = (track.title ?? '').trim();
+    if (!artist) return title || track.filename;
+    return title ? `${artist} - ${title}` : artist;
   }
 
   function sleepSummary() {
@@ -7402,7 +7492,7 @@
           {/if}
 
           <div class="now-sheet-actions">
-            <button onclick={() => void moveTrackBy(-1)} disabled={!shownCanSkip || (playbackTarget === 'phone' && shuffle && randomHistoryIndex <= 0)} aria-label={$t("Previous track")}>|◀</button>
+            <button class="step-button" onclick={() => void moveTrackBy(-1)} disabled={!shownCanSkip || (playbackTarget === 'phone' && shuffle && randomHistoryIndex <= 0)} aria-label={$t("Previous track")}>|◀</button>
             <button class="skip-button" onclick={() => void nudgeShown(-15)} disabled={!shownCanSeek} aria-label={$t("Back 15 seconds")} title={$t("Back 15 seconds")}>
               <SeekIcon />
             </button>
@@ -7412,7 +7502,7 @@
             <button class="skip-button" onclick={() => void nudgeShown(15)} disabled={!shownCanSeek} aria-label={$t("Forward 15 seconds")} title={$t("Forward 15 seconds")}>
               <SeekIcon forward />
             </button>
-            <button onclick={() => void moveTrackBy(1)} disabled={!shownCanSkip} aria-label={$t("Next track")}>▶|</button>
+            <button class="step-button" onclick={() => void moveTrackBy(1)} disabled={!shownCanSkip} aria-label={$t("Next track")}>▶|</button>
           </div>
 
           {#if playbackTarget === 'desktop' && remoteState?.active}
@@ -8120,21 +8210,38 @@
         </button>
         {@render playbackTargetRows()}
       {:else if showTrackCode}
-        <button class="actions-row back" onclick={() => (showTrackCode = false)}>
+        <button class="actions-row back" onclick={() => (showTrackCode = false)} aria-label={$t("Back")}>
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14.5 5 8 12l6.5 7" /></svg>
-          <span>{$t("Show Napstrfy Code")}</span>
         </button>
         <div class="actions-code">
-          <img src="/napstr-logo-small.png" alt="" />
           {#if trackCodeSvg}
-            <div class="actions-code-qr">{@html trackCodeSvg}</div>
+            <div class="actions-code-qr">
+              {@html trackCodeSvg}
+              <!-- The mark in the middle is drawn over the code rather than cut
+                   out of it: the code is rendered at the highest correction
+                   level it can carry, which is what leaves room for this. -->
+              <img class="actions-code-mark" src="/napstr-logo-small.png" alt="" />
+            </div>
           {:else if trackCodeError}
             <p class="error">{trackCodeError}</p>
           {/if}
           <small>{trackUri(menuTrack)}</small>
         </div>
+        <button class="actions-row" onclick={() => void copyTrackUri(menuTrack)}>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2" /><path d="M15 5.5H6.5A1.5 1.5 0 0 0 5 7v8.5" /></svg>
+          <span>{$t("Copy link")}</span>
+        </button>
+        <button class="actions-row" onclick={() => shareTrackUri(menuTrack)}>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4" /><path d="M8 7.5 12 3.5l4 4" /><path d="M5 14v6h14v-6" /></svg>
+          <span>{$t("Share link")}</span>
+        </button>
+        <button class="actions-row" disabled={sharingTrack || !cachedFileIds.has(menuTrack.fileId)} onclick={() => void shareTrackAudio(menuTrack)}>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18V7l10-2v11" /><circle cx="6.6" cy="18" r="2.4" /><circle cx="16.6" cy="16" r="2.4" /></svg>
+          <span>{$t("Share the audio file")}</span>
+          {#if !cachedFileIds.has(menuTrack.fileId)}<small>{$t("Not on this phone yet")}</small>{/if}
+        </button>
       {:else}
-        <button class="actions-row" onclick={() => void shareTrack(menuTrack)}>
+        <button class="actions-row" onclick={() => void openTrackCode(menuTrack)}>
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4" /><path d="M8 7.5 12 3.5l4 4" /><path d="M5 14v6h14v-6" /></svg>
           <span>{$t("Share")}</span><small>{trackUri(menuTrack)}</small>
         </button>
@@ -8142,10 +8249,6 @@
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4.2 5.4h15.6v9.8H9.6L5.2 19v-3.8H4.2z" /></svg>
           <span>{$t("Track discussion")}</span>
           {#if !remoteAvailable()}<small>{$t("Needs a connection")}</small>{/if}
-        </button>
-        <button class="actions-row" onclick={() => void openTrackCode(menuTrack)}>
-          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.6" y="3.6" width="6.4" height="6.4" rx="1.2" /><rect x="14" y="3.6" width="6.4" height="6.4" rx="1.2" /><rect x="3.6" y="14" width="6.4" height="6.4" rx="1.2" /><path d="M14 14h2.6v2.6H14z" /><path d="M17.8 18.4h2.6v2H17.8z" /><path d="M14 20.4h1.6" /><path d="M20.4 14v2.6" /></svg>
-          <span>{$t("Show Napstrfy Code")}</span>
         </button>
         <button class="actions-row" onclick={() => toggleTrackLike(menuTrack)}>
           <svg class:filled={isTrackLiked(menuTrack)} viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20.3c-1.4-1-7.2-5.2-7.2-9.4A4.2 4.2 0 0 1 12 8.2a4.2 4.2 0 0 1 7.2 2.7c0 4.2-5.8 8.4-7.2 9.4z" /></svg>

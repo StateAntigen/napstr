@@ -333,11 +333,31 @@ test('Napstrfy desktop pins the player as its own column with artwork, likes and
   const rule = await likedTitle.evaluate((node) => getComputedStyle(node, '::after'));
   expect(rule.width).toBe('40px');
   expect(rule.height).toBe('2px');
-  // The code row carries this app's own scheme, and the code itself is drawn by
-  // the native side rather than by the page.
-  await page.getByRole('button', { name: 'Show Napstrfy Code' }).click();
+  // The share row opens one panel that holds the code, the link and the ways of
+  // passing either on - rather than two rows that each did half of it. The row's
+  // name carries the link it previews, so this matches on the start of it.
+  const shareRow = page.getByRole('button', { name: /^Share\b/ });
+  await shareRow.click();
   await expect(page.locator('.actions-code-qr svg')).toBeVisible();
   await expect(page.locator('.actions-code small')).toHaveText(`napstrfy://track/${'a'.repeat(64)}`);
+  // The mark is drawn over the code, which is only readable because the code is
+  // rendered at the highest error-correction level it can carry.
+  await expect(page.locator('.actions-code-qr .actions-code-mark')).toBeVisible();
+  await expect(page.locator('.actions-row', { hasText: 'Copy link' })).toBeVisible();
+  await expect(page.locator('.actions-row', { hasText: 'Share link' })).toBeVisible();
+  // The audio row is offered because this spec's phone holds the file, and in a
+  // browser there is no share sheet to hand it to - so the honest answer is the
+  // notice rather than a button that does nothing.
+  const audioRow = page.locator('.actions-row', { hasText: 'Share the audio file' });
+  await expect(audioRow).toBeEnabled();
+  await expect(audioRow.locator('small')).toHaveCount(0);
+  await audioRow.click();
+  await expect(page.locator('.toast')).toContainText('only on the phone');
+  // The back row is a chevron with a name rather than a heading of its own.
+  await page.getByRole('button', { name: 'Back', exact: true }).click();
+  await expect(page.locator('.actions-code')).toHaveCount(0);
+  await shareRow.click();
+  await expect(page.locator('.actions-code-qr svg')).toBeVisible();
   // The panel is bottom-anchored and the menu is tall, so the scrim is only
   // clear of it near the top of the window.
   await page.getByRole('button', { name: 'Close the track options' }).click({ position: { x: 12, y: 12 } });
