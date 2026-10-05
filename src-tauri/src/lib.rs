@@ -1424,6 +1424,24 @@ enum IndexScope {
     /// Too much changed to name - a folder moved, a tree copied, or a burst so
     /// large that walking the library is cheaper than asking about each path.
     WholeFolder,
+    /// Nothing this index holds: only this host's own staging files changed, and
+    /// the finished file arrives as its own event a moment later.
+    Nothing,
+}
+
+/// Whether a path is one of this host's own staging files.
+///
+/// A download is written as `.napstr-download-<uuid>.<extension>.part` in the very
+/// folder it will live in, and renamed to its finished name when the bytes have
+/// verified. The staging name is neither library content nor evidence that a folder
+/// changed - but that is what the watcher used to conclude from it, because `.part`
+/// is not an audio extension. A real installation walked its whole library, 3000-odd
+/// files, on every download: the finished track was indexed by a full pass before the
+/// rename that named it had even happened.
+fn is_napstr_staging_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|name| name.starts_with(".napstr-") && name.ends_with(".part"))
 }
 
 /// Rows one burst may name before the whole folder is walked instead.
@@ -1437,11 +1455,20 @@ const INDEX_MAX_PATHS_PER_BURST: usize = 200;
 /// network share, and a folder is never named `track.mp3`.
 fn index_scope(events: &[notify::Event]) -> IndexScope {
     let mut paths = Vec::new();
+    let mut staged = 0usize;
     for event in events {
         if matches!(event.kind, EventKind::Access(_)) {
             continue;
         }
         for path in &event.paths {
+            // This host's own staging file. Skipped before the audio test, because
+            // the point of that test is "something changed that is not a track we
+            // can name", and a partial file is a track we are in the middle of
+            // writing - the finished name follows as its own event.
+            if is_napstr_staging_path(path) {
+                staged += 1;
+                continue;
+            }
             if !supported_audio_path(path) {
                 return IndexScope::WholeFolder;
             }
@@ -1451,11 +1478,17 @@ fn index_scope(events: &[notify::Event]) -> IndexScope {
             return IndexScope::WholeFolder;
         }
     }
+    if paths.is_empty() {
+        // Only staging files changed, so there is nothing to index yet. A burst that
+        // named nothing at all is a folder change, which only a walk can answer.
+        return if staged > 0 {
+            IndexScope::Nothing
+        } else {
+            IndexScope::WholeFolder
+        };
+    }
     paths.sort();
     paths.dedup();
-    if paths.is_empty() {
-        return IndexScope::WholeFolder;
-    }
     IndexScope::Paths(paths)
 }
 
@@ -1553,6 +1586,7 @@ fn start_folder_watcher(
                 // asked about is a stat saved, and over a share that is the whole
                 // cost of the walk.
                 let outcome = match index_scope(&burst) {
+                    IndexScope::Nothing => continue,
                     IndexScope::Paths(paths) => run_path_index_job(
                         &db_path,
                         &folder,
@@ -3348,12 +3382,12 @@ mod tests {
             IndexScope::Paths(paths) => {
                 assert_eq!(paths, vec![PathBuf::from("/music/artist/track.mp3")])
             }
-            IndexScope::WholeFolder => panic!("one audio file is a path, not a walk"),
+            other => panic!("one audio file is a path, not {other:?}"),
         }
         // The same file named twice - which is what one write looks like - is one.
         match index_scope(&[modify(), modify()]) {
             IndexScope::Paths(paths) => assert_eq!(paths.len(), 1),
-            IndexScope::WholeFolder => panic!("two events about one file are one path"),
+            other => panic!("two events about one file are one path, not {other:?}"),
         }
         // A picture is not this index's business, and means a folder has changed.
         let image = notify::Event::new(EventKind::Create(notify::event::CreateKind::File))
@@ -3370,6 +3404,24 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(index_scope(&many), IndexScope::WholeFolder);
+        // This host's own staging file asks for nothing at all. It is a download being
+        // written - `.napstr-download-<uuid>.mp3.part` - and the finished name follows
+        // as its own event. Reading it as "a folder changed" is what walked a whole
+        // library, 3000-odd files, for every download that landed.
+        let staging = notify::Event::new(EventKind::Create(notify::event::CreateKind::File))
+            .add_path(PathBuf::from(
+                "/music/artist/.napstr-download-7b0f3f6e-2a1e-4a7f-8c2b-5d9f0a1b2c3d.mp3.part",
+            ));
+        assert_eq!(index_scope(&[staging.clone()]), IndexScope::Nothing);
+        // A real file in the same burst is still the thing to index, by name.
+        let finished = notify::Event::new(EventKind::Create(notify::event::CreateKind::File))
+            .add_path(PathBuf::from("/music/artist/track.mp3"));
+        match index_scope(&[staging, finished]) {
+            IndexScope::Paths(paths) => {
+                assert_eq!(paths, vec![PathBuf::from("/music/artist/track.mp3")])
+            }
+            other => panic!("the finished file is the path to index, not {other:?}"),
+        }
     }
 
     #[test]
