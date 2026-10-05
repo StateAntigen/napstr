@@ -5,7 +5,10 @@ mod public_http;
 use public_http::{podcast_http_client, safe_public_https_url};
 
 use futures_util::StreamExt;
-use iroh::{endpoint::presets, Endpoint, EndpointAddr, EndpointId, SecretKey};
+use iroh::{
+    endpoint::{presets, TransportAddrUsage},
+    Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr,
+};
 use napstr_remote_protocol::{
     ArtRendition, ClientRequest, DeviceRights, DiscoverMode, PairingTicket, PlaybackCommand,
     RemoteAlbumCover, RemoteAudiobook, RemoteAudiobookSummary, RemoteDiscussionActivity,
@@ -1900,20 +1903,11 @@ impl RemoteClient {
         ));
         for host in &hosts {
             let addresses = decode_endpoint_addr(host)
-                .map(|address| {
-                    address
-                        .addrs
-                        .iter()
-                        .take(4)
-                        .map(|addr| format!("{addr:?}"))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_else(|error| vec![format!("unreadable: {error}")]);
+                .map(|address| describe_addresses(address.addrs.iter().cloned()))
+                .unwrap_or_else(|error| format!("unreadable: {error}"));
             diag::note(&format!(
                 "  {:.8}… \"{}\" at [{}]",
-                host.endpoint_id,
-                host.desktop_name,
-                addresses.join(", ")
+                host.endpoint_id, host.desktop_name, addresses
             ));
         }
         Arc::new(Self {
@@ -2019,32 +2013,51 @@ impl RemoteClient {
     /// A tunnel to one computer, opened if it is not already.
     async fn connection(&self, host: &SavedHost) -> Result<iroh::endpoint::Connection, String> {
         if let Some(connection) = self.connections.read().await.get(&host.endpoint_id).cloned() {
+            // A tunnel that is already up is still somewhere to learn from, and
+            // it has to be: the two machines usually find their direct path a
+            // moment *after* the tunnel opens, so the moment the tunnel appears
+            // is too early to know what to dial next time. Asking on every use
+            // of a live tunnel costs a lookup until something has really
+            // changed, and it is what makes the address in the file follow a
+            // computer rather than only the day it was paired on.
+            let learned = self.live_addresses(&host.endpoint_id).await;
+            self.remember_addresses(&host.endpoint_id, &learned).await;
             return Ok(connection);
         }
         let started = std::time::Instant::now();
         let address = decode_endpoint_addr(host)?;
         // The address this phone holds is the one written down at pairing time,
-        // and a computer's own addresses change when it restarts - so how many
+        // and a computer's own addresses change when it restarts - so which ones
         // are in it, and whether dialling them works, is the difference between
         // a fast start and a minute of "Connecting".
-        let dialled = address.addrs.len();
         diag::note(&format!(
-            "opening a tunnel to {} ({:.8}…) at {dialled} known address(es)",
+            "opening a tunnel to {} ({:.8}…) at {} address(es) [{}]",
             host.desktop_name,
-            host.endpoint_id
+            host.endpoint_id,
+            address.addrs.len(),
+            describe_addresses(address.addrs.iter().cloned())
         ));
         let connection = match tokio::time::timeout(
             Duration::from_secs(25),
-            self.endpoint().await?.connect(address, ALPN),
+            self.endpoint().await?.connect(address.clone(), ALPN),
         )
         .await
         {
             Ok(Ok(connection)) => {
+                // A tunnel that works is the one moment this phone knows where
+                // a computer really is, which makes it the moment to write it
+                // down: this is what stops the next cold start from dialling the
+                // addresses of the day the pairing code was made. Both halves
+                // are logged, because "it dialled the wrong port" and "the live
+                // connection could not say where it is" want opposite fixes.
+                let learned = self.live_addresses(&host.endpoint_id).await;
                 diag::note(&format!(
-                    "tunnel to {} is up after {}",
+                    "tunnel to {} is up after {}; it answers at [{}]",
                     host.desktop_name,
-                    diag::millis(started)
+                    diag::millis(started),
+                    describe_addresses(learned.iter().cloned())
                 ));
+                self.remember_addresses(&host.endpoint_id, &learned).await;
                 connection
             }
             Ok(Err(error)) => {
@@ -2072,6 +2085,88 @@ impl RemoteClient {
         Ok(connection)
     }
 
+    /// Where a computer is answering right now, as this phone's endpoint sees it.
+    ///
+    /// Only the addresses in use. Everything else an endpoint holds about a
+    /// remote is collected opinion - an address some lookup service published, a
+    /// port from a dial that has since closed - and the point of asking is to
+    /// stop dialling yesterday's ports tomorrow.
+    ///
+    /// Nothing here can disturb a tunnel that is already up: an endpoint with no
+    /// record of the computer, or one that takes too long to describe it, simply
+    /// leaves what was saved alone.
+    async fn live_addresses(&self, endpoint_id: &str) -> Vec<TransportAddr> {
+        let Ok(id) = endpoint_id.parse::<EndpointId>() else {
+            return Vec::new();
+        };
+        let endpoint = match self.endpoint().await {
+            Ok(endpoint) => endpoint,
+            Err(_) => return Vec::new(),
+        };
+        match tokio::time::timeout(Duration::from_secs(3), endpoint.remote_info(id)).await {
+            Ok(Some(info)) => info
+                .addrs()
+                .filter(|address| matches!(address.usage(), TransportAddrUsage::Active))
+                .map(|address| address.addr().clone())
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Write down where a computer was found, for the next cold start to dial.
+    ///
+    /// Only when the address really changed. This runs every time a tunnel is
+    /// opened rather than reused, and rewriting the pairings for a computer that
+    /// has not moved is how a phone ends up writing a file on every reconnect.
+    ///
+    /// Failing to save is not a failure: the tunnel is already up, and the only
+    /// thing lost is a faster start next time.
+    async fn remember_addresses(&self, endpoint_id: &str, learned: &[TransportAddr]) {
+        let saved = {
+            let hosts = self.hosts.read().await;
+            let Some(host) = hosts.iter().find(|host| host.endpoint_id == endpoint_id) else {
+                return;
+            };
+            match decode_endpoint_addr(host) {
+                Ok(saved) => saved,
+                // An address nobody can read is one nobody can improve on, and
+                // pairing again is what replaces it.
+                Err(_) => return,
+            }
+        };
+        let merged = merge_learned_addresses(&saved, learned);
+        if merged == saved {
+            return;
+        }
+        let Ok(text) = serde_json::to_string(&merged) else {
+            return;
+        };
+        let snapshot = {
+            let mut hosts = self.hosts.write().await;
+            let Some(host) = hosts.iter_mut().find(|host| host.endpoint_id == endpoint_id) else {
+                return;
+            };
+            // Another exchange may have learned the same thing while this one
+            // was reading: what is in the file is what matters, and it is right.
+            if host.endpoint_addr == text {
+                return;
+            }
+            host.endpoint_addr = text;
+            hosts.to_vec()
+        };
+        match save_hosts(&self.app_data.join(PAIRED_HOSTS_FILE), &snapshot) {
+            Ok(()) => diag::note(&format!(
+                "{:.8}… answers at [{}] - saved for the next start",
+                endpoint_id,
+                describe_addresses(merged.addrs.iter().cloned())
+            )),
+            Err(error) => diag::note(&format!(
+                "could not save where {:.8}… answers: {error}",
+                endpoint_id
+            )),
+        }
+    }
+
     async fn pair(&self, code: &str, device_name: &str) -> Result<String, String> {
         let ticket = PairingTicket::from_uri(code)?;
         if ticket.expires_at < chrono_timestamp() {
@@ -2095,7 +2190,7 @@ impl RemoteClient {
         let endpoint = self.endpoint().await?;
         let address = decode_endpoint_addr(&host)?;
         let connection =
-            tokio::time::timeout(Duration::from_secs(25), endpoint.connect(address, ALPN))
+            tokio::time::timeout(Duration::from_secs(25), endpoint.connect(address.clone(), ALPN))
                 .await
                 .map_err(|_| "Napstr did not answer. Keep its Mobile page open and try again.")?
                 .map_err(|error| format!("Could not pair over Iroh: {error}"))?;
@@ -2127,6 +2222,16 @@ impl RemoteClient {
         saved.desktop_name = desktop_name.clone();
         saved.stream_only = grant.is_read_only();
         saved.rights = Some(grant);
+        // The code was made on the other machine, and a code can be minutes and
+        // a walk across a house old by the time it is scanned: replace what it
+        // carried with the addresses this pairing is really being made over, so
+        // the first cold start after pairing is not the first stale dial. The
+        // relay in it stays, because that is the address that will still be
+        // right when the direct ones have moved on.
+        let learned = self.live_addresses(&saved.endpoint_id).await;
+        if let Ok(text) = serde_json::to_string(&merge_learned_addresses(&address, &learned)) {
+            saved.endpoint_addr = text;
+        }
         // The connection this pairing was made on is the one to keep for this
         // computer, and every other computer's tunnel is left as it was: a
         // second code for a friend is not a reason to drop the first.
@@ -4773,6 +4878,61 @@ fn decode_endpoint_addr(host: &SavedHost) -> Result<EndpointAddr, String> {
         .map_err(|_| "The saved Napstr Iroh address is invalid".into())
 }
 
+/// The address to dial next time, given what the last tunnel really used.
+///
+/// A pairing code is written once, and the addresses inside it were true on the
+/// day it was made: a computer that has been restarted since is somewhere else,
+/// and a cold start that dials the port it used to be on reports a computer that
+/// is plainly there as unreachable. So an address the live connection is using
+/// replaces the saved ones of its own kind.
+///
+/// Its own kind, rather than all of them, because of the relay: that is the one
+/// address that still reaches a computer whose direct addresses have all moved,
+/// and a phone that dropped it would be trading a slow start for no start at
+/// all. Nothing heard about a kind of address leaves that kind as it was.
+fn merge_learned_addresses(saved: &EndpointAddr, learned: &[TransportAddr]) -> EndpointAddr {
+    if learned.is_empty() {
+        return saved.clone();
+    }
+    let mut addrs: Vec<TransportAddr> = saved
+        .addrs
+        .iter()
+        .filter(|address| !learned.iter().any(|heard| same_kind(heard, address)))
+        .cloned()
+        .collect();
+    addrs.extend(learned.iter().cloned());
+    EndpointAddr::from_parts(saved.id, addrs)
+}
+
+/// Whether two addresses travel by the same means.
+///
+/// A relay address is a relay address wherever it points, and that is the
+/// comparison that matters here: hearing about one direct address is reason to
+/// stop dialling the direct addresses that were written down earlier, and no
+/// reason at all to give up the relay.
+fn same_kind(left: &TransportAddr, right: &TransportAddr) -> bool {
+    (left.is_relay() && right.is_relay())
+        || (left.is_ip() && right.is_ip())
+        || (left.is_custom() && right.is_custom())
+}
+
+/// A few addresses, written the way the log reads best.
+///
+/// Bounded, because the point of the line is to be read at a glance while
+/// watching a cold start: whether the port is the one that was written down last
+/// time, and whether a relay is still in there as the fallback.
+fn describe_addresses(addresses: impl IntoIterator<Item = TransportAddr>) -> String {
+    let described: Vec<String> = addresses
+        .into_iter()
+        .take(4)
+        .map(|address| address.to_string())
+        .collect();
+    if described.is_empty() {
+        return "nothing".to_string();
+    }
+    described.join(", ")
+}
+
 fn validate_file_id(value: &str) -> Result<(), String> {
     if hex::decode(value)
         .map(|bytes| bytes.len() == 32)
@@ -5318,6 +5478,104 @@ mod tests {
             included: true,
             pubkey: String::new(),
         }
+    }
+
+    /// A direct address, of the kind a pairing code carries and a computer moves
+    /// away from when it restarts.
+    fn ip(text: &str) -> TransportAddr {
+        TransportAddr::Ip(text.parse().unwrap())
+    }
+
+    /// A relay address, of the kind that stays right while the direct ones move.
+    fn relay(text: &str) -> TransportAddr {
+        TransportAddr::Relay(text.parse().unwrap())
+    }
+
+    /// A pairing code is written once, and the addresses in it were true on the
+    /// day it was made.
+    ///
+    /// This is the whole of the cold-start fix: once a tunnel works, what it
+    /// really used is what gets dialled next time. The relay is the reason this
+    /// is a merge and not a replacement - it is the one address that still
+    /// reaches a computer whose direct addresses have all moved, and dropping it
+    /// would trade a slow start for no start at all.
+    #[test]
+    fn a_learned_address_replaces_the_stale_one_and_keeps_the_relay() {
+        let endpoint_id = SecretKey::generate().public();
+        let saved = EndpointAddr::from_parts(
+            endpoint_id,
+            [
+                relay("https://relay.example.com"),
+                ip("192.168.1.10:50752"),
+            ],
+        );
+
+        let merged = merge_learned_addresses(&saved, &[ip("192.168.1.10:61111")]);
+        assert!(merged.addrs.contains(&ip("192.168.1.10:61111")));
+        assert!(
+            !merged.addrs.contains(&ip("192.168.1.10:50752")),
+            "the port from the pairing code must not be dialled again"
+        );
+        assert!(
+            merged.addrs.contains(&relay("https://relay.example.com")),
+            "the fallback is the one address worth keeping when the rest moves"
+        );
+        assert_eq!(merged.id, endpoint_id);
+
+        // Nothing heard is nothing to change: the address saved at pairing is
+        // still the only thing this phone knows, and writing it out again would
+        // be a file write per reconnect for no reason.
+        assert_eq!(merge_learned_addresses(&saved, &[]), saved);
+    }
+
+    /// A computer that moves to another relay is followed there.
+    ///
+    /// The same rule as the direct addresses, and worth its own test because the
+    /// naive version of the fix - always keep the relay, always take the direct
+    /// addresses - would pin a phone to a relay its computer no longer uses,
+    /// which is a fallback that fails exactly when it is needed. What was heard
+    /// about the relay says nothing about the port, so the port stayed.
+    #[test]
+    fn a_learned_relay_replaces_the_one_the_code_carried() {
+        let endpoint_id = SecretKey::generate().public();
+        let saved = EndpointAddr::from_parts(
+            endpoint_id,
+            [relay("https://old.example.com"), ip("10.0.0.2:5000")],
+        );
+
+        let merged =
+            merge_learned_addresses(&saved, &[relay("https://new.example.com")]);
+        assert!(merged.addrs.contains(&relay("https://new.example.com")));
+        assert!(!merged.addrs.contains(&relay("https://old.example.com")));
+        assert!(merged.addrs.contains(&ip("10.0.0.2:5000")));
+    }
+
+    /// The refreshed address is only worth anything if a later run can read it.
+    ///
+    /// A phone saves this as text and reads it back as text, so the merge has to
+    /// survive that seam: an address that cannot be written down is an address
+    /// that is forgotten, and the cold start stays as slow as it was.
+    #[test]
+    fn a_refreshed_address_survives_the_file_it_is_saved_in() {
+        let endpoint_id = SecretKey::generate().public();
+        let mut saved = host("stale", DeviceRights::full(), "Studio");
+        saved.endpoint_id = endpoint_id.to_string();
+        saved.endpoint_addr =
+            serde_json::to_string(&EndpointAddr::from_parts(endpoint_id, [ip("192.168.4.4:50752")]))
+                .unwrap();
+
+        let merged = merge_learned_addresses(
+            &decode_endpoint_addr(&saved).unwrap(),
+            &[ip("192.168.4.4:61111")],
+        );
+        saved.endpoint_addr = serde_json::to_string(&merged).unwrap();
+
+        let read_back = decode_endpoint_addr(&saved).unwrap();
+        assert_eq!(read_back, merged);
+        assert_eq!(
+            read_back.ip_addrs().cloned().collect::<Vec<_>>(),
+            vec!["192.168.4.4:61111".parse::<std::net::SocketAddr>().unwrap()]
+        );
     }
 
     /// One library row, of the shape a computer sends.
