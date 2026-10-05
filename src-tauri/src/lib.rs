@@ -24,6 +24,7 @@ mod catalogue;
 mod cover;
 mod cover_publish;
 mod device_account;
+mod diag;
 mod mobile;
 mod network;
 mod playback_bridge;
@@ -1608,7 +1609,9 @@ fn start_folder_watcher(
                     ),
                 };
                 if let Err(error) = outcome {
-                    eprintln!("The Napstr folder changed but could not be indexed: {error}");
+                    diag::note(&format!(
+                        "The Napstr folder changed but could not be indexed: {error}"
+                    ));
                 }
             }
         })
@@ -1677,15 +1680,17 @@ fn wait_for_folder_and_watch(
                 return;
             }
             Err(error) => {
-                eprintln!("The Napstr folder is back but could not be watched: {error}");
+                diag::note(&format!(
+                    "The Napstr folder is back but could not be watched: {error}"
+                ));
                 return;
             }
         }
     }
-    eprintln!(
+    diag::note(&format!(
         "The Napstr folder {} was not there when Napstr started and has not appeared since; press Rescan once it is mounted.",
         folder.display()
-    );
+    ));
 }
 
 #[tauri::command]
@@ -2569,7 +2574,7 @@ async fn close_window(window: tauri::Window, state: State<'_, AppState>) -> Resu
     // be able to stop the exit itself. A database that will not answer is a reason
     // to close anyway, and the window used to stay open in exactly that case.
     if let Err(error) = state.network.preserve_interrupted_downloads() {
-        eprintln!("Could not preserve interrupted downloads: {error}");
+        diag::note(&format!("Could not preserve interrupted downloads: {error}"));
     }
     state.tor.stop().await;
     state.mobile.stop().await;
@@ -2937,6 +2942,14 @@ pub fn run() {
                 .path()
                 .app_data_dir()
                 .map_err(|error| error.to_string())?;
+            // Before anything else that can go wrong, so that going wrong is in
+            // the log: a desktop that will not start is the one case where the
+            // file has to already exist by the time somebody looks for it.
+            diag::start(&app_data);
+            diag::note(&format!(
+                "Napstr starting from {}",
+                app_data.display()
+            ));
             let resource_dir = app
                 .path()
                 .resource_dir()
@@ -3006,7 +3019,9 @@ pub fn run() {
             let startup_folder = existing_folder.clone();
             if let Some(folder) = &startup_folder {
                 if let Err(error) = transfer::cleanup_abandoned_downloads(folder) {
-                    eprintln!("Could not clean abandoned temporary downloads: {error}");
+                    diag::note(&format!(
+                        "Could not clean abandoned temporary downloads: {error}"
+                    ));
                 }
             }
             // A folder that is not a directory right now is almost never a folder
@@ -3198,7 +3213,7 @@ pub fn run() {
             // Rotate pending requests before stopping Tor, so old workers cannot
             // turn a normal application exit into a permanent failed download.
             if let Err(error) = services.network.preserve_interrupted_downloads() {
-                eprintln!("Could not preserve interrupted downloads: {error}");
+                diag::note(&format!("Could not preserve interrupted downloads: {error}"));
             }
             services.tor.stop().await;
             services.mobile.stop().await;

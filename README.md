@@ -85,3 +85,11 @@ Open Anyway** after the first blocked launch.
 - Files are audio-validated and identified by SHA-256. Downloads use a responsive seeder, verify the complete hash, and are available in the built-in player.
 
 Profiles and catalogue metadata are public. Requests, transfer credentials, file contents, and peer IP addresses are not published. Tor use may still be visible to an ISP.
+
+## Where Napstr says what it did
+
+Both halves of a pairing keep their own record, because a fault is nearly always described from one side only: a phone says the computer stopped answering, and the only place that can say whether it was asked anything at all is the computer.
+
+The desktop writes `napstr.log` in its own data directory — `%APPDATA%\social.napstr.desktop` on Windows, `~/.local/share/social.napstr.desktop` on Linux, and the equivalent under `~/Library/Application Support` on macOS. Every line is stamped to the millisecond, the file is capped at a megabyte, and what was there before it is kept beside it as `napstr.log.1`. The requests a paired phone makes are in it by name — `asked for status`, `was answered in 19ms` — together with every refusal and its reason, which is what separates a phone that is being turned away from one that is not being heard.
+
+Napstrfy writes to the device log under the tag `Napstrfy` (`adb logcat -s Napstrfy`), using the same eight-character device names and the same word for the same request, so the two files can be read against each other.

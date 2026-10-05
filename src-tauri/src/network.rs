@@ -961,16 +961,24 @@ fn store_catalogue_row(connection: &Connection, row: &CatalogueRow<'_>) {
         Err(error) => error,
     };
     if super::catalogue::index_is_sound(connection) {
-        eprintln!("Could not store an announcement in the local catalogue: {error}");
+        crate::diag::note(&format!(
+            "Could not store an announcement in the local catalogue: {error}"
+        ));
         return;
     }
-    eprintln!("The catalogue's word index was damaged ({error}); rebuilding it");
+    crate::diag::note(&format!(
+        "The catalogue's word index was damaged ({error}); rebuilding it"
+    ));
     if let Err(error) = super::catalogue::rebuild_index(connection) {
-        eprintln!("Could not rebuild the catalogue's word index: {error}");
+        crate::diag::note(&format!(
+            "Could not rebuild the catalogue's word index: {error}"
+        ));
         return;
     }
     if let Err(error) = write_catalogue_row(connection, row) {
-        eprintln!("Could not store an announcement after rebuilding the index: {error}");
+        crate::diag::note(&format!(
+            "Could not store an announcement after rebuilding the index: {error}"
+        ));
     }
 }
 
@@ -1410,19 +1418,21 @@ impl NetworkService {
             // The index is derived data, and a failure here is a failure of an
             // accelerator: repair a damaged index and try it again, otherwise fall
             // back to asking the network, which is what would have happened anyway.
-            eprintln!("Could not search the local catalogue: {error}");
+            crate::diag::note(&format!("Could not search the local catalogue: {error}"));
             if super::catalogue::index_is_sound(&connection) {
                 return Ok(None);
             }
-            eprintln!("The catalogue's word index was damaged; rebuilding it");
+            crate::diag::note("The catalogue's word index was damaged; rebuilding it");
             if let Err(error) = super::catalogue::rebuild_index(&connection) {
-                eprintln!("Could not rebuild the catalogue's word index: {error}");
+                crate::diag::note(&format!(
+                    "Could not rebuild the catalogue's word index: {error}"
+                ));
                 return Ok(None);
             }
             hits = super::catalogue::search(&connection, query, NETWORK_SEARCH_RESULT_LIMIT, now);
         }
         let Ok(hits) = hits else {
-            eprintln!("The rebuilt catalogue index still could not be searched");
+            crate::diag::note("The rebuilt catalogue index still could not be searched");
             return Ok(None);
         };
         Ok((!hits.is_empty()).then_some(hits))
@@ -1806,7 +1816,7 @@ impl NetworkService {
                 let delay = match recovery.dispatch_queued_downloads(generation).await {
                     Ok(()) => Duration::from_secs(1),
                     Err(error) => {
-                        eprintln!("Could not advance download queue: {error}");
+                        crate::diag::note(&format!("Could not advance download queue: {error}"));
                         Duration::from_secs(10)
                     }
                 };
@@ -1847,7 +1857,9 @@ impl NetworkService {
                 && mirror.generation.load(Ordering::SeqCst) == generation
             {
                 if let Err(error) = mirror.refresh_catalogue_mirror(&mirror_client).await {
-                    eprintln!("Could not bring the local catalogue up to date: {error}");
+                    crate::diag::note(&format!(
+                        "Could not bring the local catalogue up to date: {error}"
+                    ));
                 }
                 tokio::time::sleep(Duration::from_secs(CATALOGUE_MIRROR_INTERVAL_SECONDS)).await;
             }

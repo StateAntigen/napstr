@@ -127,7 +127,7 @@ pub(crate) fn initialise_schema(connection: &Connection) -> Result<(), String> {
         // not broken: a search the index cannot answer falls through to the
         // substring pass and then to the network, and the next start tries again
         // because the marker is only written when the count came out right.
-        eprintln!("Could not index the stored catalogue: {error}");
+        crate::diag::note(&format!("Could not index the stored catalogue: {error}"));
     }
     Ok(())
 }

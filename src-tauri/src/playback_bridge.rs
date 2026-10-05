@@ -241,7 +241,9 @@ impl PlaybackBridge {
     /// describe something that did not happen.
     fn notify(&self, command: &PlaybackCommand) {
         if let Err(error) = self.forward(command) {
-            eprintln!("the Napstr window could not be told what a phone asked for: {error}");
+            crate::diag::note(&format!(
+                "the Napstr window could not be told what a phone asked for: {error}"
+            ));
         }
     }
 

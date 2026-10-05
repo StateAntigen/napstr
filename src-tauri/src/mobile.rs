@@ -177,9 +177,10 @@ impl MobileService {
         }
         if let Ok(mut status) = self.status.lock() {
             status.running = true;
-            status.endpoint_id = endpoint_id;
+            status.endpoint_id = endpoint_id.clone();
             status.error.clear();
         }
+        crate::diag::note(&format!("Napstrfy listening as {endpoint_id}"));
 
         let accept_service = self.clone();
         let accept_endpoint = endpoint.clone();
@@ -188,6 +189,7 @@ impl MobileService {
                 let permit = match accept_service.connection_slots.clone().try_acquire_owned() {
                     Ok(permit) => permit,
                     Err(_) => {
+                        crate::diag::note("every Napstrfy connection slot is busy; turned one away");
                         incoming.refuse();
                         continue;
                     }
@@ -197,8 +199,10 @@ impl MobileService {
                     let _permit = permit;
                     match tokio::time::timeout(HANDSHAKE_TIMEOUT, incoming).await {
                         Ok(Ok(connection)) => service.handle_connection(connection).await,
-                        Ok(Err(error)) => eprintln!("Napstrfy connection failed: {error}"),
-                        Err(_) => eprintln!("Napstrfy connection handshake timed out"),
+                        Ok(Err(error)) => {
+                            crate::diag::note(&format!("a Napstrfy connection failed: {error}"))
+                        }
+                        Err(_) => crate::diag::note("a Napstrfy handshake timed out"),
                     }
                 });
             }
@@ -216,6 +220,7 @@ impl MobileService {
 
     pub async fn stop(&self) {
         if let Some(endpoint) = self.endpoint.write().await.take() {
+            crate::diag::note("Napstrfy is stopping; closing its endpoint");
             endpoint.close().await;
         }
         if let Ok(mut status) = self.status.lock() {
@@ -350,6 +355,7 @@ impl MobileService {
     }
 
     fn remember_error(&self, message: String) -> String {
+        crate::diag::note(&message);
         if let Ok(mut status) = self.status.lock() {
             status.error = message.clone();
             status.running = false;
@@ -360,24 +366,45 @@ impl MobileService {
 
     async fn handle_connection(self: Arc<Self>, connection: iroh::endpoint::Connection) {
         let remote_id = connection.remote_id().to_string();
+        let who = crate::diag::device(&remote_id);
         if !self.connection_is_allowed(&remote_id) {
+            // Worth a line every time: the phone's side of this is "connecting,
+            // offline, connecting", and which of the two - an unpaired device or
+            // a device whose grant was revoked - is only visible here.
+            crate::diag::note(&format!("{who} is not paired here; refusing its tunnel"));
             return;
         }
+        crate::diag::note(&format!("{who} opened a tunnel"));
         loop {
             if !self.connection_is_allowed(&remote_id) {
+                crate::diag::note(&format!(
+                    "{who} is no longer allowed here; closing its tunnel"
+                ));
                 break;
             }
             let (mut send, mut receive) =
                 match tokio::time::timeout(CONNECTION_IDLE_TIMEOUT, connection.accept_bi()).await {
                     Ok(Ok(streams)) => streams,
-                    Ok(Err(_)) | Err(_) => break,
+                    Ok(Err(error)) => {
+                        crate::diag::note(&format!("{who} closed its tunnel: {error}"));
+                        break;
+                    }
+                    Err(_) => {
+                        crate::diag::note(&format!(
+                            "{who} said nothing for {} minutes; closing its tunnel",
+                            CONNECTION_IDLE_TIMEOUT.as_secs() / 60
+                        ));
+                        break;
+                    }
                 };
             let service = self.clone();
             let remote_id = remote_id.clone();
+            let who = who.clone();
             let permit = match self.request_slots.clone().try_acquire_owned() {
                 Ok(permit) => permit,
                 Err(_) => {
                     // Never let an overloaded peer block the connection's accept loop.
+                    crate::diag::note(&format!("{who} asked while every slot was busy; refused"));
                     let _ = send.reset(1u32.into());
                     let _ = receive.stop(1u32.into());
                     continue;
@@ -385,12 +412,14 @@ impl MobileService {
             };
             tokio::spawn(async move {
                 let _permit = permit;
+                let started = Instant::now();
                 let request =
                     match tokio::time::timeout(Duration::from_secs(15), read_request(&mut receive))
                         .await
                     {
                         Ok(Ok(request)) => request,
                         Ok(Err(error)) => {
+                            crate::diag::note(&format!("{who} sent something unreadable: {error}"));
                             let _ = write_response(
                                 &mut send,
                                 &ServerResponse::Error { message: error },
@@ -400,6 +429,7 @@ impl MobileService {
                             return;
                         }
                         Err(_) => {
+                            crate::diag::note(&format!("{who} stopped in the middle of a request"));
                             let _ = write_response(
                                 &mut send,
                                 &ServerResponse::Error {
@@ -411,11 +441,29 @@ impl MobileService {
                             return;
                         }
                     };
-                if let Err(error) = service.serve_request(&remote_id, request, &mut send).await {
-                    let _ =
-                        write_response(&mut send, &ServerResponse::Error { message: error }).await;
+                // What was asked for, and - the line a slow answer is read from
+                // - how long it took. A request that arrives and is never
+                // answered leaves the first line without the second, which is
+                // the difference between this computer being busy and this
+                // computer never having heard anything.
+                crate::diag::note(&format!(
+                    "{who} asked for {}",
+                    crate::diag::request_kind(&request)
+                ));
+                match service.serve_request(&remote_id, request, &mut send).await {
+                    Ok(()) => crate::diag::note(&format!(
+                        "{who} was answered in {}",
+                        crate::diag::millis(started)
+                    )),
+                    Err(error) => {
+                        crate::diag::note(&format!("{who} could not be answered: {error}"));
+                        let _ = write_response(&mut send, &ServerResponse::Error { message: error })
+                            .await;
+                    }
                 }
-                let _ = send.finish();
+                if let Err(error) = send.finish() {
+                    crate::diag::note(&format!("the answer to {who} could not be finished: {error}"));
+                }
             });
         }
     }
@@ -568,13 +616,16 @@ impl MobileService {
         request: ClientRequest,
         send: &mut iroh::endpoint::SendStream,
     ) -> Result<(), String> {
+        let who = crate::diag::device(remote_id);
+        let kind = crate::diag::request_kind(&request);
         if let ClientRequest::Pair {
             token,
             device_name,
         } = request
         {
-            let rights =
-                self.accept_pairing(remote_id, &token, &device_name)?;
+            let rights = self.accept_pairing(remote_id, &token, &device_name).inspect_err(|error| {
+                crate::diag::note(&format!("{who} could not pair: {error}"));
+            })?;
             return write_response(
                 send,
                 &ServerResponse::Paired {
@@ -585,8 +636,16 @@ impl MobileService {
             )
             .await;
         }
-        let rights = self.authorise(remote_id)?;
-        check_request_permission(rights, &request)?;
+        // Both refusals are logged with the device and what it wanted, because
+        // the answer the phone gets is the same word in both cases - and the
+        // difference between "this phone was never paired" and "this phone may
+        // not do that" is the whole question when a phone says it is refused.
+        let rights = self.authorise(remote_id).inspect_err(|error| {
+            crate::diag::note(&format!("{who} is not allowed to ask for {kind}: {error}"));
+        })?;
+        check_request_permission(rights, &request).inspect_err(|error| {
+            crate::diag::note(&format!("{who} may not ask for {kind}: {error}"));
+        })?;
         self.touch_device(remote_id);
         match request {
             ClientRequest::Library {
@@ -743,7 +802,9 @@ impl MobileService {
                         })
                         .collect::<Vec<_>>(),
                 ) {
-                    eprintln!("Could not queue the albums a phone searched for: {error}");
+                    crate::diag::note(&format!(
+                        "Could not queue the albums a phone searched for: {error}"
+                    ));
                 }
                 write_response(send, &ServerResponse::Search { tracks }).await
             }
