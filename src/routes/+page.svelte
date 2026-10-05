@@ -600,11 +600,11 @@
       : files.filter((file) => file.folder === folderView);
   }
 
-  function audiobookFolderFiles() {
-    if (libraryFolderView === '*') return [];
-    const prefix = `${libraryFolderView}/`;
-    return sharedFiles
-      .filter((file) => file.folder === libraryFolderView || file.folder.startsWith(prefix))
+  function audiobookFolderFiles(folderView: string, files: Array<NativeFile & { readableSize: string }>) {
+    if (folderView === '*') return [];
+    const prefix = `${folderView}/`;
+    return files
+      .filter((file) => file.folder === folderView || file.folder.startsWith(prefix))
       .sort((left, right) => `${left.folder}/${left.filename}`.localeCompare(`${right.folder}/${right.filename}`, undefined, { numeric: true, sensitivity: 'base' }));
   }
 
@@ -612,9 +612,9 @@
     return Math.max(1, Math.ceil(files.length / LOCAL_PAGE_SIZE));
   }
 
-  function paginatedTagFiles() {
-    const start = downloadLibraryPage * LOCAL_PAGE_SIZE;
-    return sharedFiles.slice(start, start + LOCAL_PAGE_SIZE);
+  function paginatedTagFiles(files: NativeFile[], page: number) {
+    const start = page * LOCAL_PAGE_SIZE;
+    return files.slice(start, start + LOCAL_PAGE_SIZE);
   }
 
   function paginatedSharedFiles(files = visibleSharedFiles(), page = sharedLibraryPage) {
@@ -717,6 +717,18 @@
   $: sharedRows = paginatedSharedFiles(sharedVisible, sharedLibraryPage);
   $: sharedPageCount = localPageCount(sharedVisible);
   $: sharedFolders = libraryFolders(sharedFiles);
+
+  // The same rule, for the panes whose helper was still called from the markup. A
+  // template expression that names only a function is not re-run when the state that
+  // function reads changes: the Downloads library went on drawing the first hundred
+  // files under a caption that had already said "Page 2 of 2", and the audiobook
+  // preview kept the previous folder's chapters. Naming the state in a `$:` and
+  // passing it in is what makes it a dependency.
+  $: tagFiles = paginatedTagFiles(sharedFiles, downloadLibraryPage);
+  $: audiobookChapters = audiobookFolderFiles(libraryFolderView, sharedFiles);
+  $: folderAudiobook = currentFolderAudiobook(localAudiobooks, libraryFolderView);
+  $: selectedAudiobookIsComplete = selectedAudiobookComplete(selected?.audiobook, localFileIds);
+  $: selectedAudiobookIsDownloading = selectedAudiobookDownloading(selected?.audiobook, audiobookDownloads);
 
   async function changeResultPage(nextPage: number) {
     if (nextPage >= resultPageCount(results) && browseCursor && !browseLoading) {
@@ -2915,15 +2927,15 @@
     await playAudio(selected.fileId, selected.name, playerMode, 'search');
   }
 
-  function currentFolderAudiobook() {
-    if (libraryFolderView === '*') return null;
-    return localAudiobooks.find((book) => book.localFolder === libraryFolderView) ?? null;
+  function currentFolderAudiobook(books: Audiobook[], folderView: string) {
+    if (folderView === '*') return null;
+    return books.find((book) => book.localFolder === folderView) ?? null;
   }
 
   function openAudiobookEditor() {
-    if (libraryFolderView === '*' || audiobookFolderFiles().length < 1) return;
-    const existing = currentFolderAudiobook();
-    const files = audiobookFolderFiles();
+    if (libraryFolderView === '*' || audiobookChapters.length < 1) return;
+    const existing = folderAudiobook;
+    const files = audiobookChapters;
     const folderTitle = folderName(libraryFolderView).split('/').at(-1) ?? 'Audiobook';
     audiobookTitle = existing?.title || files.find((file) => file.album)?.album || folderTitle.replace(/[_-]+/g, ' ');
     audiobookAuthor = existing?.author || files.find((file) => file.artist)?.artist || '';
@@ -2952,7 +2964,7 @@
   }
 
   async function ungroupAudiobook() {
-    const existing = currentFolderAudiobook();
+    const existing = folderAudiobook;
     if (!existing || audiobookSaving) return;
     audiobookSaving = true;
     try {
@@ -3101,13 +3113,13 @@
     await requestNextAudiobookChapter(book.audiobookId);
   }
 
-  function selectedAudiobookComplete() {
-    return selected?.audiobook?.chapters.every((chapter) => isLocalFile(chapter.fileId)) ?? false;
+  function selectedAudiobookComplete(book: Audiobook | undefined, cached: Set<string>) {
+    return book?.chapters.every((chapter) => cached.has(chapter.fileId)) ?? false;
   }
 
-  function selectedAudiobookDownloading() {
-    const audiobookId = selected?.audiobook?.audiobookId;
-    return Boolean(audiobookId && audiobookDownloads.some((item) => item.audiobookId === audiobookId));
+  function selectedAudiobookDownloading(book: Audiobook | undefined, downloads: AudiobookDownload[]) {
+    const audiobookId = book?.audiobookId;
+    return Boolean(audiobookId && downloads.some((item) => item.audiobookId === audiobookId));
   }
 
   async function playSelectedAudiobook() {
@@ -3764,7 +3776,7 @@
                     ><span>{String(chapter.position).padStart(2, '0')}</span><b>{chapter.title}</b><small>{readableSize(chapter.size)}</small><i>{$t(audiobookChapterStatus(selected.audiobook!, chapter))}</i></button>
                   {/each}
                 </div>
-                <div class="detail-actions">{#if selectedAudiobookComplete()}<button class="classic-button primary" onclick={playSelectedAudiobook}>{$t("▶ Play book")}</button><button class="classic-button" onclick={openNapstrFolder}>{$t("Open folder")}</button>{:else}<button class="classic-button primary" disabled={selectedAudiobookDownloading()} onclick={downloadSelectedAudiobook}>⇩ {selectedAudiobookDownloading() ? $t("Downloading…") : $t("Download book")}</button>{/if}</div>
+                <div class="detail-actions">{#if selectedAudiobookIsComplete}<button class="classic-button primary" onclick={playSelectedAudiobook}>{$t("▶ Play book")}</button><button class="classic-button" onclick={openNapstrFolder}>{$t("Open folder")}</button>{:else}<button class="classic-button primary" disabled={selectedAudiobookIsDownloading} onclick={downloadSelectedAudiobook}>⇩ {selectedAudiobookIsDownloading ? $t("Downloading…") : $t("Download book")}</button>{/if}</div>
                 {#if !selected.audiobook.local}<p class="privacy-note"><span>♜</span> {$t("Chapters download first-to-last through private Tor onion services. Play each chapter as soon as it shows Ready.")}</p>{:else}<p class="privacy-note"><span>♬</span> {$t("This complete audiobook is ready to play.")}</p>{/if}
               {:else}
               <div class="detail-cover">
@@ -3836,7 +3848,7 @@
           </div>
           <div class="tag-library">
             <table class="file-table tags-table"><thead><tr><th>{$t("Name")}</th><th>{$t("Folder")}</th><th>{$t("Tags")}</th></tr></thead><tbody>
-              {#each paginatedTagFiles() as file}
+              {#each tagFiles as file}
                 <tr class:selected={selectedTagFile?.fileId === file.fileId} onclick={() => selectTagFile(file)} ondblclick={() => playAudio(file.fileId, file.filename, playerMode, 'downloads')}><td><button type="button" class="file-icon file-play-button" title={$t("Play {p0}", { p0: file.filename })} aria-label={$t("Play {p0}", { p0: file.filename })} onclick={(event) => { event.stopPropagation(); selectTagFile(file); playAudio(file.fileId, file.filename, playerMode, 'downloads'); }}>▶</button>{file.filename}</td><td>{folderName(file.folder)}</td><td>{file.tags || '—'}</td></tr>
               {/each}
             </tbody></table>
@@ -3847,7 +3859,7 @@
       {:else if activeView === 'Shared'}
         <section class="full-panel">
           <div class="panel-title"><span></span><b>{$t("My Shared Files")}</b><span></span></div>
-          <div class="actionbar"><button class="classic-button" onclick={indexing ? cancelLibraryScan : rescanSharedFolder}>{indexing ? $t("× Cancel scan") : rescanPending ? $t("… Rescanning") : $t("↻ Rescan")}</button><button class="classic-button" onclick={openNapstrFolder}>{$t("Open folder")}</button><button class="classic-button" onclick={playSelectedSharedAudio} disabled={!selectedShared}>{$t("▶ Play")}</button><button class="classic-button" onclick={playSelectedFolder} disabled={!selectedShared}>{$t("▶ Play folder")}</button><button class="classic-button primary" onclick={playAllSongs} disabled={!sharedFiles.length}>{$t("▶ Play all")}</button><button class="classic-button audiobook-button" onclick={openAudiobookEditor} disabled={libraryFolderView === '*' || audiobookFolderFiles().length < 1}>▥ {currentFolderAudiobook() ? $t("Edit audiobook") : $t("Group as audiobook…")}</button><div class="spacer"></div><span>{$t("Sharing")} {sharedFiles.length} {$t("files ·")} {readableSize(indexedBytes)}</span></div>
+          <div class="actionbar"><button class="classic-button" onclick={indexing ? cancelLibraryScan : rescanSharedFolder}>{indexing ? $t("× Cancel scan") : rescanPending ? $t("… Rescanning") : $t("↻ Rescan")}</button><button class="classic-button" onclick={openNapstrFolder}>{$t("Open folder")}</button><button class="classic-button" onclick={playSelectedSharedAudio} disabled={!selectedShared}>{$t("▶ Play")}</button><button class="classic-button" onclick={playSelectedFolder} disabled={!selectedShared}>{$t("▶ Play folder")}</button><button class="classic-button primary" onclick={playAllSongs} disabled={!sharedFiles.length}>{$t("▶ Play all")}</button><button class="classic-button audiobook-button" onclick={openAudiobookEditor} disabled={libraryFolderView === '*' || audiobookChapters.length < 1}>▥ {folderAudiobook ? $t("Edit audiobook") : $t("Group as audiobook…")}</button><div class="spacer"></div><span>{$t("Sharing")} {sharedFiles.length} {$t("files ·")} {readableSize(indexedBytes)}</span></div>
           <div class="folder-path"><b>{$t("Napstr folder:")}</b><input value={napstrFolder || 'No folder selected'} readonly /><button class="classic-button" onclick={chooseNapstrFolder}>{$t("Browse…")}</button></div>
           <div class="library-filter">
             <span class="library-filter-label">{$t("View folder:")}</span>
@@ -3866,8 +3878,8 @@
             </div>
             <span class="library-song-count">{$t("Songs shown: {p0}", { p0: sharedVisible.length })}</span>
           </div>
-          {#if !currentFolderAudiobook() && libraryFolderView.toLowerCase().includes('audiobook') && audiobookFolderFiles().length >= 1}<div class="audiobook-folder-banner"><span class="audiobook-glyph">▥</span><div><b>{$t("Possible audiobook detected")}</b><small>{$t("Review the natural chapter order before making the collection public.")}</small></div><button class="classic-button primary" onclick={openAudiobookEditor}>{$t("Group as audiobook…")}</button></div>{/if}
-          {#if currentFolderAudiobook()}<div class="audiobook-folder-banner"><span class="audiobook-glyph">▥</span><div><b>{currentFolderAudiobook()?.title}</b><small>{currentFolderAudiobook()?.author || $t("Unknown author")} · {currentFolderAudiobook()?.chapters.length} {$t("ordered chapters · published as one audiobook")}</small></div><button class="classic-button primary" onclick={() => playAudiobook(currentFolderAudiobook()!)}>{$t("▶ Play book")}</button></div>{/if}
+          {#if !folderAudiobook && libraryFolderView.toLowerCase().includes('audiobook') && audiobookChapters.length >= 1}<div class="audiobook-folder-banner"><span class="audiobook-glyph">▥</span><div><b>{$t("Possible audiobook detected")}</b><small>{$t("Review the natural chapter order before making the collection public.")}</small></div><button class="classic-button primary" onclick={openAudiobookEditor}>{$t("Group as audiobook…")}</button></div>{/if}
+          {#if folderAudiobook}<div class="audiobook-folder-banner"><span class="audiobook-glyph">▥</span><div><b>{folderAudiobook?.title}</b><small>{folderAudiobook?.author || $t("Unknown author")} · {folderAudiobook?.chapters.length} {$t("ordered chapters · published as one audiobook")}</small></div><button class="classic-button primary" onclick={() => playAudiobook(folderAudiobook!)}>{$t("▶ Play book")}</button></div>{/if}
           <table class="file-table shared-table"><thead><tr><th>{$t("Name")}</th><th>{$t("Folder")}</th><th>{$t("Size")}</th><th>{$t("Catalogue")}</th><th>{$t("Active peers")}</th></tr></thead><tbody>{#each sharedRows as file}<tr class:selected={selectedShared?.fileId === file.fileId} onclick={() => (selectedShared = { ...file })} ondblclick={() => playAudio(file.fileId, file.name, playerMode, 'shared')}><td><span class="file-icon">▶</span>{file.name}</td><td>{folderName(file.folder)}</td><td>{file.readableSize}</td><td><span class:amber={!networkConnected} class="led"></span>{networkConnected ? $t("Published") : $t("Indexed")}</td><td>{file.peers}</td></tr>{/each}</tbody></table>
           {#if sharedVisible.length > LOCAL_PAGE_SIZE}<div class="results-pager"><button disabled={sharedLibraryPage === 0} onclick={() => changeSharedLibraryPage(sharedLibraryPage - 1)}>{$t("◀ Previous")}</button><span>{$t("Showing {range} of {count} loaded", { range: localPageRange(sharedLibraryPage, sharedVisible.length), count: sharedVisible.length })} · {$t("Page {page} of {pages}", { page: sharedLibraryPage + 1, pages: sharedPageCount })}</span><button disabled={sharedLibraryPage + 1 >= sharedPageCount} onclick={() => changeSharedLibraryPage(sharedLibraryPage + 1)}>{$t("Next ▶")}</button></div>{/if}
           <p class="privacy-note wide"><span>♜</span> {$t("Only validated MP3, FLAC, WAV, Ogg Vorbis, and Opus audio is indexed recursively. Put book folders or complete one-file books inside Audiobooks for automatic grouping. Existing contents are never replaced. Folder names remain local and embedded cover artwork is allowed.")}</p>
@@ -4365,10 +4377,10 @@
           <label>{$t("Title")} <input bind:value={audiobookTitle} maxlength="256" /></label>
           <label>{$t("Author")} <input bind:value={audiobookAuthor} maxlength="256" /></label>
           <label>{$t("Narrator")} <input bind:value={audiobookNarrator} maxlength="256" /></label>
-          <fieldset><legend>{$t("Chapter order")}</legend><div class="audiobook-preview">{#each audiobookFolderFiles() as file, index}<div><span>{String(index + 1).padStart(2, '0')}</span><b>{file.title || file.filename}</b><small>{file.readableSize}</small></div>{/each}</div></fieldset>
+          <fieldset><legend>{$t("Chapter order")}</legend><div class="audiobook-preview">{#each audiobookChapters as file, index}<div><span>{String(index + 1).padStart(2, '0')}</span><b>{file.title || file.filename}</b><small>{file.readableSize}</small></div>{/each}</div></fieldset>
           <p class="privacy-note"><span>i</span> {$t("The title, author, narrator, chapter names, and ordered file hashes will be public. Your folder name and filesystem path remain private.")}</p>
         </div>
-        <div class="dialog-actions audiobook-dialog-actions">{#if currentFolderAudiobook()}<button class="classic-button" disabled={audiobookSaving} onclick={ungroupAudiobook}>{$t("Publish separately")}</button>{/if}<span></span><button class="classic-button primary" disabled={audiobookSaving || !audiobookTitle.trim()} onclick={saveAudiobookGroup}>{audiobookSaving ? $t("Publishing…") : $t("Save & publish")}</button><button class="classic-button" disabled={audiobookSaving} onclick={() => (audiobookEditorOpen = false)}>{$t("Cancel")}</button></div>
+        <div class="dialog-actions audiobook-dialog-actions">{#if folderAudiobook}<button class="classic-button" disabled={audiobookSaving} onclick={ungroupAudiobook}>{$t("Publish separately")}</button>{/if}<span></span><button class="classic-button primary" disabled={audiobookSaving || !audiobookTitle.trim()} onclick={saveAudiobookGroup}>{audiobookSaving ? $t("Publishing…") : $t("Save & publish")}</button><button class="classic-button" disabled={audiobookSaving} onclick={() => (audiobookEditorOpen = false)}>{$t("Cancel")}</button></div>
       </dialog>
     </div>
   {/if}
