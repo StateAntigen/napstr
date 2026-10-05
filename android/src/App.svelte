@@ -94,6 +94,19 @@
    * while they were offline.
    */
   const likedSyncedKey = 'napstrfy-likes-synced';
+  /**
+   * The songs this phone will not play again.
+   *
+   * A list of its own rather than a sign on the liked one, in this phone and on
+   * the computer both: a track can be liked, then turned off, and taking the
+   * dislike back has to leave the like where it was. It is kept under this
+   * phone's key like the likes are, and for the same reason - it belongs to the
+   * person holding the phone rather than to the computer it is asking, which is
+   * also why a phone lent only the library can keep it.
+   */
+  const dislikedMusicKey = 'napstrfy-disliked-music';
+  const dislikedOrphansKey = 'napstrfy-disliked-orphans';
+  const dislikedSyncedKey = 'napstrfy-dislikes-synced';
   const playedTracksKey = 'napstrfy-played-tracks';
   /** Tracks one "recently played" list holds before the oldest falls off. */
   const PLAYED_TRACKS_KEPT = 100;
@@ -507,6 +520,32 @@
     void status.libraryRevision;
     untrack(() => void resolveLikedOrphans());
   });
+
+  // The never-play list is carried exactly the way the liked list is, and asked
+  // for at the same moment: once per connection, because merging writes the
+  // answer back into the list it just read.
+  let dislikesSyncedOnce = false;
+  $effect(() => {
+    if (!status.connected || dislikesSyncedOnce) return;
+    dislikesSyncedOnce = true;
+    void mergeDislikesFromHome();
+  });
+
+  // Same retry as the likes, on the same signal: the library moving is what
+  // turns an id this phone could not draw into a row it can.
+  $effect(() => {
+    void status.libraryRevision;
+    untrack(() => void resolveDislikedOrphans());
+  });
+
+  // The way back is offered, not kept forever. A toast that outlived the moment
+  // it belongs to would undo something done several tracks ago.
+  $effect(() => {
+    if (!dislikeNotice) return;
+    const timer = setTimeout(() => { dislikeNotice = null; }, NOTICE_VISIBLE_MS);
+    return () => clearTimeout(timer);
+  });
+
   let statusLoading = $state(true);
   let statusPending = $state(false);
   /**
@@ -549,6 +588,20 @@
   /** Liked file ids with no record on this phone yet. See `likedOrphansKey`. */
   let likedOrphans = $state<string[]>([]);
   let showingLikedMusic = $state(false);
+  /** The songs this phone will not play again, as records it can draw. */
+  let dislikedMusic = $state<RemoteTrack[]>([]);
+  /** Disliked ids it cannot draw yet. See `dislikedOrphansKey`. */
+  let dislikedOrphans = $state<string[]>([]);
+  /** The list of them, opened from Settings. */
+  let showingDisliked = $state(false);
+  /**
+   * The "not played again" toast: what was turned off, and the way back.
+   *
+   * Its own toast rather than the shared notice, because it is the only message
+   * in the app that carries an action - and an Undo that a later notice could
+   * leave stranded on screen would be worse than no undo at all.
+   */
+  let dislikeNotice = $state<null | { fileId: string; title: string }>(null);
   let total = $state(0);
   let loading = $state(false);
   /** The network half of a search is still running while the host's half is not. */
@@ -1012,6 +1065,7 @@
     playbackTarget === 'desktop' ? `Repeat: ${remoteRepeatLabel(remoteState?.repeat ?? 'off')}` : LOOP_LABELS[loopMode]
   );
   let shownLiked = $derived(shownTrack ? isTrackLiked(shownTrack) : false);
+  let shownDisliked = $derived(shownTrack ? isTrackDisliked(shownTrack) : false);
   let shownLoopOne = $derived(playbackTarget === 'desktop' ? remoteState?.repeat === 'one' : loopMode === 'one');
   /**
    * Whichever track the open menu applies to: the chosen one, else the one the
@@ -1243,6 +1297,12 @@
       closeLikedMusic();
       return;
     }
+    // And its opposite number, which is reached from Settings rather than from a
+    // chip, so back has to look for it after the settings screen is gone.
+    if (showingDisliked) {
+      closeDislikedTracks();
+      return;
+    }
     // Back from any other tab is the way home.
     if (activeTab !== 'music') activeTab = 'music';
   }
@@ -1424,10 +1484,185 @@
     }
   }
 
+  /**
+   * Which ids the other copy holds that this phone neither has nor agreed on.
+   *
+   * The rule that keeps a merge from undoing a person's decision, shared by both
+   * lists: an id this phone never had is new, and an id it had and dropped was
+   * dropped on purpose. One function rather than two, because getting this wrong
+   * in either list means a track coming back from the dead.
+   */
+  function additionsFromTheOtherCopy(theirs: string[], held: Set<string>, agreed: Set<string>) {
+    return theirs.filter((fileId) => !held.has(fileId) && !agreed.has(fileId));
+  }
+
+  function isTrackDisliked(track: RemoteTrack) {
+    return dislikedMusic.some((item) => item.fileId === track.fileId);
+  }
+
+  /** Every file this phone will not play again, as ids. */
+  function dislikedFileIds(): string[] {
+    return [...dislikedMusic.map((item) => item.fileId), ...dislikedOrphans];
+  }
+
+  function saveDislikedOrphans() {
+    saveLikes(dislikedOrphansKey, dislikedOrphans);
+  }
+
+  function dislikedSnapshot(): Set<string> {
+    try {
+      const saved = JSON.parse(window.localStorage.getItem(dislikedSyncedKey) || '[]') as unknown;
+      if (Array.isArray(saved)) return new Set(saved.filter((id): id is string => typeof id === 'string'));
+    } catch {
+      // Same safe direction as the likes: an unreadable snapshot merges the
+      // computer's list in, which adds turned-off tracks rather than forgetting
+      // them - and a forgotten dislike is a track that plays again.
+    }
+    return new Set();
+  }
+
+  /**
+   * Tell the home computer what this phone's key never wants played again.
+   *
+   * Fire and forget, like the likes: the phone's copy is already written, so a
+   * computer that is asleep costs the second copy rather than the decision.
+   */
+  async function pushDislikesToHome() {
+    if (!status.paired) return;
+    try {
+      const stored = await invoke<string[]>('remote_set_dislikes', { fileIds: dislikedFileIds() });
+      saveLikes(dislikedSyncedKey, stored);
+    } catch {
+      // Goes again on the next change or the next connect.
+    }
+  }
+
+  /**
+   * Put this phone's never-play list together with the computer's, once.
+   *
+   * The same two-way merge the likes use, and the same reason for each half: an
+   * id the computer holds that this phone never had is somebody turning
+   * something off elsewhere, and an id it holds that this phone had and dropped
+   * is a track allowed again here. That second half matters more in this list
+   * than in the likes: merging by union alone would silently re-ban a track
+   * somebody just forgave.
+   */
+  async function mergeDislikesFromHome() {
+    if (!status.paired) return;
+    let theirs: string[] = [];
+    try {
+      theirs = await invoke<string[]>('remote_dislikes');
+    } catch {
+      return;
+    }
+    const agreed = dislikedSnapshot();
+    const additions = additionsFromTheOtherCopy(theirs, new Set(dislikedFileIds()), agreed);
+    if (additions.length > 0) {
+      dislikedOrphans = [...dislikedOrphans, ...additions.filter((fileId) => !dislikedOrphans.includes(fileId))];
+      saveDislikedOrphans();
+      await resolveDislikedOrphans();
+    }
+    const now = dislikedFileIds();
+    if (theirs.length === now.length && theirs.every((fileId) => now.includes(fileId))) {
+      saveLikes(dislikedSyncedKey, theirs);
+      return;
+    }
+    await pushDislikesToHome();
+  }
+
+  /** Turn turned-off ids this phone cannot draw yet into records, when it can. */
+  async function resolveDislikedOrphans() {
+    if (dislikedOrphans.length === 0 || !anyoneReachable) return;
+    const asked = dislikedOrphans.slice(0, MAX_LIKED_RESOLVE);
+    const answered = await tracksByIds(asked);
+    if (answered.length === 0) return;
+    const found = new Set(answered.map((track) => track.fileId));
+    dislikedMusic = [...dislikedMusic, ...answered.filter((track) => !isTrackDisliked(track))];
+    saveLikes(dislikedMusicKey, dislikedMusic);
+    dislikedOrphans = dislikedOrphans.filter((fileId) => !found.has(fileId));
+    saveDislikedOrphans();
+    if (showingDisliked) {
+      tracks = [...dislikedMusic];
+      total = tracks.length;
+    }
+  }
+
+  /**
+   * Turn a track off: it is written down here and on the computer, the queue
+   * moves on, and the toast holds the way back.
+   *
+   * A read-only pairing can do this. The list is kept under this phone's key and
+   * guarded by the key proof rather than by a right, so a phone lent only the
+   * library - the one that has most reason to want a track gone - is not the one
+   * that cannot say so.
+   */
+  async function dislikeTrack(track: RemoteTrack) {
+    const already = isTrackDisliked(track);
+    if (!already) {
+      dislikedMusic = [track, ...dislikedMusic.filter((item) => item.fileId !== track.fileId)].slice(0, 1000);
+      // One or the other, never both: a track cannot be the one you want and the
+      // one you never want again.
+      likedMusic = likedMusic.filter((item) => item.fileId !== track.fileId);
+      dislikedOrphans = dislikedOrphans.filter((fileId) => fileId !== track.fileId);
+      saveLikes(dislikedMusicKey, dislikedMusic);
+      saveLikes(likedMusicKey, likedMusic);
+      saveDislikedOrphans();
+      void pushDislikesToHome();
+      void pushLikesToHome();
+    }
+    dislikeNotice = { fileId: track.fileId, title: title(track) };
+    // Something turned off mid-track should stop being what is playing. The
+    // queue moves on the way a skip does, and a track that was the last one
+    // simply stops.
+    if (current?.fileId === track.fileId) {
+      await moveTrack(1);
+      // The skip has its own thing to say sometimes - a track it had to pass over
+      // because it had not arrived. That message is about the track *after* this
+      // decision, and it would sit under the one that carries the way back, or
+      // worse, appear alone a moment after the person read about something else.
+      notice = '';
+    }
+  }
+
+  /**
+   * Allow a track again, from the toast or from the list itself.
+   *
+   * This is the half of the feature that makes it usable: a dislike is a guess
+   * about a track, and a guess made with a thumb on a dashboard has to be
+   * cheap to take back. Nothing is restored to the queue - the moment has
+   * passed - so it says what actually happened.
+   */
+  function allowTrackAgain(track: RemoteTrack | { fileId: string; title: string }) {
+    const before = dislikedFileIds().length;
+    dislikedMusic = dislikedMusic.filter((item) => item.fileId !== track.fileId);
+    dislikedOrphans = dislikedOrphans.filter((fileId) => fileId !== track.fileId);
+    saveLikes(dislikedMusicKey, dislikedMusic);
+    saveDislikedOrphans();
+    void pushDislikesToHome();
+    if (before !== dislikedFileIds().length) {
+      notice = `“${track.title}” can be played again`;
+    }
+    if (showingDisliked) {
+      tracks = [...dislikedMusic];
+      total = tracks.length;
+    }
+  }
+
+  function showDislikedTracks() {
+    showSettings = false;
+    showingDisliked = true;
+    tracks = [...dislikedMusic];
+    total = tracks.length;
+  }
+
+  function closeDislikedTracks() {
+    showingDisliked = false;
+    void searchTracks(query);
+  }
+
   function isPodcastLiked(feed: PodcastFeed) {
     return likedPodcasts.some((item) => item.id === feed.id);
   }
-
   function togglePodcastLike(feed: PodcastFeed) {
     likedPodcasts = isPodcastLiked(feed)
       ? likedPodcasts.filter((item) => item.id !== feed.id)
@@ -1569,6 +1804,20 @@
   }
 
   /**
+   * Whether a track may be *chosen* by the player, as opposed to played by hand.
+   *
+   * This is the whole of what a dislike does: it takes a track out of every
+   * automatic choice - the next one, the shuffle draw, the filler a network run
+   * backfills with - and leaves it alone everywhere a person is the one pointing
+   * at it. Tapping a row in a list, a search result, or a playlist still plays
+   * the file, because a dislike is a standing instruction about what the player
+   * should not do on its own rather than a lock on the record.
+   */
+  function mayBeChosen(track: RemoteTrack): boolean {
+    return playableNow(track) && !isTrackDisliked(track);
+  }
+
+  /**
    * The nearest entry beyond `from`, in the direction of play, that can play now.
    *
    * Forwards is the queue's own order, which is what "nearest" means when a track
@@ -1589,7 +1838,7 @@
       const start = direction === 1 ? 0 : length - 1;
       for (let index = start; index !== from; index += direction) order.push(index);
     }
-    return order.find((index) => playableNow(playerQueue[index])) ?? -1;
+    return order.find((index) => mayBeChosen(playerQueue[index])) ?? -1;
   }
 
   /**
@@ -1632,11 +1881,11 @@
     return true;
   }
 
-  /** A random entry that can play now, other than `excluded`, or -1. */
+  /** A random entry this phone may play on its own, other than `excluded`, or -1. */
   function randomPlayableExcept(excluded: number): number {
     const pool = playerQueue
       .map((_, index) => index)
-      .filter((index) => index !== excluded && playableNow(playerQueue[index]));
+      .filter((index) => index !== excluded && mayBeChosen(playerQueue[index]));
     if (pool.length === 0) return -1;
     return pool[Math.floor(Math.random() * pool.length)];
   }
@@ -1688,6 +1937,20 @@
   function toggleShownLike() {
     const track = shownTrack;
     if (track) toggleTrackLike(track);
+  }
+
+  /**
+   * Turn off whatever the drawer is showing, whichever player owns it.
+   *
+   * The list is this phone's, like the liked one, and it names files - which are
+   * the same files either player holds. A track playing on the computer is
+   * turned off here, in the list under this phone's key, and a queue that the
+   * computer is building is not something this can reach into: what stops is
+   * what this phone would do next, which is the honest half of it.
+   */
+  function dislikeShownTrack() {
+    const track = shownTrack;
+    if (track) void dislikeTrack(track);
   }
 
   function readableSize(size: number) {
@@ -2124,7 +2387,9 @@
    */
   function randomOwnedTrack(run: RemoteTrack[]): RemoteTrack | null {
     const named = new Set(run.map((track) => track.fileId));
-    const spare = tracks.filter((track) => track.local && !named.has(track.fileId));
+    // Never one that was turned off: this is the player choosing, which is
+    // exactly what the list is about.
+    const spare = tracks.filter((track) => mayBeChosen(track) && !named.has(track.fileId));
     if (spare.length === 0) return null;
     return spare[Math.floor(Math.random() * spare.length)];
   }
@@ -2148,7 +2413,7 @@
    */
   function withOwnRunway(discovery: RemoteTrack[], exclude: RemoteTrack[] = []): RemoteTrack[] {
     const taken = new Set([...discovery, ...exclude].map((track) => track.fileId));
-    const owned = tracks.filter((track) => track.local && !taken.has(track.fileId));
+    const owned = tracks.filter((track) => mayBeChosen(track) && !taken.has(track.fileId));
     // Shuffled, so a long run is not filled by the same handful of records - and
     // properly, rather than by sorting on a coin toss.
     for (let index = owned.length - 1; index > 0; index -= 1) {
@@ -3959,6 +4224,12 @@
         if (likedMusic.some((item) => item.fileId === pendingFileId)) {
           saveLikes(likedMusicKey, likedMusic);
         }
+        // The never-play list keeps the same records, so it needs the same
+        // refresh - otherwise a track turned off before it arrived would stay
+        // stuck in that list as a row that says it is still missing.
+        if (dislikedMusic.some((item) => item.fileId === pendingFileId)) {
+          saveLikes(dislikedMusicKey, dislikedMusic);
+        }
         const next = new Map(pending);
         next.delete(pendingFileId);
         pending = next;
@@ -4436,6 +4707,7 @@
       !!discussionTrack ||
       (showNowPlaying && !sheetClosing) ||
       showingLikedMusic ||
+      showingDisliked ||
       !!playlistDraft ||
       activeTab !== 'music'
   );
@@ -6424,6 +6696,16 @@
       }
     } catch { likedOrphans = []; }
     try {
+      const saved = JSON.parse(window.localStorage.getItem(dislikedMusicKey) || '[]') as unknown;
+      if (Array.isArray(saved)) dislikedMusic = saved.filter(isStoredTrack).slice(0, 1000);
+    } catch { dislikedMusic = []; }
+    try {
+      const saved = JSON.parse(window.localStorage.getItem(dislikedOrphansKey) || '[]') as unknown;
+      if (Array.isArray(saved)) {
+        dislikedOrphans = saved.filter((fileId): fileId is string => typeof fileId === 'string').slice(0, 1000);
+      }
+    } catch { dislikedOrphans = []; }
+    try {
       const saved = JSON.parse(window.localStorage.getItem(likedPodcastsKey) || '[]') as unknown;
       if (Array.isArray(saved)) {
         likedPodcasts = saved.filter(isStoredPodcast).slice(0, 500).map((feed) => ({
@@ -6719,7 +7001,19 @@
     <!-- On a desktop this is the middle column of the shell grid. -->
     <div class="app-content">
       {#if error}<button class="error-banner" onclick={() => (error = '')}>{$t(error)}<span>×</span></button>{/if}
-      {#if notice}{#key notice}<div class="toast" role="status">{$t(notice)}</div>{/key}{/if}
+      <!-- The one toast that carries an action, and the reason it is its own
+           element rather than a longer notice: an Undo has to be a button, and a
+           button has to belong to the message it undoes. While this is up it is
+           the only thing shown, because the decision it reports is the newest
+           thing that happened and the way back is worth more than a status line. -->
+      {#if dislikeNotice}
+        <div class="toast toast-action" role="status">
+          <span>{$t("{p0} will not be played again", { p0: dislikeNotice.title })}</span>
+          <button onclick={() => { const undone = dislikeNotice; dislikeNotice = null; if (undone) void allowTrackAgain(undone); }}>
+            {$t("Undo")}
+          </button>
+        </div>
+      {:else if notice}{#key notice}<div class="toast" role="status">{$t(notice)}</div>{/key}{/if}
 
       {#if activeTab === 'search'}
         <section class="search-area">
@@ -7550,6 +7844,14 @@
                 <path d="M12 20.3c-1.4-1-7.2-5.2-7.2-9.4A4.2 4.2 0 0 1 12 8.2a4.2 4.2 0 0 1 7.2 2.7c0 4.2-5.8 8.4-7.2 9.4z" />
               </svg>
             </button>
+            <!-- Next to the heart rather than in a menu: this one both says a track
+                 is never wanted and moves on from it, which is a thing done while
+                 listening. It is where a thumb already is on a dashboard. -->
+            <button class="now-mode-dislike" class:disliked={shownDisliked} onclick={dislikeShownTrack} aria-label={$t("Never play this again")} disabled={!shownTrack}>
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <circle cx="12" cy="12" r="8.2" /><path d="M6.4 17.6 17.6 6.4" />
+              </svg>
+            </button>
           </div>
 
           <!-- The social card: always here, one line tall when nobody has spoken,
@@ -7692,6 +7994,16 @@
             <span>{$t("Play on")}</span>
             <small>{playbackTargetLabel()}</small>
           </button>
+          <!-- Under Playback because it is a rule about what plays, and it is
+               the only list in here that has to be looked at to be believed. The
+               count is the row's own answer to whether the list is empty, so the
+               screen it opens is never a surprise. -->
+          <button class="settings-row" onclick={showDislikedTracks}>
+            <span>{$t("Songs not played again")}</span>
+            <small>{dislikedFileIds().length === 0
+              ? $t("Nothing turned off yet")
+              : $t("{p0} turned off", { p0: String(dislikedFileIds().length) })}</small>
+          </button>
         </div>
       {/if}
 
@@ -7812,6 +8124,54 @@
       <div class="settings-section language-section">
         <LanguageSelect />
       </div>
+    </div>
+  </div>
+{/if}
+
+<!-- The songs this phone will not play on its own. Opened from Settings rather
+     than from a chip beside the search field, because it is a list to inspect
+     when something is missing from a queue, not a place to browse. Each row
+     carries the way back, so nothing here needs a menu. -->
+{#if showingDisliked}
+  <div class="settings-view disliked-page" role="dialog" aria-modal="true" aria-label={$t("Songs not played again")}>
+    <header class="view-head">
+      <h1>{$t("Songs not played again")}</h1>
+      <button class="view-icon" onclick={closeDislikedTracks} aria-label={$t("Close")}>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6.5 6.5 17.5 17.5" /><path d="M17.5 6.5 6.5 17.5" /></svg>
+      </button>
+    </header>
+    <div class="settings-scroll">
+      <p class="settings-note">{$t("The player skips these when it is choosing on its own. Tapping one still plays it, and letting one back in takes it off this list.")}</p>
+      {#if dislikedMusic.length === 0 && dislikedOrphans.length === 0}
+        <div class="empty-library">
+          <h2>{$t("Nothing is turned off")}</h2>
+          <p>{$t("Use the Dislike button while something is playing and it will wait here.")}</p>
+        </div>
+      {:else}
+        <div class="track-list" role="list">
+          {#each dislikedMusic as track (track.fileId)}
+            <div class="track-row disliked" role="listitem">
+              <span class="track-copy">
+                <strong>{title(track)}</strong>
+                <small>{artist(track)}{track.album ? ` — ${track.album}` : ''}</small>
+              </span>
+              <button class="settings-action allow-again" onclick={() => void allowTrackAgain(track)} aria-label={$t("Allow {p0} again", { p0: title(track) })}>{$t("Allow again")}</button>
+            </div>
+          {/each}
+          <!-- An id the library has not described yet is still a track this phone
+               will not play, so it is listed rather than hidden: a row nobody can
+               read is better than a decision nobody can take back. -->
+          {#each dislikedOrphans as fileId (fileId)}
+            <div class="track-row disliked" role="listitem">
+              <span class="track-copy">
+                <strong>{$t("A track this phone cannot name yet")}</strong>
+                <small>{fileId.slice(0, 16)}…</small>
+              </span>
+              <button class="settings-action allow-again" onclick={() => void allowTrackAgain({ fileId, title: fileId.slice(0, 16) })} aria-label={$t("Allow this track again")}>{$t("Allow again")}</button>
+            </div>
+          {/each}
+        </div>
+      {/if}
     </div>
   </div>
 {/if}
@@ -8253,6 +8613,11 @@
         <button class="actions-row" onclick={() => toggleTrackLike(menuTrack)}>
           <svg class:filled={isTrackLiked(menuTrack)} viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20.3c-1.4-1-7.2-5.2-7.2-9.4A4.2 4.2 0 0 1 12 8.2a4.2 4.2 0 0 1 7.2 2.7c0 4.2-5.8 8.4-7.2 9.4z" /></svg>
           <span>{isTrackLiked(menuTrack) ? 'Remove from Liked Songs' : 'Add to Liked Songs'}</span>
+        </button>
+        <button class="actions-row" onclick={() => void dislikeTrack(menuTrack as RemoteTrack)}>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.2" /><path d="M6.4 17.6 17.6 6.4" /></svg>
+          <span>{$t("Never play this again")}</span>
+          {#if isTrackDisliked(menuTrack)}<small>{$t("Already in the list")}</small>{/if}
         </button>
         <button class="actions-row" disabled={playbackTarget === 'desktop'} onclick={() => addToQueue(menuTrack as RemoteTrack)}>
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h10" /><path d="M4 12h10" /><path d="M4 17h6" /><path d="M18 11.5V19" /><path d="M15 16l3 3 3-3" /></svg>

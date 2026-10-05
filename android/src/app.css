@@ -96,6 +96,13 @@ audio { display: none; }
 .toast { position: fixed; z-index: 45; top: calc(env(safe-area-inset-top) + 6px); right: 17px; left: 17px; max-width: 686px; margin: 0 auto; padding: 11px 14px; color: #d9ffe1; background: rgba(22,51,30,.94); border: 1px solid #29643a; border-radius: 12px; box-shadow: 0 14px 34px rgba(0,0,0,.55); backdrop-filter: blur(14px) saturate(1.2); -webkit-backdrop-filter: blur(14px) saturate(1.2); font-size: 14px; line-height: 1.35; overflow-wrap: anywhere; text-align: left; animation: toast-in .22s ease-out, toast-out .5s ease-in 3.6s forwards; }
 @keyframes toast-in { from { opacity: 0; transform: translateY(-10px) scale(.98); } }
 @keyframes toast-out { to { opacity: 0; transform: translateY(-8px); } }
+/* The one toast that carries a decision back. Red rather than green, because it
+   reports something being turned off, and a row rather than a line, because an
+   Undo has to be reachable with the same thumb that made the mistake. */
+.toast.toast-action { display: flex; gap: 12px; align-items: center; color: #f8dede; background: rgba(58,17,20,.95); border-color: #7d2229; }
+.toast.toast-action > span { flex: 1 1 auto; min-width: 0; }
+.toast.toast-action button { flex: 0 0 auto; padding: 7px 15px; color: #ffe2e2; background: rgba(255,255,255,.1); border: 1px solid rgba(255,255,255,.3); border-radius: 18px; font-size: 13px; font-weight: 700; }
+.toast.toast-action button:active { background: rgba(255,255,255,.22); }
 
 .library-heading { padding: 20px 20px 9px; display: flex; align-items: end; justify-content: space-between; gap: 15px; }.library-heading p { margin: 0 0 4px; color: #8b84e9; font-size: 10px; font-weight: 800; letter-spacing: .18em; }.library-heading h1 { max-width: 70vw; margin: 0; overflow: hidden; font-size: 28px; letter-spacing: -.035em; text-overflow: ellipsis; white-space: nowrap; }.library-heading > span { flex: 0 0 auto; padding-bottom: 4px; color: #85858d; font-size: 12px; }
 .track-list { min-height: 250px; padding: 0 10px 22px; }.track-row { width: 100%; min-height: 72px; padding: 6px 5px 6px 7px; display: flex; align-items: center; color: white; background: transparent; border-radius: 10px; text-align: left; }.track-row.selected { background: #202027; }.track-row.remote { color: #e8e8ed; }.track-open { min-width: 0; padding: 0; flex: 1; display: grid; grid-template-columns: 58px minmax(0, 1fr) 46px; gap: 10px; align-items: center; color: inherit; background: transparent; border: 0; text-align: left; }.track-copy { min-width: 0; }.track-copy strong, .track-copy small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.track-copy strong { font-size: 16px; font-weight: 620; letter-spacing: -.018em; }.track-copy small { margin-top: 5px; color: #a2a2aa; font-size: 13px; }.track-meta { display: block; margin-top: 4px; overflow: hidden; color: #777780; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
@@ -121,6 +128,18 @@ audio { display: none; }
 .track-row.liked .track-copy strong::after,
 .queue-row.liked .queue-copy strong::after,
 .album-tracks li.liked .album-track-copy strong::after { content: ""; display: block; width: 40px; height: 2px; margin-top: 3px; border-radius: 2px; background: linear-gradient(90deg, #f2d08a, rgba(224,166,63,0)); }
+/* The opposite answer, marked the same way and told apart by colour: the same
+   short rule under the title, in a murky deep red instead of gold. The title
+   itself is a light dusty red rather than the same dark tone as the rule, because
+   a deep red on a near-black row is the one combination that reads as damage
+   rather than as a decision. The rule is a shape as well as a colour, so the two
+   states stay apart in greyscale. */
+.track-row.disliked .track-copy strong,
+.queue-row.disliked .queue-copy strong,
+.album-tracks li.disliked .album-track-copy strong { color: #e59a9a; }
+.track-row.disliked .track-copy strong::after,
+.queue-row.disliked .queue-copy strong::after,
+.album-tracks li.disliked .album-track-copy strong::after { content: ""; display: block; width: 40px; height: 2px; margin-top: 3px; border-radius: 2px; background: linear-gradient(90deg, #8c1f26, rgba(140,31,38,0)); }
 .artwork { width: 58px; height: 58px; overflow: hidden; background: linear-gradient(145deg, hsl(var(--cover-hue) 58% 44%), hsl(calc(var(--cover-hue) + 70) 45% 16%)); border-radius: 6px; box-shadow: 0 4px 10px rgba(0,0,0,.35); }.artwork img { width: 100%; height: 100%; object-fit: cover; }.artwork img.fallback { padding: 8px; object-fit: contain; filter: drop-shadow(0 3px 4px rgba(0,0,0,.45)); }.artwork.large { width: 52px; height: 52px; flex: 0 0 auto; }
 .loading-list { min-height: 230px; display: grid; place-items: center; align-content: center; gap: 13px; color: #9a9aa2; }.loading-list i { width: 28px; height: 28px; border: 3px solid #33333b; border-top-color: #a69eff; border-radius: 50%; animation: spin .8s linear infinite; }.empty-library { min-height: 290px; display: flex; flex-direction: column; align-items: center; justify-content: center; color: #aaaab2; text-align: center; }.empty-library img { width: 70px; opacity: .65; }.empty-library h2 { margin: 14px 0 2px; color: #eee; }.empty-library p { max-width: 270px; margin: 4px; }.load-more { width: calc(100% - 18px); min-height: 45px; margin: 12px 9px; color: #ddd; background: #202025; border: 1px solid #33333a; border-radius: 23px; }
 
@@ -366,6 +385,13 @@ audio { display: none; }
 .now-sheet-modes button.active { color: #ffffff; background: rgba(255,255,255,.08); }
 .now-sheet-modes button:disabled { color: #4b4b53; }
 .now-sheet-modes button.liked { color: #ff5576; }.now-sheet-modes button.liked svg { fill: currentColor; }
+.now-sheet-modes button.now-mode-dislike { color: #d98a8a; }
+.now-sheet-modes button.now-mode-dislike.disliked { color: #ff8f8f; }
+/* The list of turned-off songs, opened from Settings. Rows are the library's own
+   rows, so a track looks the same here as everywhere it is listed; the only new
+   thing is the way back, which sits where a row's menu would. */
+.disliked-page .track-copy { flex: 1 1 auto; }
+.disliked-page .allow-again { color: #cfe8d2; background: #16211a; border-color: #26382c; }
 .now-sheet-modes svg { width: 33px; height: 33px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
 svg .filled { fill: currentColor; stroke: none; }
 .now-sheet-actions .skip-button svg { width: 30px; height: 30px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }

@@ -77,17 +77,28 @@ export async function mockNative(page, { app = 'napstrfy', nativeLocale = 'en-GB
     // The key a phone's own things are filed under is the phone's, not the
     // computer's, so the stand-in reads it from the identity it hands out.
     const phonePubkey = () => (window.nostrIdentity ?? { pubkey: 'c'.repeat(64) }).pubkey;
-    // What a computer holds for this phone's key: liked file ids, kept the way
-    // the host keeps them - 64 hex characters, once each, in the order given.
-    const hostLikes = () => window.hostLikes ?? [];
-    const storeHostLikes = (fileIds) => {
+    // What a computer holds for this phone's key: file ids, kept the way the host
+    // keeps them - 64 hex characters, once each, in the order given.
+    const cleanedIds = (fileIds) => {
       const wanted = [];
       for (const fileId of fileIds ?? []) {
         const clean = String(fileId ?? '').trim().toLowerCase();
         if (clean.length === 64 && /^[0-9a-f]+$/.test(clean) && !wanted.includes(clean)) wanted.push(clean);
       }
-      window.hostLikes = wanted;
       return wanted;
+    };
+    const hostLikes = () => window.hostLikes ?? [];
+    const storeHostLikes = (fileIds) => {
+      window.hostLikes = cleanedIds(fileIds);
+      return window.hostLikes;
+    };
+    // The never-play list is a list of its own on the host, so it is one on the
+    // stand-in too: a track can be liked and turned off at once, and neither list
+    // may move the other.
+    const hostDislikes = () => window.hostDislikes ?? [];
+    const storeHostDislikes = (fileIds) => {
+      window.hostDislikes = cleanedIds(fileIds);
+      return window.hostDislikes;
     };
     const findPlaylist = (author, playlistId) =>
       playlistRows().find((row) => row.playlistId === playlistId && (!author || row.author === author)) ?? null;
@@ -385,16 +396,19 @@ export async function mockNative(page, { app = 'napstrfy', nativeLocale = 'en-GB
             return savePlaylistRow({ ...args.playlist, author: phonePubkey(), updatedAt: 1787000000 });
           case 'remote_likes': return hostLikes();
           case 'remote_set_likes': return storeHostLikes(args.fileIds);
+          case 'remote_dislikes': return hostDislikes();
+          case 'remote_set_dislikes': return storeHostDislikes(args.fileIds);
           case 'carry_own_data': {
             // The computer being left is the one thing that can make this fail,
             // and the failure has to be visible rather than silent: nothing is
             // lost, but a page that said "moved" would be lying.
             if (window.carryFails) throw 'the computer being left is not answering';
             const moved = storeHostLikes([...hostLikes(), ...(args.likes ?? [])]);
+            const turnedOff = storeHostDislikes([...hostDislikes(), ...(args.dislikes ?? [])]);
             const mine = playlistSummaries().filter((row) => !row.author || row.author === phonePubkey());
             window.carriedTo = args.to;
             window.carriedFrom = args.from;
-            return { likes: moved.length, playlists: mine.length, skipped: 0, failed: [] };
+            return { likes: moved.length, dislikes: turnedOff.length, playlists: mine.length, skipped: 0, failed: [] };
           }
           case 'remote_publish_playlist':
             return filePlaylistRevision(args.playlist, { published: true });
