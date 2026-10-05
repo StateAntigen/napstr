@@ -958,6 +958,37 @@ pub(crate) fn upsert_verified_file(
     Ok(())
 }
 
+/// Spare the row of a file that is still there but could not be read.
+///
+/// The walk's final sweep deletes every row it did not verify, and for a file that
+/// has gone that is right: a row for a file this computer cannot serve is a row
+/// that lies about what it can hand out. It is the wrong answer for a file the
+/// walk *met* and failed to read. A transient error over a network share, a
+/// half-written download, or a tag the parser cannot make sense of would otherwise
+/// withdraw a track that is still on disk - and the next good walk would publish it
+/// again, so the catalogue would flap.
+///
+/// A file with no row yet has nothing to spare and nothing is withdrawn for it.
+/// The row that is kept is the one the index was already serving, so what is kept
+/// is what was already true; if those bytes have since changed, serving re-hashes
+/// them and refuses rather than handing out something that is not what was asked.
+fn keep_unreadable_index_row(
+    connection: &Connection,
+    existing: &HashMap<String, (String, u64, i64, i64)>,
+    path: &Path,
+) -> Result<(), String> {
+    let Some((file_id, _, _, _)) = existing.get(path.to_string_lossy().as_ref()) else {
+        return Ok(());
+    };
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO napstr_seen(file_id) VALUES (?1)",
+            [file_id],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 fn supported_audio_path(path: &Path) -> bool {
     path.extension()
         .and_then(|value| value.to_str())
@@ -1106,6 +1137,9 @@ fn index_path_with_progress(
             Ok(metadata) => metadata,
             Err(error) => {
                 record_index_error(&mut report, format!("{}: {error}", path.display()));
+                // It was here when the walk listed it and cannot be read now, so it
+                // is unread rather than absent: its row stays.
+                keep_unreadable_index_row(connection, &existing, path)?;
                 continue;
             }
         };
@@ -1146,10 +1180,12 @@ fn index_path_with_progress(
                                     path.display()
                                 ),
                             );
+                            keep_unreadable_index_row(connection, &existing, path)?;
                         }
                     }
                     Err(error) => {
-                        record_index_error(&mut report, format!("{}: {}", path.display(), error))
+                        record_index_error(&mut report, format!("{}: {}", path.display(), error));
+                        keep_unreadable_index_row(connection, &existing, path)?;
                     }
                 }
             }
@@ -1157,7 +1193,8 @@ fn index_path_with_progress(
             match validate_and_hash_index_file(path, current_modified_ns) {
                 Ok(file) => verified.push(file),
                 Err(error) => {
-                    record_index_error(&mut report, format!("{}: {}", path.display(), error))
+                    record_index_error(&mut report, format!("{}: {}", path.display(), error));
+                    keep_unreadable_index_row(connection, &existing, path)?;
                 }
             }
         }
@@ -1427,14 +1464,22 @@ fn index_scope(events: &[notify::Event]) -> IndexScope {
 /// The event already says where the change is, so the library is not asked. This is
 /// what makes a downloaded track appear in this computer's index - and so on a
 /// paired phone - in the moment the bytes land rather than at the end of a walk.
+///
+/// It takes the walk's own lock, and it is the same one for the same reason: a burst
+/// that lands a new download used to run beside a walk, and the walk's final sweep
+/// deletes every row it did not verify - so the row this job had just written could
+/// be withdrawn a moment later by a walk that never saw the file. Being slow is not
+/// the cost of the lock; being absent from the index is.
 fn run_path_index_job(
     db_path: &Path,
     folder: &Path,
     paths: &[PathBuf],
+    scan_lock: &Mutex<()>,
     app_handle: &tauri::AppHandle,
     network: &Arc<network::NetworkService>,
     covers: &Arc<cover_publish::CoverPublisher>,
 ) -> Result<IndexReport, String> {
+    let _scan_guard = scan_lock.lock().map_err(|_| "library scan lock poisoned")?;
     let mut connection = open_connection(db_path)?;
     let mut report = IndexReport {
         file_count: 0,
@@ -1512,6 +1557,7 @@ fn start_folder_watcher(
                         &db_path,
                         &folder,
                         &paths,
+                        &scan_lock,
                         &app_handle,
                         &network,
                         &covers,
@@ -1533,6 +1579,78 @@ fn start_folder_watcher(
         })
         .map_err(|error| error.to_string())?;
     Ok(FolderWatcher { _watcher: watcher })
+}
+
+/// How often the waiting thread asks whether the shared folder is back.
+const FOLDER_WAIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+/// How many times it asks. An hour is long past any remount or reconnect, and a
+/// folder that has not appeared by then is one to press Rescan for once it is there.
+const FOLDER_WAIT_ATTEMPTS: usize = 240;
+
+/// Wait for the shared folder to appear, then watch it and walk it.
+///
+/// A folder that is not a directory when Napstr starts is nearly always a network
+/// share that has not been mounted yet rather than one that has been deleted, and
+/// the difference decides what happens to the index: nothing is emptied for it, so
+/// what is missing is the watcher and the walk. This thread is what makes a share
+/// that arrives a minute - or ten - after the app a library that is live again
+/// without anybody doing anything, and it ends as soon as the folder is there.
+fn wait_for_folder_and_watch(
+    folder: PathBuf,
+    db_path: PathBuf,
+    app_handle: tauri::AppHandle,
+    network: Arc<network::NetworkService>,
+    covers: Arc<cover_publish::CoverPublisher>,
+    scan_lock: Arc<Mutex<()>>,
+    scan_cancel: Arc<AtomicBool>,
+) {
+    for _ in 0..FOLDER_WAIT_ATTEMPTS {
+        std::thread::sleep(FOLDER_WAIT_INTERVAL);
+        if !folder.is_dir() {
+            continue;
+        }
+        match start_folder_watcher(
+            folder.clone(),
+            db_path.clone(),
+            network.clone(),
+            covers.clone(),
+            scan_lock.clone(),
+            scan_cancel.clone(),
+            app_handle.clone(),
+        ) {
+            Ok(watcher) => {
+                // Kept where every other watcher lives, or it would be dropped
+                // here and the folder would stop being watched the moment this
+                // thread returned.
+                if let Some(state) = app_handle.try_state::<AppState>() {
+                    if let Ok(mut slot) = state.watcher.lock() {
+                        *slot = Some(watcher);
+                    }
+                }
+                // The folder was unreachable for a while, so everything that
+                // changed while it was away is absent from the index: only a walk
+                // can say what is in there now.
+                let _ = run_index_job(
+                    &db_path,
+                    &folder,
+                    &scan_lock,
+                    &scan_cancel,
+                    &app_handle,
+                    &network,
+                    &covers,
+                );
+                return;
+            }
+            Err(error) => {
+                eprintln!("The Napstr folder is back but could not be watched: {error}");
+                return;
+            }
+        }
+    }
+    eprintln!(
+        "The Napstr folder {} was not there when Napstr started and has not appeared since; press Rescan once it is mounted.",
+        folder.display()
+    );
 }
 
 #[tauri::command]
@@ -2411,7 +2529,13 @@ fn toggle_maximise(window: tauri::Window) -> Result<(), String> {
 #[tauri::command]
 async fn close_window(window: tauri::Window, state: State<'_, AppState>) -> Result<(), String> {
     state.network.stop().await;
-    state.network.preserve_interrupted_downloads()?;
+    // Rotating pending requests has to happen before Tor goes, so that old workers
+    // cannot turn a normal exit into a permanent failed download - but it must not
+    // be able to stop the exit itself. A database that will not answer is a reason
+    // to close anyway, and the window used to stay open in exactly that case.
+    if let Err(error) = state.network.preserve_interrupted_downloads() {
+        eprintln!("Could not preserve interrupted downloads: {error}");
+    }
     state.tor.stop().await;
     state.mobile.stop().await;
     window.close().map_err(|error| error.to_string())
@@ -2850,11 +2974,17 @@ pub fn run() {
                     eprintln!("Could not clean abandoned temporary downloads: {error}");
                 }
             }
+            // A folder that is not a directory right now is almost never a folder
+            // that has gone: this library is very often a network share, and a share
+            // that is not mounted yet - or is being remounted - looks exactly like
+            // one that was deleted. The index is therefore left untouched. Emptying
+            // it would take the whole library off every paired phone until somebody
+            // noticed and pressed Rescan, whereas the far smaller truth is that a
+            // file this computer cannot reach is refused where it is served. What is
+            // missing for the absent case is the watcher and the walk, and the thread
+            // below supplies both when the folder turns up.
             let watcher = existing_folder.and_then(|folder| {
                 if !folder.is_dir() {
-                    if let Ok(connection) = open_connection(&db_path) {
-                        let _ = connection.execute("DELETE FROM files", []);
-                    }
                     return None;
                 }
                 start_folder_watcher(
@@ -2887,25 +3017,56 @@ pub fn run() {
                     let _ = mobile.start().await;
                 });
             }
-            if let Some(folder) = startup_folder.filter(|folder| folder.is_dir()) {
-                let startup_db_path = app
-                    .path()
-                    .app_data_dir()
-                    .map_err(|error| error.to_string())?
-                    .join("napstr.sqlite3");
-                let startup_handle = app.handle().clone();
-                let startup_covers = covers.clone();
-                tauri::async_runtime::spawn_blocking(move || {
-                    let _ = run_index_job(
-                        &startup_db_path,
-                        &folder,
-                        &scan_lock,
-                        &scan_cancel,
-                        &startup_handle,
-                        &network,
-                        &startup_covers,
-                    );
-                });
+            match startup_folder {
+                // The folder is here: the watcher is already on it, so all that is
+                // left is to walk it.
+                Some(folder) if folder.is_dir() => {
+                    let startup_db_path = app
+                        .path()
+                        .app_data_dir()
+                        .map_err(|error| error.to_string())?
+                        .join("napstr.sqlite3");
+                    let startup_handle = app.handle().clone();
+                    let startup_covers = covers.clone();
+                    tauri::async_runtime::spawn_blocking(move || {
+                        let _ = run_index_job(
+                            &startup_db_path,
+                            &folder,
+                            &scan_lock,
+                            &scan_cancel,
+                            &startup_handle,
+                            &network,
+                            &startup_covers,
+                        );
+                    });
+                }
+                // It is not here. Nothing was emptied for it, so what is missing is
+                // the watcher and the walk: a thread waits for the path to come back
+                // and then does both.
+                Some(folder) => {
+                    let startup_db_path = app
+                        .path()
+                        .app_data_dir()
+                        .map_err(|error| error.to_string())?
+                        .join("napstr.sqlite3");
+                    let retry_handle = app.handle().clone();
+                    let retry_network = network.clone();
+                    let retry_covers = covers.clone();
+                    let retry_lock = scan_lock.clone();
+                    let retry_cancel = scan_cancel.clone();
+                    tauri::async_runtime::spawn_blocking(move || {
+                        wait_for_folder_and_watch(
+                            folder,
+                            startup_db_path,
+                            retry_handle,
+                            retry_network,
+                            retry_covers,
+                            retry_lock,
+                            retry_cancel,
+                        );
+                    });
+                }
+                None => {}
             }
             Ok(())
         })
@@ -3409,6 +3570,53 @@ mod tests {
         assert_eq!(report.file_count, 0);
         assert_eq!(report.error_count, MAX_INDEX_ERRORS + 5);
         assert_eq!(report.errors.len(), MAX_INDEX_ERRORS);
+        drop(connection);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A file the walk could not read is not a file that has gone.
+    ///
+    /// The walk ends by deleting every row it did not verify, which is right for a
+    /// file that vanished and wrong for one that is still there. A half-written
+    /// download, a corrupt tag, or one transient error over a network share used to
+    /// withdraw a track from every paired phone - and the next good walk would
+    /// publish it again, so the catalogue flapped.
+    #[test]
+    fn a_file_that_cannot_be_read_keeps_the_row_it_had() {
+        let directory = test_directory("unreadable-index-row-test");
+        fs::create_dir_all(&directory).unwrap();
+        let audio = directory.join("track.wav");
+        let mut bytes = b"RIFF".to_vec();
+        bytes.extend_from_slice(&40u32.to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt \x10\0\0\0\x01\0\x01\0\x44\xac\0\0\x88\x58\x01\0\x02\0\x10\0data\x04\0\0\0");
+        bytes.extend_from_slice(&7u32.to_le_bytes());
+        fs::write(&audio, bytes).unwrap();
+        let db_path = directory.join("napstr.sqlite3");
+        initialise_database(&db_path, &directory).unwrap();
+        let mut connection = open_connection(&db_path).unwrap();
+        assert_eq!(
+            index_path(&mut connection, &directory).unwrap().file_count,
+            1
+        );
+        let indexed = load_files(&connection, None).unwrap();
+        assert_eq!(indexed.len(), 1);
+        let file_id = indexed[0].file_id.clone();
+
+        // The bytes are replaced with something no parser can make sense of, and
+        // the size changes with them, so the walk has to read the file again and
+        // cannot.
+        fs::write(&audio, b"not audio").unwrap();
+        let report = index_path(&mut connection, &directory).unwrap();
+
+        assert_eq!(report.error_count, 1, "the failure is still reported");
+        let after = load_files(&connection, None).unwrap();
+        assert_eq!(after.len(), 1, "a file that is still here keeps its row");
+        assert_eq!(after[0].file_id, file_id, "and it is the row it already had");
+
+        // Gone is still gone: the sweep has to keep doing its own job.
+        fs::remove_file(&audio).unwrap();
+        index_path(&mut connection, &directory).unwrap();
+        assert!(load_files(&connection, None).unwrap().is_empty());
         drop(connection);
         fs::remove_dir_all(directory).unwrap();
     }

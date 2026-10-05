@@ -1376,9 +1376,15 @@ fn accept_pairing(
     Ok(rights)
 }
 
-/// What this device may do. `None` for the column means a row written before
-/// grants existed and read without the migration having run: the old boolean's
-/// default was the owner's own device, so that is what it reads as.
+/// What this device may do.
+///
+/// `NULL` in the column means a row written before grants existed whose repair
+/// never ran: the migration adds the column and then fills it, and a crash between
+/// those halves leaves rows with no grant at all. That reads as the smallest grant
+/// rather than the largest. An unknown grant must never be the owner's own, because
+/// the only thing a device has to do to reach this code is be paired - so a lent
+/// phone would become the owner's phone because a migration was interrupted.
+/// `initialise_schema` fills these rows in, so this is a floor, not a steady state.
 fn device_rights(db_path: &Path, remote_id: &str) -> Result<DeviceRights, String> {
     let stored = open_connection(db_path)?
         .query_row(
@@ -1390,7 +1396,7 @@ fn device_rights(db_path: &Path, remote_id: &str) -> Result<DeviceRights, String
         .map_err(|error| error.to_string())?;
     match stored {
         None => Err("This phone is not paired with Napstr".into()),
-        Some(None) => Ok(DeviceRights::full()),
+        Some(None) => Ok(DeviceRights::read_only()),
         Some(Some(bits)) => Ok(DeviceRights::from_bits(bits as u32)),
     }
 }
@@ -1744,16 +1750,19 @@ fn initialise_schema(db_path: &Path) -> Result<(), String> {
         connection
             .execute_batch("ALTER TABLE mobile_devices ADD COLUMN rights INTEGER;")
             .map_err(|error| error.to_string())?;
-        // Every device paired before this had the boolean, and it meant exactly one
-        // of two things: browse and play, or the owner's own.
-        connection
-            .execute_batch(&format!(
-                "UPDATE mobile_devices SET rights = CASE WHEN stream_only = 1 THEN {} ELSE {} END WHERE rights IS NULL;",
-                DeviceRights::read_only().bits(),
-                DeviceRights::full().bits()
-            ))
-            .map_err(|error| error.to_string())?;
     }
+    // Every device paired before this had the boolean, and it meant exactly one of
+    // two things: browse and play, or the owner's own. This runs every time rather
+    // than only when the column was just added, because the two halves are not one
+    // statement: a crash in between would leave rows with no grant at all, and an
+    // interrupted migration that is never repaired is a fail-open that stays.
+    connection
+        .execute_batch(&format!(
+            "UPDATE mobile_devices SET rights = CASE WHEN stream_only = 1 THEN {} ELSE {} END WHERE rights IS NULL;",
+            DeviceRights::read_only().bits(),
+            DeviceRights::full().bits()
+        ))
+        .map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -1771,11 +1780,12 @@ fn load_devices(db_path: &Path) -> Result<Vec<PairedDevice>, String> {
                 name: row.get(1)?,
                 paired_at: row.get(2)?,
                 last_seen: row.get(3)?,
-                // A row written before grants existed reads as the owner's own,
-                // which is what the old boolean's default meant.
+                // A row with no grant at all reads as the smallest one. Reading it
+                // as the owner's own is what would let an interrupted migration hand
+                // a lent phone the whole library.
                 rights: DeviceRights::from_bits(
                     row.get::<_, Option<i64>>(4)?
-                        .unwrap_or(DeviceRights::FULL as i64) as u32,
+                        .unwrap_or(DeviceRights::read_only().bits() as i64) as u32,
                 ),
             })
         })
@@ -2434,6 +2444,62 @@ mod tests {
         // A revoked device has no rights to read, which is the same call that
         // authorises it: one question, asked once.
         assert!(device_rights(&db, &endpoint).is_err());
+        drop(connection);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A device whose grant is unknown is a device with the least, not the most.
+    ///
+    /// The migration adds the `rights` column and then fills it, and the two are not
+    /// one statement: a crash in between leaves rows with no grant at all. Reading
+    /// those as the owner's own - which is what the old boolean's *default* meant -
+    /// turns a lent phone into the owner's phone because a migration was interrupted,
+    /// so anything unreadable reads as the smallest grant instead, and the next start
+    /// repairs the row.
+    #[test]
+    fn a_device_with_no_grant_never_reads_as_the_owners() {
+        let directory =
+            std::env::temp_dir().join(format!("napstr-null-rights-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let db = directory.join("napstr.sqlite3");
+        initialise_schema(&db).unwrap();
+        let connection = open_connection(&db).unwrap();
+        let endpoint = SecretKey::generate().public().to_string();
+        // A device that was lent access, left without a grant by an interrupted
+        // migration.
+        connection
+            .execute(
+                "INSERT INTO mobile_devices(endpoint_id,name,paired_at,last_seen,stream_only) VALUES(?1,'Guest','now','now',1)",
+                [&endpoint],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE mobile_devices SET rights=NULL WHERE endpoint_id=?1",
+                [&endpoint],
+            )
+            .unwrap();
+
+        assert_eq!(
+            device_rights(&db, &endpoint).unwrap(),
+            DeviceRights::read_only()
+        );
+        assert_eq!(
+            load_devices(&db).unwrap().first().unwrap().rights,
+            DeviceRights::read_only()
+        );
+        // And it is repaired rather than left for the floor to hold up for ever.
+        drop(connection);
+        initialise_schema(&db).unwrap();
+        let connection = open_connection(&db).unwrap();
+        let repaired: Option<i64> = connection
+            .query_row(
+                "SELECT rights FROM mobile_devices WHERE endpoint_id=?1",
+                [&endpoint],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(repaired, Some(DeviceRights::read_only().bits() as i64));
         drop(connection);
         fs::remove_dir_all(directory).unwrap();
     }
