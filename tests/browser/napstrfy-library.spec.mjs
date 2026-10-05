@@ -104,7 +104,7 @@ async function openLikedPage(page) {
 
 const searchPageIsBack = (page) => Promise.all([
   expect(page.getByRole('textbox', { name: 'Search tracks', exact: true })).toBeVisible(),
-  expect(page.locator('.library-heading h1')).toHaveText('Find something'),
+  expect(page.locator('.library-heading h1')).toHaveText('Discover'),
   expect(page.locator('.liked-close')).toHaveCount(0)
 ]);
 

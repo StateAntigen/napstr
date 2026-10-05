@@ -79,8 +79,10 @@ test('the search tab opened on nothing shows what the network has, and nothing e
   const rows = section.locator('.track-row');
   await expect(rows).toHaveCount(2);
   await expect(rows.first()).toContainText('Gimme All Your Lovin');
-  // The label says how many the whole list holds, which is more than this page.
-  await expect(page.locator('.section-label', { hasText: 'Discover' })).toContainText('2 live on the network');
+  // The heading says what the page is, and how many the whole list holds - which
+  // is more than this page.
+  await expect(page.locator('.library-heading')).toContainText('Discover');
+  await expect(page.locator('.library-heading')).toContainText('2 live on the network');
   // Nothing of the library: an empty search tab is where the network's list goes,
   // and a list of what is already here is an answer to a search rather than a page
   // standing there before one has been made.
@@ -140,45 +142,89 @@ test('a phone that may not reach the network is shown no list to play from', asy
   await expect.poll(() => calls(page, 'remote_download')).toHaveLength(0);
 });
 
-test('play all leads with a track of this phone’s own, and asks for the first row', async ({ page }) => {
+test('crate digging leads with a track of this phone’s own, and plays the rarest row first', async ({ page }) => {
   // The library holds one track that this run does not name, so that is the lead -
-  // and there is nothing of ours left to warm behind the first row. One deep, so
-  // the ask proved here is the first row of the list and nothing else.
+  // and there is nothing of ours left to warm behind the first row, so one deep is
+  // the whole of what is asked for.
+  //
+  // The two rows are deliberately in the *other* order in the fixture: the common
+  // file first. Digging is a question about the far end of the computer's ranking,
+  // so a phone that read the list as given would play the common one - which is
+  // exactly what this rules out.
   const mine = {
     ...inLibrary,
     fileId: id('e'),
     filename: 'Cheap Sunglasses.mp3',
     title: 'Cheap Sunglasses'
   };
-  const wanted = track('b', 'Doubleback', false);
-  // Only one track of this phone's own, and the run does not name it - so the lead
-  // is that track and there is nothing else of ours for the runway. The file the
-  // computer says this phone already holds is avoided on purpose: a cached file is
-  // skipped by the pre-load, so a row with that id would prove nothing here.
-  await openApp(page, { library: [mine], discovered: [wanted, live[1]], preload: 1 });
+  const common = { ...track('b', 'Doubleback', false), seeders: 20 };
+  const rare = { ...track('c', 'Sharp Dressed Man', false), seeders: 1 };
+  await openApp(page, { library: [mine], discovered: [common, rare], preload: 1 });
   await expect(page.locator('.track-row')).toHaveCount(1);
   await openSearchTab(page);
-  await page.locator('.discover-play').click();
+  await page.getByRole('button', { name: 'Crate Digging' }).click();
 
   // It makes a sound at once, rather than after the first row has been fetched.
   await expect.poll(() => audioPaused(page)).toBe(false);
-  // One deep, so the first row of the list is the whole of what is asked for.
-  await expect.poll(() => files(page, 'remote_download')).toEqual([wanted.fileId]);
+  // The first row of that order is the whole of what is asked for, and the row the
+  // computer ranked rarest is the one it starts on.
+  await expect.poll(() => files(page, 'remote_download')).toEqual([rare.fileId]);
+  // And the order was the computer's to choose, so the other end of its ranking is
+  // what was asked for rather than the list re-sorted on this phone.
+  await expect
+    .poll(() => calls(page, 'remote_discover'))
+    .toContainEqual(expect.objectContaining({ mode: 'leastSeeded' }));
 
-  // And the queue is that track, then the row the computer ranked first.
+  // And the queue is that track, then the rarest row.
   await page.locator('.now-open').click();
   await expect(page.locator('.now-sheet')).toBeVisible();
   await page.locator('[aria-label="Open the playlist"]').click();
   await expect(page.locator('.queue-row').nth(0)).toContainText('Cheap Sunglasses');
-  await expect(page.locator('.queue-row').nth(1)).toContainText('Doubleback');
+  await expect(page.locator('.queue-row').nth(1)).toContainText('Sharp Dressed Man');
+});
+
+test('random deals every row of the list once, in an order nobody chose', async ({ page }) => {
+  // A shuffle rather than a draw with repeats: over a long session a person should
+  // still hear each row, and a row that came round twice would mean one that never
+  // came round at all. The order itself cannot be asserted - it is dealt from a
+  // random seed - so what is asserted is that it is a permutation, and that the
+  // run still opens with something already here.
+  const list = [
+    track('b', 'Gimme All Your Lovin', false),
+    track('c', 'Sharp Dressed Man', false),
+    track('d', 'Legs', false),
+    track('e', 'Tush', false)
+  ];
+  const mine = ['f', 'g', 'h'].map((letter, index) => ({
+    ...inLibrary,
+    fileId: id(letter),
+    filename: `Mine ${index + 1}.mp3`,
+    title: `Mine ${index + 1}`
+  }));
+  await openApp(page, { library: mine, discovered: list, preload: 0 });
+  await expect(page.locator('.track-row')).toHaveCount(3);
+  await openSearchTab(page);
+
+  const drawn = await page.locator('section[aria-label="Discover"] .track-row strong').allTextContents();
+  await page.getByRole('button', { name: 'Random' }).click();
+  await expect.poll(() => audioPaused(page)).toBe(false);
+
+  const played = await page.locator('section[aria-label="Discover"] .track-row strong').allTextContents();
+  expect([...played].sort()).toEqual([...drawn].sort());
+  expect(played).not.toEqual(drawn);
 });
 
 test('a run does not park on a track that has not arrived: the nearest one that can play is pulled in', async ({ page }) => {
   // The run names two files nobody here holds and the library has two of its own,
   // so the queue is an owned track, a fetch, another owned track, a fetch. The
-  // entry after what Play all opened with is a fetch that has not landed - and
-  // waiting for it is what left the player looking stuck: it stood on a download
-  // for minutes, or until that download failed. Advancing skips it instead.
+  // entry after the chip opened with is a fetch that has not landed - and waiting
+  // for it is what left the player looking stuck: it stood on a download for
+  // minutes, or until that download failed. Advancing skips it instead.
+  //
+  // This is the second answer, not the first: both of this phone's own tracks are
+  // already in the run, so there is nothing spare to put in the next place and the
+  // nearest entry that can play is pulled there. The case with something spare is
+  // the test below.
   const mine = ['f', 'g'].map((letter, index) => ({
     ...inLibrary,
     fileId: id(letter),
@@ -190,7 +236,7 @@ test('a run does not park on a track that has not arrived: the nearest one that 
   await openApp(page, { library: mine, discovered: live, preload: 0 });
   await expect(page.locator('.track-row')).toHaveCount(2);
   await openSearchTab(page);
-  await page.locator('.discover-play').click();
+  await page.getByRole('button', { name: 'Crate Digging' }).click();
   await expect.poll(() => audioPaused(page)).toBe(false);
 
   const playing = () => page.locator('.now-title').innerText();
@@ -220,6 +266,50 @@ test('a run does not park on a track that has not arrived: the nearest one that 
   expect(order[3]).toBe('Sharp Dressed Man');
 });
 
+test('a track that has not arrived is stood in for by one of ours, and keeps its turn', async ({ page }) => {
+  // The first answer, and the one that matters on a phone with anything spare: a
+  // track of ours goes into the place the player was about to take. The entry that
+  // has not arrived moves one place back and stays in the run, so its turn comes
+  // round again once the fetch has landed - which is what keeps a slow network
+  // from draining the queue into the library, one skip at a time.
+  const mine = ['f', 'g', 'h'].map((letter, index) => ({
+    ...inLibrary,
+    fileId: id(letter),
+    filename: `Mine ${index + 1}.mp3`,
+    title: `Mine ${index + 1}`
+  }));
+  await openApp(page, { library: mine, discovered: live, preload: 0 });
+  await expect(page.locator('.track-row')).toHaveCount(3);
+  await openSearchTab(page);
+  await page.getByRole('button', { name: 'Crate Digging' }).click();
+  await expect.poll(() => audioPaused(page)).toBe(false);
+
+  // Two of the three are in the run - the lead and the runway - so there is one
+  // spare, and the run has something to put in the place it was about to take.
+  const playing = () => page.locator('.now-title').innerText();
+  const opened = await playing();
+  await page.locator('.now-open').click();
+  await page.getByLabel('Next track').click();
+
+  await expect.poll(playing).not.toBe(opened);
+  const standing = await playing();
+  expect(mine.map((track) => track.title)).toContain(standing);
+
+  // And it says why, naming the track it is standing in for, rather than appearing
+  // to have played something unrelated.
+  await expect(page.locator('.toast')).toContainText('Waiting on');
+  await expect(page.locator('.toast')).toContainText('Gimme All Your Lovin');
+
+  // The queue holds the file that has not arrived, one place further back, and the
+  // rest of the network's list behind it in its own order.
+  await page.locator('[aria-label="Open the playlist"]').click();
+  const order = await page.locator('.queue-row .queue-copy strong').allTextContents();
+  expect(order[0]).toBe(opened);
+  expect(order[1]).toBe(standing);
+  expect(order[2]).toBe('Gimme All Your Lovin');
+  expect(order.filter((title) => title === 'Sharp Dressed Man')).toHaveLength(1);
+});
+
 test('the list draws only the file types it is asked for', async ({ page }) => {
   // One format for now: anything larger is a fetch this phone would rather not pay
   // for. The row is left out of the drawing rather than out of the answer - the
@@ -235,7 +325,7 @@ test('the list draws only the file types it is asked for', async ({ page }) => {
   const rows = page.locator('section[aria-label="Discover"] .track-row');
   await expect(rows).toHaveCount(1);
   await expect(rows.first()).toContainText('Gimme All Your Lovin');
-  await expect(page.locator('.section-label', { hasText: 'Discover' })).toContainText('2 live on the network');
+  await expect(page.locator('.library-heading')).toContainText('2 live on the network');
 });
 
 test('a run of the network list leaves a track of ours between each pair', async ({ page }) => {
@@ -250,9 +340,9 @@ test('a run of the network list leaves a track of ours between each pair', async
     track('d', 'Legs', false),
     track('e', 'Tush', false)
   ];
-  // Three tracks of this phone's own, because a Play all takes one of them as its
-  // lead and the run then uses each of the rest once: with a single track the lead
-  // is all there is, and nothing of ours is left for the rows further down.
+  // Three tracks of this phone's own, because a chip takes one of them as its lead
+  // and the run then uses each of the rest once: with a single track the lead is
+  // all there is, and nothing of ours is left for the rows further down.
   const mine = ['f', 'g', 'h'].map((letter, index) => ({
     ...inLibrary,
     fileId: id(letter),
@@ -266,7 +356,7 @@ test('a run of the network list leaves a track of ours between each pair', async
   // to put there.
   await expect(page.locator('.track-row')).toHaveCount(3);
   await openSearchTab(page);
-  await page.locator('.discover-play').click();
+  await page.getByRole('button', { name: 'Crate Digging' }).click();
 
   // Asked for in play order, and no further ahead than the computer can run: it
   // fetches two at a time, so a third ask would queue behind those two and put the
@@ -332,7 +422,7 @@ test('the list stays the queue when a track fetched for it lands', async ({ page
   });
   await expect(page.locator('.track-row')).toHaveCount(1);
   await openSearchTab(page);
-  await page.locator('.discover-play').click();
+  await page.getByRole('button', { name: 'Crate Digging' }).click();
   await expect.poll(() => audioPaused(page)).toBe(false);
 
   // The run is the queue - the two new files, once each - rather than the library

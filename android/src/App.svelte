@@ -1856,6 +1856,40 @@
   }
 
   /**
+   * Put a track of this phone's own into the queue at `position`.
+   *
+   * The answer to a network file that has not arrived. The entry keeps its turn -
+   * it moves one place back, so it is asked for again as soon as this track is
+   * over - and something plays in the meantime, which is the difference between a
+   * queue that keeps feeding new tracks and a queue that stops on an empty turn.
+   *
+   * False when there is nothing of ours left to put there: a library already
+   * named in the queue has nothing spare, and the caller waits instead.
+   */
+  function insertRunwayTrack(position: number): boolean {
+    const runway = randomOwnedTrack(playerQueue);
+    if (!runway) return false;
+    const queue = [...playerQueue];
+    queue.splice(position, 0, runway);
+    playerQueue = queue;
+    return true;
+  }
+
+  /**
+   * The same track, at the end of the queue, for a shuffle to draw on.
+   *
+   * Appended rather than inserted because a random order is recorded as positions:
+   * an insertion moves every entry the history already names, and the history would
+   * then be describing a queue that no longer exists.
+   */
+  function appendRunwayTrack(): number {
+    const runway = randomOwnedTrack(playerQueue);
+    if (!runway) return -1;
+    playerQueue = [...playerQueue, runway];
+    return playerQueue.length - 1;
+  }
+
+  /**
    * Take a track out of the playlist for good.
    *
    * This is the other half of the skip. A track that has not arrived *yet* is
@@ -2271,6 +2305,27 @@
   let discoverAsked = false;
   /** How long the list is to be filled to, which the button below it raises. */
   let discoverWanted = $state(DISCOVER_LIST_SIZE);
+  /**
+   * Which of the two orders the network's list is in.
+   *
+   * `mostSeeded` is what most of the network already holds, which is the quick
+   * list: plenty of seeders, so a file arrives. `leastSeeded` is the other
+   * question - what almost nobody holds - and it is the one that finds things, at
+   * the price of a file that may never arrive at all.
+   */
+  type DiscoverMode = 'mostSeeded' | 'leastSeeded';
+  let discoverListMode = $state<DiscoverMode>('mostSeeded');
+  /** Shuffled on top of that order, which is what the Random chip turns on. */
+  let discoverShuffling = $state(false);
+  /**
+   * Bumped to deal a new shuffle.
+   *
+   * A shuffle cannot be a derived value, because every recompute would deal a new
+   * hand while the list is being looked at. So it is dealt from a seed instead:
+   * the same seed over the same list gives the same order, and pressing Random
+   * again is what changes it.
+   */
+  let discoverShuffleSeed = $state(0);
 
   /** Whether the network's list may offer this file. */
   function isDiscoverable(track: RemoteTrack) {
@@ -2282,10 +2337,18 @@
    *
    * Filtered rather than asked for filtered: the computer's own list is the
    * network's, and what a particular phone wants to see of it is the phone's
-   * business. The label above the list still says how many the network has, which
-   * is what it claims to say.
+   * business. The heading still says how many the network has, which is what it
+   * claims to say.
+   *
+   * The order is the order the queue will be built in, because these rows are
+   * what a press on a chip sends to the player: what a person sees is what they
+   * get. Shuffling here rather than only in the queue is the whole difference.
    */
-  let discoverRows = $derived(discoverTracks.filter(isDiscoverable));
+  let discoverRows = $derived(
+    discoverShuffling
+      ? shuffled(discoverTracks.filter(isDiscoverable), networkDiscoverSeed + discoverShuffleSeed)
+      : discoverTracks.filter(isDiscoverable)
+  );
 
   /**
    * One page of that list, from the computer that keeps the mirror.
@@ -2294,14 +2357,18 @@
    * live, so this is the one network read that costs the far end nothing. Rows
    * arrive with `local: false`, which is what makes playing one a fetch rather
    * than a read - the computer goes and gets it from the seeders the row names.
+   *
+   * `mode` is which end of the seeder count to read from, and it is the order the
+   * rows come back in: the computer ranks them, so the phone does not have to.
    */
-  async function loadDiscover(wanted = discoverWanted) {
+  async function loadDiscover(wanted = discoverWanted, mode: DiscoverMode = discoverListMode) {
     // The home computer's own mirror of the network, so it needs the computer
     // that holds it as well as the right to read it.
     if (discoverLoading || !status.connected || !mayDownload) return;
     discoverAsked = true;
     discoverLoading = true;
     discoverWanted = wanted;
+    discoverListMode = mode;
     try {
       // One page is what fits in a control frame, so a long list is this many
       // pages of it rather than one fat answer. The loop stops when the computer
@@ -2310,7 +2377,7 @@
       // means a page can be mostly rows this phone will not draw.
       while (shownDiscoverRows() < wanted && discoverTracks.length < DISCOVER_FETCH_LIMIT) {
         const page = await invoke<{ tracks: RemoteTrack[]; total: number }>('remote_discover', {
-          mode: 'mostSeeded',
+          mode,
           seed: networkDiscoverSeed,
           offset: discoverTracks.length,
           limit: DISCOVER_PAGE
@@ -2347,7 +2414,7 @@
    * next one is fetched - and the pre-load depth is what starts the asks early
    * enough to use it.
    *
-   * `leadOwned` puts one of those tracks in front as well, because Play all is a
+   * `leadOwned` puts one of those tracks in front as well, because a chip is a
    * press that expects to make a sound: without it the first thing heard is the
    * first thing fetched, which is minutes away. Tapping a row does not, because a
    * tap on a row means that row.
@@ -2368,8 +2435,48 @@
     void activateTrack(playerQueue[Math.max(0, playerIndex)], true);
   }
 
-  /** Play the list from its first row, which is the one the computer ranked highest. */
-  function playDiscover() {
+  /**
+   * Read the network's own list in the order a chip wants it, asking again only
+   * when the list in hand is the other order.
+   *
+   * The order is the few end of the computer's ranking rather than a sort here,
+   * because the ranking is over the whole network rather than over the rows that
+   * happen to have arrived - so a list re-sorted on this phone would be the right
+   * order of the wrong set.
+   */
+  async function ensureDiscover(mode: DiscoverMode) {
+    if (discoverListMode === mode && discoverTracks.length > 0) return;
+    discoverTracks = [];
+    discoverTotal = 0;
+    await loadDiscover(discoverWanted, mode);
+  }
+
+  /**
+   * Crate digging: the network's own list, rarest first.
+   *
+   * The other half of the same list. Most-seeded is the quick end - what plenty
+   * of people are keeping alive, so it arrives; least-seeded is what almost
+   * nobody holds, which is where the records worth finding are, and where the
+   * waits are. Nothing is promised about it arriving: the runway and the
+   * substitution are what keep a slow file from stopping the music.
+   */
+  async function startDigging() {
+    discoverShuffling = false;
+    await ensureDiscover('leastSeeded');
+    runDiscover(0, true);
+  }
+
+  /**
+   * Random: the same list, every row of it once, in no order at all.
+   *
+   * Shuffled rather than sampled, so a long listening session still hears each
+   * row: a random draw with a repeat in it would leave rows never played while
+   * others came round twice, which is not what a shuffle is.
+   */
+  async function startRandom() {
+    discoverShuffling = true;
+    discoverShuffleSeed += 1;
+    await ensureDiscover('mostSeeded');
     runDiscover(0, true);
   }
 
@@ -6100,11 +6207,35 @@
     sleepClock = `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`;
   }
 
-  function shuffled<T>(items: T[]): T[] {
+  /**
+   * A copy of `items` in a shuffled order.
+   *
+   * Without a seed it deals a fresh hand, which is what a playback order wants:
+   * nobody is looking at it while it is made. With one it deals the same order
+   * every time, which is what a *drawn* list needs - such a list is re-derived on
+   * every render, and a shuffle that changed under the finger would move the row a
+   * person was about to press. That is also why the seeded draw is a
+   * multiplicative congruential generator rather than `Math.random`.
+   */
+  function shuffled<T>(items: T[], seed?: number): T[] {
     const copy = [...items];
+    let state = (seed ?? 0) >>> 0;
     for (let index = copy.length - 1; index > 0; index -= 1) {
-      const swap = Math.floor(Math.random() * (index + 1));
+      let swap: number;
+      if (seed === undefined) {
+        swap = Math.floor(Math.random() * (index + 1));
+      } else {
+        state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+        swap = state % (index + 1);
+      }
       [copy[index], copy[swap]] = [copy[swap], copy[index]];
+    }
+    // A seeded shuffle that came out in the order it went in looks like the press
+    // did nothing, so it is moved on by one. Only the seeded callers promise this:
+    // a playback order nobody is looking at has no such promise to keep.
+    if (seed !== undefined && copy.length > 1 && copy.every((item, index) => item === items[index])) {
+      const [first] = copy.splice(0, 1);
+      copy.push(first);
     }
     return copy;
   }
@@ -6276,9 +6407,12 @@
       }
       // A random order has no notion of "nearer", so an entry the network has not
       // delivered is simply not an entry to play: another is drawn in its place,
-      // and the history records the one that was really taken.
-      if (!playableNow(playerQueue[next])) {
-        const drawn = randomPlayableExcept(playerIndex);
+      // and the history records the one that was really taken. The queue is asked
+      // first and this phone's own library second, so a queue that has run dry of
+      // anything playable still makes a sound rather than stopping on it.
+      if (!mayBeChosen(playerQueue[next])) {
+        const inQueue = randomPlayableExcept(playerIndex);
+        const drawn = inQueue >= 0 ? inQueue : appendRunwayTrack();
         if (drawn >= 0) {
           next = drawn;
           randomHistory = randomHistory.map((value, position) =>
@@ -6287,15 +6421,28 @@
         }
       }
     } else {
-      // The place the player was about to take, and the nearest entry that can
-      // really play there. Nothing playable means nothing to skip to, so the entry
-      // that is there is waited for exactly as it always was.
+      // The place the player was about to take. A track of this phone's own goes in
+      // there when the network has not delivered it, so something plays now and the
+      // entry keeps its turn - which comes round again, a place later, once the
+      // file has arrived. The nearest entry that is ready is the second answer, for
+      // a phone with nothing spare to put there, and waiting is the third: an entry
+      // that has not arrived is worth waiting for when there is nothing else at all.
       next = (playerIndex + direction + playerQueue.length) % playerQueue.length;
-      const playable = nearestPlayable(playerIndex, direction);
-      if (playable >= 0 && playable !== next) {
-        const passedOver = playerQueue[next];
-        pullQueueEntry(next, playable);
-        notice = msg("Skipped {p0} — it has not arrived yet", { p0: title(passedOver) });
+      if (!mayBeChosen(playerQueue[next])) {
+        const waiting = playerQueue[next];
+        if (insertRunwayTrack(next)) {
+          // The reason is said only when the reason is the network. A track turned
+          // off here is not waiting for anything, and whoever turned it off knows.
+          if (!isTrackDisliked(waiting)) {
+            notice = msg("Waiting on {p0} — playing one of yours", { p0: title(waiting) });
+          }
+        } else {
+          const playable = nearestPlayable(playerIndex, direction);
+          if (playable >= 0 && playable !== next) {
+            pullQueueEntry(next, playable);
+            notice = msg("Skipped {p0} — it has not arrived yet", { p0: title(waiting) });
+          }
+        }
       }
     }
     playerIndex = next;
@@ -7064,15 +7211,20 @@
           </section>
           <div class="section-label tracks-label"><b>{$t("Tracks")}</b><span>{tracks.length} {tracks.length === 1 ? 'result' : 'results'}</span></div>
         {:else if !query.trim()}
-          <section class="library-heading"><div><p>{$t("SEARCH")}</p><h1>{$t("Find something")}</h1></div><span>{$t("Your library and the network")}</span></section>
+          <!-- The title is the tab's answer to "what is this?", and there is no
+               eyebrow above it and no line under it: what the page holds is the
+               network's own list, which is the one thing the chips below start. -->
+          <section class="library-heading">
+            <div><h1>{$t("Discover")}</h1></div>
+            <span>{discoverTotal} {$t("live on the network")}</span>
+          </section>
           {#if discoverTracks.length > 0}
             <!-- What the network has, above the library it is not. The rows are
                  the same rows: a discover track is a track, and its badge is what
                  says whose computer has it. -->
-            <div class="section-label tracks-label discover-label">
-              <b>{$t("Discover")}</b>
-              <span>{discoverTotal} {$t("live on the network")}</span>
-              <button class="discover-play" onclick={playDiscover} disabled={!mayDownload}>{$t("Play all")}</button>
+            <div class="discover-chips">
+              <button class="discover-play" class:active={!discoverShuffling && discoverListMode === 'leastSeeded'} onclick={() => void startDigging()} disabled={!mayDownload}>{$t("Crate Digging")}</button>
+              <button class="discover-play" class:active={discoverShuffling} onclick={() => void startRandom()} disabled={!mayDownload}>{$t("Random")}</button>
             </div>
             <section class="track-list" role="list" aria-label={$t("Discover")} aria-busy={discoverLoading}>
               {#each discoverRows as track (track.fileId)}

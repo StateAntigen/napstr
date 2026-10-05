@@ -279,9 +279,20 @@ export async function mockNative(page, { app = 'napstrfy', nativeLocale = 'en-GB
           case 'remote_search': if (window.searchError) throw window.searchError; return (args.source && window.remoteLibraryByHost?.[args.source]) ?? window.networkSearchResults ?? [track];
           // What the computer's own mirror says is live on the network. Empty
           // unless a spec seeds it, because it is a suggestion and not a page.
+          //
+          // The two modes are the two ends of how many people are keeping each
+          // file alive, and the computer is the side that ranks them - so the
+          // stand-in ranks by the same field the host does. Rows a spec gives no
+          // seeder count keep the order it gave them.
           case 'remote_discover': {
             const found = window.discoverTracks ?? [];
-            return { tracks: found.slice(args.offset ?? 0, (args.offset ?? 0) + (args.limit ?? found.length)), total: found.length };
+            const ranked =
+              args.mode === 'leastSeeded'
+                ? [...found].sort((left, right) => (left.seeders ?? 0) - (right.seeders ?? 0))
+                : [...found];
+            const offset = Number(args.offset ?? 0);
+            const limit = Number(args.limit ?? ranked.length);
+            return { tracks: ranked.slice(offset, offset + limit), total: ranked.length };
           }
           // The conversation around a track: a test seeds what has been said, and
           // a send appends to the same list, so the page asks again and finds it.
