@@ -20,6 +20,7 @@
   import SeekIcon from './lib/SeekIcon.svelte';
   import { rateLimitedTask, safePosition, validDuration } from './lib/playback';
   import { AUDIO_FORMATS, BITRATE_CHOICES, activeProfile, fitsProfile, readQuality, writeQuality, type QualityProfile } from './lib/quality';
+import { playedBars, waveformPeaks } from './lib/waveform';
   import { PRELOAD_DEPTHS, readPreloadDepth, storePreloadDepth } from './lib/preload';
   import { meteredNow, watchNetwork } from './lib/network';
   import appIcon from '../src-tauri/icons/icon.png';
@@ -202,6 +203,8 @@
     one: 'Repeat this track'
   };
   const playModeKey = 'napstrfy-play-mode';
+  /** The rate this phone remembers, which is a property of the phone and not a track. */
+  const playbackSpeedKey = 'napstrfy-playback-speed';
   type SleepOption = { value: string; label: string; minutes?: number; endsTrack?: boolean };
   const SLEEP_OPTIONS: SleepOption[] = [
     { value: '5', label: '5 minutes', minutes: 5 },
@@ -699,6 +702,21 @@
   let sheetClosing = $state(false);
   /** The playlist lives in its own view so the drawer never scrolls. */
   let showQueue = $state(false);
+  /** The speed panel, which is a drawer of its own over the now-playing one. */
+  let showSpeed = $state(false);
+  /**
+   * How fast this phone plays, as a multiplier.
+   *
+   * Speed and not pitch. A record played slower is the same voice at a lower pitch,
+   * which is why a turntable has a speed control and no pitch control - but this is
+   * a file, not a record, and the pitch is left where the artist put it: a podcast
+   * at 1.5x is the same voices, sooner. What a person wants when they reach for this
+   * is to get through something, or to hear it again more slowly.
+   */
+  let playbackSpeed = $state(1);
+  /** The ends of the slider, which are also the ends of what is worth offering. */
+  const SPEED_MIN = 0.5;
+  const SPEED_MAX = 2.5;
   /** The track menu, opened from the drawer or from any album track. */
   let showActions = $state(false);
   /**
@@ -1047,6 +1065,51 @@
       ? mayControl && remoteState?.active === true
       : !caching && verifiedDuration > 0
   );
+  /**
+   * How many bars the track's shape is drawn in.
+   *
+   * Enough to see where the quiet and the loud parts are, few enough that a bar is
+   * a shape rather than a pixel - and few enough that redrawing the played part of
+   * it costs nothing on a phone.
+   */
+  const WAVEFORM_BARS = 140;
+  /**
+   * The rate the file is decoded at, which is nothing like the rate it plays at.
+   *
+   * A waveform is a shape, not a sound: at 8 kHz there is still a sample for every
+   * bar, and the whole decode costs a fraction of the memory a full-rate one would
+   * take. What a person hears comes from the element, which plays the file itself
+   * and is untouched by any of this.
+   */
+  const WAVEFORM_SAMPLE_RATE = 8000;
+  /** The source the audio element was last given, which is what can be decoded. */
+  let mediaSource = $state('');
+  /** The bars for the file the drawer is showing, and which file they belong to. */
+  let waveformFor = $state('');
+  let waveformBars = $state<number[]>([]);
+  /**
+   * Shapes already worked out, by file, for as long as the app is running.
+   *
+   * A shape is a few hundred numbers, so keeping one per track costs nothing next
+   * to the audio it describes - and a track replayed, scrubbed over, or returned
+   * to after the drawer was closed comes back instantly rather than decoded twice.
+   */
+  const waveformCache = new Map<string, number[]>();
+  /**
+   * Files whose shape has been asked for, whether or not it arrived.
+   *
+   * One set rather than two, and it is never cleared for a failure: a file this
+   * phone cannot decode will not decode on a second attempt either, and asking
+   * again on every open of the drawer would cost a fetch each time to learn the
+   * same nothing.
+   */
+  const waveformAsked = new Set<string>();
+  /** True when the drawer has a shape to draw rather than a plain bar. */
+  let waveformShown = $derived(
+    activeMedia === 'music' && waveformFor === current?.fileId && waveformBars.length > 0
+  );
+  /** How many of those bars are behind the play-head. */
+  let waveformPlayed = $derived(playedBars(barProgress, WAVEFORM_BARS));
   /** The playlist the drawer would open: this phone's, or the copy of theirs. */
   let shownQueue = $derived(playbackTarget === 'desktop' ? remoteQueue : playerQueue);
   /** The row the playlist marks as playing, or -1 when that cannot be trusted. */
@@ -1267,6 +1330,12 @@
     }
     if (showSettings) {
       showSettings = false;
+      return;
+    }
+    // The speed panel sits over the drawer and is closed before it: the press that
+    // dismisses a control should not dismiss the screen it was opened on.
+    if (showSpeed) {
+      showSpeed = false;
       return;
     }
     if (showActions) {
@@ -1929,6 +1998,52 @@
       window.localStorage.setItem(playModeKey, JSON.stringify({ loop: loopMode, shuffle }));
     } catch {
       // A preference that cannot be stored is only a lost convenience.
+    }
+  }
+
+  // The element is the only thing that knows about speed, so it is the only thing
+  // told: the rate lives on the player rather than on the track, which is why a
+  // queue carries it from one file to the next without anything doing the carrying.
+  $effect(() => {
+    if (!audio) return;
+    // Both, and the second one is the one that matters. Loading a file resets the
+    // element's rate to its *default* rate, so a speed that lived only in
+    // `playbackRate` would be forgotten by the next track in the queue - which is
+    // exactly when a person would not be looking at the control.
+    audio.playbackRate = playbackSpeed;
+    audio.defaultPlaybackRate = playbackSpeed;
+    // The promise this panel's words make out loud: the tempo changes, the pitch
+    // does not. Written rather than assumed, because it is a choice.
+    audio.preservesPitch = true;
+  });
+
+  /**
+   * The rate as a person reads it: 1, 1.25, 2 - never 1.00, never 2.
+   *
+   * A multiplier with a trailing zero on it looks like a number something went
+   * wrong with rather than a speed somebody chose.
+   */
+  function speedLabel(value: number) {
+    return String(Number(value.toFixed(2)));
+  }
+
+  /** Set the rate, within the ends of the slider rather than what the caller said. */
+  function setSpeed(value: number) {
+    playbackSpeed = Math.min(SPEED_MAX, Math.max(SPEED_MIN, Number(value.toFixed(2))));
+  }
+
+  /**
+   * Write the rate down, once a drag has ended.
+   *
+   * On `change` rather than on every `input`: a slider dragged across its whole
+   * range fires dozens of those, and a synchronous write to storage on each one is
+   * what makes a slider stutter.
+   */
+  function rememberSpeed() {
+    try {
+      window.localStorage.setItem(playbackSpeedKey, String(playbackSpeed));
+    } catch {
+      // As with the other preferences: a lost convenience, not a lost setting.
     }
   }
 
@@ -4159,6 +4274,7 @@
       durationEstimated = false;
       await tick();
       audio.src = cached.url;
+      mediaSource = cached.url;
       audio.volume = volume;
       await audio.play();
       playing = true;
@@ -5083,6 +5199,53 @@
     }
     seek(seconds);
   }
+
+  /**
+   * Work out the shape of a file this phone is playing, once.
+   *
+   * Nothing waits for this: it is decoration beside the music. A file that will not
+   * decode, a webview that refuses another audio context, and a fetch that never
+   * answers all end in the same place - the plain bar the drawer had before there
+   * was a waveform - so there is nothing to report when one of them happens.
+   */
+  async function loadWaveform(fileId: string, url: string) {
+    if (!url || waveformAsked.has(fileId)) return;
+    waveformAsked.add(fileId);
+    try {
+      const response = await fetch(url);
+      const bytes = await response.arrayBuffer();
+      // One channel at a low rate: the same shape, a fraction of the memory, and
+      // all of it thrown away as soon as the bars are counted.
+      const decoded = await new OfflineAudioContext(1, 1, WAVEFORM_SAMPLE_RATE).decodeAudioData(bytes);
+      const peaks = waveformPeaks(decoded.getChannelData(0), WAVEFORM_BARS);
+      waveformCache.set(fileId, peaks);
+      if (current?.fileId === fileId) {
+        waveformFor = fileId;
+        waveformBars = peaks;
+      }
+    } catch {
+      // The fallback is what was on screen a moment ago, so this is not a failure
+      // anybody needs to hear about.
+    }
+  }
+
+  // The shape of whatever this phone has put on. Asked for when the file changes
+  // rather than when the drawer is opened, because a decode takes a moment and the
+  // drawer is exactly where a person wants to see it.
+  $effect(() => {
+    const fileId = activeMedia === 'music' ? current?.fileId ?? '' : '';
+    const url = mediaSource;
+    // The computer's player is a different machine's audio: there is nothing here
+    // to decode, and the plain bar is what that player gets.
+    if (!fileId || playbackTarget === 'desktop') return;
+    const known = waveformCache.get(fileId);
+    if (known) {
+      waveformFor = fileId;
+      waveformBars = known;
+      return;
+    }
+    untrack(() => void loadWaveform(fileId, url));
+  });
 
   /** Albums among the loaded tracks, grouped by the key covers are addressed by. */
   function albumsFromTracks(source: RemoteTrack[]): AlbumShelf[] {
@@ -6761,6 +6924,7 @@
       duration = episode.duration || 0;
       durationEstimated = true;
       audio.src = source.url;
+      mediaSource = source.url;
       audio.volume = volume;
       await audio.play();
       rememberPodcast(episode);
@@ -6831,6 +6995,14 @@
       }
     } catch {
       // An unreadable preference just means the defaults.
+    }
+    try {
+      const saved = Number(window.localStorage.getItem(playbackSpeedKey));
+      // Clamped rather than trusted: the ends can move between builds, and a rate
+      // outside them would be a slider nobody could put back.
+      if (Number.isFinite(saved) && saved > 0) setSpeed(saved);
+    } catch {
+      // Same again: the default rate is the one everybody starts at.
     }
     try {
       const saved = JSON.parse(window.localStorage.getItem(likedMusicKey) || '[]') as unknown;
@@ -7895,7 +8067,18 @@
             <p class="sheet-error">{remoteState?.error || remoteError}</p>
           {/if}
 
-          <div class="now-sheet-timeline">
+          <div class="now-sheet-timeline" class:waves={waveformShown}>
+            {#if waveformShown}
+              <!-- The track's own shape, worked out from the file this phone is
+                   playing. The range input below is laid over it rather than
+                   replaced, so a drag, a keyboard and a screen reader keep working
+                   exactly as they did when a four-pixel bar was all there was. -->
+              <svg class="now-sheet-wave" viewBox={`0 0 ${WAVEFORM_BARS} 1`} preserveAspectRatio="none" aria-hidden="true">
+                {#each waveformBars as peak, index}
+                  <rect x={index + 0.2} y={(1 - peak) / 2} width={0.6} height={peak} class:played={index < waveformPlayed} />
+                {/each}
+              </svg>
+            {/if}
             <input
               type="range"
               min="0"
@@ -7911,11 +8094,18 @@
 
           <div class="now-sheet-meta">
             <span>{clock(shownPosition)}</span>
-            <span class="now-sheet-speed">
-              {playbackTarget === 'desktop'
-                ? `${remoteState?.queueLen ?? 0} ${(remoteState?.queueLen ?? 0) === 1 ? 'track' : 'tracks'} there`
-                : 'Speed: 1x'}
-            </span>
+            {#if playbackTarget === 'desktop'}
+              <span class="now-sheet-speed">
+                {`${remoteState?.queueLen ?? 0} ${(remoteState?.queueLen ?? 0) === 1 ? 'track' : 'tracks'} there`}
+              </span>
+            {:else}
+              <!-- The rate the phone is playing at, and the way to change it. Its own
+                   panel rather than a row of buttons, because this is a thing people
+                   set once and then reach for rarely. -->
+              <button class="now-sheet-speed" onclick={() => (showSpeed = true)} aria-label={$t("Playback speed")}>
+                {$t("Speed: {p0}×", { p0: speedLabel(playbackSpeed) })}
+              </button>
+            {/if}
             <span>{shownDurationLabel}</span>
           </div>
 
@@ -8029,6 +8219,35 @@
       </div>
     {/if}
   </main>
+{/if}
+
+<!-- The speed panel, drawn over the drawer rather than inside it: the drawer is one
+     screen that does not scroll, and a control that pushed the artwork up and down
+     while it was being dragged would be worse than a panel that covers it. -->
+{#if showSpeed}
+  <button class="speed-scrim" onclick={() => (showSpeed = false)} aria-label={$t("Close")}></button>
+  <div class="speed-panel" role="dialog" aria-modal="true" aria-label={$t("Playback speed")}>
+    <h2>
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M4.7 18.1a9 9 0 0 1 14.6 0" /><path d="M12 15.4 16.1 10" /><circle cx="12" cy="16" r="1.5" />
+      </svg>
+      {$t("Playback speed")}
+    </h2>
+    <p class="speed-read">{$t("Speed: {p0}×", { p0: speedLabel(playbackSpeed) })}</p>
+    <input
+      type="range"
+      min={SPEED_MIN}
+      max={SPEED_MAX}
+      step="0.05"
+      value={playbackSpeed}
+      oninput={(event) => setSpeed(Number(event.currentTarget.value))}
+      onchange={rememberSpeed}
+      aria-label={$t("Playback speed")}
+      aria-valuetext={$t("Speed: {p0}×", { p0: speedLabel(playbackSpeed) })}
+    />
+    <!-- The two ends, so the range is legible before it is dragged. -->
+    <div class="speed-ends"><span>{speedLabel(SPEED_MIN)}×</span><span>{speedLabel(SPEED_MAX)}×</span></div>
+  </div>
 {/if}
 
 {#if showQueue && (playbackTarget === 'desktop' || activeMedia === 'music')}
