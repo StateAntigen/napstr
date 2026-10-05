@@ -79,6 +79,7 @@ for (const filename of [
   'MediaNotificationService.kt',
   'BackBridge.kt',
   'NetworkBridge.kt',
+  'ShareBridge.kt',
 ]) {
   await copyFile(resolve(native, filename), resolve(javaDirectory, filename));
 }
@@ -94,6 +95,19 @@ await writeFile(
         <domain includeSubdomains="false">127.0.0.1</domain>
     </domain-config>
 </network-security-config>
+`,
+);
+// What the file provider is allowed to hand to another app: one directory in the
+// cache, and nothing else. Sharing audio with an editor needs a content URI, and
+// the alternative - exposing the app's data directory - would let a share point at
+// anything this application keeps. Written here rather than left to the template
+// so the list of paths this app exposes is visible in the repository.
+await writeFile(
+  resolve(xmlDirectory, 'file_paths.xml'),
+  `<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <cache-path name="share" path="share/" />
+</paths>
 `,
 );
 const drawableDirectory = resolve(main, 'res/drawable');

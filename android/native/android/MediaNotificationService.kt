@@ -180,6 +180,13 @@ class MediaNotificationService : Service() {
     position = intent.getLongExtra(EXTRA_POSITION, 0L).coerceAtLeast(0L)
     duration = intent.getLongExtra(EXTRA_DURATION, 0L).coerceAtLeast(0L)
     canPrevious = intent.getBooleanExtra(EXTRA_CAN_PREVIOUS, false)
+    // The page has always sent this, and nothing read it: `canNext` stayed false,
+    // so ACTION_SKIP_TO_NEXT was never published and every "next" from a lock
+    // screen, a car head unit or a Bluetooth button was refused. That is worse
+    // than a dead button on a car stereo, because a player that does not offer
+    // skip usually offers fast-forward instead - so the head unit's skip button
+    // fell through to the fifteen-second jump, which is exactly what it did.
+    canNext = intent.getBooleanExtra(EXTRA_CAN_NEXT, false)
     canSeek = intent.getBooleanExtra(EXTRA_CAN_SEEK, false)
     previousLabel = intent.getStringExtra("label_previous")?.ifBlank { "Previous" } ?: "Previous"
     playLabel = intent.getStringExtra("label_play")?.ifBlank { "Play" } ?: "Play"

@@ -19,7 +19,7 @@ use napstr_remote_protocol::{
     MAX_REPORT_NOTE_CHARS, MAX_TRACKS_BY_ID, NOT_PROVED_MESSAGE, REPORT_REASONS, shuffle_key,
 };
 use quick_xml::{events::Event, Reader};
-use qrcode::{render::svg, QrCode};
+use qrcode::{render::svg, EcLevel, QrCode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -2973,6 +2973,38 @@ impl RemoteClient {
         }
     }
 
+    /// What this phone's key never wants played again, on one computer.
+    ///
+    /// The same shape as likes, in a list of its own: a like and a dislike are two
+    /// statements about one file, and a phone may hold it in neither, in one, or -
+    /// after a change of mind - in the other.
+    async fn dislikes_on(&self, source: Option<&str>) -> Result<Vec<String>, String> {
+        match self
+            .request_under_this_key(source, ClientRequest::Dislikes)
+            .await?
+        {
+            ServerResponse::Dislikes { file_ids } => Ok(file_ids),
+            ServerResponse::Error { message } => Err(message),
+            response => Err(unexpected_response(&response)),
+        }
+    }
+
+    /// Replace that list on one computer, and answer with what was stored.
+    async fn set_dislikes_on(
+        &self,
+        source: Option<&str>,
+        file_ids: Vec<String>,
+    ) -> Result<Vec<String>, String> {
+        match self
+            .request_under_this_key(source, ClientRequest::SetDislikes { file_ids })
+            .await?
+        {
+            ServerResponse::Dislikes { file_ids } => Ok(file_ids),
+            ServerResponse::Error { message } => Err(message),
+            response => Err(unexpected_response(&response)),
+        }
+    }
+
     /// Every playlist this phone's key has on one computer, as summaries.
     async fn own_playlists_on(
         &self,
@@ -3059,6 +3091,11 @@ impl RemoteClient {
     /// person who liked something while the other computer was home does not
     /// lose it by moving back.
     ///
+    /// Dislikes are merged the same way, and for a sharper reason: a track
+    /// somebody turned off is a track they do not want played, so a list that
+    /// came back shorter after a move would start playing it again. Nothing is
+    /// ever removed from that list by carrying it.
+    ///
     /// Playlists are documents rather than sets, so each one is taken from the
     /// side that edited it most recently, and one the destination already holds a
     /// newer revision of is left alone rather than overwritten.
@@ -3067,9 +3104,21 @@ impl RemoteClient {
         from: &str,
         to: &str,
         likes: Vec<String>,
+        dislikes: Vec<String>,
     ) -> Result<CarryReport, String> {
         let elsewhere = self.likes_on(Some(from)).await?;
         let kept = self.set_likes_on(Some(to), merge_likes(likes, elsewhere)).await?;
+        let turned_off = self.dislikes_on(Some(from)).await?;
+        // A failure here is not a failure of the move: the likes above are the
+        // reason this runs at all, and a computer that will not answer about
+        // dislikes has still had everything else carried to it.
+        let (_kept_off, dislikes_failed) = match self
+            .set_dislikes_on(Some(to), merge_likes(dislikes, turned_off))
+            .await
+        {
+            Ok(stored) => (stored, None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
 
         let leaving = self.own_playlists_on(Some(from)).await?;
         let staying = self.own_playlists_on(Some(to)).await?;
@@ -3109,6 +3158,11 @@ impl RemoteClient {
                 }
                 response => failed.push(format!("{}: {}", summary.title, unexpected_response(&response))),
             }
+        }
+        if let Some(error) = dislikes_failed {
+            // Said in the same place a playlist that would not travel is said, so
+            // the sentence a person reads after moving computers mentions it.
+            failed.push(format!("songs to never play again: {error}"));
         }
         Ok(CarryReport {
             likes: kept.len(),
@@ -3720,6 +3774,27 @@ struct AppState {
     /// Where the artwork this phone holds is kept. Shared with the server, which
     /// is the only thing allowed to hand it out.
     art_root: PathBuf,
+    /// Where a track is staged to be handed to another app. One directory in the
+    /// cache, and the only one the file provider this app declares exposes.
+    share_root: PathBuf,
+}
+
+/// The directory inside the cache that sharing stages files in.
+///
+/// Must match `ShareBridge.SHARE_DIRECTORY` on the Android side: the path is
+/// checked against it there, and a mismatch would refuse every share.
+const SHARE_DIRECTORY: &str = "share";
+
+/// A track staged for another app, as the page needs to describe it.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ShareableAudio {
+    /// Where it is, for the Android share bridge to wrap in a content URI.
+    path: String,
+    /// What to declare it as, so an editor knows what it is being given.
+    mime: String,
+    /// The name it should be seen under.
+    name: String,
 }
 
 #[tauri::command]
@@ -3803,21 +3878,153 @@ async fn remote_set_likes(
         .await
 }
 
-/// Move this phone's key's likes and playlists from one computer to another.
+/// Stage a track this phone holds so that another app can be handed it.
+///
+/// Sharing needs two things the page cannot produce: a path in the one directory
+/// the file provider is allowed to expose, and a mime type. Both are facts about
+/// this device's storage rather than about the track, so both are decided here.
+///
+/// A hard link where the filesystem allows one, and a copy where it does not: a
+/// 60 MB file should not have to be duplicated to be shared, but a share that
+/// fails on a filesystem without links would be worse than the copy. The name is
+/// the track's own, cleaned, because that is what an editor's project list will
+/// show - while the id keeps it unique.
+#[tauri::command]
+async fn shareable_audio(
+    file_id: String,
+    state: State<'_, AppState>,
+) -> Result<ShareableAudio, String> {
+    validate_file_id(&file_id)?;
+    let app_data = state.remote.app_data.clone();
+    let track = cached_entries_in(&app_data)?
+        .into_iter()
+        .find(|entry| entry.track.file_id == file_id)
+        .map(|entry| entry.track)
+        .ok_or_else(|| "That track is not on this phone yet".to_string())?;
+    let extension = safe_extension(&track.format)?;
+    let source = app_data
+        .join("audio")
+        .join(format!("{}.{}", track.file_id, extension));
+    if !source.is_file() {
+        return Err("That track is not on this phone yet".into());
+    }
+    fs::create_dir_all(&state.share_root).map_err(|error| error.to_string())?;
+    let name = format!("{}.{}", share_name(&track), extension);
+    let staged = state.share_root.join(&name);
+    let _ = fs::remove_file(&staged);
+    if fs::hard_link(&source, &staged).is_err() {
+        fs::copy(&source, &staged).map_err(|error| error.to_string())?;
+    }
+    Ok(ShareableAudio {
+        path: staged.to_string_lossy().into_owned(),
+        mime: share_mime(&track, extension),
+        name,
+    })
+}
+
+/// What a shared track is called, as a file name another app can hold.
+///
+/// Built from the track rather than from its id, because this is the name a
+/// person reads in whatever they open it with. Everything that is not plainly
+/// part of a name is replaced rather than dropped, so `AC/DC` does not become two
+/// path segments and `?` does not become a wildcard.
+fn share_name(track: &RemoteTrack) -> String {
+    let joined = if track.artist.trim().is_empty() {
+        track.title.clone()
+    } else {
+        format!("{} - {}", track.artist, track.title)
+    };
+    let cleaned: String = joined
+        .chars()
+        .map(|character| {
+            if character.is_alphanumeric() || matches!(character, ' ' | '-' | '_' | '.' | '(' | ')') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    let bounded: String = collapsed.chars().take(120).collect();
+    let trimmed = bounded.trim_matches([' ', '.']).to_string();
+    // A name with nothing but punctuation in it is not a name: `///` on its own
+    // cleans to underscores and a dash, which is worse than the id it could have
+    // been - and the id is at least something one can search for.
+    if trimmed.is_empty() || !trimmed.chars().any(|character| character.is_alphanumeric()) {
+        return track.file_id.clone();
+    }
+    trimmed
+}
+
+/// The type to declare a shared track as.
+///
+/// The catalogue's own mime when it has one, because that is what the file really
+/// is and what the network said it was. The extension is the fallback, for the
+/// older records that carry none.
+fn share_mime(track: &RemoteTrack, extension: &str) -> String {
+    if track.mime.starts_with("audio/") || track.mime.starts_with("video/") {
+        return track.mime.clone();
+    }
+    match extension {
+        "mp3" => "audio/mpeg",
+        "flac" => "audio/flac",
+        "wav" => "audio/wav",
+        "m4a" | "aac" => "audio/mp4",
+        "ogg" | "oga" => "audio/ogg",
+        "opus" => "audio/opus",
+        _ => "audio/*",
+    }
+    .to_string()
+}
+
+/// The file ids this phone's key never wants played again, as its home computer
+/// (or a named one) keeps them.
+///
+/// Kept under the phone's own key and guarded by the proof rather than by a
+/// right, which is what lets a phone lent only the library turn a track off for
+/// itself - the list belongs to the person holding the phone, not to the
+/// computer it is asking.
+#[tauri::command]
+async fn remote_dislikes(
+    source: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    state.remote.dislikes_on(source.as_deref()).await
+}
+
+/// Replace that list, and answer with what the computer stored.
+#[tauri::command]
+async fn remote_set_dislikes(
+    source: Option<String>,
+    file_ids: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    state
+        .remote
+        .set_dislikes_on(source.as_deref(), file_ids)
+        .await
+}
+
+/// Move this phone's key's likes, dislikes and playlists from one computer to
+/// another.
 ///
 /// Called when someone changes which computer this phone acts through: the
 /// lists are filed under the phone's key on whichever computer it is talking to,
 /// so the one being left is where they were, and this is the explicit step that
-/// brings them along. `likes` is the phone's own copy, so a like made while
-/// nothing was reachable is not lost on the way.
+/// brings them along. `likes` and `dislikes` are the phone's own copies, so a
+/// mark made while nothing was reachable is not lost on the way.
 #[tauri::command]
 async fn carry_own_data(
     from: String,
     to: String,
     likes: Vec<String>,
+    dislikes: Option<Vec<String>>,
     state: State<'_, AppState>,
 ) -> Result<CarryReport, String> {
-    state.remote.carry_own_data(&from, &to, likes).await
+    state
+        .remote
+        .carry_own_data(&from, &to, likes, dislikes.unwrap_or_default())
+        .await
 }
 
 /// Forget one computer, leaving the others this phone may read.
@@ -4529,13 +4736,21 @@ const MAX_TRACK_URI_BYTES: usize = 256;
 /// the URI and this process draws the markup, so it is trusted by construction.
 /// It still goes through the same sanitiser as a host's code, because that is
 /// what guarantees only a QR renderer's own elements ever reach the page.
+///
+/// Drawn at the highest error correction the symbol can carry rather than the
+/// default, because the page draws the Napstr mark in the middle of it: a
+/// scanner reads the modules around the logo, and the level is the budget that
+/// says how much of the middle can be covered and still read. It costs a denser
+/// pattern, which is a fair trade for a code that a person has to point a camera
+/// at - and a smaller logo than this leaves room for would be worse to look at
+/// than a slightly denser square.
 #[tauri::command]
 fn track_code(uri: String) -> Result<String, String> {
     let trimmed = uri.trim();
     if trimmed.is_empty() || trimmed.len() > MAX_TRACK_URI_BYTES {
         return Err("invalid track code".into());
     }
-    let drawn = QrCode::new(trimmed.as_bytes())
+    let drawn = QrCode::with_error_correction_level(trimmed.as_bytes(), EcLevel::H)
         .map_err(|error| format!("could not create the track code: {error}"))?
         .render::<svg::Color>()
         .min_dimensions(240, 240)
@@ -4644,6 +4859,10 @@ async fn remote_discover(
 ) -> Result<DiscoverPage, String> {
     let mode = match mode.as_str() {
         "mostSeeded" => DiscoverMode::MostSeeded,
+        // What one person is keeping alive, rather than what everybody holds:
+        // the other end of the same list, which is what digging through a crate
+        // means.
+        "leastSeeded" => DiscoverMode::LeastSeeded,
         other => {
             return Err(format!(
                 "that is not a way this phone knows to choose a list: {other}"
@@ -5341,12 +5560,22 @@ pub fn run() {
             // One path, decided once: the server serves from it and the command
             // that fetches writes into it.
             let art_root = app_data.join(art_store::ART_DIRECTORY);
+            // Sharing happens out of the cache rather than out of the audio
+            // directory, because the file provider this app declares exposes one
+            // directory in the cache and nothing else: a share that could point
+            // anywhere would be a way to hand any file on the device to any app.
+            let share_root = app
+                .path()
+                .app_cache_dir()
+                .map(|directory| directory.join(SHARE_DIRECTORY))
+                .unwrap_or_else(|_| app_data.join(SHARE_DIRECTORY));
             app.manage(AppState {
                 remote: RemoteClient::new(app_data, Arc::clone(&identity)),
                 media: MediaServer::start(art_root.clone())?,
                 podcasts,
                 identity,
                 art_root,
+                share_root,
             });
             Ok(())
         })
@@ -5370,6 +5599,9 @@ pub fn run() {
             remote_playlists_containing,
             remote_likes,
             remote_set_likes,
+            remote_dislikes,
+            remote_set_dislikes,
+            shareable_audio,
             carry_own_data,
             remote_new_playlist_id,
             remote_save_playlist,
@@ -5780,6 +6012,45 @@ mod tests {
             lossless: false,
             duration_ms: 200_000,
         }
+    }
+
+    /// A shared file's name is a name, whatever the tags happen to say.
+    ///
+    /// The one place in sharing where a string from the network becomes part of a
+    /// path, so the rules are checked rather than assumed: a separator is not a
+    /// separator, a question mark is not a wildcard, and a name that cleans away
+    /// to nothing falls back to the file id - which is ugly, and is also a name.
+    #[test]
+    fn a_shared_tracks_name_cannot_become_a_path() {
+        let mut track = library_row(&"a".repeat(64), false);
+        track.artist = "AC/DC".into();
+        track.title = "Back in Black".into();
+        assert_eq!(share_name(&track), "AC_DC - Back in Black");
+
+        track.artist = String::new();
+        track.title = "  Nothing/../Useful?  ".into();
+        assert_eq!(share_name(&track), "Nothing_.._Useful_");
+
+        track.artist = "///".into();
+        track.title = "".into();
+        assert_eq!(
+            share_name(&track),
+            "a".repeat(64),
+            "nothing usable left means the id, not an empty name"
+        );
+        assert!(!share_name(&track).contains(std::path::MAIN_SEPARATOR));
+    }
+
+    /// What a shared track is declared as, from what is known about it.
+    #[test]
+    fn a_shared_track_is_declared_as_what_it_is() {
+        let mut track = library_row(&"b".repeat(64), false);
+        assert_eq!(share_mime(&track, "mp3"), "audio/mpeg", "the catalogue's own word wins");
+
+        track.mime = String::new();
+        assert_eq!(share_mime(&track, "flac"), "audio/flac");
+        assert_eq!(share_mime(&track, "m4a"), "audio/mp4");
+        assert_eq!(share_mime(&track, "weird"), "audio/*", "unknown is still audio");
     }
 
     /// Rows for whole files, named by one character each so a library can be

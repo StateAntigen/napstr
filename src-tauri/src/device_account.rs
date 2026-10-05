@@ -24,7 +24,7 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use napstr_remote_protocol::{SignedEvent, AUTHENTICATION_KIND, MAX_LIKES};
+use napstr_remote_protocol::{SignedEvent, AUTHENTICATION_KIND, MAX_DISLIKES, MAX_LIKES};
 use nostr_sdk::nostr::{Event, JsonUtil};
 
 use crate::open_connection;
@@ -150,9 +150,63 @@ pub fn remember_key(db_path: &Path, endpoint_id: &str, pubkey: &str) -> Result<(
 
 /// The file ids this key liked, oldest first.
 pub fn likes(db_path: &Path, pubkey: &str) -> Result<Vec<String>, String> {
+    stored_list(db_path, LIKES_TABLE, pubkey)
+}
+
+/// Replace this key's likes with a list, and answer with what was stored.
+///
+/// The whole list rather than one at a time: a like is a state and not an event,
+/// and two devices holding the same key would otherwise interleave into a list
+/// neither of them chose.
+pub fn set_likes(db_path: &Path, pubkey: &str, file_ids: &[String]) -> Result<Vec<String>, String> {
+    replace_list(db_path, LIKES_TABLE, MAX_LIKES, "likes", pubkey, file_ids)
+}
+
+/// The file ids this key never wants played again, oldest first.
+pub fn dislikes(db_path: &Path, pubkey: &str) -> Result<Vec<String>, String> {
+    stored_list(db_path, DISLIKES_TABLE, pubkey)
+}
+
+/// Replace this key's dislikes with a list, and answer with what was stored.
+///
+/// A list of its own rather than a sign on the likes list: a device may hold a
+/// file in neither, in one, or - after a change of mind - in the other, and
+/// keeping them apart is what makes "undo" mean the earlier state rather than
+/// the absence of a mark.
+pub fn set_dislikes(
+    db_path: &Path,
+    pubkey: &str,
+    file_ids: &[String],
+) -> Result<Vec<String>, String> {
+    replace_list(
+        db_path,
+        DISLIKES_TABLE,
+        MAX_DISLIKES,
+        "dislikes",
+        pubkey,
+        file_ids,
+    )
+}
+
+/// The table one device's likes are kept in.
+const LIKES_TABLE: &str = "device_likes";
+/// And its dislikes. Two tables rather than one with a column, because a list of
+/// ids is the whole of what either is and a second column would only ever hold
+/// one of two values.
+const DISLIKES_TABLE: &str = "device_dislikes";
+
+/// One device's list, out of one of the two tables above.
+///
+/// The table name is interpolated into the SQL rather than bound, which is only
+/// safe because both callers pass a constant from this file - never anything a
+/// device said. Naming that here because a bound parameter is impossible for a
+/// table name and the next reader deserves to know why this looks careless.
+fn stored_list(db_path: &Path, table: &str, pubkey: &str) -> Result<Vec<String>, String> {
     let connection = open_connection(db_path)?;
     let mut statement = connection
-        .prepare("SELECT file_id FROM device_likes WHERE pubkey=?1 ORDER BY added_at, file_id")
+        .prepare(&format!(
+            "SELECT file_id FROM {table} WHERE pubkey=?1 ORDER BY added_at, file_id"
+        ))
         .map_err(|error| error.to_string())?;
     let rows = statement
         .query_map([pubkey], |row| row.get::<_, String>(0))
@@ -161,21 +215,24 @@ pub fn likes(db_path: &Path, pubkey: &str) -> Result<Vec<String>, String> {
         .map_err(|error| error.to_string())
 }
 
-/// Replace this key's likes with a list, and answer with what was stored.
+/// Replace one device's list in one of those tables, and answer with what stuck.
 ///
-/// The whole list rather than one at a time: a like is a state and not an event,
-/// and two devices holding the same key would otherwise interleave into a list
-/// neither of them chose. A file id that is not a file id is dropped rather than
-/// refused, because the rest of the list is still the person's answer.
-///
-/// A list too long to fit a control frame is refused rather than trimmed. The
-/// cap is not a policy about how much somebody may like, it is the size of the
-/// wire, and quietly dropping the end of a list would delete likes that the
-/// phone still believes it saved.
-pub fn set_likes(db_path: &Path, pubkey: &str, file_ids: &[String]) -> Result<Vec<String>, String> {
-    if file_ids.len() > MAX_LIKES {
+/// A file id that is not a file id is dropped rather than refused, because the
+/// rest of the list is still the person's answer. A list too long to fit a
+/// control frame is refused rather than trimmed: the cap is not a policy about
+/// how much somebody may like, it is the size of the wire, and quietly dropping
+/// the end of a list would delete marks the phone still believes it saved.
+fn replace_list(
+    db_path: &Path,
+    table: &str,
+    limit: usize,
+    what: &str,
+    pubkey: &str,
+    file_ids: &[String],
+) -> Result<Vec<String>, String> {
+    if file_ids.len() > limit {
         return Err(format!(
-            "That is {} likes, and this computer keeps at most {MAX_LIKES}",
+            "That is {} {what}, and this computer keeps at most {limit}",
             file_ids.len()
         ));
     }
@@ -193,11 +250,13 @@ pub fn set_likes(db_path: &Path, pubkey: &str, file_ids: &[String]) -> Result<Ve
         .transaction()
         .map_err(|error| error.to_string())?;
     transaction
-        .execute("DELETE FROM device_likes WHERE pubkey=?1", [pubkey])
+        .execute(&format!("DELETE FROM {table} WHERE pubkey=?1"), [pubkey])
         .map_err(|error| error.to_string())?;
     {
         let mut insert = transaction
-            .prepare("INSERT INTO device_likes(pubkey,file_id,added_at) VALUES(?1,?2,?3)")
+            .prepare(&format!(
+                "INSERT INTO {table}(pubkey,file_id,added_at) VALUES(?1,?2,?3)"
+            ))
             .map_err(|error| error.to_string())?;
         let now = chrono::Utc::now().timestamp();
         for (index, file_id) in wanted.iter().enumerate() {
@@ -207,23 +266,25 @@ pub fn set_likes(db_path: &Path, pubkey: &str, file_ids: &[String]) -> Result<Ve
         }
     }
     transaction.commit().map_err(|error| error.to_string())?;
-    likes(db_path, pubkey)
+    stored_list(db_path, table, pubkey)
 }
 
-/// The table and the column this module reads, added to a database that predates
-/// them.
+/// The tables and the column this module reads, added to a database that
+/// predates them.
 pub fn initialise_schema(db_path: &Path) -> Result<(), String> {
     let connection = open_connection(db_path)?;
-    connection
-        .execute_batch(
-            "CREATE TABLE IF NOT EXISTS device_likes (
-               pubkey TEXT NOT NULL,
-               file_id TEXT NOT NULL,
-               added_at INTEGER NOT NULL,
-               PRIMARY KEY (pubkey, file_id)
-             );",
-        )
-        .map_err(|error| error.to_string())?;
+    for table in [LIKES_TABLE, DISLIKES_TABLE] {
+        connection
+            .execute_batch(&format!(
+                "CREATE TABLE IF NOT EXISTS {table} (
+                   pubkey TEXT NOT NULL,
+                   file_id TEXT NOT NULL,
+                   added_at INTEGER NOT NULL,
+                   PRIMARY KEY (pubkey, file_id)
+                 );"
+            ))
+            .map_err(|error| error.to_string())?;
+    }
     let has_pubkey: bool = connection
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('mobile_devices') WHERE name='pubkey')",
@@ -422,6 +483,61 @@ mod tests {
         assert!(error.contains(&MAX_LIKES.to_string()), "said: {error}");
         // The refusal leaves the list it had, rather than half of the new one.
         assert_eq!(likes(&db, &phone).unwrap(), vec![file]);
+
+        let _ = std::fs::remove_dir_all(db.parent().unwrap());
+    }
+
+    /// The two lists are two lists, not one list with a sign on it.
+    ///
+    /// This is what makes undo mean the state before rather than the absence of
+    /// a mark: a file can be liked, then disliked while still liked elsewhere, and
+    /// taking the dislike back has to leave the like where it was.
+    #[test]
+    fn dislikes_are_a_list_of_their_own_rather_than_the_likes_upside_down() {
+        let db = device_database("dislikes");
+        let phone = "b".repeat(64);
+        let other = "c".repeat(64);
+        let liked = "1".repeat(64);
+        let disliked = "2".repeat(64);
+
+        set_likes(&db, &phone, &[liked.clone()]).unwrap();
+        assert_eq!(
+            set_dislikes(&db, &phone, &[disliked.clone()]).unwrap(),
+            vec![disliked.clone()]
+        );
+        assert_eq!(dislikes(&db, &phone).unwrap(), vec![disliked.clone()]);
+        assert_eq!(
+            likes(&db, &phone).unwrap(),
+            vec![liked.clone()],
+            "the like is still a like"
+        );
+        // Another key is another list here too.
+        assert!(dislikes(&db, &other).unwrap().is_empty());
+        // And taking the dislike back leaves the like standing.
+        set_dislikes(&db, &phone, &[]).unwrap();
+        assert!(dislikes(&db, &phone).unwrap().is_empty());
+        assert_eq!(likes(&db, &phone).unwrap(), vec![liked]);
+
+        let _ = std::fs::remove_dir_all(db.parent().unwrap());
+    }
+
+    /// A dislikes list is cleaned and capped by the same rules as a likes list.
+    #[test]
+    fn a_dislikes_list_is_cleaned_and_capped_the_same_way() {
+        let db = device_database("dislikes-clean");
+        let phone = "b".repeat(64);
+        let file = "1".repeat(64);
+        assert_eq!(
+            set_dislikes(&db, &phone, &[file.clone(), "nonsense".into()]).unwrap(),
+            vec![file.clone()]
+        );
+
+        let too_many: Vec<String> = (0..=MAX_DISLIKES)
+            .map(|index| format!("{index:064x}"))
+            .collect();
+        let error = set_dislikes(&db, &phone, &too_many).unwrap_err();
+        assert!(error.contains(&MAX_DISLIKES.to_string()), "said: {error}");
+        assert_eq!(dislikes(&db, &phone).unwrap(), vec![file]);
 
         let _ = std::fs::remove_dir_all(db.parent().unwrap());
     }

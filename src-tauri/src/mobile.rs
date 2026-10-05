@@ -1417,6 +1417,19 @@ impl MobileService {
                 let stored = crate::device_account::set_likes(&self.db_path, &pubkey, &file_ids)?;
                 write_response(send, &ServerResponse::Likes { file_ids: stored }).await
             }
+            // The same shape as likes, in a list of its own: what a person never
+            // wants played again belongs to the person rather than to the
+            // computer, so a phone lent only the library keeps it just as well.
+            ClientRequest::Dislikes => {
+                let pubkey = self.proved_key(remote_id)?;
+                let file_ids = crate::device_account::dislikes(&self.db_path, &pubkey)?;
+                write_response(send, &ServerResponse::Dislikes { file_ids }).await
+            }
+            ClientRequest::SetDislikes { file_ids } => {
+                let pubkey = self.proved_key(remote_id)?;
+                let stored = crate::device_account::set_dislikes(&self.db_path, &pubkey, &file_ids)?;
+                write_response(send, &ServerResponse::Dislikes { file_ids: stored }).await
+            }
             ClientRequest::Ping => write_response(send, &ServerResponse::Pong).await,
             ClientRequest::Pair { .. } => unreachable!(),
         }
@@ -1622,13 +1635,17 @@ fn check_request_permission(rights: DeviceRights, request: &ClientRequest) -> Re
         // The identity and what belongs to it are here for the same reason, with a
         // stronger one: a device's likes are the device's own, not this computer's,
         // so they are not part of any grant this computer hands out. What guards
-        // them is the proof, not a right.
+        // them is the proof, not a right - and the dislikes are the same list by
+        // another name, which is what lets a phone lent only the library turn a
+        // track off for itself.
         ClientRequest::Status
         | ClientRequest::Ping
         | ClientRequest::IdentityChallenge
         | ClientRequest::AuthenticateDevice { .. }
         | ClientRequest::Likes
-        | ClientRequest::SetLikes { .. } => Ok(()),
+        | ClientRequest::SetLikes { .. }
+        | ClientRequest::Dislikes
+        | ClientRequest::SetDislikes { .. } => Ok(()),
         ClientRequest::FetchAudio { .. } => require(
             rights,
             DeviceRights::FETCH,

@@ -27,6 +27,14 @@ pub const NOT_PROVED_MESSAGE: &str =
 /// thousand of them come to about 200 KB of the 256 KB a frame holds. The
 /// largest test in this file keeps that honest.
 pub const MAX_LIKES: usize = 3_000;
+/// Longest dislikes list one device may keep.
+///
+/// The same budget as likes, and for the same reason: a dislike is the same
+/// 64-character file id travelling in the same frame in both directions. It is a
+/// list of its own rather than one list with a sign on it, because a like and a
+/// dislike are two different statements about one file and a device may hold it
+/// in neither, in one, or - after a change of mind - in the other.
+pub const MAX_DISLIKES: usize = 3_000;
 /// Album covers per request. Bounded so a full answer always fits in one
 /// control frame even when every URL is at its maximum length.
 pub const MAX_COVER_KEYS: usize = 40;
@@ -120,6 +128,11 @@ pub enum DiscoverMode {
     /// Live files with the most seeders first, varied inside each tier of
     /// seeders, with anything this computer already holds left out.
     MostSeeded,
+    /// Live files with the *fewest* seeders first: the ones a single person is
+    /// keeping alive, which is what digging through a crate is for. The same
+    /// filters as `MostSeeded`, so this is a ranking rather than a different
+    /// search - a file nobody seeds at all is not in the live set either way.
+    LeastSeeded,
 }
 
 /// Longest queue either side may hand to the other. 200 file ids of the 64
@@ -1020,6 +1033,17 @@ pub enum ClientRequest {
     SetLikes {
         file_ids: Vec<String>,
     },
+    /// The file ids this device never wants played again.
+    ///
+    /// Kept beside its likes under the same key and guarded by the same proof,
+    /// because it is the same kind of thing: a list that belongs to the person
+    /// holding the phone rather than to the computer, and one that a phone lent
+    /// only the library must still be able to keep.
+    Dislikes,
+    /// Replace that list with this one, and answer with what was stored.
+    SetDislikes {
+        file_ids: Vec<String>,
+    },
     Status,
     Ping,
 }
@@ -1159,6 +1183,11 @@ pub enum ServerResponse {
     /// What this device liked. Its own list rather than the computer's: it is
     /// kept under the device's key, so it belongs to whoever holds that key.
     Likes {
+        file_ids: Vec<String>,
+    },
+    /// What this device never wants played again, under the same key and for the
+    /// same reason as `Likes`.
+    Dislikes {
         file_ids: Vec<String>,
     },
     Status {
@@ -1304,6 +1333,33 @@ mod tests {
         assert!(
             answered.len() <= MAX_CONTROL_FRAME_BYTES,
             "{MAX_LIKES} likes is {} bytes answered, over the {MAX_CONTROL_FRAME_BYTES} byte limit",
+            answered.len()
+        );
+    }
+
+    /// A full dislikes list crosses the wire the same way, and is the same size.
+    ///
+    /// Worth its own test rather than an assumption from the likes one: these are
+    /// two lists that can both be at their maximum at once, and the number that
+    /// decides `MAX_DISLIKES` is this one.
+    #[test]
+    fn a_full_dislikes_list_fits_in_one_control_frame() {
+        let full: Vec<String> = (0..MAX_DISLIKES)
+            .map(|index| format!("{index:064x}"))
+            .collect();
+        let asked = serde_json::to_vec(&ClientRequest::SetDislikes {
+            file_ids: full.clone(),
+        })
+        .unwrap();
+        assert!(
+            asked.len() <= MAX_CONTROL_FRAME_BYTES,
+            "{MAX_DISLIKES} dislikes is {} bytes asked, over the {MAX_CONTROL_FRAME_BYTES} byte limit",
+            asked.len()
+        );
+        let answered = serde_json::to_vec(&ServerResponse::Dislikes { file_ids: full }).unwrap();
+        assert!(
+            answered.len() <= MAX_CONTROL_FRAME_BYTES,
+            "{MAX_DISLIKES} dislikes is {} bytes answered, over the {MAX_CONTROL_FRAME_BYTES} byte limit",
             answered.len()
         );
     }

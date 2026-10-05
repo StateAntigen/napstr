@@ -437,12 +437,18 @@ pub(crate) fn search(
 /// no words, so there is nothing for the index to look up — it is the live set
 /// ordered by whether anybody can actually play it.
 ///
-/// What comes back is a window of the most-seeded live files, ordered the way a
-/// search orders its hits (how many seeders, then how recently they said so) and
-/// then shuffled *inside* each tier of seeders by [`shuffle_key`] — the same
-/// function the phone's own shuffled library browse uses. So the order is one order
-/// for a given seed, which is what lets a page be an offset rather than a cursor,
-/// and a different seed presents the same files in a different order.
+/// What comes back is a window of the live files, ordered the way a search orders
+/// its hits (how many seeders, then how recently they said so) and then shuffled
+/// *inside* each tier of seeders by [`shuffle_key`] — the same function the
+/// phone's own shuffled library browse uses. So the order is one order for a given
+/// seed, which is what lets a page be an offset rather than a cursor, and a
+/// different seed presents the same files in a different order.
+///
+/// Which end of the seeder ranking it is read from is the whole of the difference
+/// between the modes: `MostSeeded` is what everybody is holding today, and
+/// `LeastSeeded` is what a single person is keeping alive, which is what digging
+/// through a crate is for. Everything else — the live set, the exclusions, the
+/// paging — is the same question either way.
 ///
 /// `total` is how many files that list holds — the window, not the whole live set,
 /// because a page past the end of it is not a page.
@@ -457,14 +463,39 @@ pub(crate) fn discover(
     limit: usize,
     now: i64,
 ) -> Result<(Vec<Hit>, usize), String> {
-    match mode {
-        DiscoverMode::MostSeeded => discover_most_seeded(connection, seed, offset, limit, now),
+    let order = match mode {
+        DiscoverMode::MostSeeded => SeederOrder::Most,
+        DiscoverMode::LeastSeeded => SeederOrder::Least,
+    };
+    discover_by_seeders(connection, order, seed, offset, limit, now)
+}
+
+/// Which end of the seeder ranking a discover list is read from.
+///
+/// One function with one word changed rather than two that could drift apart: the
+/// two are the same question asked from opposite ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeederOrder {
+    /// What most people are holding.
+    Most,
+    /// What the fewest are: the one person keeping something alive.
+    Least,
+}
+
+impl SeederOrder {
+    /// How the tier with more seeders sorts against one with fewer.
+    fn sql(self) -> &'static str {
+        match self {
+            Self::Most => "DESC",
+            Self::Least => "ASC",
+        }
     }
 }
 
-/// The live network's most-seeded files, varied inside each tier of seeders.
-fn discover_most_seeded(
+/// The live network's files, varied inside each tier of seeders.
+fn discover_by_seeders(
     connection: &Connection,
+    order: SeederOrder,
     seed: u64,
     offset: usize,
     limit: usize,
@@ -479,8 +510,9 @@ fn discover_most_seeded(
                 AND NOT EXISTS (SELECT 1 FROM blocked_files b WHERE b.file_id = c.file_id)
                 AND NOT EXISTS (SELECT 1 FROM blocked_pubkeys p WHERE p.pubkey = c.source_pubkey)
               GROUP BY c.file_id
-              ORDER BY seeders DESC, newest DESC
-              LIMIT ?2"
+              ORDER BY seeders {}, newest DESC
+              LIMIT ?2",
+            order.sql()
         ))
         .map_err(|error| error.to_string())?;
     let mut hits = statement
@@ -493,10 +525,11 @@ fn discover_most_seeded(
     // the tie, because a shuffled order still has to be *an* order for paging to
     // mean anything.
     hits.sort_by(|left, right| {
-        right
-            .sources
-            .len()
-            .cmp(&left.sources.len())
+        let mut seeders = left.sources.len().cmp(&right.sources.len());
+        if order == SeederOrder::Most {
+            seeders = seeders.reverse();
+        }
+        seeders
             .then_with(|| shuffle_key(seed, &left.file_id).cmp(&shuffle_key(seed, &right.file_id)))
             .then_with(|| left.file_id.cmp(&right.file_id))
     });
@@ -1253,6 +1286,36 @@ mod tests {
             vec![hex_id(1), hex_id(2)]
         );
         assert_eq!(page[0].sources.len(), 2);
+    }
+
+    #[test]
+    fn digging_leads_with_what_one_person_is_keeping_alive() {
+        let connection = database();
+        let now = 1_700_000_000;
+        // The same three files as above: two people holding one, one person
+        // holding another. Digging reads the ranking from the other end.
+        announce(&connection, &hex_id(1), 9, "Ghost", "One");
+        announce(&connection, &hex_id(1), 10, "Ghost", "One");
+        holding(&connection, &hex_id(1), 9, now);
+        holding(&connection, &hex_id(1), 10, now);
+        announce(&connection, &hex_id(2), 11, "Ghost", "Two");
+        holding(&connection, &hex_id(2), 11, now);
+
+        let (page, total) = discover(&connection, DiscoverMode::LeastSeeded, 5, 0, 10, now).unwrap();
+        assert_eq!(total, 2, "the same live set, read from the other end");
+        assert_eq!(
+            page.iter().map(|hit| hit.file_id.clone()).collect::<Vec<_>>(),
+            vec![hex_id(2), hex_id(1)],
+            "the rarest is what a dig finds first"
+        );
+        // Both modes are the same question, so the files in them are the same
+        // files - a dig is a ranking, not a different search.
+        let (most, _) = discover(&connection, DiscoverMode::MostSeeded, 5, 0, 10, now).unwrap();
+        let mut wanted = most.iter().map(|hit| hit.file_id.clone()).collect::<Vec<_>>();
+        let mut found = page.iter().map(|hit| hit.file_id.clone()).collect::<Vec<_>>();
+        wanted.sort();
+        found.sort();
+        assert_eq!(found, wanted);
     }
 
     #[test]

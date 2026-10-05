@@ -41,6 +41,9 @@ class MainActivity : TauriActivity() {
     webView.addJavascriptInterface(MediaControlBridge(this), "NapstrfyMedia")
     webView.addJavascriptInterface(BackBridge(), "NapstrfyBack")
     webView.addJavascriptInterface(NetworkBridge(this), "NapstrfyNetwork")
+    // Sharing is the one thing a webview cannot do for itself: a code or a file
+    // handed to another app is an Android intent.
+    webView.addJavascriptInterface(ShareBridge(this), "NapstrfyShare")
   }
 
   fun ensureMediaNotificationPermission() {
