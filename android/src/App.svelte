@@ -26,7 +26,7 @@
   import { artworkHue, coverFor, coverKey, invalidateCoverNegatives, loadFullCover, preloadArtwork, type AlbumCover } from './lib/artwork';
   import { reportReasons } from './lib/types';
   import { hostHue } from './lib/hosts';
-  import type { AudiobookLibraryPage, CachedAudio, CompanionStatus, CoverReport, LibraryPage, PlaybackCommand, PlaylistPage, PodcastDownload, PodcastEpisode, PodcastFeed, ReadOnlyTicketOffer, RemoteAudiobook, RemoteAudiobookSummary, RemoteDiscussionMessage, RemoteHost, RemotePlaybackState, RemotePlaylist, RemotePlaylistCoordinate, RemotePlaylistSummary, RemotePlaylistTrack, RemoteRepeat, RemoteTrack, RemoteTransfer, ReportReason } from './lib/types';
+  import type { AudiobookLibraryPage, CachedAudio, CompanionStatus, CoverReport, LibraryPage, NostrIdentity, PlaybackCommand, PlaylistPage, PodcastDownload, PodcastEpisode, PodcastFeed, ReadOnlyTicketOffer, RemoteAudiobook, RemoteAudiobookSummary, RemoteDiscussionMessage, RemoteHost, RemotePlaybackState, RemotePlaylist, RemotePlaylistCoordinate, RemotePlaylistSummary, RemotePlaylistTrack, RemoteRepeat, RemoteTrack, RemoteTransfer, ReportReason } from './lib/types';
 
   const musicChips = ['Rock', 'Soundtrack', 'Punk', 'Folk', 'Upbeat'];
   const musicHistoryKey = 'napstrfy-played-albums';
@@ -766,6 +766,20 @@
   let readOnlyTicket = $state<ReadOnlyTicketOffer | null>(null);
   let ticketBusy = $state(false);
   let ticketError = $state('');
+  /**
+   * This phone's own Nostr identity.
+   *
+   * Not the computer's key and not a copy of it: what this phone says in public
+   * is signed here, and a computer is only where it is published. The secret is
+   * shown only when it is asked for, because everything this phone published can
+   * only ever be edited by whoever holds it.
+   */
+  let nostrIdentity = $state<NostrIdentity>({ pubkey: '', npub: '' });
+  let identityExport = $state('');
+  let identityRestore = $state('');
+  let identityRestoreOpen = $state(false);
+  let identityRestoring = $state(false);
+  let identityError = $state('');
   /** NIP-56: reporting the cover on an album, opened from the track menu. */
   let showReport = $state(false);
   let reportKey = $state('');
@@ -5115,6 +5129,84 @@
     return Math.max(0, Math.round((readOnlyTicket.expiresAt * 1000 - Date.now()) / 60_000));
   }
 
+  /** This phone's public key, which is all a screen ever needs to show. */
+  async function loadNostrIdentity() {
+    try {
+      nostrIdentity = await invoke<NostrIdentity>('nostr_identity');
+    } catch {
+      // Nothing to report: an identity that cannot be read is an identity whose
+      // rows simply do not appear, and the pairing and playback are unaffected.
+    }
+  }
+
+  async function copyText(value: string, confirmation: string) {
+    try {
+      await navigator.clipboard.writeText(value);
+      notice = confirmation;
+    } catch {
+      // A refused clipboard still leaves the text on screen to copy by hand.
+      notice = value;
+    }
+  }
+
+  function copyNostrIdentity() {
+    if (!nostrIdentity.npub) return;
+    void copyText(nostrIdentity.npub, 'Public key copied');
+  }
+
+  /**
+   * Show or hide the secret.
+   *
+   * Hidden again by the same button, and asked for the first time rather than
+   * drawn on the page: a key that is simply lying there in a screenshot is the
+   * one way a phone's identity leaves it without the owner meaning to.
+   */
+  async function toggleIdentityExport() {
+    if (identityExport) {
+      identityExport = '';
+      return;
+    }
+    identityError = '';
+    try {
+      identityExport = await invoke<string>('export_nostr_identity');
+    } catch (nextError) {
+      identityError = String(nextError);
+    }
+  }
+
+  function copyIdentitySecret() {
+    if (!identityExport) return;
+    void copyText(identityExport, 'Secret key copied');
+  }
+
+  /**
+   * Take an exported key as this phone's identity.
+   *
+   * Asked first, and the question says what it costs: everything this phone
+   * published belongs to the key that signed it, so a different key leaves those
+   * playlists behind, editable only by the key this phone no longer holds.
+   */
+  async function restoreNostrIdentity() {
+    const secret = identityRestore.trim();
+    if (!secret || identityRestoring) return;
+    if (!window.confirm(
+      'Use this key as the phone’s identity? Playlists and comments this phone published under its old key stay with the old key.'
+    )) return;
+    identityRestoring = true;
+    identityError = '';
+    try {
+      nostrIdentity = await invoke<NostrIdentity>('import_nostr_identity', { secret });
+      identityRestore = '';
+      identityRestoreOpen = false;
+      identityExport = '';
+      notice = 'This phone now signs as that key';
+    } catch (nextError) {
+      identityError = String(nextError);
+    } finally {
+      identityRestoring = false;
+    }
+  }
+
   /**
    * A cover is reported by album key, never by event id: the computer decides
    * which claim to report, and the phone cannot name a pubkey it cannot verify.
@@ -6005,6 +6097,9 @@
     void loadCachedLibrary()
       .then(() => refreshStatus(true, false))
       .then(() => { if (anyoneReachable) void loadLibrary(); });
+    // This phone's own key, which is made on first launch and read from its file
+    // on every one after that.
+    void loadNostrIdentity();
     void refreshPodcastDownloads();
     // Fifteen seconds is right for a connection that is up, and far too slow for one
     // that is being opened - which is the whole of a cold start. The tunnel lands in a
@@ -7257,6 +7352,41 @@
           </button>
         </div>
       {/if}
+
+      <!-- What this phone signs with. Its own section because it is about who
+           this phone *is*, not about what it is allowed to do: the key is the
+           phone's, and what it writes is published by a computer rather than
+           authored by one. -->
+      <div class="settings-section">
+        <p>{$t("Your Nostr identity")}</p>
+        <p class="settings-note">{$t("This phone signs what it says in public with a key of its own, so your comments and playlists belong to this phone rather than to a computer. A computer you are paired with is only where they are published.")}</p>
+        <div class="identity-row">
+          <code title={nostrIdentity.npub}>{nostrIdentity.npub || $t("Preparing…")}</code>
+          <button class="settings-action" onclick={() => void copyNostrIdentity()} aria-label={$t("Copy your public key")}>{$t("Copy")}</button>
+        </div>
+        <button class="settings-row" onclick={() => void toggleIdentityExport()} aria-expanded={identityExport !== ''}>
+          <span>{$t("Export your secret key")}</span>
+          <small>{$t("Write it down: everything this phone published can only be edited by whoever holds it")}</small>
+        </button>
+        {#if identityExport}
+          <div class="identity-secret">
+            <textarea readonly value={identityExport} aria-label={$t("Your secret key")} spellcheck="false"></textarea>
+            <button class="settings-action" onclick={() => void copyIdentitySecret()}>{$t("Copy")}</button>
+          </div>
+          <p class="settings-note">{$t("Anyone who has this key can post as this phone. Keep it somewhere you would keep a password.")}</p>
+        {/if}
+        <button class="settings-row" onclick={() => (identityRestoreOpen = !identityRestoreOpen)} aria-expanded={identityRestoreOpen}>
+          <span>{$t("Restore from a key")}</span>
+          <small>{$t("For a new install, or to move this phone to another")}</small>
+        </button>
+        {#if identityRestoreOpen}
+          <div class="identity-secret">
+            <textarea bind:value={identityRestore} placeholder="nsec1…" aria-label={$t("The key to restore")} spellcheck="false" autocapitalize="off" autocomplete="off"></textarea>
+            <button class="settings-action" disabled={identityRestoring || !identityRestore.trim()} onclick={() => void restoreNostrIdentity()}>{identityRestoring ? $t("Restoring…") : $t("Restore")}</button>
+          </div>
+        {/if}
+        {#if identityError}<p class="settings-note settings-error">{identityError}</p>{/if}
+      </div>
 
       <!-- Its own section rather than a row inside another: it is the only
            setting here about what this phone spends, and it differs by

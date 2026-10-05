@@ -836,5 +836,17 @@
   "This phone has one home computer that signs and downloads for it; the others are libraries to read and play from. What a code may do is set by the computer that issued it.": "Este teléfono tiene un ordenador principal que firma y descarga por él; los demás son bibliotecas para leer y reproducir. Lo que un código permite lo decide el ordenador que lo emitió.",
   "This phone's home computer": "El ordenador principal de este teléfono",
   "Your home computer is the one this phone signs, downloads and browses through. The others are libraries to read and play from.": "Tu ordenador principal es aquel mediante el que este teléfono firma, descarga y navega. Los demás son bibliotecas para leer y reproducir.",
+  "Anyone who has this key can post as this phone. Keep it somewhere you would keep a password.": "Quien tenga esta clave puede publicar como este teléfono. Guárdala donde guardarías una contraseña.",
+  "Copy": "Copiar",
+  "Copy your public key": "Copiar tu clave pública",
+  "Export your secret key": "Exportar tu clave secreta",
+  "For a new install, or to move this phone to another": "Para una instalación nueva, o para pasar este teléfono a otro",
+  "Restore from a key": "Restaurar desde una clave",
+  "Restoring…": "Restaurando…",
+  "The key to restore": "La clave que restaurar",
+  "This phone signs what it says in public with a key of its own, so your comments and playlists belong to this phone rather than to a computer. A computer you are paired with is only where they are published.": "Este teléfono firma lo que dice en público con una clave propia, así que tus comentarios y listas pertenecen a este teléfono y no a un ordenador. El ordenador con el que está emparejado solo es donde se publican.",
+  "Write it down: everything this phone published can only be edited by whoever holds it": "Anótala: todo lo que este teléfono publicó solo lo puede editar quien tenga esta clave",
+  "Your Nostr identity": "Tu identidad de Nostr",
+  "Your secret key": "Tu clave secreta",
   "♥ Liked": "♥ Favoritos"
 }

@@ -836,5 +836,17 @@
   "This phone has one home computer that signs and downloads for it; the others are libraries to read and play from. What a code may do is set by the computer that issued it.": "Este telefone tem um computador principal que assina e baixa por ele; os outros são bibliotecas para ler e reproduzir. O que um código permite é decidido pelo computador que o emitiu.",
   "This phone's home computer": "O computador principal deste telefone",
   "Your home computer is the one this phone signs, downloads and browses through. The others are libraries to read and play from.": "O seu computador principal é aquele através do qual este telefone assina, baixa e navega. Os outros são bibliotecas para ler e reproduzir.",
+  "Anyone who has this key can post as this phone. Keep it somewhere you would keep a password.": "Quem tiver esta chave pode publicar como este telefone. Guarde-a onde guardaria uma palavra-passe.",
+  "Copy": "Copiar",
+  "Copy your public key": "Copiar a sua chave pública",
+  "Export your secret key": "Exportar a sua chave secreta",
+  "For a new install, or to move this phone to another": "Para uma instalação nova, ou para passar este telefone para outro",
+  "Restore from a key": "Restaurar a partir de uma chave",
+  "Restoring…": "A restaurar…",
+  "The key to restore": "A chave a restaurar",
+  "This phone signs what it says in public with a key of its own, so your comments and playlists belong to this phone rather than to a computer. A computer you are paired with is only where they are published.": "Este telefone assina o que diz em público com uma chave própria, por isso os seus comentários e listas pertencem a este telefone e não a um computador. O computador com que está emparelhado é apenas onde são publicados.",
+  "Write it down: everything this phone published can only be edited by whoever holds it": "Anote-a: tudo o que este telefone publicou só pode ser editado por quem tiver esta chave",
+  "Your Nostr identity": "A sua identidade Nostr",
+  "Your secret key": "A sua chave secreta",
   "♥ Liked": "♥ Favoritos"
 }

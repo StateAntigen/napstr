@@ -521,6 +521,14 @@ svg .filled { fill: currentColor; stroke: none; }
 .computer-include { display: flex; flex: 0 0 auto; align-items: center; gap: 6px; color: #8a8a95; font-size: 11px; }
 .computer-include input { width: 18px; height: 18px; accent-color: #7c6df2; }
 .settings-action { flex: 0 0 auto; padding: 7px 13px; color: #ff9aa6; background: #211519; border: 1px solid #3a2229; border-radius: 9px; font-size: 12px; }
+/* This phone's own key: a row that reads out the public half, and a textarea for
+   the secret when somebody asks to see it. The secret is monospace and wraps,
+   because writing it down by hand is the point of showing it at all. */
+.identity-row { padding: 4px 18px 12px; display: flex; align-items: center; gap: 10px; }
+.identity-row code { min-width: 0; flex: 1; overflow-wrap: anywhere; color: #cbc4ff; font-size: 11px; line-height: 1.35; }
+.identity-secret { padding: 0 18px 12px; display: flex; align-items: flex-start; gap: 10px; }
+.identity-secret textarea { min-width: 0; min-height: 62px; flex: 1; padding: 9px 10px; color: #ffd7dc; background: #17141b; border: 1px solid #3a2229; border-radius: 9px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; line-height: 1.4; resize: vertical; }
+.settings-error { color: #ff9aa6; background: #211519; border-color: #3a2229; }
 /* The status line above the pages: one dot per computer, in that computer's own
    colour. The ones that answered are clustered on the left and the ones that did
    not sit a little to their right. */

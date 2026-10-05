@@ -836,5 +836,17 @@
   "This phone has one home computer that signs and downloads for it; the others are libraries to read and play from. What a code may do is set by the computer that issued it.": "这部手机有一台为它签名和下载的家庭电脑；其他计算机是可读取和播放的音乐库。配对码能做什么由发出配对码的电脑决定。",
   "This phone's home computer": "这部手机的家庭电脑",
   "Your home computer is the one this phone signs, downloads and browses through. The others are libraries to read and play from.": "你的家庭电脑就是这部手机用来签名、下载和浏览的那台。其他计算机是可读取和播放的音乐库。",
+  "Anyone who has this key can post as this phone. Keep it somewhere you would keep a password.": "任何拿到这把密钥的人都能以这部手机的名义发布。请把它放在你会放密码的地方。",
+  "Copy": "复制",
+  "Copy your public key": "复制你的公钥",
+  "Export your secret key": "导出你的私钥",
+  "For a new install, or to move this phone to another": "用于全新安装，或把这部手机换到另一台",
+  "Restore from a key": "从密钥恢复",
+  "Restoring…": "正在恢复…",
+  "The key to restore": "要恢复的密钥",
+  "This phone signs what it says in public with a key of its own, so your comments and playlists belong to this phone rather than to a computer. A computer you are paired with is only where they are published.": "这部手机用它自己的密钥为公开言论签名，因此你的评论和播放列表属于这部手机，而不是某台电脑。配对的电脑只是发布它们的地方。",
+  "Write it down: everything this phone published can only be edited by whoever holds it": "请写下来：这部手机发布过的内容，只有持有这把密钥的人才能修改",
+  "Your Nostr identity": "你的 Nostr 身份",
+  "Your secret key": "你的私钥",
   "♥ Liked": "♥ 已喜欢"
 }

@@ -1,4 +1,5 @@
 mod art_store;
+mod identity;
 mod public_http;
 use public_http::{podcast_http_client, safe_public_https_url};
 
@@ -3161,6 +3162,10 @@ struct AppState {
     remote: Arc<RemoteClient>,
     media: Arc<MediaServer>,
     podcasts: Arc<PodcastStore>,
+    /// This phone's own Nostr identity, which is what signs anything it says in
+    /// public. A computer it is paired with is the way those events reach the
+    /// relays, not the author of them.
+    identity: Arc<identity::DeviceIdentity>,
     /// Where the artwork this phone holds is kept. Shared with the server, which
     /// is the only thing allowed to hand it out.
     art_root: PathBuf,
@@ -3183,6 +3188,35 @@ async fn pair_desktop(
 #[tauri::command]
 async fn forget_desktop(state: State<'_, AppState>) -> Result<(), String> {
     state.remote.forget().await
+}
+
+/// This phone's own Nostr identity: the key it signs with, never the key itself.
+///
+/// The public half is enough for everything the app draws - which key a playlist
+/// belongs to, what to show as "mine", what to tell a computer to expect.
+#[tauri::command]
+fn nostr_identity(state: State<'_, AppState>) -> Result<identity::NostrIdentity, String> {
+    state.identity.describe()
+}
+
+/// Show the secret, because a key nobody can write down is a key that is lost
+/// with the install. Everything this identity published can only be edited by
+/// whoever holds it, so this is the only way those things survive a reinstall.
+#[tauri::command]
+fn export_nostr_identity(state: State<'_, AppState>) -> Result<String, String> {
+    state.identity.export()
+}
+
+/// Put an exported key back, in place of the one this install made.
+///
+/// The caller warns first: a phone that restores a different key leaves behind
+/// every playlist its old key signed, and cannot edit them again.
+#[tauri::command]
+fn import_nostr_identity(
+    secret: String,
+    state: State<'_, AppState>,
+) -> Result<identity::NostrIdentity, String> {
+    state.identity.adopt(&secret)
 }
 
 /// Forget one computer, leaving the others this phone may read.
@@ -4512,7 +4546,7 @@ fn load_or_create_key(path: &Path) -> Result<SecretKey, String> {
 }
 
 #[cfg(unix)]
-fn write_private_key(path: &Path, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn write_private_key(path: &Path, bytes: &[u8]) -> Result<(), String> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let mut options = fs::OpenOptions::new();
@@ -4525,7 +4559,7 @@ fn write_private_key(path: &Path, bytes: &[u8]) -> Result<(), String> {
 }
 
 #[cfg(not(unix))]
-fn write_private_key(path: &Path, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn write_private_key(path: &Path, bytes: &[u8]) -> Result<(), String> {
     match fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -4582,6 +4616,9 @@ pub fn run() {
                 .app_data_dir()
                 .map_err(|error| error.to_string())?;
             let podcasts = PodcastStore::new(&app_data)?;
+            // Made or read once, here: everything that signs holds this, and the
+            // file it comes from is what makes the identity outlive an install.
+            let identity = identity::DeviceIdentity::load_or_create(&app_data)?;
             // One path, decided once: the server serves from it and the command
             // that fetches writes into it.
             let art_root = app_data.join(art_store::ART_DIRECTORY);
@@ -4589,6 +4626,7 @@ pub fn run() {
                 remote: RemoteClient::new(app_data),
                 media: MediaServer::start(art_root.clone())?,
                 podcasts,
+                identity: Arc::new(identity),
                 art_root,
             });
             Ok(())
@@ -4596,6 +4634,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             client_platform,
             companion_status,
+            nostr_identity,
+            export_nostr_identity,
+            import_nostr_identity,
             pair_desktop,
             forget_desktop,
             remote_hosts,

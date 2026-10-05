@@ -87,6 +87,21 @@ export type AudiobookLibraryPage = {
 };
 
 /**
+ * This phone's own Nostr identity.
+ *
+ * A key of its own, made on this device: what the phone says in public is signed
+ * here and published by a computer, rather than signed by the computer. Only the
+ * public half is ever named here - the secret leaves the app when somebody
+ * exports it and at no other time.
+ */
+export type NostrIdentity = {
+  /** Lowercase hex, which is what an event's `pubkey` field is. */
+  pubkey: string;
+  /** The same key as people exchange it: `npub1…`. */
+  npub: string;
+};
+
+/**
  * One computer this phone may talk to.
  *
  * There may be more than one: one of them is home - the one this phone signs,

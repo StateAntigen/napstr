@@ -836,5 +836,17 @@
   "This phone has one home computer that signs and downloads for it; the others are libraries to read and play from. What a code may do is set by the computer that issued it.": "Ce téléphone a un ordinateur principal qui signe et télécharge pour lui ; les autres sont des bibliothèques à lire et à écouter. Ce qu’un code autorise est décidé par l’ordinateur qui l’a émis.",
   "This phone's home computer": "L’ordinateur principal de ce téléphone",
   "Your home computer is the one this phone signs, downloads and browses through. The others are libraries to read and play from.": "Votre ordinateur principal est celui par lequel ce téléphone signe, télécharge et parcourt. Les autres sont des bibliothèques à lire et à écouter.",
+  "Anyone who has this key can post as this phone. Keep it somewhere you would keep a password.": "Quiconque possède cette clé peut publier en tant que ce téléphone. Gardez-la là où vous garderiez un mot de passe.",
+  "Copy": "Copier",
+  "Copy your public key": "Copier votre clé publique",
+  "Export your secret key": "Exporter votre clé secrète",
+  "For a new install, or to move this phone to another": "Pour une nouvelle installation, ou pour passer ce téléphone à un autre",
+  "Restore from a key": "Restaurer depuis une clé",
+  "Restoring…": "Restauration…",
+  "The key to restore": "La clé à restaurer",
+  "This phone signs what it says in public with a key of its own, so your comments and playlists belong to this phone rather than to a computer. A computer you are paired with is only where they are published.": "Ce téléphone signe ce qu’il dit en public avec sa propre clé : vos commentaires et vos listes appartiennent donc à ce téléphone, pas à un ordinateur. L’ordinateur auquel il est associé n’est que le lieu de publication.",
+  "Write it down: everything this phone published can only be edited by whoever holds it": "Notez-la : tout ce que ce téléphone a publié ne peut être modifié que par qui détient cette clé",
+  "Your Nostr identity": "Votre identité Nostr",
+  "Your secret key": "Votre clé secrète",
   "♥ Liked": "♥ Favoris"
 }
