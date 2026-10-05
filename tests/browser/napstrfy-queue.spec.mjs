@@ -41,10 +41,10 @@ const elsewhere = (letter, title) => ({
 const away = elsewhere('c', 'Sharp Dressed Man');
 const furtherAway = elsewhere('d', 'Legs');
 
-async function openApp(page, { library = [first, second], results = [found], fetching = null, holds = null } = {}) {
+async function openApp(page, { library = [first, second], results = [found], fetching = null, holds = null, refuse = null } = {}) {
   await mockNative(page, { platform: 'android' });
   await page.route('**/fixture.wav', serveAudio);
-  await page.addInitScript(({ library, results, fetching, holds }) => {
+  await page.addInitScript(({ library, results, fetching, holds, refuse }) => {
     window.remoteLibrary = library;
     // The answers a search gives, which a spec rewrites while the app is running
     // when it wants a file to change hands - the mock reads them at every call.
@@ -55,6 +55,9 @@ async function openApp(page, { library = [first, second], results = [found], fet
     // A file the computer already holds, as its own record of it: asking to
     // download one is refused, exactly as the real computer refuses it.
     window.holds = holds;
+    // A refusal that is not about holding the file: a lent pairing, or a host that
+    // will not fetch this one at all.
+    window.refuse = refuse;
     const invoke = window.__TAURI_INTERNALS__.invoke;
     window.__TAURI_INTERNALS__.invoke = async (cmd, args = {}) => {
       if (cmd === 'remote_download' && window.holds) {
@@ -89,11 +92,17 @@ async function openApp(page, { library = [first, second], results = [found], fet
         // answered with somebody else's row would make the phone believe a file had
         // already arrived.
         window.asked = [...(window.asked ?? []), args.fileId];
+        if (window.refuse) {
+          // A host that will not fetch this one says so instead of starting a
+          // transfer, which is what a lent pairing and a refused file look like.
+          await invoke(cmd, args).catch(() => {});
+          throw window.refuse;
+        }
         return invoke(cmd, args);
       }
       return invoke(cmd, args);
     };
-  }, { library, results, fetching, holds });
+  }, { library, results, fetching, holds, refuse });
   await page.goto('http://127.0.0.1:15174');
 }
 
@@ -191,6 +200,36 @@ test('a queued track the computer already holds plays instead of asking again', 
     window.calls.filter((call) => call.cmd === 'remote_download').length
   );
   expect(asked).toBe(1);
+});
+
+test('a fetch the computer refuses does not leave the player waiting for ever', async ({ page }) => {
+  // Nobody here holds this one, so playing it asks the computer to fetch it - and
+  // the computer refuses, which is what a lent pairing or a file the host will not
+  // take looks like. The wait for those bytes has to end when the refusal does:
+  // left standing it disables the player for the rest of the session, and the
+  // track that was asked for can never be asked for again.
+  await openApp(page, {
+    library: [],
+    results: [{ ...away }],
+    refuse: 'This pairing is read only. It cannot ask Napstr to download songs.'
+  });
+  // Queued while nothing is playing, which is the one route into this that goes
+  // through `playTrack` - the same path a queued network track's turn takes.
+  await addFoundTrack(page, away);
+
+  // The refusal is what the person is told, in the host's own words.
+  await expect(page.locator('.error-banner')).toContainText('read only');
+  // And the bar is not left showing that it is fetching something that will never
+  // arrive: its button is a button again. `caching` is the flag this reads, and it
+  // is the flag the next tap is measured against.
+  await expect(page.locator('.now-play')).toBeEnabled();
+
+  // The decisive part: the same track can be asked for a second time, from the
+  // queue it is in. `playTrack` refuses to start at all while it believes a fetch
+  // is running, so a tap that lands is a tap that found the flag clear.
+  await openQueue(page);
+  await page.locator('.queue-row').first().locator('.queue-open').click();
+  await expect.poll(async () => (await downloads(page)).length).toBe(2);
 });
 
 test('the row is not offered while the computer is the one playing', async ({ page }) => {

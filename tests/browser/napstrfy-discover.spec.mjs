@@ -135,6 +135,53 @@ test('play all leads with a track of this phone’s own, and asks for the first 
   await expect(page.locator('.queue-row').nth(1)).toContainText('Doubleback');
 });
 
+test('a run does not park on a track that has not arrived: the nearest one that can play is pulled in', async ({ page }) => {
+  // The run names two files nobody here holds and the library has two of its own,
+  // so the queue is an owned track, a fetch, another owned track, a fetch. The
+  // entry after what Play all opened with is a fetch that has not landed - and
+  // waiting for it is what left the player looking stuck: it stood on a download
+  // for minutes, or until that download failed. Advancing skips it instead.
+  const mine = ['f', 'g'].map((letter, index) => ({
+    ...inLibrary,
+    fileId: id(letter),
+    filename: `Mine ${index + 1}.mp3`,
+    title: `Mine ${index + 1}`
+  }));
+  // Nothing is warmed, so the only thing that could make a sound is a track that
+  // was already here: the fetches are never started.
+  await openApp(page, { library: mine, discovered: live, preload: 0 });
+  await expect(page.locator('.track-row')).toHaveCount(2);
+  await openSearchTab(page);
+  await page.locator('.discover-play').click();
+  await expect.poll(() => audioPaused(page)).toBe(false);
+
+  const playing = () => page.locator('.now-title').innerText();
+  const opened = await playing();
+  expect(mine.map((track) => track.title)).toContain(opened);
+
+  // The next entry is the first row of the network's list, which this computer has
+  // not fetched, so the run takes the nearest entry that can play instead.
+  await page.locator('.now-open').click();
+  await page.getByLabel('Next track').click();
+  await expect.poll(playing).not.toBe(opened);
+  const advanced = await playing();
+  expect(mine.map((track) => track.title)).toContain(advanced);
+
+  // And it says what it passed over, rather than appearing to lose a track.
+  await expect(page.locator('.toast')).toContainText('Gimme All Your Lovin');
+  await expect(page.locator('.toast')).toContainText('has not arrived yet');
+
+  // The queue was reformed rather than merely walked: the track that could play is
+  // now in the position the player was about to take, and the fetch it passed over
+  // is behind it - still in the run, so its turn comes round if it does land.
+  await page.locator('[aria-label="Open the playlist"]').click();
+  const order = await page.locator('.queue-row .queue-copy strong').allTextContents();
+  expect(order[0]).toBe(opened);
+  expect(order[1]).toBe(advanced);
+  expect(order[2]).toBe('Gimme All Your Lovin');
+  expect(order[3]).toBe('Sharp Dressed Man');
+});
+
 test('the list draws only the file types it is asked for', async ({ page }) => {
   // One format for now: anything larger is a fetch this phone would rather not pay
   // for. The row is left out of the drawing rather than out of the answer - the

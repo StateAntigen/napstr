@@ -661,7 +661,7 @@
   let reportReason = $state<ReportReason>('spam');
   let reportNote = $state('');
   let reportBusy = $state(false);
-  let reportError = $state('');
+  let reportError = $state<string | Message>('');
   /** The album view's scroller, so opening another album can jump to the top. */
   let albumScroll = $state<HTMLDivElement | undefined>(undefined);
 
@@ -1168,6 +1168,65 @@
     randomUpcoming = randomIndexExcept(playerIndex);
   }
 
+  /**
+   * Whether this phone can start a track without waiting for anything.
+   *
+   * Two things make that true: the computer holds the file, which is what lets it
+   * arrive over Iroh in seconds, and this phone already has the bytes. Anything
+   * else is a fetch from the network - minutes, if it happens at all - and a queue
+   * drawn from the network's own list is mostly that.
+   */
+  function playableNow(track: RemoteTrack): boolean {
+    return track.local || cachedFileIds.has(track.fileId);
+  }
+
+  /**
+   * The nearest entry beyond `from`, in the direction of play, that can play now.
+   *
+   * Forwards is the queue's own order, which is what "nearest" means when a track
+   * is skipped: the next one worth hearing, not the one behind it. A queue set to
+   * repeat wraps round once, because it has no end; one set to stop does not,
+   * because going back to something already played is not what "next" asked for.
+   * -1 when there is nothing to skip to, which the caller answers by waiting
+   * exactly as it always did.
+   */
+  function nearestPlayable(from: number, direction: 1 | -1): number {
+    const length = playerQueue.length;
+    if (length === 0) return -1;
+    const order: number[] = [];
+    for (let index = from + direction; index >= 0 && index < length; index += direction) {
+      order.push(index);
+    }
+    if (loopMode !== 'off') {
+      const start = direction === 1 ? 0 : length - 1;
+      for (let index = start; index !== from; index += direction) order.push(index);
+    }
+    return order.find((index) => playableNow(playerQueue[index])) ?? -1;
+  }
+
+  /**
+   * Move the entry at `index` into position `position`, keeping the order of the
+   * rest. This is what "pull the nearest available track into the next position"
+   * means: the entry that could not play is passed over rather than dropped, so
+   * its turn comes round again once it has arrived.
+   */
+  function pullQueueEntry(position: number, index: number) {
+    if (index === position || index < 0 || position < 0) return;
+    const queue = [...playerQueue];
+    const [pulled] = queue.splice(index, 1);
+    queue.splice(position, 0, pulled);
+    playerQueue = queue;
+  }
+
+  /** A random entry that can play now, other than `excluded`, or -1. */
+  function randomPlayableExcept(excluded: number): number {
+    const pool = playerQueue
+      .map((_, index) => index)
+      .filter((index) => index !== excluded && playableNow(playerQueue[index]));
+    if (pool.length === 0) return -1;
+    return pool[Math.floor(Math.random() * pool.length)];
+  }
+
   function savePlaySettings() {
     try {
       window.localStorage.setItem(playModeKey, JSON.stringify({ loop: loopMode, shuffle }));
@@ -1325,6 +1384,21 @@
   }
 
   /**
+   * Stop waiting on a file that is not coming.
+   *
+   * A fetch the player is waiting on is held in two places - the `caching` flag
+   * every later tap is measured against, and the file's place in
+   * `playingWhenReady` - and both are released in exactly one place: the moment
+   * the bytes land. A fetch that was refused, or whose transfer failed, or whose
+   * host turned out not to have it after all, has to let go here instead. Without
+   * this the player stays busy for the rest of the session and refuses every tap.
+   */
+  function releaseWait(fileId: string) {
+    if (!playingWhenReady.delete(fileId)) return;
+    if (!playing) caching = false;
+  }
+
+  /**
    * Take a file this computer already holds over Iroh, and play it if its turn was
    * what asked for it at all.
    *
@@ -1337,7 +1411,12 @@
     try {
       const rows = await invoke<RemoteTrack[]>('remote_library_by_ids', { fileIds: [track.fileId] });
       const local = rows.find((item) => item.fileId === track.fileId && item.local);
-      if (!local) return;
+      if (!local) {
+        // The computer said it holds the file but cannot name a row that does, so
+        // nothing is on its way: the wait ends rather than spinning for ever.
+        releaseWait(track.fileId);
+        return;
+      }
       adoptLocalTrack(local);
       if (playingWhenReady.delete(local.fileId)) {
         if (!playing) caching = false;
@@ -1348,7 +1427,9 @@
       // the whole point of the pre-load.
       queuePrefetch(local, local.fileId, libraryVisible);
     } catch {
-      // Whatever the reason, the next play asks again.
+      // Whatever the reason, the next play asks again - and if this was the track
+      // the player was waiting on, it stops waiting now rather than never.
+      releaseWait(track.fileId);
     }
   }
 
@@ -2060,6 +2141,14 @@
         playlistMode = 'view';
         return;
       }
+      // A lent pairing is not offered the editor either. The computer refuses
+      // every one of its writes - a save, a publish, a copy, a delete - so a
+      // draft here would be a promise this phone could not keep. The playlist is
+      // still readable, and the view screen says what this pairing may not do.
+      if (status.streamOnly) {
+        playlistMode = 'view';
+        return;
+      }
       playlistMode = 'edit';
       playlistError = '';
       playlistNotice = '';
@@ -2071,6 +2160,13 @@
   /** The playlist's own description: what it is called, and whether it is out. */
   function openPlaylistDetails() {
     if (playlistDraft && !playlistIsMine(playlistDraft.author)) {
+      playlistMode = 'view';
+      return;
+    }
+    // The details screen is the one that holds Save, Publish, Withdraw and the
+    // private switch: every control on it is a write, so a lent pairing has no
+    // business standing on it.
+    if (status.streamOnly) {
       playlistMode = 'view';
       return;
     }
@@ -2088,6 +2184,10 @@
 
   /** An editor holding a playlist that does not exist anywhere yet. */
   async function newPlaylist() {
+    if (status.streamOnly) {
+      playlistsError = msg("This pairing is read only, so nothing can be changed on the computer.");
+      return;
+    }
     playlistsError = '';
     try {
       playlistDraft = {
@@ -2317,6 +2417,12 @@
   }
 
   function openPlaylistAdd() {
+    // Adding a track writes the playlist down, which a lent pairing cannot do: the
+    // sheet would collect an answer the computer would refuse.
+    if (status.streamOnly) {
+      playlistError = msg("This pairing is read only, so nothing can be changed on the computer.");
+      return;
+    }
     showPlaylistAdd = true;
     addTab = 'songs';
     void loadAddTracks();
@@ -2371,6 +2477,10 @@
    */
   async function sortPlaylist(by: 'title' | 'artist' | 'album' | 'reverse') {
     showPlaylistSort = false;
+    if (status.streamOnly) {
+      playlistError = msg("This pairing is read only, so nothing can be changed on the computer.");
+      return;
+    }
     const wanted = [...playlistMembers];
     if (by === 'reverse') wanted.reverse();
     else {
@@ -2557,6 +2667,10 @@
   /** Write the draft down on the computer. Saving is what makes it exist. */
   async function savePlaylist(): Promise<boolean> {
     if (!playlistDraft) return false;
+    if (status.streamOnly) {
+      playlistError = msg("This pairing is read only, so nothing can be changed on the computer.");
+      return false;
+    }
     playlistSaving = true;
     playlistError = '';
     playlistNotice = '';
@@ -2578,6 +2692,10 @@
 
   async function publishPlaylist() {
     if (!playlistDraft) return;
+    if (status.streamOnly) {
+      playlistError = msg("This pairing is read only, so nothing can be changed on the computer.");
+      return;
+    }
     playlistSaving = true;
     playlistError = '';
     playlistNotice = '';
@@ -2607,6 +2725,10 @@
    */
   async function savePlaylistCopy() {
     if (!playlistDraft || playlistIsMine(playlistDraft.author)) return;
+    if (status.streamOnly) {
+      playlistError = msg("This pairing is read only, so nothing can be changed on the computer.");
+      return;
+    }
     playlistSaving = true;
     playlistError = '';
     playlistNotice = '';
@@ -2643,6 +2765,11 @@
    * away.
    */
   async function deletePlaylist(playlist: { playlistId: string; author: string; published: boolean }) {
+    if (status.streamOnly) {
+      playlistsError = msg("This pairing is read only, so nothing can be changed on the computer.");
+      showPlaylistDelete = false;
+      return;
+    }
     playlistsError = '';
     showPlaylistDelete = false;
     try {
@@ -2947,9 +3074,15 @@
       // handler must stay free to warm the queue and to notice it landing. A file
       // the computer turns out to be holding already is taken over Iroh instead -
       // waiting for a download it will never start is what left the player stuck.
-      void requestDownload(track).then((outcome) => {
-        if (outcome === 'held') void adoptHeldTrack(track, playerQueueLibraryVisible);
-      });
+      void requestDownload(track)
+        .then((outcome) => {
+          if (outcome === 'held') return adoptHeldTrack(track, playerQueueLibraryVisible);
+          // A refusal is an answer, and the wait it ends has to end here: it is the
+          // same entry `refreshTransfers` would otherwise hold for a file that is
+          // never coming.
+          if (outcome === 'refused') releaseWait(track.fileId);
+        })
+        .catch(() => releaseWait(track.fileId));
       // The wait for the bytes is not a freeze on the queue: what follows is warmed
       // exactly as it would be behind a track that was already here.
       warmUpcoming(track.fileId, playerQueueLibraryVisible);
@@ -3203,9 +3336,16 @@
       // Asked for, not waited on: the computer's answer is only "queued", and this
       // handler must stay free to warm the queue and to notice it landing. A file
       // the computer turns out to be holding already is taken over Iroh instead.
-      void requestDownload(track).then((outcome) => {
-        if (outcome === 'held') void adoptHeldTrack(track, libraryVisible);
-      });
+      void requestDownload(track)
+        .then((outcome) => {
+          if (outcome === 'held') return adoptHeldTrack(track, libraryVisible);
+          // Refused - a read-only pairing, no connection, a host that would not
+          // have it - so no download will ever land and the wait has to end here.
+          if (outcome === 'refused') releaseWait(track.fileId);
+        })
+        // The ask can still throw - a dropped connection, a host too old to know
+        // the command - and a wait nobody releases is a player that never plays.
+        .catch(() => releaseWait(track.fileId));
       // The fetch is the wait, but the queue is not frozen by it: what follows is
       // warmed exactly as it would be behind a track that was already here.
       warmUpcoming(track.fileId, libraryVisible);
@@ -3333,6 +3473,11 @@
           const awaited = playingWhenReady.delete(pendingFileId);
           if (awaited && !playing) caching = false;
           error = `${transfer.filename}: ${transfer.status}`;
+          // The player was waiting on this one, so a failure is not a reason to sit
+          // on a track that is never coming: the queue moves on to the nearest entry
+          // that can play. The failed one keeps its place, so its turn comes round
+          // again if it does turn up later.
+          if (awaited && current?.fileId === pendingFileId) void moveTrack(1);
           continue;
         }
         if (transfer && transfer.progress < 100 && !/complete|verified/i.test(transfer.status)) continue;
@@ -4796,6 +4941,12 @@
    * which claim to report, and the phone cannot name a pubkey it cannot verify.
    */
   function openCoverReport(track: RemoteTrack) {
+    if (status.streamOnly) {
+      // A report is signed and published in the user's own name, which is a write
+      // the computer refuses for a lent pairing. The sheet is not opened at all.
+      error = msg("This pairing is read only, so nothing can be changed on the computer.");
+      return;
+    }
     const key = coverKey(track.artist ?? '', track.album ?? '');
     if (!key) {
       error = 'This track names no artist and album to report.';
@@ -4811,6 +4962,10 @@
 
   async function submitCoverReport() {
     if (reportBusy || !reportKey) return;
+    if (status.streamOnly) {
+      reportError = msg("This pairing is read only, so nothing can be changed on the computer.");
+      return;
+    }
     reportBusy = true;
     reportError = '';
     try {
@@ -5240,8 +5395,29 @@
         randomHistoryIndex = randomHistory.length - 1;
         randomUpcoming = randomIndexExcept(next);
       }
+      // A random order has no notion of "nearer", so an entry the network has not
+      // delivered is simply not an entry to play: another is drawn in its place,
+      // and the history records the one that was really taken.
+      if (!playableNow(playerQueue[next])) {
+        const drawn = randomPlayableExcept(playerIndex);
+        if (drawn >= 0) {
+          next = drawn;
+          randomHistory = randomHistory.map((value, position) =>
+            position === randomHistoryIndex ? drawn : value
+          );
+        }
+      }
     } else {
+      // The place the player was about to take, and the nearest entry that can
+      // really play there. Nothing playable means nothing to skip to, so the entry
+      // that is there is waited for exactly as it always was.
       next = (playerIndex + direction + playerQueue.length) % playerQueue.length;
+      const playable = nearestPlayable(playerIndex, direction);
+      if (playable >= 0 && playable !== next) {
+        const passedOver = playerQueue[next];
+        pullQueueEntry(next, playable);
+        notice = msg("Skipped {p0} — it has not arrived yet", { p0: title(passedOver) });
+      }
     }
     playerIndex = next;
     selected = playerQueue[next];
@@ -6275,15 +6451,19 @@
                 </div>
                 <div class="playlist-tools">
                   {#if playlistIsMine(playlistDraft.author)}
-                    <button onclick={openPlaylistAdd}><span aria-hidden="true">{PLAYLIST_TOOL_GLYPH.add}</span>{$t("Add")}</button>
-                    <button onclick={() => void openPlaylistEditor(playlistDraft as RemotePlaylist)}><span aria-hidden="true">{PLAYLIST_TOOL_GLYPH.edit}</span>{$t("Edit")}</button>
-                    <button onclick={() => (showPlaylistSort = true)}><span aria-hidden="true">{PLAYLIST_TOOL_GLYPH.sort}</span>{$t("Sort")}</button>
-                    <button onclick={openPlaylistDetails}>{$t("Name & details")}</button>
+                    <!-- Every one of these ends in a write, so a lent pairing is not
+                         offered them: the computer refuses its saves, publishes and
+                         copies, and a button that always failed would only say so
+                         more slowly. -->
+                    <button disabled={status.streamOnly} onclick={openPlaylistAdd}><span aria-hidden="true">{PLAYLIST_TOOL_GLYPH.add}</span>{$t("Add")}</button>
+                    <button disabled={status.streamOnly} onclick={() => void openPlaylistEditor(playlistDraft as RemotePlaylist)}><span aria-hidden="true">{PLAYLIST_TOOL_GLYPH.edit}</span>{$t("Edit")}</button>
+                    <button disabled={status.streamOnly} onclick={() => (showPlaylistSort = true)}><span aria-hidden="true">{PLAYLIST_TOOL_GLYPH.sort}</span>{$t("Sort")}</button>
+                    <button disabled={status.streamOnly} onclick={openPlaylistDetails}>{$t("Name & details")}</button>
                   {:else}
                     <!-- Somebody else's public playlist. It plays like any other;
                          the one write it may get is a copy of its own, because
                          the computer can only ever sign its own coordinates. -->
-                    <button disabled={playlistSaving || !status.connected} onclick={() => void savePlaylistCopy()}>{playlistSaving ? $t("Saving…") : $t("Save a copy")}</button>
+                    <button disabled={playlistSaving || !status.connected || status.streamOnly} onclick={() => void savePlaylistCopy()}>{playlistSaving ? $t("Saving…") : $t("Save a copy")}</button>
                   {/if}
                 </div>
               </div>
@@ -6388,10 +6568,10 @@
               {/if}
 
               <div class="playlist-actions">
-                <button class="primary" disabled={playlistSaving || !playlistDraft.title.trim() || !playlistIsMine(playlistDraft.author)} onclick={() => void savePlaylist()}>{playlistSaving ? $t("Saving…") : $t("Save")}</button>
-                <button disabled={playlistSaving || playlistDraft.private || !playlistDraft.title.trim() || !status.connected || !playlistIsMine(playlistDraft.author)} onclick={() => void publishPlaylist()}>{$t("Publish")}</button>
+                <button class="primary" disabled={playlistSaving || status.streamOnly || !playlistDraft.title.trim() || !playlistIsMine(playlistDraft.author)} onclick={() => void savePlaylist()}>{playlistSaving ? $t("Saving…") : $t("Save")}</button>
+                <button disabled={playlistSaving || status.streamOnly || playlistDraft.private || !playlistDraft.title.trim() || !status.connected || !playlistIsMine(playlistDraft.author)} onclick={() => void publishPlaylist()}>{$t("Publish")}</button>
                 {#if playlistIsMine(playlistDraft.author)}
-                  <button disabled={playlistSaving} onclick={() => (showPlaylistDelete = true)}>{playlistDraft.published ? $t("Withdraw") : $t("Delete")}</button>
+                  <button disabled={playlistSaving || status.streamOnly} onclick={() => (showPlaylistDelete = true)}>{playlistDraft.published ? $t("Withdraw") : $t("Delete")}</button>
                 {/if}
               </div>
             </div>
@@ -6410,7 +6590,7 @@
               </button>
               <button
                 class="playlist-save"
-                disabled={playlistSaving || !playlistDraft.title.trim()}
+                disabled={playlistSaving || status.streamOnly || !playlistDraft.title.trim()}
                 onclick={() => void savePlaylist()}
               >{playlistSaving ? $t("Saving…") : $t("Save")}</button>
             </header>
@@ -6463,7 +6643,7 @@
           <section class="playlist-view" aria-busy={playlistsLoading}>
             <header class="library-heading">
               <div><p>{$t("YOUR NAPSTR")}</p><h1>{$t("Playlists")}</h1></div>
-              <button class="playlist-new" onclick={() => void newPlaylist()} aria-label={$t("New playlist")}>+</button>
+              <button class="playlist-new" disabled={status.streamOnly} onclick={() => void newPlaylist()} aria-label={$t("New playlist")}>+</button>
             </header>
 
             {#if playlistsError}<p class="error-card">{$t(playlistsError)}</p>{/if}
@@ -7083,11 +7263,11 @@
         <span>{$t("Anything to add? (optional)")}</span>
         <textarea bind:value={reportNote} rows="3" maxlength="500" placeholder={$t("Say what is wrong with this cover")}></textarea>
       </label>
-      {#if reportError}<p class="report-error">{reportError}</p>{/if}
+      {#if reportError}<p class="report-error">{$t(reportError)}</p>{/if}
       <p class="remote-note">
         {$t("Signed by")} {status.desktopName || 'your computer'} {$t("as a NIP-56 report. It tells other clients which cover to distrust.")}
       </p>
-      <button class="report-send" onclick={() => void submitCoverReport()} disabled={reportBusy || !status.connected}>
+      <button class="report-send" onclick={() => void submitCoverReport()} disabled={reportBusy || !status.connected || status.streamOnly}>
         {reportBusy ? 'Sending…' : 'Send report'}
       </button>
     </div>
@@ -7191,7 +7371,7 @@
       </div>
       <div class="actions-divider"></div>
       <button class="actions-row" onclick={() => (showPlaylistDelete = false)}><span>{$t("Cancel")}</span></button>
-      <button class="actions-row danger" onclick={() => void deletePlaylist(playlistDraft as RemotePlaylist)}>
+      <button class="actions-row danger" disabled={status.streamOnly} onclick={() => void deletePlaylist(playlistDraft as RemotePlaylist)}>
         <span>{playlistDraft.published ? $t("Withdraw") : $t("Delete")}</span>
       </button>
     </div>
@@ -7416,7 +7596,7 @@
           <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8.2" r="3.4" /><path d="M5.6 19.6a6.5 6.5 0 0 1 12.8 0" /></svg>
           <span>{$t("Go to artist")}</span>
         </button>
-        <button class="actions-row" disabled={!remoteAvailable()} onclick={() => openCoverReport(menuTrack)}>
+        <button class="actions-row" disabled={!remoteAvailable() || status.streamOnly} onclick={() => openCoverReport(menuTrack)}>
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4.8 21 20H3z" /><path d="M12 10.6v4" /><circle class="filled" cx="12" cy="17.4" r="0.9" /></svg>
           <span>{$t("Report this cover")}</span><small>{remoteAvailable() ? '' : 'Needs a connection'}</small>
         </button>

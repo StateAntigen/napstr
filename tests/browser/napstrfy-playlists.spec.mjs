@@ -1031,3 +1031,40 @@ test('a browse carries the one seed this launch was given, and a search does not
   const [found] = (await calls(page, 'remote_library')).filter((call) => Boolean(call.query));
   expect(found.shuffleSeed).toBeUndefined();
 });
+
+test('a read-only pairing reads a playlist and is offered no way to change it', async ({ page }) => {
+  await mockNative(page, { platform: 'android' });
+  // The computer lent this phone access: it browses, plays and fetches, and every
+  // write it makes is refused. A phone that offered the editor anyway would take a
+  // draft the host would never accept, and the person would only find out by
+  // watching a Save fail.
+  await page.addInitScript(() => {
+    window.streamOnly = true;
+  });
+  await page.goto('http://127.0.0.1:15174');
+  await seed(page, [
+    row({ title: 'Driving', tracks: [member(1, TRACK, 'Enter Sandman', 'Metallica')] })
+  ]);
+  await page.locator('.bottom-nav button').filter({ hasText: 'Playlists' }).click();
+  await expect(page.locator('.playlist-view')).toBeVisible();
+
+  // Reading is what the pairing is for, so the playlist is there...
+  await expect(page.locator('.playlist-row strong')).toHaveText(['Driving']);
+  // ...and the button that would start a new one is not offered.
+  await expect(page.locator('.playlist-new')).toBeDisabled();
+
+  await page.locator('.playlist-open').click();
+  // It opens as itself rather than as a draft, so there is no Save anywhere on it.
+  await expect(page.locator('.playlist-sheet h1')).toHaveText('Driving');
+  await expect(page.locator('.playlist-sheet .playlist-save')).toHaveCount(0);
+  // And the tools that exist only to change it are all off.
+  const tools = page.locator('.playlist-sheet .playlist-tools button');
+  await expect(tools).toHaveCount(4);
+  for (const tool of await tools.all()) await expect(tool).toBeDisabled();
+
+  // Nothing was even asked of the computer: the screen does not offer what the
+  // host would refuse.
+  expect(await calls(page, 'remote_save_playlist')).toHaveLength(0);
+  expect(await calls(page, 'remote_publish_playlist')).toHaveLength(0);
+  expect(await calls(page, 'remote_new_playlist_id')).toHaveLength(0);
+});
