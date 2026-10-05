@@ -331,13 +331,33 @@ impl TransferService {
         self.tor.start().await.map(|_| ())
     }
 
+    /// The session's onion, published again if the Tor holding it is gone.
+    ///
+    /// An onion is ephemeral: what keeps it alive is the control connection the
+    /// lease holds, so it dies with the process that connection belongs to. Tor is
+    /// restarted after this machine wakes, so a lease easily outlives its onion -
+    /// and a stale lease is worse than no lease at all, because every offer built
+    /// from it names an address nobody can reach while everything else about this
+    /// computer looks perfectly healthy. A downloader sees a peer that is online,
+    /// heartbeating and answering the request, and then a connection that never
+    /// completes.
+    async fn current_session_onion(&self, port: u16) -> Result<Arc<OnionLease>, String> {
+        let mut session_onion = self.session_onion.lock().await;
+        if let Some(lease) = session_onion.as_ref() {
+            if self.tor.lease_is_current(lease) {
+                return Ok(lease.clone());
+            }
+            *session_onion = None;
+        }
+        let lease = self.tor.create_onion(port).await?;
+        *session_onion = Some(lease.clone());
+        Ok(lease)
+    }
+
     pub async fn warm_for_sharing(&self) -> Result<(), String> {
         let port = self.ensure_listener().await?;
-        let mut session_onion = self.session_onion.lock().await;
-        if session_onion.is_none() {
-            *session_onion = Some(self.tor.create_onion(port).await?);
-        }
-        Ok(())
+        // The lease is kept by the service, which is the whole point of warming it.
+        self.current_session_onion(port).await.map(|_| ())
     }
 
     pub async fn create_offer(
@@ -388,16 +408,7 @@ impl TransferService {
         }
 
         let port = self.ensure_listener().await?;
-        let onion_lease = {
-            let mut session_onion = self.session_onion.lock().await;
-            if session_onion.is_none() {
-                *session_onion = Some(self.tor.create_onion(port).await?);
-            }
-            session_onion
-                .as_ref()
-                .cloned()
-                .ok_or("Tor session onion disappeared")?
-        };
+        let onion_lease = self.current_session_onion(port).await?;
         let mut random = [0u8; 32];
         rand::rng().fill_bytes(&mut random);
         let capability = hex::encode(random);
@@ -523,6 +534,7 @@ impl TransferService {
             // late fallback cannot revive a failed song outside the queue limit.
             let mut active_guard = active.lock().await;
             let remaining = coordinator.workers.fetch_sub(1, Ordering::SeqCst) - 1;
+            let succeeded = result.is_ok();
             let source_status = match &result {
                 Ok(_) => "Complete".to_string(),
                 Err(error) => format!("Failed: {error}"),
@@ -533,23 +545,42 @@ impl TransferService {
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                     .map_err(|error| error.to_string())?;
                 transaction.execute("UPDATE download_sources SET status=?1,updated_at=?2 WHERE request_id=?3 AND source_pubkey=?4", params![source_status, Utc::now().to_rfc3339(), offer.request_id, source_pubkey]).map_err(|error| error.to_string())?;
+                // Which peers have served this computer before, so the next request
+                // does not open with three strangers. An attempt the user stopped,
+                // and one that failed because another worker had already finished
+                // the file, say nothing about the seeder and are not recorded.
+                if succeeded
+                    || (!coordinator.cancel.is_cancelled()
+                        && !coordinator.complete.load(Ordering::SeqCst))
+                {
+                    crate::network::record_seeder_outcome(&transaction, &source_pubkey, succeeded)?;
+                }
                 if let Err(error) = result {
                     if remaining == 0 && !coordinator.complete.load(Ordering::SeqCst) {
                         let awaiting_offer: bool = transaction.query_row(
                             "SELECT EXISTS(SELECT 1 FROM download_sources WHERE request_id=?1 AND status='Requested')",
                             [&offer.request_id], |row| row.get(0),
                         ).map_err(|error| error.to_string())?;
-                        let status = if coordinator.cancel.is_cancelled() {
-                            "Cancelled".to_string()
-                        } else if awaiting_offer {
-                            crate::network::DOWNLOAD_WAITING_FALLBACK.to_string()
-                        } else {
-                            format!("Failed: {error}")
-                        };
-                        transaction.execute(
-                            "UPDATE network_downloads SET status=?1,speed='—',updated_at=?2 WHERE request_id=?3",
-                            params![status, Utc::now().to_rfc3339(), offer.request_id],
-                        ).map_err(|error| error.to_string())?;
+                        // A seeder that went away is not a verdict on the song: the
+                        // transfer is parked for another attempt, with its sources
+                        // looked up afresh, and only the last attempt it is allowed
+                        // tells the user it failed.
+                        let retried = !coordinator.cancel.is_cancelled()
+                            && !awaiting_offer
+                            && crate::network::retry_download(&transaction, &offer.request_id)?;
+                        if !retried {
+                            let status = if coordinator.cancel.is_cancelled() {
+                                "Cancelled".to_string()
+                            } else if awaiting_offer {
+                                crate::network::DOWNLOAD_WAITING_FALLBACK.to_string()
+                            } else {
+                                format!("Failed: {error}")
+                            };
+                            transaction.execute(
+                                "UPDATE network_downloads SET status=?1,speed='—',updated_at=?2 WHERE request_id=?3",
+                                params![status, Utc::now().to_rfc3339(), offer.request_id],
+                            ).map_err(|error| error.to_string())?;
+                        }
                     }
                 }
                 transaction.commit().map_err(|error| error.to_string())
@@ -1192,7 +1223,7 @@ mod tests {
         let connection = crate::open_connection(&db_path).unwrap();
         for status in [
             "Queued",
-            "Waiting to restart after reconnect",
+            "Waiting to try again",
             "Failed: no seeder responded",
             "Cancelled",
             "All seeders refused",

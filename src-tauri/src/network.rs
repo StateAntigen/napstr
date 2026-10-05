@@ -57,9 +57,20 @@ const DOWNLOAD_QUEUED: &str = "Queued";
 const MAX_ACTIVE_DOWNLOADS: usize = 2;
 pub(crate) const DOWNLOAD_WAITING_FALLBACK: &str = "Waiting for another seeder";
 const DOWNLOAD_REQUESTED: &str = "Requesting Tor seeders";
-const DOWNLOAD_RESTART_PENDING: &str = "Waiting to restart after reconnect";
+// A transfer that is parked between attempts. It covers both a download that a
+// restart interrupted and one whose seeder went away: the queue treats them the
+// same way, which is why the text no longer claims a reconnection happened.
+const DOWNLOAD_RESTART_PENDING: &str = "Waiting to try again";
 const DOWNLOAD_RESTART_REQUESTED: &str = "Restarting · requesting fresh Tor seeders";
 const DOWNLOAD_OFFER_TIMEOUT: Duration = Duration::from_secs(120);
+/// How many extra attempts one file gets after a seeder failed to serve it.
+///
+/// The seeders are strangers running their own Tor and their own computer: a
+/// transport failure usually means the other end was still coming up, was busy,
+/// or is a copy of the file that will never complete - and a different seeder
+/// very often answers a minute later. Three attempts, each with the sources
+/// looked up afresh, is a few extra minutes rather than a verdict on the file.
+const MAX_DOWNLOAD_RETRIES: i64 = 3;
 const CATALOGUE_EVENT_PACE: Duration = Duration::from_millis(75);
 const AVAILABILITY_QUERY_LIMIT: usize = 1_000;
 const AVAILABILITY_FILE_LIMIT: usize = 50_000;
@@ -3770,15 +3781,16 @@ impl NetworkService {
             .collect::<HashSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        unique.sort();
-        // A small race finds a responsive onion without opening a data stream
-        // to every profile advertising the file. The remaining candidates are
-        // automatic fallbacks if the selected source fails.
-        unique.truncate(MAX_SEEDER_CANDIDATES);
         if unique.is_empty() {
             return Err("at least one seeder is required".into());
         }
         let connection = super::open_connection(&self.db_path)?;
+        // A small race finds a responsive onion without opening a data stream to
+        // every profile advertising the file, and the ones asked first are the
+        // ones that have served this computer before. The remaining candidates are
+        // automatic fallbacks if the selected source fails.
+        sort_by_seeder_history(&connection, &mut unique)?;
+        unique.truncate(MAX_SEEDER_CANDIDATES);
         let already_local: bool = connection
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM files WHERE file_id=?1)",
@@ -4008,11 +4020,27 @@ impl NetworkService {
                     }
                 });
             } else if restart {
+                // A restart whose request cannot be delivered keeps waiting for the
+                // relays to come back: that is what being parked means for a song
+                // that was only interrupted, and one attempt is not the end of it.
                 delivery_failed = true;
                 super::open_connection(&self.db_path)?.execute(
                     "UPDATE network_downloads SET status=?1 WHERE request_id=?2 AND status='Failed: NIP-17 request could not be delivered'",
                     params![DOWNLOAD_RESTART_PENDING, request_id],
                 ).map_err(|error| error.to_string())?;
+            } else {
+                // The first request could not be delivered either. Relays accept
+                // events when they feel like it, so the song is asked for again
+                // rather than reported as one nobody has.
+                let connection = super::open_connection(&self.db_path)?;
+                let transaction = connection
+                    .unchecked_transaction()
+                    .map_err(|error| error.to_string())?;
+                let retried = retry_download(&transaction, &request_id)?;
+                transaction.commit().map_err(|error| error.to_string())?;
+                if !retried {
+                    delivery_failed = true;
+                }
             }
         }
         let _ = self.app_handle.emit(TRANSFERS_CHANGED_EVENT, ());
@@ -4906,63 +4934,176 @@ pub fn queue_interrupted_downloads(connection: &Connection) -> Result<(), String
     let interrupted = {
         let mut statement = transaction
             .prepare(
-                "SELECT request_id,source_pubkey FROM network_downloads
+                "SELECT request_id FROM network_downloads
              WHERE status != 'Verified · Complete' AND status != 'Cancelled'
                AND status NOT LIKE 'Failed%' AND status NOT LIKE 'Refused%'
                AND status NOT LIKE 'All seeders refused%' ORDER BY rowid",
             )
             .map_err(|error| error.to_string())?;
         let rows = statement
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
+            .query_map([], |row| row.get::<_, String>(0))
             .map_err(|error| error.to_string())?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())?
     };
-    for (previous_id, primary_source) in interrupted {
-        let mut sources = {
-            let mut statement = transaction
-                .prepare("SELECT source_pubkey FROM download_sources WHERE request_id=?1")
-                .map_err(|error| error.to_string())?;
-            let rows = statement
-                .query_map([&previous_id], |row| row.get::<_, String>(0))
-                .map_err(|error| error.to_string())?;
-            rows.collect::<Result<Vec<_>, _>>()
-                .map_err(|error| error.to_string())?
-        };
-        if sources.is_empty() {
-            sources.push(primary_source);
-        }
-        // Keep the transfer row/order and audiobook destination, but discard
-        // old session IDs and onion addresses: only newly negotiated offers may run.
-        let request_id = Uuid::new_v4().to_string();
-        transaction
-            .execute(
-                "DELETE FROM download_sources WHERE request_id=?1",
-                [&previous_id],
-            )
-            .map_err(|error| error.to_string())?;
-        transaction
-            .execute(
-                "UPDATE network_downloads SET request_id=?1,progress=0,status=?2,speed='—',
-             destination='',onion='',updated_at=?3 WHERE request_id=?4",
-                params![
-                    request_id,
-                    DOWNLOAD_RESTART_PENDING,
-                    Utc::now().to_rfc3339(),
-                    previous_id
-                ],
-            )
-            .map_err(|error| error.to_string())?;
-        for source in sources {
-            transaction.execute(
-                "INSERT INTO download_sources(request_id,source_pubkey,status,updated_at) VALUES(?1,?2,'Pending restart',?3)",
-                params![request_id, source, Utc::now().to_rfc3339()],
-            ).map_err(|error| error.to_string())?;
-        }
+    for previous_id in interrupted {
+        restart_download(&transaction, &previous_id)?;
     }
     transaction.commit().map_err(|error| error.to_string())
+}
+
+/// Move one transfer onto a fresh request, so the queue asks for it again.
+///
+/// The row, its place in the queue and its audiobook destination are kept;
+/// everything that belonged to the session that ended goes - the request id, the
+/// progress, the partial file, the onion, and the per-seeder statuses - because
+/// only newly negotiated offers may run.
+fn restart_download(connection: &Connection, previous_id: &str) -> Result<(), String> {
+    let primary_source: String = connection
+        .query_row(
+            "SELECT source_pubkey FROM network_downloads WHERE request_id=?1",
+            [previous_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("no transfer to restart: {previous_id}"))?;
+    let mut sources = {
+        let mut statement = connection
+            .prepare("SELECT source_pubkey FROM download_sources WHERE request_id=?1")
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([previous_id], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?
+    };
+    if sources.is_empty() {
+        sources.push(primary_source);
+    }
+    let request_id = Uuid::new_v4().to_string();
+    connection
+        .execute(
+            "DELETE FROM download_sources WHERE request_id=?1",
+            [previous_id],
+        )
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute(
+            "UPDATE network_downloads SET request_id=?1,progress=0,status=?2,speed='—',
+             destination='',onion='',updated_at=?3 WHERE request_id=?4",
+            params![
+                request_id,
+                DOWNLOAD_RESTART_PENDING,
+                Utc::now().to_rfc3339(),
+                previous_id
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    for source in sources {
+        connection
+            .execute(
+                "INSERT INTO download_sources(request_id,source_pubkey,status,updated_at) VALUES(?1,?2,'Pending restart',?3)",
+                params![request_id, source, Utc::now().to_rfc3339()],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+/// Whether one failed transfer is asked for again, and the work of doing it.
+///
+/// False means the file has had the attempts it is allowed, which is when the
+/// caller reports the failure to the user. The count lives on the row, so
+/// attempts are not handed back by a restart.
+///
+/// Runs inside the caller's transaction: deciding to retry and moving the row
+/// onto a fresh request have to be one change, or two workers failing at the same
+/// moment could spend the same attempt twice.
+pub(crate) fn retry_download(connection: &Connection, request_id: &str) -> Result<bool, String> {
+    let retries: Option<i64> = connection
+        .query_row(
+            "SELECT retries FROM network_downloads WHERE request_id=?1",
+            [request_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some(retries) = retries else {
+        return Ok(false);
+    };
+    if retries >= MAX_DOWNLOAD_RETRIES {
+        return Ok(false);
+    }
+    connection
+        .execute(
+            "UPDATE network_downloads SET retries=?1 WHERE request_id=?2",
+            params![retries + 1, request_id],
+        )
+        .map_err(|error| error.to_string())?;
+    restart_download(connection, request_id)?;
+    Ok(true)
+}
+
+/// Remember how one seeder behaved, so the next request can ask the peers that
+/// have served this computer before.
+pub(crate) fn record_seeder_outcome(
+    connection: &Connection,
+    source_pubkey: &str,
+    served: bool,
+) -> Result<(), String> {
+    connection
+        .execute(
+            "INSERT INTO seeder_history(source_pubkey,served,failed,updated_at) VALUES(?1,?2,?3,?4)
+             ON CONFLICT(source_pubkey) DO UPDATE SET
+               served=served+excluded.served,failed=failed+excluded.failed,updated_at=excluded.updated_at",
+            params![
+                source_pubkey,
+                i64::from(served),
+                i64::from(!served),
+                Utc::now().to_rfc3339()
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// Put the seeders this computer has heard from before at the front.
+///
+/// The candidates arrive in the order the network happened to name them, and
+/// taking the first few of those picked the same strangers for every file: three
+/// unreachable seeders then looked exactly like a song nobody had. A peer that has
+/// served bytes before is worth asking first, and one that has already let this
+/// computer down goes last.
+fn sort_by_seeder_history(connection: &Connection, sources: &mut [String]) -> Result<(), String> {
+    let mut scores = HashMap::new();
+    {
+        let mut statement = connection
+            .prepare("SELECT source_pubkey,served,failed FROM seeder_history")
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        for row in rows {
+            let (pubkey, served, failed) = row.map_err(|error| error.to_string())?;
+            scores.insert(pubkey, served - failed);
+        }
+    }
+    sources.sort_by(|left, right| {
+        scores
+            .get(right)
+            .copied()
+            .unwrap_or(0)
+            .cmp(&scores.get(left).copied().unwrap_or(0))
+            .then_with(|| left.cmp(right))
+    });
+    Ok(())
 }
 
 // Only remove recovery requests that never started a transfer. An accepted
@@ -5044,8 +5185,12 @@ fn refresh_restart_sources(
         .unchecked_transaction()
         .map_err(|error| error.to_string())?;
     if let Some(sources) = sources {
-        let mut sources = sources.iter().collect::<Vec<_>>();
-        sources.sort();
+        // The announced set is wider than the handful that will be asked, and the
+        // ones marked fresh here are the ones the claim prefers, so they are
+        // chosen the way a new download chooses them: peers that have served this
+        // computer before come first, and the ones that let it down come last.
+        let mut sources = sources.iter().cloned().collect::<Vec<_>>();
+        sort_by_seeder_history(&connection, &mut sources)?;
         let mut added = 0;
         for source in sources {
             // The existence/status check also prevents an in-flight discovery
@@ -5111,6 +5256,10 @@ fn expire_download_request(connection: &Connection, request_id: &str) -> Result<
     if remove_unavailable_restart(connection, request_id)? {
         return Ok(true);
     }
+    // A window in which every candidate was silent is where this ends, and it is
+    // not asked for again: the window itself is what a transfer in progress costs,
+    // and a queue of songs whose seeders never answer would hold the two slots for
+    // hours while the songs that *could* arrive wait behind them.
     let changed = connection.execute(
         "UPDATE network_downloads SET status='Failed: no seeder responded',speed='—',updated_at=?1
          WHERE request_id=?2 AND status IN (?3,?4)
@@ -5174,8 +5323,12 @@ fn claim_queued_download(
     let receivers = {
         let mut statement = transaction
             .prepare(
-                "SELECT source_pubkey FROM download_sources WHERE request_id=?1
-             AND source_pubkey NOT IN (SELECT pubkey FROM blocked_pubkeys) ORDER BY (status='Fresh restart') DESC,source_pubkey",
+                "SELECT s.source_pubkey FROM download_sources s
+             LEFT JOIN seeder_history h ON h.source_pubkey=s.source_pubkey
+             WHERE s.request_id=?1 AND s.source_pubkey NOT IN (SELECT pubkey FROM blocked_pubkeys)
+             ORDER BY (s.status='Fresh restart') DESC,
+                      (COALESCE(h.served,0)-COALESCE(h.failed,0)) DESC,
+                      s.source_pubkey",
             )
             .map_err(|error| error.to_string())?;
         let rows = statement
@@ -5254,6 +5407,10 @@ pub fn initialise_network_schema(connection: &Connection) -> Result<(), String> 
            PRIMARY KEY(request_id, source_pubkey),
            FOREIGN KEY(request_id) REFERENCES network_downloads(request_id) ON DELETE CASCADE
          );
+         CREATE TABLE IF NOT EXISTS seeder_history (
+           source_pubkey TEXT PRIMARY KEY, served INTEGER NOT NULL DEFAULT 0,
+           failed INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL
+         );
          CREATE TABLE IF NOT EXISTS published_catalogue (
            file_id TEXT PRIMARY KEY, published_at TEXT NOT NULL, fingerprint TEXT NOT NULL DEFAULT ''
          );
@@ -5312,6 +5469,7 @@ pub fn initialise_network_schema(connection: &Connection) -> Result<(), String> 
     .and_then(|_| super::ensure_column(connection, "remote_catalogue", "tags", "TEXT NOT NULL DEFAULT ''"))
     .and_then(|_| super::ensure_column(connection, "published_catalogue", "fingerprint", "TEXT NOT NULL DEFAULT ''"))
     .and_then(|_| super::ensure_column(connection, "network_downloads", "destination_folder", "TEXT NOT NULL DEFAULT ''"))
+    .and_then(|_| super::ensure_column(connection, "network_downloads", "retries", "INTEGER NOT NULL DEFAULT 0"))
     .and_then(|_| super::cover::initialise_cover_schema(connection))
     .and_then(|_| super::art_cache::initialise_schema(connection))
     .and_then(|_| super::catalogue::initialise_schema(connection))
@@ -5942,6 +6100,139 @@ mod tests {
             2
         );
         assert_eq!(active_download_count(&connection).unwrap(), 2);
+        drop(connection);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_seeder_that_went_away_is_asked_for_again_and_only_so_many_times() {
+        let directory = std::env::temp_dir().join(format!("napstr-retry-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let db = directory.join("napstr.sqlite3");
+        crate::initialise_database(&db, &directory).unwrap();
+        let connection = super::super::open_connection(&db).unwrap();
+        let source = Keys::generate().public_key().to_hex();
+        insert_interrupted_download(&connection, "song", DOWNLOAD_REQUESTED, &source);
+        let mut request_id = "song".to_string();
+        for attempt in 1..=MAX_DOWNLOAD_RETRIES {
+            assert!(
+                retry_download(&connection, &request_id).unwrap(),
+                "attempt {attempt}"
+            );
+            let (next, status, progress, destination, retries): (String, String, f64, String, i64) =
+                connection
+                    .query_row(
+                        "SELECT request_id,status,progress,destination,retries FROM network_downloads",
+                        [],
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                            ))
+                        },
+                    )
+                    .unwrap();
+            // A fresh request with nothing left of the session that failed, and the
+            // attempt counted against the file rather than the session.
+            assert_ne!(next, request_id);
+            assert_eq!(status, DOWNLOAD_RESTART_PENDING);
+            assert_eq!(progress, 0.0);
+            assert!(destination.is_empty());
+            assert_eq!(retries, attempt);
+            request_id = next;
+        }
+        assert!(!retry_download(&connection, &request_id).unwrap());
+        // The queue really does take it up again, with the seeder it had before.
+        let pending = pending_downloads(&connection).unwrap();
+        assert_eq!(pending.len(), 1);
+        let (queued_id, file_id, restart) = pending.into_iter().next().unwrap();
+        assert_eq!(queued_id, request_id);
+        assert!(restart);
+        let receivers = claim_queued_download(&db, &queued_id, &file_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(receivers.len(), 1);
+        assert_eq!(receivers[0].0, source);
+        // The attempts belong to the file, not to the session, so a restart does
+        // not hand them back.
+        crate::initialise_database(&db, &directory).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT retries FROM network_downloads", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            MAX_DOWNLOAD_RETRIES
+        );
+        assert!(!retry_download(&connection, &queued_id).unwrap());
+        drop(connection);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn the_seeders_that_have_served_before_are_asked_first() {
+        let directory =
+            std::env::temp_dir().join(format!("napstr-seeder-history-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let db = directory.join("napstr.sqlite3");
+        crate::initialise_database(&db, &directory).unwrap();
+        let connection = super::super::open_connection(&db).unwrap();
+        let primary = Keys::generate().public_key().to_hex();
+        let served = Keys::generate().public_key().to_hex();
+        let failed = Keys::generate().public_key().to_hex();
+        let unknown = Keys::generate().public_key().to_hex();
+        let file_id = insert_interrupted_download(&connection, "song", DOWNLOAD_QUEUED, &primary);
+        for source in [&served, &failed, &unknown] {
+            connection
+                .execute(
+                    "INSERT INTO download_sources VALUES('song',?1,'Requested','now')",
+                    [source],
+                )
+                .unwrap();
+        }
+        record_seeder_outcome(&connection, &served, true).unwrap();
+        record_seeder_outcome(&connection, &served, true).unwrap();
+        record_seeder_outcome(&connection, &failed, false).unwrap();
+        // The candidates are ordered before they are cut down to the number asked,
+        // so the peer that has served this computer is not the one dropped.
+        let mut candidates = vec![failed.clone(), unknown.clone(), served.clone()];
+        sort_by_seeder_history(&connection, &mut candidates).unwrap();
+        assert_eq!(
+            candidates,
+            vec![served.clone(), unknown.clone(), failed.clone()]
+        );
+        let receivers = claim_queued_download(&db, "song", &file_id)
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .map(|(source, _)| source)
+            .collect::<Vec<_>>();
+        assert_eq!(receivers.len(), MAX_SEEDER_CANDIDATES);
+        assert!(receivers.contains(&served));
+        assert!(!receivers.contains(&failed));
+        // And the same choice is made when a parked transfer looks its seeders up
+        // again: the one that let this computer down is not asked a second time
+        // while there is anybody else to ask.
+        connection
+            .execute(
+                "UPDATE network_downloads SET status=?1 WHERE request_id='song'",
+                [DOWNLOAD_RESTART_PENDING],
+            )
+            .unwrap();
+        let announced = [primary, served.clone(), failed.clone(), unknown]
+            .into_iter()
+            .collect::<HashSet<_>>();
+        refresh_restart_sources(&db, "song", Some(&announced)).unwrap();
+        let receivers = claim_queued_download(&db, "song", &file_id)
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .map(|(source, _)| source)
+            .collect::<Vec<_>>();
+        assert!(receivers.contains(&served));
+        assert!(!receivers.contains(&failed));
         drop(connection);
         std::fs::remove_dir_all(directory).unwrap();
     }

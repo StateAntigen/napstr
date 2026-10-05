@@ -511,21 +511,29 @@ direct-IP transfer fallback.
 The reference Tor process is launched with equivalent options:
 
 ```text
---DataDirectory <new private session directory>
+--DataDirectory <cached data directory>
 --SocksPort auto
 --ControlPort auto
 --ControlPortWriteToFile <session file>
 --CookieAuthentication 1
 --CookieAuthFile <session cookie file>
 --ClientOnly 1
---AvoidDiskWrites 1
 --Log notice stdout
 ```
 
 The client waits for `status/bootstrap-phase` to report 100 percent and obtains
 the SOCKS listener through `GETINFO net/listeners/socks`. The Tor process stays
 available for the application session and is stopped when the application
-closes. Temporary Tor data is removed after shutdown.
+closes.
+
+The data directory is kept between starts. It is where Tor stores the network
+consensus and the relay descriptors it has fetched, so a directory that survives
+a restart is the difference between a start of a few seconds and one of minutes,
+and nothing can be offered or fetched before Tor has started. For the same
+reason `--AvoidDiskWrites` MUST NOT be set: it discards exactly that cache. A
+second Napstr on the same machine cannot share the directory, because Tor
+refuses to share one, so that case is given a directory of its own; only those
+private directories are removed after shutdown.
 
 To seed files:
 

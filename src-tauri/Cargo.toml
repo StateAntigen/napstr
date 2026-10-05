@@ -47,3 +47,13 @@ qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 # feature set the companion uses, so both sides share one reqwest build.
 reqwest = { version = "0.13", default-features = false, features = ["hickory-dns", "rustls-no-provider", "json"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+
+# Tor is a child process, and it must not outlive the application that started it.
+# Both of these are only used to say so to the operating system: a job object on
+# Windows, a death signal on Linux. Both crates are already in the dependency
+# graph (through tauri and keyring), so this adds no new code to the build.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_System_JobObjects"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

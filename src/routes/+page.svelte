@@ -545,7 +545,7 @@
     items = items.map((item) => item.status === 'Starting download'
       ? { ...item, status: 'Queued', speed: 'Queued' } : item);
     let available = Math.max(0, 2 - items.filter((item) => isActiveTransfer(item)
-      && item.status !== 'Queued' && item.status !== 'Waiting to restart after reconnect').length);
+      && item.status !== 'Queued' && item.status !== 'Waiting to try again').length);
     // Native rows and optimistic rows are newest first. Reserve free slots for
     // the oldest queued tracks while the native dispatcher starts their requests.
     return items.slice().reverse().map((item) => {

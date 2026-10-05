@@ -3409,6 +3409,7 @@ dependencies = [
  "hex",
  "iroh",
  "keyring",
+ "libc",
  "lofty",
  "napstr-remote-protocol",
  "nostr-sdk",
@@ -3431,6 +3432,7 @@ dependencies = [
  "tokio-util",
  "uuid",
  "walkdir",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
