@@ -29,7 +29,7 @@ export function template({ slug, language, languages, direction, content, t, cat
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="${t(pages[slug].description)}">
-  <meta name="github-repository" content="lnbits/napstr">
+  <meta name="github-repository" content="StateAntigen/napstr">
   <link rel="canonical" href="${canonical}">
   ${languages.map(({ code }) => `<link rel="alternate" hreflang="${code}" href="${pageUrl(slug, code)}">`).join('\n  ')}
   <link rel="alternate" hreflang="x-default" href="${pageUrl(slug, 'en')}">

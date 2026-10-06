@@ -1,6 +1,6 @@
 [package]
 name = "napstr"
-version = "0.1.0"
+version = "0.2.4-fork"
 description = "Private audio sharing over Nostr and Tor"
 authors = ["Napstr contributors"]
 edition = "2021"

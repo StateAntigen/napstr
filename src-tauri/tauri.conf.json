@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Napstr",
-  "version": "0.1.0",
+  "version": "0.2.4-fork",
   "identifier": "social.napstr.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -26,7 +26,10 @@
     "security": {
       "assetProtocol": {
         "enable": true,
-        "scope": ["$APPCACHE/art/**", "$APPLOCALDATA/art/**"]
+        "scope": [
+          "$APPCACHE/art/**",
+          "$APPLOCALDATA/art/**"
+        ]
       },
       "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' asset: http://asset.localhost https: data:; media-src 'self' asset: http://asset.localhost; connect-src 'self' ipc: http://ipc.localhost https://api.github.com"
     }
@@ -41,7 +44,9 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": ["resources/tor/**/*"],
+    "resources": [
+      "resources/tor/**/*"
+    ],
     "category": "Utility",
     "shortDescription": "Decentralised private audio sharing",
     "longDescription": "Napstr combines public audio discovery with private Tor transfers.",
@@ -65,9 +70,18 @@
     "macOS": {
       "minimumSystemVersion": "10.15",
       "dmg": {
-        "windowSize": { "width": 660, "height": 400 },
-        "appPosition": { "x": 180, "y": 170 },
-        "applicationFolderPosition": { "x": 480, "y": 170 }
+        "windowSize": {
+          "width": 660,
+          "height": 400
+        },
+        "appPosition": {
+          "x": 180,
+          "y": 170
+        },
+        "applicationFolderPosition": {
+          "x": 480,
+          "y": 170
+        }
       }
     }
   }

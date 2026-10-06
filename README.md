@@ -8,6 +8,13 @@ https://napstr.net
 
 The cross-platform Napstrfy phone companion lives in [`android/`](android/README.md).
 
+> **This is a fork, and it is mobile-first.** Releases here are built from this
+> repository, and what has actually been used is the Android companion: the phone
+> is where the work went. The desktop build shipped beside it works, but it has had
+> far less testing than upstream's — treat it as a preview, and keep the official
+> [lnbits/napstr](https://github.com/lnbits/napstr) build if you want the
+> well-trodden path.
+
 ## Build your own Napstr!
 
 See the complete [Napstr protocol specification](PROTOCOL.md) for everything
