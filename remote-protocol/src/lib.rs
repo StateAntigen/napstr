@@ -1027,6 +1027,20 @@ pub enum ClientRequest {
     AuthenticateDevice {
         event: SignedEvent,
     },
+    /// An event this device signed itself, for the relays.
+    ///
+    /// The other half of a device holding its own key: a comment or a playlist
+    /// from this phone is the phone's to say, so the computer's part is to hand
+    /// it to the relays rather than to sign it in somebody else's name. That is
+    /// the whole of what a lent pairing needs - what the device signs is its own,
+    /// and `privileged` stays the line for acting as the owner.
+    ///
+    /// Nothing here is trusted: the computer checks the signature against the key
+    /// the device proved, and refuses anything that key did not sign. Relaying is
+    /// not free, so it is the device's own voice or nothing.
+    PublishDeviceEvent {
+        event: SignedEvent,
+    },
     /// The file ids this device liked.
     Likes,
     /// Replace that list with this one, and answer with what was stored.
@@ -1179,6 +1193,13 @@ pub enum ServerResponse {
     /// this computer keeps for it is kept under.
     DeviceIdentity {
         pubkey: String,
+    },
+    /// The id an event this device signed was published under.
+    ///
+    /// The id rather than a flag, because it is what a view needs to say "this is
+    /// yours" - a comment the phone posted is its own event, not the computer's.
+    DeviceEventPublished {
+        event_id: String,
     },
     /// What this device liked. Its own list rather than the computer's: it is
     /// kept under the device's key, so it belongs to whoever holds that key.

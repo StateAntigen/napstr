@@ -552,8 +552,9 @@ impl TorManager {
                     // Growing, then capped: a descriptor that is still spreading is
                     // worth asking about again quickly, and one that is not coming
                     // should not be asked about every second for three minutes.
-                    let gap =
-                        Duration::from_secs(u64::from(attempt).min(ONION_CONNECT_MAX_GAP.as_secs()));
+                    let gap = Duration::from_secs(
+                        u64::from(attempt).min(ONION_CONNECT_MAX_GAP.as_secs()),
+                    );
                     tokio::select! {
                         _ = cancel.cancelled() => return Err("cancelled".into()),
                         _ = sleep(gap) => {}
@@ -954,8 +955,7 @@ mod tests {
     /// out cannot be reached by anybody.
     #[tokio::test]
     async fn a_lease_stops_being_current_when_its_tor_is_replaced() {
-        let directory =
-            std::env::temp_dir().join(format!("napstr-lease-{}", uuid::Uuid::new_v4()));
+        let directory = std::env::temp_dir().join(format!("napstr-lease-{}", uuid::Uuid::new_v4()));
         let manager = TorManager::new(directory.clone(), directory.clone());
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let stream = TcpStream::connect(listener.local_addr().unwrap())

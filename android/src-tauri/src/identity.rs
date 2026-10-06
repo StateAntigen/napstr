@@ -61,7 +61,9 @@ impl DeviceIdentity {
                 keys
             }
             Err(error) => {
-                return Err(format!("The saved Nostr identity could not be read: {error}"))
+                return Err(format!(
+                    "The saved Nostr identity could not be read: {error}"
+                ))
             }
         };
         Ok(Self {

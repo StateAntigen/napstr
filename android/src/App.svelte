@@ -2890,6 +2890,18 @@
    * answer to that is no: the actions that would be wrong to offer are the
    * writes, and reading and playing a playlist needs no permission at all.
    */
+  /**
+   * Whether something said in a conversation is this person's own.
+   *
+   * Either key counts. A pairing lent the owner's signature has this computer say
+   * it in their name; one that was not signs it here, with the key this phone made
+   * and never handed over. Both are the person who is holding the phone.
+   */
+  function isOwnMessage(pubkey: string) {
+    if (pubkey === status.pubkey) return true;
+    return Boolean(nostrIdentity.pubkey) && pubkey === nostrIdentity.pubkey;
+  }
+
   function playlistIsMine(author: string) {
     if (!author) return true;
     if (!nostrIdentity.pubkey) return false;
@@ -3113,10 +3125,6 @@
       // every one of its writes - a save, a publish, a copy, a delete - so a
       // draft here would be a promise this phone could not keep. The playlist is
       // still readable, and the view screen says what this pairing may not do.
-      if (status.streamOnly) {
-        playlistMode = 'view';
-        return;
-      }
       playlistMode = 'edit';
       playlistError = '';
       playlistNotice = '';
@@ -3132,12 +3140,8 @@
       return;
     }
     // The details screen is the one that holds Save, Publish, Withdraw and the
-    // private switch: every control on it is a write, so a lent pairing has no
-    // business standing on it.
-    if (status.streamOnly) {
-      playlistMode = 'view';
-      return;
-    }
+    // private switch: every control on it is a write, and a pairing that was lent
+    // the network rather than the signature writes lists of its own here.
     playlistMode = 'details';
     playlistError = '';
     playlistNotice = '';
@@ -3152,10 +3156,6 @@
 
   /** An editor holding a playlist that does not exist anywhere yet. */
   async function newPlaylist() {
-    if (status.streamOnly) {
-      playlistsError = msg("This pairing is read only, so nothing can be changed on the computer.");
-      return;
-    }
     playlistsError = '';
     try {
       playlistDraft = {
@@ -3385,12 +3385,8 @@
   }
 
   function openPlaylistAdd() {
-    // Adding a track writes the playlist down, which a lent pairing cannot do: the
-    // sheet would collect an answer the computer would refuse.
-    if (status.streamOnly) {
-      playlistError = msg("This pairing is read only, so nothing can be changed on the computer.");
-      return;
-    }
+    // Adding a track writes the playlist down, and a playlist this phone made is
+    // one this phone may write: the computer files it under the key that signs it.
     showPlaylistAdd = true;
     addTab = 'songs';
     void loadAddTracks();
@@ -3445,10 +3441,6 @@
    */
   async function sortPlaylist(by: 'title' | 'artist' | 'album' | 'reverse') {
     showPlaylistSort = false;
-    if (status.streamOnly) {
-      playlistError = msg("This pairing is read only, so nothing can be changed on the computer.");
-      return;
-    }
     const wanted = [...playlistMembers];
     if (by === 'reverse') wanted.reverse();
     else {
@@ -3635,10 +3627,6 @@
   /** Write the draft down on the computer. Saving is what makes it exist. */
   async function savePlaylist(): Promise<boolean> {
     if (!playlistDraft) return false;
-    if (status.streamOnly) {
-      playlistError = msg("This pairing is read only, so nothing can be changed on the computer.");
-      return false;
-    }
     playlistSaving = true;
     playlistError = '';
     playlistNotice = '';
@@ -3660,18 +3648,21 @@
 
   async function publishPlaylist() {
     if (!playlistDraft) return;
-    if (status.streamOnly) {
-      playlistError = msg("This pairing is read only, so nothing can be changed on the computer.");
-      return;
-    }
     playlistSaving = true;
     playlistError = '';
     playlistNotice = '';
     try {
-      playlistDraft = await invoke<RemotePlaylist>('remote_publish_playlist', {
-        playlist: playlistForHost(),
-        suggestTags: playlistSuggestTags
-      });
+      // Signed by this phone when the pairing was not lent the owner's signature:
+      // a playlist this phone made belongs to the key that made it, so publishing
+      // one is the phone's own act and the computer's part is the relays.
+      playlistDraft = status.streamOnly
+        ? await invoke<RemotePlaylist>('remote_publish_device_playlist', {
+            playlist: playlistForHost()
+          })
+        : await invoke<RemotePlaylist>('remote_publish_playlist', {
+            playlist: playlistForHost(),
+            suggestTags: playlistSuggestTags
+          });
       playlistMembers = [...playlistDraft.tracks];
       playlistNotice = msg("Published to the relays");
     } catch (nextError) {
@@ -3693,10 +3684,6 @@
    */
   async function savePlaylistCopy() {
     if (!playlistDraft || playlistIsMine(playlistDraft.author)) return;
-    if (status.streamOnly) {
-      playlistError = msg("This pairing is read only, so nothing can be changed on the computer.");
-      return;
-    }
     playlistSaving = true;
     playlistError = '';
     playlistNotice = '';
@@ -3733,11 +3720,6 @@
    * away.
    */
   async function deletePlaylist(playlist: { playlistId: string; author: string; published: boolean }) {
-    if (status.streamOnly) {
-      playlistsError = msg("This pairing is read only, so nothing can be changed on the computer.");
-      showPlaylistDelete = false;
-      return;
-    }
     playlistsError = '';
     showPlaylistDelete = false;
     try {
@@ -6236,19 +6218,29 @@
     }
   }
 
-  /** Posts a comment: the computer signs it and publishes it under the user's name. */
+  /**
+   * Posts a comment.
+   *
+   * Which key signs it is one question: a pairing lent the owner's signature has
+   * this computer publish it under their name, and one that was not signs it here,
+   * with the key this phone made and never handed over. Either way it is a comment
+   * in the same conversation, which is why the shape on the wire is the same one.
+   */
   async function sendDiscussion() {
     const track = discussionTrack;
     const content = discussionDraft.trim();
-    if (!track || !content || discussionSending || status.streamOnly) return;
+    if (!track || !content || discussionSending) return;
     discussionSending = true;
     discussionError = '';
     try {
-      await invoke<string>('remote_send_track_discussion', {
-        fileId: track.fileId,
-        content,
-        replyTo: discussionReply?.eventId
-      });
+      await invoke<string>(
+        status.streamOnly ? 'remote_send_device_discussion' : 'remote_send_track_discussion',
+        {
+          fileId: track.fileId,
+          content,
+          replyTo: discussionReply?.eventId
+        }
+      );
       discussionDraft = '';
       discussionReply = null;
       await refreshDiscussion();
@@ -7808,15 +7800,15 @@
                          offered them: the computer refuses its saves, publishes and
                          copies, and a button that always failed would only say so
                          more slowly. -->
-                    <button disabled={status.streamOnly} onclick={openPlaylistAdd}><span aria-hidden="true">{PLAYLIST_TOOL_GLYPH.add}</span>{$t("Add")}</button>
-                    <button disabled={status.streamOnly} onclick={() => void openPlaylistEditor(playlistDraft as RemotePlaylist)}><span aria-hidden="true">{PLAYLIST_TOOL_GLYPH.edit}</span>{$t("Edit")}</button>
-                    <button disabled={status.streamOnly} onclick={() => (showPlaylistSort = true)}><span aria-hidden="true">{PLAYLIST_TOOL_GLYPH.sort}</span>{$t("Sort")}</button>
-                    <button disabled={status.streamOnly} onclick={openPlaylistDetails}>{$t("Name & details")}</button>
+                    <button onclick={openPlaylistAdd}><span aria-hidden="true">{PLAYLIST_TOOL_GLYPH.add}</span>{$t("Add")}</button>
+                    <button onclick={() => void openPlaylistEditor(playlistDraft as RemotePlaylist)}><span aria-hidden="true">{PLAYLIST_TOOL_GLYPH.edit}</span>{$t("Edit")}</button>
+                    <button onclick={() => (showPlaylistSort = true)}><span aria-hidden="true">{PLAYLIST_TOOL_GLYPH.sort}</span>{$t("Sort")}</button>
+                    <button onclick={openPlaylistDetails}>{$t("Name & details")}</button>
                   {:else}
                     <!-- Somebody else's public playlist. It plays like any other;
                          the one write it may get is a copy of its own, because
                          the computer can only ever sign its own coordinates. -->
-                    <button disabled={playlistSaving || !status.connected || status.streamOnly} onclick={() => void savePlaylistCopy()}>{playlistSaving ? $t("Saving…") : $t("Save a copy")}</button>
+                    <button disabled={playlistSaving || !status.connected} onclick={() => void savePlaylistCopy()}>{playlistSaving ? $t("Saving…") : $t("Save a copy")}</button>
                   {/if}
                 </div>
               </div>
@@ -7921,10 +7913,10 @@
               {/if}
 
               <div class="playlist-actions">
-                <button class="primary" disabled={playlistSaving || status.streamOnly || !playlistDraft.title.trim() || !playlistIsMine(playlistDraft.author)} onclick={() => void savePlaylist()}>{playlistSaving ? $t("Saving…") : $t("Save")}</button>
-                <button disabled={playlistSaving || status.streamOnly || playlistDraft.private || !playlistDraft.title.trim() || !status.connected || !playlistIsMine(playlistDraft.author)} onclick={() => void publishPlaylist()}>{$t("Publish")}</button>
+                <button class="primary" disabled={playlistSaving || !playlistDraft.title.trim() || !playlistIsMine(playlistDraft.author)} onclick={() => void savePlaylist()}>{playlistSaving ? $t("Saving…") : $t("Save")}</button>
+                <button disabled={playlistSaving || playlistDraft.private || !playlistDraft.title.trim() || !status.connected || !playlistIsMine(playlistDraft.author)} onclick={() => void publishPlaylist()}>{$t("Publish")}</button>
                 {#if playlistIsMine(playlistDraft.author)}
-                  <button disabled={playlistSaving || status.streamOnly} onclick={() => (showPlaylistDelete = true)}>{playlistDraft.published ? $t("Withdraw") : $t("Delete")}</button>
+                  <button disabled={playlistSaving} onclick={() => (showPlaylistDelete = true)}>{playlistDraft.published ? $t("Withdraw") : $t("Delete")}</button>
                 {/if}
               </div>
             </div>
@@ -7943,7 +7935,7 @@
               </button>
               <button
                 class="playlist-save"
-                disabled={playlistSaving || status.streamOnly || !playlistDraft.title.trim()}
+                disabled={playlistSaving || !playlistDraft.title.trim()}
                 onclick={() => void savePlaylist()}
               >{playlistSaving ? $t("Saving…") : $t("Save")}</button>
             </header>
@@ -7996,7 +7988,7 @@
           <section class="playlist-view" aria-busy={playlistsLoading}>
             <header class="library-heading">
               <div><p>{$t("YOUR NAPSTR")}</p><h1>{$t("Playlists")}</h1></div>
-              <button class="playlist-new" disabled={status.streamOnly} onclick={() => void newPlaylist()} aria-label={$t("New playlist")}>+</button>
+              <button class="playlist-new" onclick={() => void newPlaylist()} aria-label={$t("New playlist")}>+</button>
             </header>
 
             {#if playlistsError}<p class="error-card">{$t(playlistsError)}</p>{/if}
@@ -8906,7 +8898,7 @@
       </div>
       <div class="actions-divider"></div>
       <button class="actions-row" onclick={() => (showPlaylistDelete = false)}><span>{$t("Cancel")}</span></button>
-      <button class="actions-row danger" disabled={status.streamOnly} onclick={() => void deletePlaylist(playlistDraft as RemotePlaylist)}>
+      <button class="actions-row danger" onclick={() => void deletePlaylist(playlistDraft as RemotePlaylist)}>
         <span>{playlistDraft.published ? $t("Withdraw") : $t("Delete")}</span>
       </button>
     </div>
@@ -9003,16 +8995,14 @@
         <button class="discussion-older" onclick={() => void refreshDiscussion(true)}>{$t("Load more")}</button>
       {/if}
       {#each discussionMessages as message (message.eventId)}
-        <article class="discussion-message" class:mine={message.pubkey === status.pubkey}>
+        <article class="discussion-message" class:mine={isOwnMessage(message.pubkey)}>
           <header>
             <b>{message.displayName || message.npub}</b>
             <span class="discussion-message-tools">
               <time>{discussionStamp(message.createdAt)}</time>
-              {#if !status.streamOnly}
-                <button class="discussion-reply" onclick={() => void startReply(message)} aria-label={$t("Reply")} title={$t("Reply")}>
-                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9.5 6 4.5 11l5 5" /><path d="M4.5 11h9a5.5 5.5 0 0 1 5.5 5.5V18" /></svg>
-                </button>
-              {/if}
+              <button class="discussion-reply" onclick={() => void startReply(message)} aria-label={$t("Reply")} title={$t("Reply")}>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9.5 6 4.5 11l5 5" /><path d="M4.5 11h9a5.5 5.5 0 0 1 5.5 5.5V18" /></svg>
+              </button>
             </span>
           </header>
           <!-- What this is answering, resolved by the computer so the phone draws
@@ -9028,29 +9018,28 @@
       {/each}
       {#if discussionError}<p class="discussion-error">{discussionError}</p>{/if}
     </div>
-    {#if status.streamOnly}
-      <p class="settings-note">{$t("This pairing cannot sign or publish anything in your name, so it cannot join a conversation.")}</p>
-    {:else}
-      <form class="discussion-compose" onsubmit={(event) => { event.preventDefault(); void sendDiscussion(); }}>
-        {#if discussionReply}
-          <button class="discussion-replying" type="button" onclick={cancelReply} aria-label={$t("Cancel reply")}>
-            <span>{$t("Replying to {p0}", { p0: discussionReply.displayName || discussionReply.npub })}</span>
-            <small>{discussionReply.content}</small>
-          </button>
-        {/if}
-        <div class="discussion-compose-row">
-          <input
-            bind:this={discussionInput}
-            bind:value={discussionDraft}
-            maxlength="500"
-            autocomplete="off"
-            aria-label={$t("Track discussion comment")}
-            placeholder={discussionReply ? $t("Write a reply…") : $t("Comment on this track…")}
-          />
-          <button disabled={!discussionDraft.trim() || discussionSending} aria-busy={discussionSending}>{discussionSending ? '…' : $t("Send")}</button>
-        </div>
-      </form>
-    {/if}
+    <!-- The box is here whoever signs it: a pairing not lent the owner's signature
+         signs a comment with the key this phone made, so there is no version of
+         this screen without one. -->
+    <form class="discussion-compose" onsubmit={(event) => { event.preventDefault(); void sendDiscussion(); }}>
+      {#if discussionReply}
+        <button class="discussion-replying" type="button" onclick={cancelReply} aria-label={$t("Cancel reply")}>
+          <span>{$t("Replying to {p0}", { p0: discussionReply.displayName || discussionReply.npub })}</span>
+          <small>{discussionReply.content}</small>
+        </button>
+      {/if}
+      <div class="discussion-compose-row">
+        <input
+          bind:this={discussionInput}
+          bind:value={discussionDraft}
+          maxlength="500"
+          autocomplete="off"
+          aria-label={$t("Track discussion comment")}
+          placeholder={discussionReply ? $t("Write a reply…") : $t("Comment on this track…")}
+        />
+        <button disabled={!discussionDraft.trim() || discussionSending} aria-busy={discussionSending}>{discussionSending ? '…' : $t("Send")}</button>
+      </div>
+    </form>
   </div>
 {/if}
 

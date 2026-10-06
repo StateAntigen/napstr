@@ -343,7 +343,7 @@ fn validate_flac(file: &mut File, size: u64) -> Result<AudioInfo, String> {
         format: "FLAC",
         mime: "audio/flac",
         metadata: AudioMetadata::default(),
-            properties: AudioProperties::default(),
+        properties: AudioProperties::default(),
     })
 }
 
@@ -428,7 +428,7 @@ fn validate_wav(file: &mut File, size: u64) -> Result<AudioInfo, String> {
         format: "WAV",
         mime: "audio/wav",
         metadata: AudioMetadata::default(),
-            properties: AudioProperties::default(),
+        properties: AudioProperties::default(),
     })
 }
 

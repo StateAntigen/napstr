@@ -10,16 +10,16 @@ use iroh::{
     Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr,
 };
 use napstr_remote_protocol::{
-    ArtRendition, ClientRequest, DeviceRights, DiscoverMode, PairingTicket, PlaybackCommand,
-    RemoteAlbumCover, RemoteAudiobook, RemoteAudiobookSummary, RemoteDiscussionActivity,
-    RemoteDiscussionMessage, RemotePlaybackState, RemotePlaylist, RemotePlaylistCoordinate,
-    RemotePlaylistSummary, RemoteTrack, RemoteTransfer, ServerResponse, SignedEvent, ALPN,
-    AUTHENTICATION_KIND, MAX_ART_KEY_CHARS, MAX_CONTROL_FRAME_BYTES, MAX_COVER_KEYS, MAX_PAGE_SIZE,
-    MAX_PLAYLIST_MEMBERS, MAX_PLAYLIST_PAGE, MAX_PLAY_QUEUE, MAX_QR_SVG_BYTES,
-    MAX_REPORT_NOTE_CHARS, MAX_TRACKS_BY_ID, NOT_PROVED_MESSAGE, REPORT_REASONS, shuffle_key,
+    shuffle_key, ArtRendition, ClientRequest, DeviceRights, DiscoverMode, PairingTicket,
+    PlaybackCommand, RemoteAlbumCover, RemoteAudiobook, RemoteAudiobookSummary,
+    RemoteDiscussionActivity, RemoteDiscussionMessage, RemotePlaybackState, RemotePlaylist,
+    RemotePlaylistCoordinate, RemotePlaylistSummary, RemoteTrack, RemoteTransfer, ServerResponse,
+    SignedEvent, ALPN, AUTHENTICATION_KIND, MAX_ART_KEY_CHARS, MAX_CONTROL_FRAME_BYTES,
+    MAX_COVER_KEYS, MAX_PAGE_SIZE, MAX_PLAYLIST_MEMBERS, MAX_PLAYLIST_PAGE, MAX_PLAY_QUEUE,
+    MAX_QR_SVG_BYTES, MAX_REPORT_NOTE_CHARS, MAX_TRACKS_BY_ID, NOT_PROVED_MESSAGE, REPORT_REASONS,
 };
-use quick_xml::{events::Event, Reader};
 use qrcode::{render::svg, EcLevel, QrCode};
+use quick_xml::{events::Event, Reader};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -77,7 +77,8 @@ struct SavedHost {
 impl SavedHost {
     /// What this computer allows.
     fn grant(&self) -> DeviceRights {
-        self.rights.unwrap_or_else(|| legacy_grant(self.stream_only))
+        self.rights
+            .unwrap_or_else(|| legacy_grant(self.stream_only))
     }
 
     /// What this phone can say about the computer without hearing from it.
@@ -205,10 +206,7 @@ fn load_home(path: &Path) -> Option<String> {
 /// was paired with, which is the single computer it has ever had.
 fn home_host(hosts: &[SavedHost], home: Option<&str>) -> Option<SavedHost> {
     if let Some(endpoint_id) = home {
-        if let Some(chosen) = hosts
-            .iter()
-            .find(|host| host.endpoint_id == endpoint_id)
-        {
+        if let Some(chosen) = hosts.iter().find(|host| host.endpoint_id == endpoint_id) {
             return Some(chosen.clone());
         }
     }
@@ -572,10 +570,7 @@ impl MediaServer {
     /// The token is in it too, which is why this is minted fresh rather than
     /// stored anywhere: a new run is a new token.
     fn art_url(&self, hash: &str) -> String {
-        format!(
-            "http://127.0.0.1:{}/{}/art/{}",
-            self.port, self.token, hash
-        )
+        format!("http://127.0.0.1:{}/{}/art/{}", self.port, self.token, hash)
     }
 
     /// Serve one held picture.
@@ -1557,8 +1552,7 @@ struct RemoteClient {
     /// computer being asleep must not cost this phone the tunnel it acts
     /// through, and a track that came from one computer has to stay playable
     /// while another is out of reach.
-    connections:
-        tokio::sync::RwLock<std::collections::HashMap<String, iroh::endpoint::Connection>>,
+    connections: tokio::sync::RwLock<std::collections::HashMap<String, iroh::endpoint::Connection>>,
     /// Every computer this phone may talk to, in the order they were paired.
     hosts: tokio::sync::RwLock<Vec<SavedHost>>,
     /// The computer someone chose this phone to act through, when anyone has.
@@ -1713,7 +1707,11 @@ fn readable_hosts(hosts: &[SavedHost], home: Option<&str>) -> Result<Vec<SavedHo
 ///
 /// `reasons` is what each unreachable computer said, in the order they were
 /// asked.
-fn none_answered(answered: usize, reasons: &[(String, String)], home: Option<&str>) -> Option<String> {
+fn none_answered(
+    answered: usize,
+    reasons: &[(String, String)],
+    home: Option<&str>,
+) -> Option<String> {
     if answered > 0 {
         return None;
     }
@@ -1854,7 +1852,10 @@ fn fetch_order(
         }
     }
     for host in may_fetch {
-        if !order.iter().any(|asked| asked.endpoint_id == host.endpoint_id) {
+        if !order
+            .iter()
+            .any(|asked| asked.endpoint_id == host.endpoint_id)
+        {
             order.push(host);
         }
     }
@@ -1980,8 +1981,7 @@ impl RemoteClient {
     async fn home(&self) -> Result<SavedHost, String> {
         let hosts = self.hosts.read().await;
         let chosen = self.home.read().await.clone();
-        home_host(&hosts, chosen.as_deref())
-            .ok_or_else(|| "Pair Napstrfy with Napstr first".into())
+        home_host(&hosts, chosen.as_deref()).ok_or_else(|| "Pair Napstrfy with Napstr first".into())
     }
 
     /// The chosen home computer, if it is still one this phone holds.
@@ -2047,7 +2047,12 @@ impl RemoteClient {
         // `if let` lives until the end of the whole statement, so closing the
         // dead tunnel below - which takes the write lock - would wait for a read
         // lock this function is still holding, for ever.
-        let held = self.connections.read().await.get(&host.endpoint_id).cloned();
+        let held = self
+            .connections
+            .read()
+            .await
+            .get(&host.endpoint_id)
+            .cloned();
         if let Some(connection) = held {
             if let Some(reason) = connection.close_reason() {
                 // A tunnel the transport has already closed is not one this
@@ -2197,7 +2202,10 @@ impl RemoteClient {
         };
         let snapshot = {
             let mut hosts = self.hosts.write().await;
-            let Some(host) = hosts.iter_mut().find(|host| host.endpoint_id == endpoint_id) else {
+            let Some(host) = hosts
+                .iter_mut()
+                .find(|host| host.endpoint_id == endpoint_id)
+            else {
                 return;
             };
             // Another exchange may have learned the same thing while this one
@@ -2243,11 +2251,13 @@ impl RemoteClient {
         };
         let endpoint = self.endpoint().await?;
         let address = decode_endpoint_addr(&host)?;
-        let connection =
-            tokio::time::timeout(Duration::from_secs(25), endpoint.connect(address.clone(), ALPN))
-                .await
-                .map_err(|_| "Napstr did not answer. Keep its Mobile page open and try again.")?
-                .map_err(|error| format!("Could not pair over Iroh: {error}"))?;
+        let connection = tokio::time::timeout(
+            Duration::from_secs(25),
+            endpoint.connect(address.clone(), ALPN),
+        )
+        .await
+        .map_err(|_| "Napstr did not answer. Keep its Mobile page open and try again.")?
+        .map_err(|error| format!("Could not pair over Iroh: {error}"))?;
         let response = tokio::time::timeout(
             Duration::from_secs(15),
             exchange_on(
@@ -2880,10 +2890,7 @@ impl RemoteClient {
             ServerResponse::DeviceIdentity { pubkey } => pubkey,
             response => return Err(unexpected_response(&response)),
         };
-        self.proved
-            .write()
-            .await
-            .insert(host.endpoint_id.clone());
+        self.proved.write().await.insert(host.endpoint_id.clone());
         Ok(key)
     }
 
@@ -3107,7 +3114,9 @@ impl RemoteClient {
         dislikes: Vec<String>,
     ) -> Result<CarryReport, String> {
         let elsewhere = self.likes_on(Some(from)).await?;
-        let kept = self.set_likes_on(Some(to), merge_likes(likes, elsewhere)).await?;
+        let kept = self
+            .set_likes_on(Some(to), merge_likes(likes, elsewhere))
+            .await?;
         let turned_off = self.dislikes_on(Some(from)).await?;
         // A failure here is not a failure of the move: the likes above are the
         // reason this runs at all, and a computer that will not answer about
@@ -3156,7 +3165,11 @@ impl RemoteClient {
                 ServerResponse::Error { message } => {
                     failed.push(format!("{}: {message}", summary.title))
                 }
-                response => failed.push(format!("{}: {}", summary.title, unexpected_response(&response))),
+                response => failed.push(format!(
+                    "{}: {}",
+                    summary.title,
+                    unexpected_response(&response)
+                )),
             }
         }
         if let Some(error) = dislikes_failed {
@@ -3328,7 +3341,13 @@ impl RemoteClient {
         // would report a failure that only meant "not yet" - so it is opened in the
         // background and this answer says what is true meanwhile. The next question
         // is the one that finds the tunnel.
-        if self.connections.read().await.get(&host.endpoint_id).is_none() {
+        if self
+            .connections
+            .read()
+            .await
+            .get(&host.endpoint_id)
+            .is_none()
+        {
             self.open_tunnel_in_background(&host).await;
             // "Connecting" only while something is actually being tried. A computer
             // that is asleep fails its attempt, and after that "offline" is the
@@ -3337,7 +3356,11 @@ impl RemoteClient {
             diag::note(&format!(
                 "status: {} has no tunnel here ({}), answering {}",
                 host.desktop_name,
-                if trying { "one is being opened" } else { "none is being opened" },
+                if trying {
+                    "one is being opened"
+                } else {
+                    "none is being opened"
+                },
                 if trying { "connecting" } else { "offline" }
             ));
             return host.status(false, trying, String::new());
@@ -3590,7 +3613,9 @@ impl RemoteClient {
             .map(|item| item.track)
             .collect::<Vec<_>>();
         Ok(OfflineLibrary {
-            stream_only: host.as_ref().is_some_and(|host| host.grant().is_read_only()),
+            stream_only: host
+                .as_ref()
+                .is_some_and(|host| host.grant().is_read_only()),
             may_download: host
                 .as_ref()
                 .is_some_and(|host| host.grant().may_download()),
@@ -3649,7 +3674,12 @@ impl RemoteClient {
         // this loop, which drops files the computer no longer holds. Three tracks
         // pre-loaded deep on a two-hundred track queue grows this directory for as
         // long as the queue runs.
-        evict_beyond_budget(&directory, &cached, &protected_file_ids, AUDIO_CACHE_BUDGET_BYTES)?;
+        evict_beyond_budget(
+            &directory,
+            &cached,
+            &protected_file_ids,
+            AUDIO_CACHE_BUDGET_BYTES,
+        )?;
         Ok(!deferred)
     }
 }
@@ -3872,10 +3902,7 @@ async fn remote_set_likes(
     file_ids: Vec<String>,
     state: State<'_, AppState>,
 ) -> Result<Vec<String>, String> {
-    state
-        .remote
-        .set_likes_on(source.as_deref(), file_ids)
-        .await
+    state.remote.set_likes_on(source.as_deref(), file_ids).await
 }
 
 /// Stage a track this phone holds so that another app can be handed it.
@@ -3937,7 +3964,8 @@ fn share_name(track: &RemoteTrack) -> String {
     let cleaned: String = joined
         .chars()
         .map(|character| {
-            if character.is_alphanumeric() || matches!(character, ' ' | '-' | '_' | '.' | '(' | ')') {
+            if character.is_alphanumeric() || matches!(character, ' ' | '-' | '_' | '.' | '(' | ')')
+            {
                 character
             } else {
                 '_'
@@ -4053,9 +4081,7 @@ async fn set_mobile_host_included(
 
 /// Which computer answered with which file, for the marks a row draws.
 #[tauri::command]
-async fn remote_file_hosts(
-    state: State<'_, AppState>,
-) -> Result<HashMap<String, String>, String> {
+async fn remote_file_hosts(state: State<'_, AppState>) -> Result<HashMap<String, String>, String> {
     Ok(state.remote.file_hosts().await)
 }
 
@@ -4615,6 +4641,218 @@ async fn remote_send_track_discussion(
     }
 }
 
+/// NIP-C7's public chat message, which is what a comment in a discussion is.
+const DEVICE_COMMENT_KIND: u16 = 9;
+/// A public playlist's kind, and the marker that says the event is one.
+const DEVICE_PLAYLIST_KIND: u16 = 30425;
+const DEVICE_PLAYLIST_MARKER: &str = "napstr-playlist";
+const DEVICE_PLAYLIST_ALT: &str = "Napstr public playlist";
+
+/// One of this phone's own events, as the shape the protocol carries.
+///
+/// The same conversion `sign_challenge` makes, for the same reason: what a
+/// computer checks is the network's own event, byte for byte, so this is where a
+/// signed event becomes the seven fields that travel.
+fn signed_event(event: nostr::Event) -> Result<SignedEvent, String> {
+    use nostr::JsonUtil;
+    serde_json::from_str(&event.as_json()).map_err(|error| error.to_string())
+}
+
+/// One member of a playlist, as the body of a published one names it.
+///
+/// camelCase and skipping what is empty, because this is the host's own body and
+/// a playlist published from this phone has to read back on the computer that
+/// minted its id: two spellings of one playlist would be two playlists.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DevicePlaylistMember {
+    position: u32,
+    file_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    title: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    artist: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    album: String,
+}
+
+/// The body of a published playlist.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DevicePlaylistContent {
+    protocol: String,
+    playlist_id: String,
+    title: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    artist: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    mbid: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    image: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    tags: String,
+    tracks: Vec<DevicePlaylistMember>,
+}
+
+/// Say something in a track's discussion under this phone's own key.
+///
+/// The other half of a pairing lent the network but not the signature: the comment
+/// is this phone's, signed here with the key this phone made and has never handed
+/// to anybody, and the computer's part is to put it on the relays. The shape is
+/// the host's own - kind, topic, tags and the bech32 reference a reply opens with -
+/// because a comment that read back differently from the one the computer writes
+/// would be two conversations rather than one.
+#[tauri::command]
+async fn remote_send_device_discussion(
+    file_id: String,
+    content: String,
+    reply_to: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let file_id = file_id.trim().to_ascii_lowercase();
+    if file_id.len() != 64 || !file_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("A track discussion needs a valid SHA-256 file id".into());
+    }
+    let text = content.trim();
+    let length = text.chars().count();
+    if length == 0 || length > 500 {
+        return Err("A comment is between 1 and 500 characters".into());
+    }
+    if text.chars().any(char::is_control) {
+        return Err("A comment is a single line without control formatting".into());
+    }
+    let mut tags = vec![
+        nostr::Tag::parse(["t", format!("napstr-{file_id}").as_str()])
+            .map_err(|error| error.to_string())?,
+        nostr::Tag::parse(["client", "Napstr"]).map_err(|error| error.to_string())?,
+        nostr::Tag::parse(["alt", "Public message in a Napstr track discussion"])
+            .map_err(|error| error.to_string())?,
+    ];
+    let mut body = text.to_string();
+    if let Some(parent) = reply_to
+        .as_deref()
+        .map(str::trim)
+        .filter(|it| !it.is_empty())
+    {
+        use nostr::ToBech32;
+        tags.push(nostr::Tag::parse(["q", parent]).map_err(|error| error.to_string())?);
+        // NIP-C7 opens a reply with a reference to what it answers, in bech32,
+        // which is the form other clients follow. The text is what the author
+        // wrote either way, so the reference is added around it.
+        if let Ok(id) = parent.parse::<nostr::EventId>() {
+            let reference = id.to_bech32().map_err(|error| error.to_string())?;
+            body = format!("nostr:{reference}\n{body}");
+        }
+    }
+    let keys = state.identity.keys()?;
+    let event = nostr::EventBuilder::new(nostr::Kind::from(DEVICE_COMMENT_KIND), body)
+        .tags(tags)
+        .sign_with_keys(&keys)
+        .map_err(|error| error.to_string())?;
+    match state
+        .remote
+        .request_under_this_key(
+            None,
+            ClientRequest::PublishDeviceEvent {
+                event: signed_event(event)?,
+            },
+        )
+        .await
+    {
+        Ok(ServerResponse::DeviceEventPublished { event_id }) => Ok(event_id),
+        Ok(response) => Err(unexpected_response(&response)),
+        Err(error) => Err(friendly_if_missing(error, DISCUSSION_UNAVAILABLE)),
+    }
+}
+
+/// Publish a playlist under this phone's own key.
+///
+/// A playlist this phone made belongs to the key that made it, so publishing one
+/// is the same kind of act as commenting on a track: signed here, handed over for
+/// the relays. The id and the body are the host's own shapes, because the computer
+/// is what mints a playlist id and what reads the body back.
+///
+/// The words a playlist can be found by are the author's own tags and nothing
+/// else: suggesting them is the computer's job, and this path exists for the
+/// pairings where the computer has not been lent the owner's signature.
+#[tauri::command]
+async fn remote_publish_device_playlist(
+    playlist: RemotePlaylist,
+    state: State<'_, AppState>,
+) -> Result<RemotePlaylist, String> {
+    if playlist.private {
+        return Err(
+            "A private playlist is never published: it stays on this computer and its phones"
+                .into(),
+        );
+    }
+    let title = playlist.title.trim();
+    if title.is_empty() || title.chars().count() > 256 {
+        return Err("A playlist needs a title of at most 256 characters".into());
+    }
+    if playlist.tracks.is_empty() {
+        return Err("A playlist needs at least one track".into());
+    }
+    let content = DevicePlaylistContent {
+        protocol: "napstr/1".into(),
+        playlist_id: playlist.playlist_id.clone(),
+        title: title.to_string(),
+        artist: playlist.artist.trim().to_string(),
+        mbid: playlist.mbid.clone(),
+        image: playlist.image.clone(),
+        tags: playlist.tags.clone(),
+        tracks: playlist
+            .tracks
+            .iter()
+            .map(|member| DevicePlaylistMember {
+                position: member.position,
+                file_id: member.file_id.clone(),
+                title: member.title.trim().to_string(),
+                artist: member.artist.trim().to_string(),
+                album: member.album.trim().to_string(),
+            })
+            .collect(),
+    };
+    let body = serde_json::to_string(&content).map_err(|error| error.to_string())?;
+    let mut tags = vec![
+        nostr::Tag::parse(["d", playlist.playlist_id.as_str()])
+            .map_err(|error| error.to_string())?,
+        nostr::Tag::parse(["t", DEVICE_PLAYLIST_MARKER]).map_err(|error| error.to_string())?,
+        nostr::Tag::parse(["title", title]).map_err(|error| error.to_string())?,
+        nostr::Tag::parse(["alt", DEVICE_PLAYLIST_ALT]).map_err(|error| error.to_string())?,
+        nostr::Tag::parse(["client", "Napstr"]).map_err(|error| error.to_string())?,
+    ];
+    // One `x` per member, in order, so a relay can answer "which playlists include
+    // this file" without fetching every playlist body - the host's own layout.
+    for member in &playlist.tracks {
+        tags.push(
+            nostr::Tag::parse(["x", member.file_id.as_str()]).map_err(|error| error.to_string())?,
+        );
+    }
+    let keys = state.identity.keys()?;
+    let event = nostr::EventBuilder::new(nostr::Kind::from(DEVICE_PLAYLIST_KIND), body)
+        .tags(tags)
+        .sign_with_keys(&keys)
+        .map_err(|error| error.to_string())?;
+    match state
+        .remote
+        .request_under_this_key(
+            None,
+            ClientRequest::PublishDeviceEvent {
+                event: signed_event(event)?,
+            },
+        )
+        .await
+    {
+        Ok(ServerResponse::DeviceEventPublished { .. }) => Ok(RemotePlaylist {
+            published: true,
+            ..playlist
+        }),
+        Ok(response) => Err(unexpected_response(&response)),
+        Err(error) => Err(friendly_if_missing(error, DISCUSSION_UNAVAILABLE)),
+    }
+}
+
 /// How many people have commented on each of these files, for the marks on rows.
 ///
 /// The host answers about the files it is willing to name to a relay, so a file
@@ -4639,9 +4877,7 @@ async fn remote_track_discussion_activity(
 }
 
 #[tauri::command]
-async fn remote_playback_state(
-    state: State<'_, AppState>,
-) -> Result<RemotePlaybackState, String> {
+async fn remote_playback_state(state: State<'_, AppState>) -> Result<RemotePlaybackState, String> {
     let response = state
         .remote
         .request(ClientRequest::PlaybackState)
@@ -4874,12 +5110,15 @@ async fn remote_discover(
     // three different rankings interleaved.
     match state
         .remote
-        .request_from(None, ClientRequest::Discover {
-            mode,
-            seed,
-            offset,
-            limit,
-        })
+        .request_from(
+            None,
+            ClientRequest::Discover {
+                mode,
+                seed,
+                offset,
+                limit,
+            },
+        )
         .await?
     {
         ServerResponse::Discover { tracks, total } => Ok(DiscoverPage { tracks, total }),
@@ -5613,6 +5852,8 @@ pub fn run() {
             remote_art,
             remote_track_discussion,
             remote_send_track_discussion,
+            remote_send_device_discussion,
+            remote_publish_device_playlist,
             remote_track_discussion_activity,
             remote_playback_state,
             remote_playback,
@@ -5753,7 +5994,10 @@ mod tests {
                 .await
                 .expect("the second dial must finish")
                 .unwrap();
-            assert!(second.close_reason().is_none(), "a live tunnel is handed out");
+            assert!(
+                second.close_reason().is_none(),
+                "a live tunnel is handed out"
+            );
             assert_ne!(
                 second.stable_id(),
                 first.stable_id(),
@@ -5783,7 +6027,9 @@ mod tests {
 
     /// A client of its own, with an identity of its own, in a directory of its
     /// own - the state the app builds at start-up, without a window.
-    fn client_with_an_identity(name: &str) -> (PathBuf, Arc<RemoteClient>, Arc<identity::DeviceIdentity>) {
+    fn client_with_an_identity(
+        name: &str,
+    ) -> (PathBuf, Arc<RemoteClient>, Arc<identity::DeviceIdentity>) {
         let root = std::env::temp_dir().join(format!("napstrfy-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
@@ -5816,7 +6062,10 @@ mod tests {
             .and_then(|tag| tag.get(1))
             .cloned()
             .unwrap_or_default();
-        assert_eq!(answered, nonce, "the nonce must be the one that was asked for");
+        assert_eq!(
+            answered, nonce,
+            "the nonce must be the one that was asked for"
+        );
 
         // The whole point of the shape: the computer can hand exactly this JSON
         // to the verifier a relay uses, with no translation in between.
@@ -5914,10 +6163,7 @@ mod tests {
         let endpoint_id = SecretKey::generate().public();
         let saved = EndpointAddr::from_parts(
             endpoint_id,
-            [
-                relay("https://relay.example.com"),
-                ip("192.168.1.10:50752"),
-            ],
+            [relay("https://relay.example.com"), ip("192.168.1.10:50752")],
         );
 
         let merged = merge_learned_addresses(&saved, &[ip("192.168.1.10:61111")]);
@@ -5953,8 +6199,7 @@ mod tests {
             [relay("https://old.example.com"), ip("10.0.0.2:5000")],
         );
 
-        let merged =
-            merge_learned_addresses(&saved, &[relay("https://new.example.com")]);
+        let merged = merge_learned_addresses(&saved, &[relay("https://new.example.com")]);
         assert!(merged.addrs.contains(&relay("https://new.example.com")));
         assert!(!merged.addrs.contains(&relay("https://old.example.com")));
         assert!(merged.addrs.contains(&ip("10.0.0.2:5000")));
@@ -5970,9 +6215,11 @@ mod tests {
         let endpoint_id = SecretKey::generate().public();
         let mut saved = host("stale", DeviceRights::full(), "Studio");
         saved.endpoint_id = endpoint_id.to_string();
-        saved.endpoint_addr =
-            serde_json::to_string(&EndpointAddr::from_parts(endpoint_id, [ip("192.168.4.4:50752")]))
-                .unwrap();
+        saved.endpoint_addr = serde_json::to_string(&EndpointAddr::from_parts(
+            endpoint_id,
+            [ip("192.168.4.4:50752")],
+        ))
+        .unwrap();
 
         let merged = merge_learned_addresses(
             &decode_endpoint_addr(&saved).unwrap(),
@@ -5998,7 +6245,11 @@ mod tests {
             file_id: file_id.into(),
             filename: format!("{}.mp3", &file_id[..8]),
             title: "A track".into(),
-            artist: if local { "Mine".into() } else { "Theirs".into() },
+            artist: if local {
+                "Mine".into()
+            } else {
+                "Theirs".into()
+            },
             album: "An album".into(),
             format: "MP3".into(),
             mime: "audio/mpeg".into(),
@@ -6045,12 +6296,20 @@ mod tests {
     #[test]
     fn a_shared_track_is_declared_as_what_it_is() {
         let mut track = library_row(&"b".repeat(64), false);
-        assert_eq!(share_mime(&track, "mp3"), "audio/mpeg", "the catalogue's own word wins");
+        assert_eq!(
+            share_mime(&track, "mp3"),
+            "audio/mpeg",
+            "the catalogue's own word wins"
+        );
 
         track.mime = String::new();
         assert_eq!(share_mime(&track, "flac"), "audio/flac");
         assert_eq!(share_mime(&track, "m4a"), "audio/mp4");
-        assert_eq!(share_mime(&track, "weird"), "audio/*", "unknown is still audio");
+        assert_eq!(
+            share_mime(&track, "weird"),
+            "audio/*",
+            "unknown is still audio"
+        );
     }
 
     /// Rows for whole files, named by one character each so a library can be
@@ -6117,7 +6376,10 @@ mod tests {
         assert_eq!(hosts.len(), 1);
         assert_eq!(hosts[0].grant(), DeviceRights::full());
 
-        upsert_host(&mut hosts, host("b", DeviceRights::read_only(), "Bob's Napstr"));
+        upsert_host(
+            &mut hosts,
+            host("b", DeviceRights::read_only(), "Bob's Napstr"),
+        );
         assert_eq!(hosts.len(), 2);
         assert_eq!(hosts[1].grant(), DeviceRights::read_only());
     }
@@ -6142,7 +6404,10 @@ mod tests {
                 .endpoint_id,
             "own"
         );
-        assert_eq!(home_host(&[friend.clone()], None).unwrap().endpoint_id, "friend");
+        assert_eq!(
+            home_host(&[friend.clone()], None).unwrap().endpoint_id,
+            "friend"
+        );
         assert!(home_host(&[], None).is_none());
     }
 
@@ -6162,13 +6427,22 @@ mod tests {
         // Without a choice, the rule decides - and both of these are privileged,
         // so it is the first one that was paired.
         assert_eq!(home_host(&hosts, None).unwrap().endpoint_id, "desktop");
-        assert_eq!(home_host(&hosts, Some("laptop")).unwrap().endpoint_id, "laptop");
+        assert_eq!(
+            home_host(&hosts, Some("laptop")).unwrap().endpoint_id,
+            "laptop"
+        );
         // A choice of a computer this phone does not hold falls back to the rule
         // rather than leaving the phone with no computer to act through.
-        assert_eq!(home_host(&hosts, Some("gone")).unwrap().endpoint_id, "desktop");
+        assert_eq!(
+            home_host(&hosts, Some("gone")).unwrap().endpoint_id,
+            "desktop"
+        );
         // And a choice may name a computer that allows only browsing: the phone
         // acts through it in the sense of asking it things, and may not sign.
-        assert_eq!(home_host(&hosts, Some("friend")).unwrap().endpoint_id, "friend");
+        assert_eq!(
+            home_host(&hosts, Some("friend")).unwrap().endpoint_id,
+            "friend"
+        );
     }
 
     /// A computer that has never named its grant is taken at the word of the old
@@ -6305,10 +6579,7 @@ mod tests {
         // A nested function rather than a closure: the answer borrows the hosts
         // it was read from, which a closure cannot say.
         fn ordered(hosts: &[SavedHost]) -> Vec<&str> {
-            hosts
-                .iter()
-                .map(|host| host.endpoint_id.as_str())
-                .collect()
+            hosts.iter().map(|host| host.endpoint_id.as_str()).collect()
         }
 
         // A friend's row is asked of the friend, then of the home computer,
@@ -6387,7 +6658,9 @@ mod tests {
         // Left out of being read, and out of being fetched from, which is the
         // same answer a track that came from it gets.
         assert_eq!(
-            fetch_order(None, &[own, left_out.clone()], None).unwrap().len(),
+            fetch_order(None, &[own, left_out.clone()], None)
+                .unwrap()
+                .len(),
             1
         );
         assert_eq!(
@@ -6488,9 +6761,12 @@ mod tests {
                 .map(|position| member(position, "Enter Sandman".into()))
                 .collect(),
         );
-        let refusal = bounded_playlist_request(ClientRequest::SavePlaylist { playlist: over })
-            .unwrap_err();
-        assert!(refusal.contains(&MAX_PLAYLIST_MEMBERS.to_string()), "{refusal}");
+        let refusal =
+            bounded_playlist_request(ClientRequest::SavePlaylist { playlist: over }).unwrap_err();
+        assert!(
+            refusal.contains(&MAX_PLAYLIST_MEMBERS.to_string()),
+            "{refusal}"
+        );
     }
 
     /// The QR the host draws has to survive the sanitiser, and nothing that
@@ -6599,7 +6875,9 @@ mod tests {
                             panic!("read-only playback requested a host operation: {request:?}");
                         };
                         assert_eq!(file_id, server_track.file_id);
-                        let response = ServerResponse::AudioReady { track: server_track.clone() };
+                        let response = ServerResponse::AudioReady {
+                            track: server_track.clone(),
+                        };
                         let payload = serde_json::to_vec(&response).unwrap();
                         send.write_all(&(payload.len() as u32).to_be_bytes())
                             .await
@@ -6628,7 +6906,11 @@ mod tests {
                         included: true,
                         pubkey: String::new(),
                     });
-                    remote.connections.write().await.insert(endpoint_id, connection);
+                    remote
+                        .connections
+                        .write()
+                        .await
+                        .insert(endpoint_id, connection);
                 }
                 let media = MediaServer::start(root.join(art_store::ART_DIRECTORY)).unwrap();
                 let playback = remote
@@ -6666,8 +6948,21 @@ mod tests {
                 let cached = root.join("audio").join(format!("{}.mp3", track.file_id));
                 assert_eq!(fs::read(cached).unwrap(), bytes);
                 remote.disconnect().await;
-                let replay = remote.cache_audio(track.clone(), media.clone(), true).await.unwrap();
-                assert_eq!(http.get(replay.url).send().await.unwrap().bytes().await.unwrap().as_ref(), bytes.as_slice());
+                let replay = remote
+                    .cache_audio(track.clone(), media.clone(), true)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    http.get(replay.url)
+                        .send()
+                        .await
+                        .unwrap()
+                        .bytes()
+                        .await
+                        .unwrap()
+                        .as_ref(),
+                    bytes.as_slice()
+                );
                 tokio::time::timeout(Duration::from_secs(5), server)
                     .await
                     .unwrap()
@@ -6839,7 +7134,10 @@ mod tests {
         assert_eq!(normalise_cover_key("artist|"), None);
         assert_eq!(normalise_cover_key("|album"), None);
         assert_eq!(normalise_cover_key("a|b|c"), None);
-        assert_eq!(normalise_cover_key(&format!("{}|album", "a".repeat(299))), None);
+        assert_eq!(
+            normalise_cover_key(&format!("{}|album", "a".repeat(299))),
+            None
+        );
 
         let request = normalise_cover_request(&[
             " Artist | Album ".into(),

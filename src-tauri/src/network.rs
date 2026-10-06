@@ -25,8 +25,8 @@ use tokio::sync::{Mutex, Notify, RwLock};
 use uuid::Uuid;
 
 use crate::cover;
-use crate::playlist;
 pub use crate::cover::AlbumCover;
+use crate::playlist;
 
 pub const CATALOGUE_KIND: u16 = 30421;
 pub const AVAILABILITY_KIND: u16 = 30422;
@@ -3496,7 +3496,12 @@ impl NetworkService {
 
         // What the index answered, on the path where the network was not asked.
         if let Some(mirror_hits) = mirror_hits {
-            merge_mirror_hits(&mut aggregated, mirror_hits, &blocked_files, &blocked_pubkeys);
+            merge_mirror_hits(
+                &mut aggregated,
+                mirror_hits,
+                &blocked_files,
+                &blocked_pubkeys,
+            );
         }
 
         for event in events_by_id.values() {
@@ -4138,6 +4143,31 @@ impl NetworkService {
     ///
     /// Returns the id of the signed claim. It has reached the relays before this
     /// returns, so a failure here is a real failure rather than a slow queue.
+    /// Put an event a device signed on the relays.
+    ///
+    /// Signed already, and by the device's own key: this computer's part is the
+    /// connection, not the signature, and the relays do not care which of the two
+    /// keys spoke. What guards it is the caller - `MobileService` checks the
+    /// signature against the key the device proved, and which kinds it may say -
+    /// because relaying is not free and a computer that published whatever it was
+    /// handed would be a relay account for strangers.
+    pub async fn publish_device_event(
+        &self,
+        event: napstr_remote_protocol::SignedEvent,
+    ) -> Result<String, String> {
+        let event = crate::device_account::to_event(&event)?;
+        let event_id = event.id.to_hex();
+        self.client
+            .read()
+            .await
+            .clone()
+            .ok_or("Nostr is not connected")?
+            .send_event(&event)
+            .await
+            .map_err(|error| format!("publication failed: {error}"))?;
+        Ok(event_id)
+    }
+
     pub async fn publish_cover(&self, fields: cover::CoverClaimFields) -> Result<String, String> {
         let event = cover::cover_event(&fields, &load_or_create_identity()?)?;
         let event_id = event.id.to_hex();
@@ -4170,11 +4200,8 @@ impl NetworkService {
         playlist: &RemotePlaylist,
         suggest_tags: bool,
     ) -> Result<RemotePlaylist, String> {
-        let event = playlist::playlist_event_builder(
-            playlist,
-            suggest_tags,
-            &load_or_create_identity()?,
-        )?;
+        let event =
+            playlist::playlist_event_builder(playlist, suggest_tags, &load_or_create_identity()?)?;
         let Some(playlist::PlaylistEvent::Playlist(read_back)) = playlist::playlist_event(&event)
         else {
             return Err("this playlist would not read back, so it was not published".into());
@@ -4283,11 +4310,9 @@ impl NetworkService {
             client.fetch_events(playlist_discovery_filter(), PLAYLIST_QUERY_TIMEOUT),
             client.fetch_events(playlist_own_filter(own_key), PLAYLIST_QUERY_TIMEOUT),
         );
-        let discovery =
-            discovery.map_err(|error| format!("playlist discovery failed: {error}"))?;
-        let mine = mine.map_err(|error| {
-            format!("this identity's own playlists could not be read: {error}")
-        })?;
+        let discovery = discovery.map_err(|error| format!("playlist discovery failed: {error}"))?;
+        let mine = mine
+            .map_err(|error| format!("this identity's own playlists could not be read: {error}"))?;
         let mut events = discovery;
         events.extend(mine);
         let revisions = newest_playlist_revisions(events);
@@ -4354,7 +4379,9 @@ impl NetworkService {
                     .await
                     .map_err(|error| format!("that playlist could not be read back: {error}"))?;
                 match newest_playlist_revisions(events).into_iter().next() {
-                    Some((_, playlist::PlaylistEvent::Playlist(read))) if read.author == own => *read,
+                    Some((_, playlist::PlaylistEvent::Playlist(read))) if read.author == own => {
+                        *read
+                    }
                     Some((_, playlist::PlaylistEvent::Withdrawn { .. })) => {
                         return Err("That playlist has been withdrawn, so there is nothing to \
                                     restore"
@@ -4434,9 +4461,7 @@ impl NetworkService {
             .await;
         profiles
             .into_iter()
-            .filter_map(|(key, metadata)| {
-                playlist_display_name(&metadata).map(|name| (key, name))
-            })
+            .filter_map(|(key, metadata)| playlist_display_name(&metadata).map(|name| (key, name)))
             .collect()
     }
 
@@ -5928,8 +5953,14 @@ mod tests {
         write_catalogue_row(&connection, &row).unwrap();
 
         let now = Utc::now().timestamp();
-        crate::catalogue::remember_seeders(&connection, &[file_id.clone()], &source, now + 600, now)
-            .unwrap();
+        crate::catalogue::remember_seeders(
+            &connection,
+            &[file_id.clone()],
+            &source,
+            now + 600,
+            now,
+        )
+        .unwrap();
         assert!(
             crate::catalogue::search(&connection, "wrong", 10, now)
                 .unwrap()
@@ -5937,7 +5968,11 @@ mod tests {
             "the words of the row that was superseded are still in the index"
         );
         let hits = crate::catalogue::search(&connection, "midnight", 10, now).unwrap();
-        assert_eq!(hits.len(), 1, "one file, however many times it is announced");
+        assert_eq!(
+            hits.len(),
+            1,
+            "one file, however many times it is announced"
+        );
         assert_eq!(hits[0].title, "Midnight City");
         assert_eq!(
             hits[0].sources,
@@ -6667,7 +6702,11 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{id}: the download row was removed ({error})"));
             assert_eq!(
                 ended.as_str(),
-                if should_end { DOWNLOAD_ABANDONED } else { status },
+                if should_end {
+                    DOWNLOAD_ABANDONED
+                } else {
+                    status
+                },
                 "{id}"
             );
             // And it reaches the phone through the very list the companion asks for,
@@ -6997,7 +7036,10 @@ mod tests {
     #[test]
     fn playlist_discovery_asks_for_the_marker_and_stays_bounded() {
         let discovery = serde_json::to_value(playlist_discovery_filter()).unwrap();
-        assert_eq!(discovery["kinds"], serde_json::json!([playlist::PLAYLIST_KIND]));
+        assert_eq!(
+            discovery["kinds"],
+            serde_json::json!([playlist::PLAYLIST_KIND])
+        );
         assert_eq!(
             discovery["#t"],
             serde_json::json!([playlist::PLAYLIST_MARKER]),
@@ -7028,8 +7070,7 @@ mod tests {
     /// be this one.
     #[test]
     fn a_look_files_everybody_elses_playlists_and_keeps_our_own_to_offer_back() {
-        let directory =
-            std::env::temp_dir().join(format!("napstr-playlists-{}", Uuid::new_v4()));
+        let directory = std::env::temp_dir().join(format!("napstr-playlists-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&directory).unwrap();
         let db = directory.join("napstr.sqlite3");
         crate::initialise_database(&db, &directory).unwrap();
@@ -7045,13 +7086,8 @@ mod tests {
         // Their playlist is filed here, under their author, with the name their
         // profile carries.
         let look = |events: Vec<Event>| {
-            apply_playlist_revisions(
-                &connection,
-                newest_playlist_revisions(events),
-                &names,
-                &own,
-            )
-            .unwrap()
+            apply_playlist_revisions(&connection, newest_playlist_revisions(events), &names, &own)
+                .unwrap()
         };
         let (report, own_playlists) = look(vec![playlist_at(THEIRS, "rock", 1_000, &theirs)]);
         assert_eq!(report.stored, 1);
@@ -7061,7 +7097,10 @@ mod tests {
             .unwrap();
         assert_eq!(stored.title, "rock");
         assert_eq!(stored.display_name, "Sean Parker");
-        assert!(stored.published, "it came off a relay, so a revision exists there");
+        assert!(
+            stored.published,
+            "it came off a relay, so a revision exists there"
+        );
 
         // This identity's own is not filed: it is the reconciliation, and the
         // author is the one who decides whether this computer holds it.
@@ -7072,7 +7111,10 @@ mod tests {
         assert_eq!(
             own_playlists.own.get(OURS).map(|row| row.title.as_str()),
             Some("Night_Rider")
-        );        assert!(playlist::page(&connection, &own, OURS, 0, 1).unwrap().is_none());
+        );
+        assert!(playlist::page(&connection, &own, OURS, 0, 1)
+            .unwrap()
+            .is_none());
 
         // A withdrawal of theirs forgets the row here and is remembered against
         // the coordinate, so the older revision cannot come back.
@@ -7082,9 +7124,14 @@ mod tests {
             &theirs,
         )]);
         assert_eq!(report.withdrawn, 1);
-        assert!(playlist::page(&connection, &their_hex, THEIRS, 0, 10).unwrap().is_none());
+        assert!(playlist::page(&connection, &their_hex, THEIRS, 0, 10)
+            .unwrap()
+            .is_none());
         let (report, _) = look(vec![playlist_at(THEIRS, "rock", 1_000, &theirs)]);
-        assert_eq!(report.stored, 0, "a withdrawn coordinate is not filed again");
+        assert_eq!(
+            report.stored, 0,
+            "a withdrawn coordinate is not filed again"
+        );
         // And a revision published after the withdrawal is a live playlist.
         let (report, _) = look(vec![playlist_at(THEIRS, "rock, again", 1_200, &theirs)]);
         assert_eq!(report.stored, 1);
@@ -7104,7 +7151,9 @@ mod tests {
         assert!(report.own.is_empty(), "it is not on the relays any more");
         assert!(own_playlists.own.is_empty());
         assert!(
-            playlist::page(&connection, &own, OURS, 0, 10).unwrap().is_some(),
+            playlist::page(&connection, &own, OURS, 0, 10)
+                .unwrap()
+                .is_some(),
             "a withdrawal read from a relay must not delete another installation's copy"
         );
 
@@ -7139,7 +7188,10 @@ mod tests {
 
         // Two revisions of one coordinate are one playlist, and the newest of
         // them is what its author last said.
-        let revisions = newest_playlist_revisions(vec![revision(1_000, "rock"), revision(2_000, "rock and roll")]);
+        let revisions = newest_playlist_revisions(vec![
+            revision(1_000, "rock"),
+            revision(2_000, "rock and roll"),
+        ]);
         assert_eq!(revisions.len(), 1);
         assert_eq!(revisions[0].0, 2_000);
         assert!(matches!(
@@ -7165,10 +7217,8 @@ mod tests {
 
         // Publishing again afterwards is a live playlist: a withdrawal is the
         // author's last word *at the time it was written*, not a life sentence.
-        let revisions = newest_playlist_revisions(vec![
-            withdrawal.clone(),
-            revision(4_000, "rock, again"),
-        ]);
+        let revisions =
+            newest_playlist_revisions(vec![withdrawal.clone(), revision(4_000, "rock, again")]);
         assert!(matches!(
             &revisions[0].1,
             playlist::PlaylistEvent::Playlist(read) if read.title == "rock, again"
@@ -7389,7 +7439,10 @@ mod tests {
         // an event id tells every other client nothing.
         assert!(discussion_reply_tag("not-an-event").is_err());
         let tag = discussion_reply_tag(&parent).unwrap();
-        assert_eq!(tag.kind(), TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::Q)));
+        assert_eq!(
+            tag.kind(),
+            TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::Q))
+        );
         assert_eq!(tag.content(), Some(parent.as_str()));
 
         let written = discussion_reply_content(&parent, "yes");
@@ -7400,14 +7453,20 @@ mod tests {
         assert_eq!(public_chat_text(&written), "yes");
         assert_eq!(public_chat_text("a plain message"), "a plain message");
         // Something that merely starts with the scheme is somebody's own text.
-        assert_eq!(public_chat_text("nostr:not-a-reference\nhi"), "nostr:not-a-reference\nhi");
+        assert_eq!(
+            public_chat_text("nostr:not-a-reference\nhi"),
+            "nostr:not-a-reference\nhi"
+        );
 
         let keys = Keys::generate();
         let reply = EventBuilder::new(Kind::from(TROLLBOX_MESSAGE_KIND), "nostr:note1qqq\nok")
             .tag(Tag::parse(["q", parent.as_str()]).unwrap())
             .sign_with_keys(&keys)
             .unwrap();
-        assert_eq!(public_chat_reply_to(&reply).as_deref(), Some(parent.as_str()));
+        assert_eq!(
+            public_chat_reply_to(&reply).as_deref(),
+            Some(parent.as_str())
+        );
         let plain = EventBuilder::new(Kind::from(TROLLBOX_MESSAGE_KIND), "hello")
             .sign_with_keys(&keys)
             .unwrap();
@@ -7452,15 +7511,29 @@ mod tests {
             // A blocked author, a comment from before the window, one dated in the
             // future, one with nothing in it, and one about another file.
             message(&blocked_keys, &topic, "blocked", now),
-            message(&other, &topic, "ancient", now - TRACK_DISCUSSION_ACTIVITY_WINDOW - 1),
-            message(&other, &topic, "tomorrow", now + 2 * TRACK_DISCUSSION_ACTIVITY_FUTURE_SLACK),
+            message(
+                &other,
+                &topic,
+                "ancient",
+                now - TRACK_DISCUSSION_ACTIVITY_WINDOW - 1,
+            ),
+            message(
+                &other,
+                &topic,
+                "tomorrow",
+                now + 2 * TRACK_DISCUSSION_ACTIVITY_FUTURE_SLACK,
+            ),
             message(&other, &topic, "   ", now),
             message(&other, &elsewhere, "somewhere else", now),
         ];
 
         let tallies = discussion_tallies(events.iter(), &asked, &blocked, now);
 
-        assert_eq!(tallies.len(), 1, "only the topic that was asked about counts");
+        assert_eq!(
+            tallies.len(),
+            1,
+            "only the topic that was asked about counts"
+        );
         let tally = tallies.get(&topic).expect("the asked topic is absent");
         assert_eq!(tally.authors, 2);
         assert_eq!(tally.messages, 4);

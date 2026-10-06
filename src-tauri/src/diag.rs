@@ -130,7 +130,10 @@ pub fn start(app_data: &Path) {
     let mut guard = lock();
     match Log::open(path) {
         Ok(mut log) => {
-            log.write(&format!("--- Napstr {} started ---", env!("CARGO_PKG_VERSION")));
+            log.write(&format!(
+                "--- Napstr {} started ---",
+                env!("CARGO_PKG_VERSION")
+            ));
             *guard = Some(log);
         }
         Err(error) => {
@@ -269,7 +272,10 @@ mod tests {
             "the file in use stays under the cap"
         );
         let contents = fs::read_to_string(&path).unwrap();
-        assert!(contents.contains("ordinary line"), "the latest lines are here");
+        assert!(
+            contents.contains("ordinary line"),
+            "the latest lines are here"
+        );
         let _ = fs::remove_dir_all(root);
     }
 

@@ -301,37 +301,39 @@ impl ArtFetcher {
     ) -> Result<(), FetchFailure> {
         match self.download(key, url, rendition, source).await {
             Ok(()) => Ok(()),
-            Err(failure) if failure.gone => match self.repair(key, rendition, url).await {
-                Repaired::Address(found) => {
-                    match self.download(key, &found, rendition, source).await {
-                        Ok(()) => {
-                            // Said out loud, because a claim whose address changed
-                            // on its own is a mystery to whoever reads it next.
-                            self.log(
+            Err(failure) if failure.gone => {
+                match self.repair(key, rendition, url).await {
+                    Repaired::Address(found) => {
+                        match self.download(key, &found, rendition, source).await {
+                            Ok(()) => {
+                                // Said out loud, because a claim whose address changed
+                                // on its own is a mystery to whoever reads it next.
+                                self.log(
                                 key,
                                 "found",
                                 source,
                                 &format!("the address on record was gone; the picture came from {found}"),
                             );
-                            Ok(())
+                                Ok(())
+                            }
+                            Err(next) => Err(next),
                         }
-                        Err(next) => Err(next),
                     }
+                    // The archive answered, and it holds no picture for that release
+                    // any more. A considered answer rather than a failure, so the
+                    // album leaves the queue instead of coming back in three days.
+                    Repaired::NoArt => {
+                        self.record_no_art(key, source);
+                        Ok(())
+                    }
+                    // This rendition has no address any more, which the corrected
+                    // resolution now says: nothing to fetch and nothing to wait for.
+                    Repaired::NothingToFetch => Ok(()),
+                    // The address is not one the archive owns, or it is not this
+                    // computer's to correct. It waits its turn like any other failure.
+                    Repaired::Unknown => Err(failure),
                 }
-                // The archive answered, and it holds no picture for that release
-                // any more. A considered answer rather than a failure, so the
-                // album leaves the queue instead of coming back in three days.
-                Repaired::NoArt => {
-                    self.record_no_art(key, source);
-                    Ok(())
-                }
-                // This rendition has no address any more, which the corrected
-                // resolution now says: nothing to fetch and nothing to wait for.
-                Repaired::NothingToFetch => Ok(()),
-                // The address is not one the archive owns, or it is not this
-                // computer's to correct. It waits its turn like any other failure.
-                Repaired::Unknown => Err(failure),
-            },
+            }
             Err(failure) => Err(failure),
         }
     }
@@ -362,9 +364,10 @@ impl ArtFetcher {
             .acquire()
             .await
             .map_err(|_| FetchFailure::busy("the artwork queue was closed"))?;
-        let response = self.client.get(address).send().await.map_err(|error| {
-            FetchFailure::busy(format!("could not fetch the artwork: {error}"))
-        })?;
+        let response =
+            self.client.get(address).send().await.map_err(|error| {
+                FetchFailure::busy(format!("could not fetch the artwork: {error}"))
+            })?;
         if !response.status().is_success() {
             return Err(FetchFailure::from_status(response.status()));
         }
@@ -389,8 +392,9 @@ impl ArtFetcher {
         let mut bytes = Vec::new();
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
-            let chunk =
-                chunk.map_err(|error| FetchFailure::busy(format!("the artwork download failed: {error}")))?;
+            let chunk = chunk.map_err(|error| {
+                FetchFailure::busy(format!("the artwork download failed: {error}"))
+            })?;
             if bytes.len().saturating_add(chunk.len()) as u64 > MAX_ART_BYTES {
                 return Err(FetchFailure::busy("that artwork is too large to hold"));
             }
@@ -457,7 +461,8 @@ impl ArtFetcher {
             thumb: thumb.clone(),
             ..named
         };
-        let _ = cover::record_art_lookup(&connection, key, cover::ArtLookupOutcome::Found(&corrected));
+        let _ =
+            cover::record_art_lookup(&connection, key, cover::ArtLookupOutcome::Found(&corrected));
         match rendition {
             ArtRendition::Full => Repaired::Address(art),
             // The archive publishes no thumbnail of its own for some records, and
@@ -493,11 +498,7 @@ impl ArtFetcher {
         // corrected and has earned the first wait rather than the last.
         let attempts = art_cache::failures(&connection, key)
             .ok()
-            .and_then(|failures| {
-                failures
-                    .get(art_cache::rendition_name(rendition))
-                    .cloned()
-            })
+            .and_then(|failures| failures.get(art_cache::rendition_name(rendition)).cloned())
             .filter(|previous| previous.url == url)
             .map(|previous| previous.attempts.saturating_add(1))
             .unwrap_or(1);
@@ -753,10 +754,7 @@ mod tests {
             .is_empty());
 
         // A claim that names no address for a rendition is not asking for it.
-        let art_only = ArtWant {
-            thumb: "",
-            ..want
-        };
+        let art_only = ArtWant { thumb: "", ..want };
         assert!(pending_renditions(&connection, &root, &art_only)
             .unwrap()
             .is_empty());
@@ -786,22 +784,28 @@ mod tests {
             .expect("the artwork client is buildable");
         assert!(fetcher.claim("a|b|full"));
         assert!(!fetcher.claim("a|b|full"), "the first claim still stands");
-        assert!(fetcher.claim("a|b|thumb"), "a rendition is its own download");
+        assert!(
+            fetcher.claim("a|b|thumb"),
+            "a rendition is its own download"
+        );
         fetcher.release("a|b|full");
-        assert!(fetcher.claim("a|b|full"), "released work can be asked for again");
+        assert!(
+            fetcher.claim("a|b|full"),
+            "released work can be asked for again"
+        );
     }
 
     #[test]
     fn a_key_is_read_back_as_the_artist_and_the_album() {
         assert_eq!(
             key_halves("kream / korolova|annihilation"),
-            (
-                "kream / korolova".to_string(),
-                "annihilation".to_string()
-            )
+            ("kream / korolova".to_string(), "annihilation".to_string())
         );
         // A key that is not a pair is still worth logging as itself.
-        assert_eq!(key_halves("not-a-pair"), ("not-a-pair".to_string(), String::new()));
+        assert_eq!(
+            key_halves("not-a-pair"),
+            ("not-a-pair".to_string(), String::new())
+        );
     }
 
     #[test]
@@ -880,7 +884,9 @@ mod tests {
             .contains_key("thumb"));
         art_cache::clear_failure(&connection, &want.key, ArtRendition::Thumb).unwrap();
         assert!(
-            art_cache::failures(&connection, want.key).unwrap().is_empty(),
+            art_cache::failures(&connection, want.key)
+                .unwrap()
+                .is_empty(),
             "art that is held cannot still be waiting to be fetched"
         );
 
@@ -889,7 +895,9 @@ mod tests {
         // which is why this does not clean up after itself.
         park(&connection, &want.key, ArtRendition::Thumb, want.thumb);
         art_cache::clear(&connection, &root).unwrap();
-        assert!(art_cache::failures(&connection, want.key).unwrap().is_empty());
+        assert!(art_cache::failures(&connection, want.key)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -988,11 +996,17 @@ mod tests {
         let held = art_cache::lookup(&connection, &root, key, ArtRendition::Full)
             .unwrap()
             .expect("the picture has to be in the cache");
-        assert!(held.bytes > 0, "and it has to be a picture, not an error page");
+        assert!(
+            held.bytes > 0,
+            "and it has to be a picture, not an error page"
+        );
         let corrected = cover::stored_art(&connection, key)
             .unwrap()
             .expect("the resolution survives the repair");
-        assert_ne!(corrected.art, gone, "the resolution has to name the live address");
+        assert_ne!(
+            corrected.art, gone,
+            "the resolution has to name the live address"
+        );
         assert_ne!(corrected.thumb, old_thumb, "and so does the thumbnail");
         assert!(
             art_cache::failures(&connection, key).unwrap().is_empty(),

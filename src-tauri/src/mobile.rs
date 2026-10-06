@@ -1,3 +1,4 @@
+use crate::art_fetch::ArtWant;
 use crate::{
     build_local_audiobooks, build_local_audiobooks_from_files, cover_publish::CoverAlbumNote,
     cover_publish::CoverPublisher, load_files, load_files_by_id, load_transfers, network,
@@ -5,15 +6,13 @@ use crate::{
 };
 use chrono::Utc;
 use iroh::{endpoint::presets, Endpoint, SecretKey};
-use crate::art_fetch::ArtWant;
 use napstr_remote_protocol::{
-    ArtRendition, ClientRequest, CoverReportResult, DeviceRights, PairingTicket, PlaybackCommand,
-    RemoteAlbumCover,
-    RemoteAudiobook, RemoteAudiobookSummary, RemoteDiscussionActivity, RemoteDiscussionMessage,
-    RemoteDiscussionReply, RemoteSource, RemoteTrack, RemoteTransfer, ServerResponse, ALPN,
-    MAX_ART_KEY_CHARS, MAX_CONTROL_FRAME_BYTES, MAX_COVER_KEYS, MAX_DISCOVER_PAGE, MAX_PAGE_SIZE,
-    MAX_PLAYLIST_PAGE,
-    MAX_PLAY_QUEUE, MAX_POSITION_MS, MAX_TRACKS_BY_ID, PROTOCOL_VERSION, shuffle_key,
+    shuffle_key, ArtRendition, ClientRequest, CoverReportResult, DeviceRights, PairingTicket,
+    PlaybackCommand, RemoteAlbumCover, RemoteAudiobook, RemoteAudiobookSummary,
+    RemoteDiscussionActivity, RemoteDiscussionMessage, RemoteDiscussionReply, RemoteSource,
+    RemoteTrack, RemoteTransfer, ServerResponse, ALPN, MAX_ART_KEY_CHARS, MAX_CONTROL_FRAME_BYTES,
+    MAX_COVER_KEYS, MAX_DISCOVER_PAGE, MAX_PAGE_SIZE, MAX_PLAYLIST_PAGE, MAX_PLAY_QUEUE,
+    MAX_POSITION_MS, MAX_TRACKS_BY_ID, PROTOCOL_VERSION,
 };
 use qrcode::{render::svg, QrCode};
 use rusqlite::{params, OptionalExtension};
@@ -189,7 +188,9 @@ impl MobileService {
                 let permit = match accept_service.connection_slots.clone().try_acquire_owned() {
                     Ok(permit) => permit,
                     Err(_) => {
-                        crate::diag::note("every Napstrfy connection slot is busy; turned one away");
+                        crate::diag::note(
+                            "every Napstrfy connection slot is busy; turned one away",
+                        );
                         incoming.refuse();
                         continue;
                     }
@@ -457,12 +458,15 @@ impl MobileService {
                     )),
                     Err(error) => {
                         crate::diag::note(&format!("{who} could not be answered: {error}"));
-                        let _ = write_response(&mut send, &ServerResponse::Error { message: error })
-                            .await;
+                        let _ =
+                            write_response(&mut send, &ServerResponse::Error { message: error })
+                                .await;
                     }
                 }
                 if let Err(error) = send.finish() {
-                    crate::diag::note(&format!("the answer to {who} could not be finished: {error}"));
+                    crate::diag::note(&format!(
+                        "the answer to {who} could not be finished: {error}"
+                    ));
                 }
             });
         }
@@ -618,14 +622,12 @@ impl MobileService {
     ) -> Result<(), String> {
         let who = crate::diag::device(remote_id);
         let kind = crate::diag::request_kind(&request);
-        if let ClientRequest::Pair {
-            token,
-            device_name,
-        } = request
-        {
-            let rights = self.accept_pairing(remote_id, &token, &device_name).inspect_err(|error| {
-                crate::diag::note(&format!("{who} could not pair: {error}"));
-            })?;
+        if let ClientRequest::Pair { token, device_name } = request {
+            let rights = self
+                .accept_pairing(remote_id, &token, &device_name)
+                .inspect_err(|error| {
+                    crate::diag::note(&format!("{who} could not pair: {error}"));
+                })?;
             return write_response(
                 send,
                 &ServerResponse::Paired {
@@ -1044,6 +1046,20 @@ impl MobileService {
             }
             ClientRequest::SavePlaylist { playlist } => {
                 let author = self.proved_key(remote_id)?;
+                // Let through the permission table because this is a question about
+                // who owns what rather than about a grant: a device may write down
+                // the lists that are its own, which is what a phone with a key of
+                // its own has instead of being lent the owner's.
+                if !may_save_playlist(
+                    &author,
+                    &playlist.author,
+                    &crate::network::own_pubkey()?,
+                    rights,
+                ) {
+                    return Err(
+                        "This phone has read-only access, so it cannot edit this playlist".into(),
+                    );
+                }
                 let stored = self.save_playlist(playlist, &author)?;
                 write_response(send, &ServerResponse::Playlist { playlist: stored }).await
             }
@@ -1094,16 +1110,12 @@ impl MobileService {
                 // whole identity may remove - the same right that lets it
                 // publish.
                 let own = self.proved_key(remote_id)?;
-                let wanted = if may_remove_playlist(
-                    &own,
-                    &wanted,
-                    &crate::network::own_pubkey()?,
-                    rights,
-                ) {
-                    wanted
-                } else {
-                    return Err("That playlist belongs to somebody else".into());
-                };
+                let wanted =
+                    if may_remove_playlist(&own, &wanted, &crate::network::own_pubkey()?, rights) {
+                        wanted
+                    } else {
+                        return Err("That playlist belongs to somebody else".into());
+                    };
                 crate::playlist::remove(&connection, &wanted, &playlist_id)?;
                 write_response(send, &ServerResponse::PlaylistRemoved).await
             }
@@ -1210,11 +1222,7 @@ impl MobileService {
                 // hears about a comment sent from a phone.
                 let event_id = self
                     .network
-                    .send_track_discussion_message(
-                        file_id.trim().to_string(),
-                        content,
-                        reply_to,
-                    )
+                    .send_track_discussion_message(file_id.trim().to_string(), content, reply_to)
                     .await?;
                 write_response(send, &ServerResponse::TrackDiscussionSent { event_id }).await
             }
@@ -1317,11 +1325,7 @@ impl MobileService {
                         // can tell its own playlists from public ones. It is a
                         // public key: nothing secret travels, and the phone
                         // holds no key of its own to compare against otherwise.
-                        pubkey: self
-                            .network
-                            .own_pubkey()
-                            .await
-                            .unwrap_or_default(),
+                        pubkey: self.network.own_pubkey().await.unwrap_or_default(),
                     },
                 )
                 .await
@@ -1407,6 +1411,27 @@ impl MobileService {
                 crate::device_account::remember_key(&self.db_path, remote_id, &pubkey)?;
                 write_response(send, &ServerResponse::DeviceIdentity { pubkey }).await
             }
+            ClientRequest::PublishDeviceEvent { event } => {
+                // The device's own voice, so two things are checked and nothing
+                // else: that the key which signed it is one this phone has proved,
+                // and that what it signed is a kind a phone has to say. The proof
+                // is what stops a copied event using this computer's relays, and
+                // the list is what stops a lent phone becoming a posting account
+                // for anything else a device decides to sign.
+                let proved = self.proved_key(remote_id)?;
+                let signer = crate::device_account::verify_signed(&event)?;
+                if signer != proved {
+                    return Err("That event is signed by a key this phone has not proved".into());
+                }
+                if !DEVICE_PUBLISHABLE_KINDS.contains(&event.kind) {
+                    return Err(format!(
+                        "A phone signs comments and playlists here, not kind {}",
+                        event.kind
+                    ));
+                }
+                let event_id = self.network.publish_device_event(event).await?;
+                write_response(send, &ServerResponse::DeviceEventPublished { event_id }).await
+            }
             ClientRequest::Likes => {
                 let pubkey = self.proved_key(remote_id)?;
                 let file_ids = crate::device_account::likes(&self.db_path, &pubkey)?;
@@ -1427,7 +1452,8 @@ impl MobileService {
             }
             ClientRequest::SetDislikes { file_ids } => {
                 let pubkey = self.proved_key(remote_id)?;
-                let stored = crate::device_account::set_dislikes(&self.db_path, &pubkey, &file_ids)?;
+                let stored =
+                    crate::device_account::set_dislikes(&self.db_path, &pubkey, &file_ids)?;
                 write_response(send, &ServerResponse::Dislikes { file_ids: stored }).await
             }
             ClientRequest::Ping => write_response(send, &ServerResponse::Pong).await,
@@ -1445,13 +1471,7 @@ impl MobileService {
             .pairing
             .lock()
             .map_err(|_| "pairing state lock was poisoned")?;
-        accept_pairing(
-            &self.db_path,
-            &mut pairing,
-            remote_id,
-            token,
-            name,
-        )
+        accept_pairing(&self.db_path, &mut pairing, remote_id, token, name)
     }
 
     /// What this device may do, which is also what proves it is paired at all:
@@ -1468,9 +1488,8 @@ impl MobileService {
     /// than named: one paired device naming another's key would otherwise read
     /// and replace their list.
     fn proved_key(&self, remote_id: &str) -> Result<String, String> {
-        crate::device_account::proved_key(&self.db_path, remote_id)?.ok_or_else(|| {
-            napstr_remote_protocol::NOT_PROVED_MESSAGE.to_string()
-        })
+        crate::device_account::proved_key(&self.db_path, remote_id)?
+            .ok_or_else(|| napstr_remote_protocol::NOT_PROVED_MESSAGE.to_string())
     }
 
     fn touch_device(&self, remote_id: &str) {
@@ -1646,6 +1665,12 @@ fn check_request_permission(rights: DeviceRights, request: &ClientRequest) -> Re
         | ClientRequest::SetLikes { .. }
         | ClientRequest::Dislikes
         | ClientRequest::SetDislikes { .. } => Ok(()),
+        // A device speaking for itself is the same case as a device's own lists:
+        // what it signs under its own key is its own to say, so no grant is being
+        // spent here and none is being asked for. What guards it is the proof, in
+        // the request's own arm, and the kinds it may say - which is what keeps a
+        // lent phone from being a relay account for anything else it might sign.
+        ClientRequest::PublishDeviceEvent { .. } => Ok(()),
         ClientRequest::FetchAudio { .. } => require(
             rights,
             DeviceRights::FETCH,
@@ -1657,17 +1682,21 @@ fn check_request_permission(rights: DeviceRights, request: &ClientRequest) -> Re
             "This phone has read-only access, so it cannot control Napstr on the computer.",
         ),
         // A playlist a phone edits is the same playlist the author could edit on
-        // the computer, so browsing access cannot reach any of these: an id for
-        // a playlist that does not exist yet included, because a listing minted
-        // there would only be a promise this phone could not keep.
+        // the computer, so browsing access cannot reach most of these. Three are a
+        // different question and are weighed where the author is known - an id for
+        // a list nobody has yet, saving a list this device wrote, and removing one:
+        // a phone with a key of its own keeps its own lists without being lent the
+        // owner's, which is the line `may_save_playlist` and `may_remove_playlist`
+        // both draw. Publishing and withdrawing stay here, because those are acts
+        // under the owner's name and a phone with a key of its own has its own way
+        // to publish.
         ClientRequest::NewPlaylistId
         | ClientRequest::SavePlaylist { .. }
-        | ClientRequest::DeletePlaylist { .. }
-        | ClientRequest::PublishPlaylist { .. }
-        | ClientRequest::WithdrawPlaylist { .. } => require(
+        | ClientRequest::DeletePlaylist { .. } => Ok(()),
+        ClientRequest::PublishPlaylist { .. } | ClientRequest::WithdrawPlaylist { .. } => require(
             rights,
             DeviceRights::PRIVILEGED,
-            "This phone has read-only access, so it cannot create or edit playlists.",
+            "This phone has read-only access, so it cannot publish playlists.",
         ),
         ClientRequest::ReadOnlyTicket => require(
             rights,
@@ -1713,6 +1742,14 @@ fn require(rights: DeviceRights, right: u32, message: &str) -> Result<(), String
     }
 }
 
+/// The kinds a device may publish under its own key through this computer.
+///
+/// A comment - `9`, NIP-C7's public message - and a playlist, `30425` of this
+/// protocol's own. An allow-list rather than "whatever the device signs": what a
+/// phone has to say here is those two things, and a computer that relayed any kind
+/// at all would be lending its relays, and its standing with them, to the rest.
+const DEVICE_PUBLISHABLE_KINDS: [u16; 2] = [9, 30425];
+
 /// Whether a device may remove the playlist filed under `wanted`.
 ///
 /// Its own, always: a playlist belongs to the key that wrote it, and a device
@@ -1724,13 +1761,22 @@ fn require(rights: DeviceRights, right: u32, message: &str) -> Result<(), String
 /// A named function rather than four lines inside the request arm, because this
 /// is a rule about who owns what and it should be readable, and testable, in
 /// one place.
-fn may_remove_playlist(
-    device: &str,
-    wanted: &str,
-    computer: &str,
-    rights: DeviceRights,
-) -> bool {
+fn may_remove_playlist(device: &str, wanted: &str, computer: &str, rights: DeviceRights) -> bool {
     wanted == device || (rights.grants(DeviceRights::PRIVILEGED) && wanted == computer)
+}
+
+/// Whether a device may write down the playlist this request carries.
+///
+/// Its own, and a list with no author yet - which is what a new playlist is. The
+/// owner's own playlists are the exception, and only for a device holding the
+/// whole identity: editing one is editing what the owner published. Everything
+/// else in between is a list that belongs to a key this device is not, so it is
+/// refused in the same breath as removing somebody else's.
+fn may_save_playlist(device: &str, author: &str, computer: &str, rights: DeviceRights) -> bool {
+    if rights.grants(DeviceRights::PRIVILEGED) {
+        return true;
+    }
+    author.is_empty() || (author != computer && author == device)
 }
 
 fn is_sha256_file_id(value: &str) -> bool {
@@ -1798,9 +1844,7 @@ fn cached_art_hashes(
 /// The name and the npub come resolved rather than empty: a phone holds no Nostr
 /// identity, so it cannot ask a relay for a profile, and the host already keeps
 /// the names it has seen for the conversation it is rendering.
-fn remote_discussion_message(
-    message: crate::network::TrollboxMessage,
-) -> RemoteDiscussionMessage {
+fn remote_discussion_message(message: crate::network::TrollboxMessage) -> RemoteDiscussionMessage {
     RemoteDiscussionMessage {
         event_id: message.event_id,
         pubkey: message.pubkey,
@@ -1982,7 +2026,8 @@ fn load_devices(db_path: &Path) -> Result<Vec<PairedDevice>, String> {
                 // a lent phone the whole library.
                 rights: DeviceRights::from_bits(
                     row.get::<_, Option<i64>>(4)?
-                        .unwrap_or(DeviceRights::read_only().bits() as i64) as u32,
+                        .unwrap_or(DeviceRights::read_only().bits() as i64)
+                        as u32,
                 ),
             })
         })
@@ -2327,9 +2372,15 @@ mod tests {
         assert_eq!(slots.available_permits(), 0);
         tokio::time::timeout(Duration::from_secs(2), async {
             for request in requests {
-                assert!(request.await.unwrap().unwrap_err().contains("stopped reading"));
+                assert!(request
+                    .await
+                    .unwrap()
+                    .unwrap_err()
+                    .contains("stopped reading"));
             }
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         assert_eq!(slots.available_permits(), 32);
         drop(readers);
     }
@@ -2342,7 +2393,9 @@ mod tests {
             reader.read_to_end(&mut bytes).await.unwrap();
             bytes
         });
-        write_with_timeout(&mut writer, b"complete response", Duration::from_secs(1)).await.unwrap();
+        write_with_timeout(&mut writer, b"complete response", Duration::from_secs(1))
+            .await
+            .unwrap();
         drop(writer);
         assert_eq!(received.await.unwrap(), b"complete response");
     }
@@ -2362,8 +2415,11 @@ mod tests {
         }
         assert!(check_request_permission(
             DeviceRights::read_only(),
-            &ClientRequest::FetchAudio { file_id: "a".repeat(64) }
-        ).is_ok());
+            &ClientRequest::FetchAudio {
+                file_id: "a".repeat(64)
+            }
+        )
+        .is_ok());
         assert!(check_request_permission(
             DeviceRights::read_only(),
             &ClientRequest::Library {
@@ -2389,7 +2445,7 @@ mod tests {
             source_pubkeys: vec![],
             destination_folder: None,
         };
-        let publish = ClientRequest::NewPlaylistId;
+        let own_list = ClientRequest::NewPlaylistId;
         let comment = ClientRequest::SendTrackDiscussion {
             file_id: "a".repeat(64),
             content: "Nice track".into(),
@@ -2400,7 +2456,11 @@ mod tests {
         let lent_the_network = DeviceRights::download_only();
         assert!(check_request_permission(lent_the_network, &fetch_one).is_ok());
         assert!(check_request_permission(lent_the_network, &ClientRequest::Transfers).is_ok());
-        assert!(check_request_permission(lent_the_network, &publish).is_err());
+        // An id for a list nobody has yet is not a signature: a phone with a key of
+        // its own keeps its own playlists without being lent the owner's, which is
+        // what the per-playlist rules weigh. What stays refused is the owner's own
+        // voice - a comment signed in their name.
+        assert!(check_request_permission(lent_the_network, &own_list).is_ok());
         assert!(check_request_permission(lent_the_network, &comment).is_err());
         // And it is still "read only" by the old boolean, which is what an older
         // companion is told: it may not act as anyone.
@@ -2415,7 +2475,7 @@ mod tests {
         assert!(!four_bits_from_an_older_build.download);
         assert!(four_bits_from_an_older_build.may_download());
         assert!(check_request_permission(four_bits_from_an_older_build, &fetch_one).is_ok());
-        assert!(check_request_permission(four_bits_from_an_older_build, &publish).is_ok());
+        assert!(check_request_permission(four_bits_from_an_older_build, &own_list).is_ok());
 
         // The other direction is the one the split is for: the right to sign does
         // not follow from the right to download, which is asserted at the top of
@@ -2443,7 +2503,7 @@ mod tests {
         let control = ClientRequest::Playback {
             command: PlaybackCommand::Toggle,
         };
-        let publish = ClientRequest::NewPlaylistId;
+        let own_list = ClientRequest::NewPlaylistId;
         let comment = ClientRequest::SendTrackDiscussion {
             file_id: "a".repeat(64),
             content: "Nice track".into(),
@@ -2461,7 +2521,10 @@ mod tests {
         assert!(check_request_permission(index_only, &library).is_ok());
         assert!(check_request_permission(index_only, &audio).is_err());
         assert!(check_request_permission(index_only, &control).is_err());
-        assert!(check_request_permission(index_only, &publish).is_err());
+        // A list of its own, which is filed under the key that wrote it rather
+        // than this computer's: the same case as its own likes, so it is the proof
+        // that guards it and not a grant.
+        assert!(check_request_permission(index_only, &own_list).is_ok());
 
         // Browse and play: what a lent phone has always been given.
         let lent = DeviceRights::read_only();
@@ -2478,7 +2541,7 @@ mod tests {
             privileged: false,
         };
         assert!(check_request_permission(remote, &control).is_ok());
-        assert!(check_request_permission(remote, &publish).is_err());
+        assert!(check_request_permission(remote, &own_list).is_ok());
         assert!(check_request_permission(remote, &comment).is_err());
 
         // Nothing at all is a device that may only ask who it is talking to.
@@ -2519,7 +2582,10 @@ mod tests {
             DeviceRights::full()
         );
         set_device_rights(&db, &endpoint, DeviceRights::default()).unwrap();
-        assert_eq!(device_rights(&db, &endpoint).unwrap(), DeviceRights::default());
+        assert_eq!(
+            device_rights(&db, &endpoint).unwrap(),
+            DeviceRights::default()
+        );
         let _ = fs::remove_dir_all(&directory);
     }
 
@@ -2584,14 +2650,13 @@ mod tests {
         // A position past anything this computer could be playing is clamped
         // rather than refused, because there is nothing a phone could do about
         // an error but the track itself is still playable.
-        let PlaybackCommand::PlayTrack { position_ms, .. } = bounded_playback(
-            PlaybackCommand::PlayTrack {
+        let PlaybackCommand::PlayTrack { position_ms, .. } =
+            bounded_playback(PlaybackCommand::PlayTrack {
                 file_id: "a".repeat(64),
                 queue: Vec::new(),
                 position_ms: MAX_POSITION_MS + 1,
-            },
-        )
-        .unwrap()
+            })
+            .unwrap()
         else {
             panic!("a play command must stay a play command")
         };
@@ -2657,7 +2722,10 @@ mod tests {
             accept_pairing(&db, &mut sessions, &endpoint, "stream", "Guest").unwrap(),
             DeviceRights::read_only()
         );
-        assert_eq!(device_rights(&db, &endpoint).unwrap(), DeviceRights::read_only());
+        assert_eq!(
+            device_rights(&db, &endpoint).unwrap(),
+            DeviceRights::read_only()
+        );
         assert!(accept_pairing(&db, &mut sessions, &endpoint, "stream", "Guest").is_err());
         assert_eq!(
             accept_pairing(&db, &mut sessions, &endpoint, "full", "Owner").unwrap(),
@@ -2770,7 +2838,12 @@ mod tests {
         let owner = "b".repeat(64);
         let stranger = "c".repeat(64);
 
-        assert!(may_remove_playlist(&phone, &phone, &owner, DeviceRights::read_only()));
+        assert!(may_remove_playlist(
+            &phone,
+            &phone,
+            &owner,
+            DeviceRights::read_only()
+        ));
         assert!(may_remove_playlist(
             &phone,
             &owner,
@@ -2794,6 +2867,55 @@ mod tests {
         assert!(!may_remove_playlist(
             &phone,
             "",
+            &owner,
+            DeviceRights::full()
+        ));
+    }
+
+    /// A device writes down its own playlists, and a new one nobody has authored.
+    ///
+    /// The case that matters is the one in the middle: a phone lent the network but
+    /// not the signature must be able to make playlists of its own, and must not be
+    /// able to rename or empty one of the owner's.
+    #[test]
+    fn a_device_may_only_save_playlists_it_wrote() {
+        let phone = "a".repeat(64);
+        let owner = "b".repeat(64);
+        let stranger = "c".repeat(64);
+
+        assert!(may_save_playlist(
+            &phone,
+            "",
+            &owner,
+            DeviceRights::read_only()
+        ));
+        assert!(may_save_playlist(
+            &phone,
+            &phone,
+            &owner,
+            DeviceRights::read_only()
+        ));
+        assert!(!may_save_playlist(
+            &phone,
+            &owner,
+            &owner,
+            DeviceRights::read_only()
+        ));
+        assert!(!may_save_playlist(
+            &phone,
+            &stranger,
+            &owner,
+            DeviceRights::read_only()
+        ));
+        assert!(may_save_playlist(
+            &phone,
+            &owner,
+            &owner,
+            DeviceRights::full()
+        ));
+        assert!(may_save_playlist(
+            &phone,
+            &stranger,
             &owner,
             DeviceRights::full()
         ));

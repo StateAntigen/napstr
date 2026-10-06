@@ -231,7 +231,9 @@ impl CoverPreferences {
             (false, false) => "Cover lookups and cover publishing are both off".into(),
             (true, false) => "Art is looked up automatically; nothing is signed".into(),
             (false, true) => "Only art already resolved here is signed and published".into(),
-            (true, true) => "Art is looked up, then signed and published under your identity".into(),
+            (true, true) => {
+                "Art is looked up, then signed and published under your identity".into()
+            }
         }
     }
 }
@@ -715,13 +717,7 @@ impl CoverPublisher {
         let Some(cover) = covers.into_iter().next() else {
             return;
         };
-        match want_for_rendition(
-            key,
-            &cover.art,
-            &cover.thumb,
-            &cover.source,
-            rendition,
-        ) {
+        match want_for_rendition(key, &cover.art, &cover.thumb, &cover.source, rendition) {
             Some(want) => {
                 self.art.ensure_all(&[want]);
             }
@@ -913,7 +909,9 @@ impl CoverPublisher {
         let client = match cover_http_client() {
             Ok(client) => client,
             Err(error) => {
-                self.finish(format!("Could not prepare the cover lookup client: {error}"));
+                self.finish(format!(
+                    "Could not prepare the cover lookup client: {error}"
+                ));
                 return;
             }
         };
@@ -966,8 +964,11 @@ impl CoverPublisher {
                     self.park(&candidate.key, delay);
                     if let Ok(mut status) = self.status.lock() {
                         status.backed_off += 1;
-                        status.message =
-                            format!("{}; waiting {}s", describe_lookup_error(error), delay.as_secs());
+                        status.message = format!(
+                            "{}; waiting {}s",
+                            describe_lookup_error(error),
+                            delay.as_secs()
+                        );
                     }
                     self.report();
                     tokio::time::sleep(delay).await;
@@ -1244,7 +1245,10 @@ pub struct CoverGap {
 /// A claim from anybody takes an album off the list, including another author's:
 /// the question is which albums have no kind `30427`, not which ones this
 /// computer signed.
-fn missing_albums(connection: &rusqlite::Connection, limit: usize) -> Result<Vec<CoverGap>, String> {
+fn missing_albums(
+    connection: &rusqlite::Connection,
+    limit: usize,
+) -> Result<Vec<CoverGap>, String> {
     let claimed = stored_cover_keys(connection)?;
     let outcomes = cover::lookup_outcomes(connection)?;
     let messages = cover::last_lookup_messages(connection)?;
@@ -1384,7 +1388,9 @@ enum Answer {
     Success,
     /// The archive's ordinary "nobody has scanned this record".
     NotFound,
-    Throttled { retry_after: Option<Duration> },
+    Throttled {
+        retry_after: Option<Duration>,
+    },
     Failed(String),
 }
 
@@ -1747,7 +1753,9 @@ async fn resolve_release_group(
     // 0.13 puts behind its `query` feature. This needs no extra dependency and
     // keeps the desktop's reqwest features identical to the companion's.
     let mut search_url = reqwest::Url::parse("https://musicbrainz.org/ws/2/release-group/")
-        .map_err(|error| LookupError::Failed(format!("could not build the MusicBrainz query: {error}")))?;
+        .map_err(|error| {
+            LookupError::Failed(format!("could not build the MusicBrainz query: {error}"))
+        })?;
     search_url
         .query_pairs_mut()
         .append_pair("query", &query)
@@ -1773,10 +1781,9 @@ async fn resolve_release_group(
         Answer::Throttled { retry_after } => return Err(LookupError::Throttled { retry_after }),
         Answer::Failed(message) => return Err(LookupError::Failed(message)),
     }
-    let found: MusicBrainzSearch = search
-        .json()
-        .await
-        .map_err(|error| LookupError::Failed(format!("MusicBrainz sent something unreadable: {error}")))?;
+    let found: MusicBrainzSearch = search.json().await.map_err(|error| {
+        LookupError::Failed(format!("MusicBrainz sent something unreadable: {error}"))
+    })?;
     Ok(best_release_group(&found.release_groups, &candidate.album, &candidate.artist).cloned())
 }
 
@@ -1929,7 +1936,8 @@ fn front_image(archive: &CoverArtArchive) -> Option<(String, String, bool)> {
     // pixels, so the 1200-pixel rendition is the whole picture at a fraction of
     // the bytes. An upload smaller than that has no 1200 rendition, and the
     // original is then already the smaller file.
-    let art = secure_image_url(&chosen.thumbnails.full).or_else(|| secure_image_url(&chosen.image))?;
+    let art =
+        secure_image_url(&chosen.thumbnails.full).or_else(|| secure_image_url(&chosen.image))?;
     // A thumbnail is a convenience: one that is missing or unusable must not
     // cost the cover itself.
     let thumb = secure_image_url(&chosen.thumbnails.small).unwrap_or_default();
@@ -1979,7 +1987,9 @@ async fn archive_image(
         Answer::Failed(message) => return Err(LookupError::Failed(message)),
     }
     let archive: CoverArtArchive = response.json().await.map_err(|error| {
-        LookupError::Failed(format!("Cover Art Archive sent something unreadable: {error}"))
+        LookupError::Failed(format!(
+            "Cover Art Archive sent something unreadable: {error}"
+        ))
     })?;
     Ok(front_image(&archive))
 }
@@ -1999,7 +2009,9 @@ async fn archive_lookup_via_releases(
     let mut url = reqwest::Url::parse(&format!(
         "https://musicbrainz.org/ws/2/release-group/{mbid}"
     ))
-    .map_err(|error| LookupError::Failed(format!("could not build the MusicBrainz query: {error}")))?;
+    .map_err(|error| {
+        LookupError::Failed(format!("could not build the MusicBrainz query: {error}"))
+    })?;
     url.query_pairs_mut()
         .append_pair("inc", "releases")
         .append_pair("fmt", "json");
@@ -2267,7 +2279,9 @@ impl ItunesResult {
         let name = self.collection_name.trim();
         for suffix in [" - Single", " - EP"] {
             if name.len() > suffix.len()
-                && name.to_ascii_lowercase().ends_with(&suffix.to_ascii_lowercase())
+                && name
+                    .to_ascii_lowercase()
+                    .ends_with(&suffix.to_ascii_lowercase())
             {
                 return name[..name.len() - suffix.len()].trim().to_string();
             }
@@ -2363,8 +2377,9 @@ async fn itunes_lookup(
     // Paced on its own interval, which does not count against MusicBrainz's: the
     // archive has already been asked by the time this runs.
     tokio::time::sleep(ITUNES_INTERVAL).await;
-    let mut url = reqwest::Url::parse(ITUNES_SEARCH_ENDPOINT)
-        .map_err(|error| LookupError::Failed(format!("could not build the iTunes query: {error}")))?;
+    let mut url = reqwest::Url::parse(ITUNES_SEARCH_ENDPOINT).map_err(|error| {
+        LookupError::Failed(format!("could not build the iTunes query: {error}"))
+    })?;
     // The name, not a Lucene query: Apple's search is a plain text match, so the
     // album and the artist are simply offered to it together.
     let term = format!("{} {}", album.trim(), artist.trim());
@@ -2390,10 +2405,9 @@ async fn itunes_lookup(
         Answer::Throttled { retry_after } => return Err(LookupError::Throttled { retry_after }),
         Answer::Failed(message) => return Err(LookupError::Failed(message)),
     }
-    let found: ItunesSearch = response
-        .json()
-        .await
-        .map_err(|error| LookupError::Failed(format!("iTunes sent something unreadable: {error}")))?;
+    let found: ItunesSearch = response.json().await.map_err(|error| {
+        LookupError::Failed(format!("iTunes sent something unreadable: {error}"))
+    })?;
     Ok(best_itunes_result(&found.results, album, artist)
         .map(ItunesResult::cover)
         .filter(|cover| !cover.art.is_empty()))
@@ -2424,8 +2438,10 @@ async fn search_groups(
     client: &reqwest::Client,
     query: &str,
 ) -> Result<Vec<MusicBrainzGroup>, LookupError> {
-    let mut url = reqwest::Url::parse("https://musicbrainz.org/ws/2/release-group/")
-        .map_err(|error| LookupError::Failed(format!("could not build the MusicBrainz query: {error}")))?;
+    let mut url =
+        reqwest::Url::parse("https://musicbrainz.org/ws/2/release-group/").map_err(|error| {
+            LookupError::Failed(format!("could not build the MusicBrainz query: {error}"))
+        })?;
     url.query_pairs_mut()
         .append_pair("query", query)
         .append_pair("fmt", "json")
@@ -2780,7 +2796,9 @@ fn fold_title(value: &str) -> String {
 fn alike(left: &str, right: &str) -> bool {
     let left = fold_title(left);
     let right = fold_title(right);
-    !left.is_empty() && !right.is_empty() && (left == right || left.contains(&right) || right.contains(&left))
+    !left.is_empty()
+        && !right.is_empty()
+        && (left == right || left.contains(&right) || right.contains(&left))
 }
 
 /// Read the user's cover choices.
@@ -2967,9 +2985,7 @@ fn pending_albums(
 }
 
 /// Cover keys that already have a live claim from somebody.
-fn stored_cover_keys(
-    connection: &rusqlite::Connection,
-) -> Result<HashSet<String>, String> {
+fn stored_cover_keys(connection: &rusqlite::Connection) -> Result<HashSet<String>, String> {
     let mut statement = connection
         .prepare("SELECT DISTINCT cover_key FROM album_covers WHERE deleted=0")
         .map_err(|error| error.to_string())?;
@@ -3011,7 +3027,12 @@ mod tests {
         connection
     }
 
-    fn insert_library_track(connection: &rusqlite::Connection, id: &str, artist: &str, album: &str) {
+    fn insert_library_track(
+        connection: &rusqlite::Connection,
+        id: &str,
+        artist: &str,
+        album: &str,
+    ) {
         connection
             .execute(
                 "INSERT INTO files(file_id,filename,path,size,format,indexed_at,artist,album)
@@ -3172,8 +3193,9 @@ mod tests {
             "https://dn711003.ca.archive.org/0/items/mbid-de91dcf0-x/index.json"
         )
         .is_none());
-        assert!(archive_org_item_and_file("https://dn711003.ca.archive.org/0/items/x/y.jpg")
-            .is_none());
+        assert!(
+            archive_org_item_and_file("https://dn711003.ca.archive.org/0/items/x/y.jpg").is_none()
+        );
         // The 250-pixel rendition of the 1200 the archive named is what a list
         // draws, and it is the same file name with one part changed.
         assert_eq!(
@@ -3198,9 +3220,15 @@ mod tests {
         // The whole point of asking: CAA says `dn711003.ca.archive.org` with a
         // `/0/items` directory, and the item is here instead.
         assert_eq!(item.server, "ia801509.us.archive.org");
-        assert_eq!(item.dir, "/2/items/mbid-de91dcf0-edd8-4e36-b78d-63570bbe718f");
+        assert_eq!(
+            item.dir,
+            "/2/items/mbid-de91dcf0-edd8-4e36-b78d-63570bbe718f"
+        );
         let base = format!("https://{}{}", item.server, item.dir);
-        assert_eq!(base, "https://ia801509.us.archive.org/2/items/mbid-de91dcf0-edd8-4e36-b78d-63570bbe718f");
+        assert_eq!(
+            base,
+            "https://ia801509.us.archive.org/2/items/mbid-de91dcf0-edd8-4e36-b78d-63570bbe718f"
+        );
         assert!(item
             .files
             .iter()
@@ -3408,7 +3436,10 @@ mod tests {
         );
         // Nothing usable is empty, not a half-built URL.
         assert_eq!(itunes_rendition("", ITUNES_FULL_RENDITION), "");
-        assert_eq!(itunes_rendition("ftp://host/a.jpg", ITUNES_FULL_RENDITION), "");
+        assert_eq!(
+            itunes_rendition("ftp://host/a.jpg", ITUNES_FULL_RENDITION),
+            ""
+        );
     }
 
     #[test]
@@ -3453,7 +3484,10 @@ mod tests {
         );
         // An empty list accepts any host, which is what every library had before
         // the setting existed.
-        assert!(cover::art_host_allowed(&[], "https://anything.example/a.jpg"));
+        assert!(cover::art_host_allowed(
+            &[],
+            "https://anything.example/a.jpg"
+        ));
         let hosts = cover::parse_art_hosts("archive.org\ncoverartarchive.org");
         // A listed domain covers its subdomains, which is where the files
         // actually live.
@@ -3466,14 +3500,20 @@ mod tests {
             "https://coverartarchive.org/release/x/front"
         ));
         // A domain that merely ends in a listed one is not that domain.
-        assert!(!cover::art_host_allowed(&hosts, "https://notarchive.org/a.jpg"));
+        assert!(!cover::art_host_allowed(
+            &hosts,
+            "https://notarchive.org/a.jpg"
+        ));
         assert!(!cover::art_host_allowed(
             &hosts,
             "https://archive.org.evil.example/a.jpg"
         ));
         // A link that is not an absolute HTTP address has nothing to check.
         assert!(!cover::art_host_allowed(&hosts, "/a.jpg"));
-        assert!(!cover::art_host_allowed(&hosts, "data:image/png;base64,AAAA"));
+        assert!(!cover::art_host_allowed(
+            &hosts,
+            "data:image/png;base64,AAAA"
+        ));
         // A port and userinfo are not part of the host.
         assert!(cover::art_host_allowed(
             &hosts,
@@ -3488,7 +3528,10 @@ mod tests {
         connection
             .execute(
                 "INSERT OR REPLACE INTO settings (key,value) VALUES (?1,?2)",
-                params![cover::SETTING_ALLOWED_ART_HOSTS, "archive.org\nmzstatic.com"],
+                params![
+                    cover::SETTING_ALLOWED_ART_HOSTS,
+                    "archive.org\nmzstatic.com"
+                ],
             )
             .unwrap();
         assert_eq!(
@@ -3535,7 +3578,10 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(outcomes, vec!["broken|record:error", "covered|record:found"]);
+        assert_eq!(
+            outcomes,
+            vec!["broken|record:error", "covered|record:found"]
+        );
 
         // It happens once: a "no art" answer recorded after the upgrade is a
         // verdict on the whole search, and keeps its fortnight.
@@ -3569,8 +3615,12 @@ mod tests {
             .unwrap();
         // One was asked about and has none, one was asked about and this
         // computer holds the picture, and a lookup fell over on another.
-        cover::record_art_lookup(&connection, "nobody|scanned", cover::ArtLookupOutcome::NoArt)
-            .unwrap();
+        cover::record_art_lookup(
+            &connection,
+            "nobody|scanned",
+            cover::ArtLookupOutcome::NoArt,
+        )
+        .unwrap();
         cover::record_art_lookup(
             &connection,
             "quiet|held",
@@ -3620,7 +3670,9 @@ mod tests {
 
         let gaps = missing_albums(&connection, 50).unwrap();
         assert_eq!(
-            gaps.iter().map(|gap| gap.state.as_str()).collect::<Vec<_>>(),
+            gaps.iter()
+                .map(|gap| gap.state.as_str())
+                .collect::<Vec<_>>(),
             // The failure first, then the albums in the order a person cares
             // about them: work to do, written off, art nobody has signed.
             vec!["failed", "not_looked_up", "no_art", "resolved_here"]
@@ -3654,7 +3706,9 @@ mod tests {
             .unwrap();
         }
         let kept: i64 = connection
-            .query_row("SELECT COUNT(*) FROM cover_lookup_log", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM cover_lookup_log", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(kept, cover::LOOKUP_LOG_LIMIT);
     }
@@ -3678,10 +3732,14 @@ mod tests {
             .send()
             .await
             .expect_err("nothing listens on port 1");
-        let LookupError::Failed(message) = request_error("MusicBrainz lookup failed", &error) else {
+        let LookupError::Failed(message) = request_error("MusicBrainz lookup failed", &error)
+        else {
             panic!("a transport failure is a failure, not a refusal");
         };
-        assert!(message.starts_with("MusicBrainz lookup failed: "), "{message}");
+        assert!(
+            message.starts_with("MusicBrainz lookup failed: "),
+            "{message}"
+        );
         assert!(
             message.contains('\u{2192}'),
             "the cause has to be appended, not left inside the error: {message}"
@@ -3714,7 +3772,10 @@ mod tests {
             .await
             .expect("the lookup has to answer rather than fail")
             .expect("Apple sells this single, so the album has a cover");
-        assert_eq!(found.source, "itunes", "the picture came from the second source");
+        assert_eq!(
+            found.source, "itunes",
+            "the picture came from the second source"
+        );
         // The identifier is still MusicBrainz's: the release group was
         // identified there, and a reader can follow an MBID and nothing else.
         assert_eq!(found.mbid, "e8fbaa62-ca7d-4a9b-8f6f-44939b3775f5");
@@ -3783,19 +3844,27 @@ mod tests {
         // start-up; nothing in a test binary has done that yet.
         let _ = rustls::crypto::ring::default_provider().install_default();
         let client = cover_http_client().expect("a lookup client");
-        let found =
-            archive_lookup_via_archive_org(&client, "de91dcf0-edd8-4e36-b78d-63570bbe718f")
-                .await
-                .expect("the archive.org route must answer rather than fail");
+        let found = archive_lookup_via_archive_org(&client, "de91dcf0-edd8-4e36-b78d-63570bbe718f")
+            .await
+            .expect("the archive.org route must answer rather than fail");
         let (art, thumb, front) = found.expect("this release has a front cover");
         assert!(front, "the front route answered, so it is the front cover");
         assert!(art.starts_with("https://"), "{art}");
-        assert!(art.contains("mbid-de91dcf0-"), "the item name is the release id: {art}");
-        assert!(art.contains("_thumb1200"), "the 1200 rendition is what a claim wants: {art}");
+        assert!(
+            art.contains("mbid-de91dcf0-"),
+            "the item name is the release id: {art}"
+        );
+        assert!(
+            art.contains("_thumb1200"),
+            "the 1200 rendition is what a claim wants: {art}"
+        );
         assert!(thumb.contains("_thumb250"), "the small rendition: {thumb}");
         // Both URLs have to be the current home of the item, not the stale one
         // Cover Art Archive redirects are stuck on.
-        assert!(!art.contains("dn711003"), "the stale node must not be named: {art}");
+        assert!(
+            !art.contains("dn711003"),
+            "the stale node must not be named: {art}"
+        );
     }
 
     #[test]
@@ -3823,7 +3892,10 @@ mod tests {
             waited: MUSICBRAINZ_TIMEOUT,
         });
         // The wait it actually gave the service, named.
-        assert!(said.contains(&MUSICBRAINZ_TIMEOUT.as_secs().to_string()), "{said}");
+        assert!(
+            said.contains(&MUSICBRAINZ_TIMEOUT.as_secs().to_string()),
+            "{said}"
+        );
         assert!(said.contains("busy"), "{said}");
         // And it must not read like a verdict on the album: that is the mistake
         // this whole path was making.
@@ -3895,7 +3967,11 @@ mod tests {
             publish_claims: false,
         };
         let pending = pending_albums(&connection, lookups_on()).unwrap();
-        assert_eq!(pending.len(), 1, "only the album with real work left is pending");
+        assert_eq!(
+            pending.len(),
+            1,
+            "only the album with real work left is pending"
+        );
         assert_eq!(pending[0].key, "artist|album");
         assert_eq!(pending[0].source, "library");
         assert_eq!(pending[0].track_count, 1);
@@ -3920,7 +3996,11 @@ mod tests {
         assert_eq!(pending_albums(&connection, lookups_on()).unwrap().len(), 1);
         assert_eq!(cover::prune_watch(&connection).unwrap(), 1);
         let watched = cover::watched_albums(&connection).unwrap();
-        assert_eq!(watched.len(), 1, "the aged entry is gone, the live one stays");
+        assert_eq!(
+            watched.len(),
+            1,
+            "the aged entry is gone, the live one stays"
+        );
         assert_eq!(watched[0].0, "artist|album");
 
         // With lookups off, the only work is signing art already held — so an
@@ -3938,7 +4018,10 @@ mod tests {
         cover::record_art_lookup(
             &connection,
             "artist|album",
-            cover::ArtLookupOutcome::Found(&art_lookup("artist|album", "https://archive.org/front.jpg")),
+            cover::ArtLookupOutcome::Found(&art_lookup(
+                "artist|album",
+                "https://archive.org/front.jpg",
+            )),
         )
         .unwrap();
         let pending = pending_albums(
@@ -3949,7 +4032,11 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(pending.len(), 1, "art already held is the publishable backlog");
+        assert_eq!(
+            pending.len(),
+            1,
+            "art already held is the publishable backlog"
+        );
         assert_eq!(pending[0].key, "artist|album");
     }
 
@@ -4089,8 +4176,8 @@ mod tests {
 
     #[test]
     fn the_first_artist_a_tag_names_beats_a_same_titled_record_by_another() {
-        let group = |id: &str, title: &str, primary_type: &str, credits: &[&str]| {
-            MusicBrainzGroup {
+        let group =
+            |id: &str, title: &str, primary_type: &str, credits: &[&str]| MusicBrainzGroup {
                 id: id.to_string(),
                 title: title.to_string(),
                 first_release_date: String::new(),
@@ -4103,8 +4190,7 @@ mod tests {
                         name: name.to_string(),
                     })
                     .collect(),
-            }
-        };
+            };
         // `Annihilation` is tagged `KREAM / Korolova`, and MusicBrainz credits
         // the record to KREAM alone - it knows no artist called Korolova at all.
         // The query asks for either name, so the ranking is what has to keep a
@@ -4144,8 +4230,10 @@ mod tests {
             connection
                 .execute_batch("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
                 .unwrap();
-            for (key, enabled) in [(SETTING_LOOKUP_EXTERNAL, true), (SETTING_PUBLISH_CLAIMS, false)]
-            {
+            for (key, enabled) in [
+                (SETTING_LOOKUP_EXTERNAL, true),
+                (SETTING_PUBLISH_CLAIMS, false),
+            ] {
                 connection
                     .execute(
                         "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",

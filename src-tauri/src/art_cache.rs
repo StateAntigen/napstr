@@ -325,11 +325,7 @@ pub fn lookup(
 }
 
 /// Note that these bytes were just used, which is what eviction orders by.
-pub fn touch(
-    connection: &Connection,
-    key: &str,
-    rendition: ArtRendition,
-) -> Result<(), String> {
+pub fn touch(connection: &Connection, key: &str, rendition: ArtRendition) -> Result<(), String> {
     connection
         .execute(
             "UPDATE art_cache SET used_at=?3 WHERE cover_key=?1 AND rendition=?2",
@@ -570,7 +566,12 @@ pub fn stats(connection: &Connection, root: &Path) -> Result<ArtCacheStats, Stri
 /// the file is named rather than looked for: this runs on every replacement, and
 /// walking a directory of thousands of pictures to find one of them is the whole
 /// cost of a fill.
-fn drop_picture(connection: &Connection, root: &Path, hash: &str, mime: &str) -> Result<(), String> {
+fn drop_picture(
+    connection: &Connection,
+    root: &Path,
+    hash: &str,
+    mime: &str,
+) -> Result<(), String> {
     let referenced: bool = connection
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM art_cache WHERE hash=?1)",
@@ -727,15 +728,22 @@ mod tests {
         assert!(stored.path.ends_with(format!("{}.jpg", stored.hash)));
         assert!(stored.path.exists());
 
-        let found = lookup(&connection, &root, "kream|annihilation", ArtRendition::Thumb)
-            .unwrap()
-            .expect("the bytes were just stored");
+        let found = lookup(
+            &connection,
+            &root,
+            "kream|annihilation",
+            ArtRendition::Thumb,
+        )
+        .unwrap()
+        .expect("the bytes were just stored");
         assert_eq!(found, stored);
         // The other rendition of the same album is a different question, and the
         // answer to it is "not yet".
-        assert!(lookup(&connection, &root, "kream|annihilation", ArtRendition::Full)
-            .unwrap()
-            .is_none());
+        assert!(
+            lookup(&connection, &root, "kream|annihilation", ArtRendition::Full)
+                .unwrap()
+                .is_none()
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -751,12 +759,18 @@ mod tests {
             b"<html>this is what a 404 page looks like</html>",
             "musicbrainz",
         );
-        assert!(refused.is_err(), "a body that is not a picture must not land");
         assert!(
-            lookup(&connection, &root, "kream|annihilation", ArtRendition::Thumb)
-                .unwrap()
-                .is_none()
+            refused.is_err(),
+            "a body that is not a picture must not land"
         );
+        assert!(lookup(
+            &connection,
+            &root,
+            "kream|annihilation",
+            ArtRendition::Thumb
+        )
+        .unwrap()
+        .is_none());
         assert_eq!(stats(&connection, &root).unwrap().entries, 0);
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -768,8 +782,24 @@ mod tests {
         // The same sleeves published for a single and for the album it came off
         // is an ordinary case, and it should cost one file.
         let bytes = jpeg(b"one sleeve, two albums");
-        let first = store(&connection, &root, "a|single", ArtRendition::Full, &bytes, "").unwrap();
-        let second = store(&connection, &root, "a|album", ArtRendition::Full, &bytes, "").unwrap();
+        let first = store(
+            &connection,
+            &root,
+            "a|single",
+            ArtRendition::Full,
+            &bytes,
+            "",
+        )
+        .unwrap();
+        let second = store(
+            &connection,
+            &root,
+            "a|album",
+            ArtRendition::Full,
+            &bytes,
+            "",
+        )
+        .unwrap();
         assert_eq!(first.hash, second.hash);
         assert_eq!(stats(&connection, &root).unwrap().files, 1);
         assert_eq!(stats(&connection, &root).unwrap().entries, 2);
@@ -838,11 +868,31 @@ mod tests {
     fn clearing_takes_the_rows_and_the_files_together() {
         let root = scratch("clear");
         let connection = database();
-        store(&connection, &root, "a|one", ArtRendition::Full, &jpeg(b"one"), "").unwrap();
-        store(&connection, &root, "b|two", ArtRendition::Thumb, &jpeg(b"two"), "").unwrap();
+        store(
+            &connection,
+            &root,
+            "a|one",
+            ArtRendition::Full,
+            &jpeg(b"one"),
+            "",
+        )
+        .unwrap();
+        store(
+            &connection,
+            &root,
+            "b|two",
+            ArtRendition::Thumb,
+            &jpeg(b"two"),
+            "",
+        )
+        .unwrap();
         assert_eq!(clear(&connection, &root).unwrap(), 2);
         assert_eq!(stats(&connection, &root).unwrap().entries, 0);
-        assert_eq!(stats(&connection, &root).unwrap().files, 0, "nothing is left behind");
+        assert_eq!(
+            stats(&connection, &root).unwrap().files,
+            0,
+            "nothing is left behind"
+        );
         // Clearing a cache that is already clear is not an error: it is what a
         // person asking twice, or a second window, does.
         assert_eq!(clear(&connection, &root).unwrap(), 0);
@@ -857,8 +907,24 @@ mod tests {
         let connection = database();
         let older = jpeg(b"the first scan");
         let newer = jpeg(b"a better scan");
-        let first = store(&connection, &root, "a|album", ArtRendition::Full, &older, "").unwrap();
-        let second = store(&connection, &root, "a|album", ArtRendition::Full, &newer, "itunes").unwrap();
+        let first = store(
+            &connection,
+            &root,
+            "a|album",
+            ArtRendition::Full,
+            &older,
+            "",
+        )
+        .unwrap();
+        let second = store(
+            &connection,
+            &root,
+            "a|album",
+            ArtRendition::Full,
+            &newer,
+            "itunes",
+        )
+        .unwrap();
         assert_ne!(first.hash, second.hash);
         let found = lookup(&connection, &root, "a|album", ArtRendition::Full)
             .unwrap()
@@ -868,7 +934,15 @@ mod tests {
         assert_eq!(first.hash, hex::encode(Sha256::digest(&older)));
         assert_eq!(stats(&connection, &root).unwrap().files, 1);
         // Storing the same bytes again is not a change and does not rewrite it.
-        let again = store(&connection, &root, "a|album", ArtRendition::Full, &newer, "itunes").unwrap();
+        let again = store(
+            &connection,
+            &root,
+            "a|album",
+            ArtRendition::Full,
+            &newer,
+            "itunes",
+        )
+        .unwrap();
         assert_eq!(again.hash, second.hash);
         assert_eq!(stats(&connection, &root).unwrap().files, 1);
         std::fs::remove_dir_all(&root).unwrap();
@@ -956,7 +1030,15 @@ mod tests {
 
         // The full rendition is its own question, and its own change.
         let before_full = cover_revision(&connection).unwrap();
-        store(&connection, &root, "a|album", ArtRendition::Full, &fresh, "").unwrap();
+        store(
+            &connection,
+            &root,
+            "a|album",
+            ArtRendition::Full,
+            &fresh,
+            "",
+        )
+        .unwrap();
         assert!(cover_revision(&connection).unwrap() > before_full);
         std::fs::remove_dir_all(&root).unwrap();
     }

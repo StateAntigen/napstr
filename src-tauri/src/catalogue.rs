@@ -162,7 +162,10 @@ fn index_stored_announcements(connection: &Connection) -> Result<i64, String> {
     if stored > 0 {
         rebuild_index(connection)?;
     }
-    let documents = count(connection, "SELECT COUNT(*) FROM remote_catalogue_fts_docsize")?;
+    let documents = count(
+        connection,
+        "SELECT COUNT(*) FROM remote_catalogue_fts_docsize",
+    )?;
     if documents < stored {
         return Err(format!(
             "the word index holds {documents} of {stored} announcements"
@@ -882,8 +885,14 @@ mod tests {
     }
 
     fn holding(connection: &Connection, file_id: &str, seeder: u8, now: i64) {
-        remember_seeders(connection, &[file_id.to_string()], &hex_id(seeder), now + 600, now)
-            .unwrap();
+        remember_seeders(
+            connection,
+            &[file_id.to_string()],
+            &hex_id(seeder),
+            now + 600,
+            now,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -921,10 +930,18 @@ mod tests {
         // The heartbeat expires and the file stops being available, while the
         // catalogue keeps the announcement.
         let later = now + 601;
-        assert!(search(&connection, "midnight", 50, later).unwrap().is_empty());
+        assert!(search(&connection, "midnight", 50, later)
+            .unwrap()
+            .is_empty());
         assert_eq!(prune(&connection, later).unwrap(), 1);
-        assert_eq!(rows(&connection, "SELECT COUNT(*) FROM catalogue_seeder"), 0);
-        assert_eq!(rows(&connection, "SELECT COUNT(*) FROM remote_catalogue"), 1);
+        assert_eq!(
+            rows(&connection, "SELECT COUNT(*) FROM catalogue_seeder"),
+            0
+        );
+        assert_eq!(
+            rows(&connection, "SELECT COUNT(*) FROM remote_catalogue"),
+            1
+        );
     }
 
     #[test]
@@ -958,7 +975,9 @@ mod tests {
         holding(&connection, &hex_id(1), 9, now);
         let hits = search(&connection, "ghost", 50, now).unwrap();
         assert_eq!(
-            hits.iter().map(|hit| hit.file_id.as_str()).collect::<Vec<_>>(),
+            hits.iter()
+                .map(|hit| hit.file_id.as_str())
+                .collect::<Vec<_>>(),
             vec![hex_id(2), hex_id(1)],
             "four people can serve the second one"
         );
@@ -1038,7 +1057,12 @@ mod tests {
         announce(&connection, &hex_id(1), 8, "Ghost", "One");
         holding(&connection, &hex_id(1), 7, now);
         holding(&connection, &hex_id(1), 8, now);
-        assert_eq!(search(&connection, "ghost", 50, now).unwrap()[0].sources.len(), 2);
+        assert_eq!(
+            search(&connection, "ghost", 50, now).unwrap()[0]
+                .sources
+                .len(),
+            2
+        );
 
         forget_author(&connection, &hex_id(7)).unwrap();
         let hits = search(&connection, "ghost", 50, now).unwrap();
@@ -1050,10 +1074,19 @@ mod tests {
             search(&connection, "ghost", 50, now).unwrap().is_empty(),
             "nobody is holding it now, so it is not a result"
         );
-        assert_eq!(rows(&connection, "SELECT COUNT(*) FROM remote_catalogue"), 2);
+        assert_eq!(
+            rows(&connection, "SELECT COUNT(*) FROM remote_catalogue"),
+            2
+        );
         forget_file(&connection, &hex_id(1)).unwrap();
-        assert_eq!(rows(&connection, "SELECT COUNT(*) FROM catalogue_seeder"), 0);
-        assert_eq!(rows(&connection, "SELECT COUNT(*) FROM remote_catalogue"), 2);
+        assert_eq!(
+            rows(&connection, "SELECT COUNT(*) FROM catalogue_seeder"),
+            0
+        );
+        assert_eq!(
+            rows(&connection, "SELECT COUNT(*) FROM remote_catalogue"),
+            2
+        );
     }
 
     #[test]
@@ -1091,8 +1124,14 @@ mod tests {
         let connection = database();
         let now = 1_700_000_000;
         assert!(remember_seeders(&connection, &[hex_id(1)], "nope", now + 600, now).is_err());
-        assert_eq!(rows(&connection, "SELECT COUNT(*) FROM catalogue_seeder"), 0);
-        assert_eq!(rows(&connection, "SELECT COUNT(*) FROM remote_catalogue"), 0);
+        assert_eq!(
+            rows(&connection, "SELECT COUNT(*) FROM catalogue_seeder"),
+            0
+        );
+        assert_eq!(
+            rows(&connection, "SELECT COUNT(*) FROM remote_catalogue"),
+            0
+        );
     }
 
     /// How many rows a query finds, for the tests that care that something was
@@ -1119,7 +1158,10 @@ mod tests {
         assert_eq!(search(&connection, "midnight", 10, now).unwrap().len(), 1);
 
         connection
-            .execute("UPDATE remote_catalogue_fts_data SET block = X'DEADBEEF'", [])
+            .execute(
+                "UPDATE remote_catalogue_fts_data SET block = X'DEADBEEF'",
+                [],
+            )
             .unwrap();
         assert!(
             !index_is_sound(&connection),
@@ -1128,7 +1170,10 @@ mod tests {
         );
         // The table itself is untouched, which is what makes the repair safe: a
         // search can still fall back to it, and nothing has been lost.
-        assert_eq!(rows(&connection, "SELECT COUNT(*) FROM remote_catalogue"), 1);
+        assert_eq!(
+            rows(&connection, "SELECT COUNT(*) FROM remote_catalogue"),
+            1
+        );
 
         rebuild_index(&connection).unwrap();
         assert!(index_is_sound(&connection));
@@ -1155,7 +1200,9 @@ mod tests {
         // Nothing came back for it, so silence is recorded and the next question
         // does not include it.
         assert_eq!(remember_asked(&connection, &asked, now).unwrap(), 1);
-        assert!(undescribed_live_files(&connection, now, 10).unwrap().is_empty());
+        assert!(undescribed_live_files(&connection, now, 10)
+            .unwrap()
+            .is_empty());
         assert_eq!(
             still_undescribed(&connection, &asked).unwrap(),
             asked,
@@ -1247,7 +1294,9 @@ mod tests {
             .execute("INSERT INTO files(file_id) VALUES(?1)", params![hex_id(3)])
             .unwrap();
         assert!(
-            undescribed_live_files(&connection, now, 10).unwrap().is_empty(),
+            undescribed_live_files(&connection, now, 10)
+                .unwrap()
+                .is_empty(),
             "a file held here and not published is not a fair question"
         );
 
@@ -1280,9 +1329,14 @@ mod tests {
         announce(&connection, &hex_id(3), 12, "Ghost", "Three");
 
         let (page, total) = discover(&connection, DiscoverMode::MostSeeded, 5, 0, 10, now).unwrap();
-        assert_eq!(total, 2, "the live set, not everything the catalogue remembers");
         assert_eq!(
-            page.iter().map(|hit| hit.file_id.clone()).collect::<Vec<_>>(),
+            total, 2,
+            "the live set, not everything the catalogue remembers"
+        );
+        assert_eq!(
+            page.iter()
+                .map(|hit| hit.file_id.clone())
+                .collect::<Vec<_>>(),
             vec![hex_id(1), hex_id(2)]
         );
         assert_eq!(page[0].sources.len(), 2);
@@ -1301,18 +1355,27 @@ mod tests {
         announce(&connection, &hex_id(2), 11, "Ghost", "Two");
         holding(&connection, &hex_id(2), 11, now);
 
-        let (page, total) = discover(&connection, DiscoverMode::LeastSeeded, 5, 0, 10, now).unwrap();
+        let (page, total) =
+            discover(&connection, DiscoverMode::LeastSeeded, 5, 0, 10, now).unwrap();
         assert_eq!(total, 2, "the same live set, read from the other end");
         assert_eq!(
-            page.iter().map(|hit| hit.file_id.clone()).collect::<Vec<_>>(),
+            page.iter()
+                .map(|hit| hit.file_id.clone())
+                .collect::<Vec<_>>(),
             vec![hex_id(2), hex_id(1)],
             "the rarest is what a dig finds first"
         );
         // Both modes are the same question, so the files in them are the same
         // files - a dig is a ranking, not a different search.
         let (most, _) = discover(&connection, DiscoverMode::MostSeeded, 5, 0, 10, now).unwrap();
-        let mut wanted = most.iter().map(|hit| hit.file_id.clone()).collect::<Vec<_>>();
-        let mut found = page.iter().map(|hit| hit.file_id.clone()).collect::<Vec<_>>();
+        let mut wanted = most
+            .iter()
+            .map(|hit| hit.file_id.clone())
+            .collect::<Vec<_>>();
+        let mut found = page
+            .iter()
+            .map(|hit| hit.file_id.clone())
+            .collect::<Vec<_>>();
         wanted.sort();
         found.sort();
         assert_eq!(found, wanted);
@@ -1350,7 +1413,11 @@ mod tests {
         let first = order(discover(&connection, DiscoverMode::MostSeeded, 7, 0, 2, now).unwrap());
         let second = order(discover(&connection, DiscoverMode::MostSeeded, 7, 2, 2, now).unwrap());
 
-        assert_eq!(first, whole[..2].to_vec(), "the same seed asks the same question");
+        assert_eq!(
+            first,
+            whole[..2].to_vec(),
+            "the same seed asks the same question"
+        );
         assert_eq!(
             first.into_iter().chain(second).collect::<Vec<_>>(),
             whole,
@@ -1403,7 +1470,10 @@ mod tests {
         // produced: this asserted a hit once before, and the fallback answered it
         // while the index held nothing at all.
         assert_eq!(
-            rows(&connection, "SELECT COUNT(*) FROM remote_catalogue_fts_docsize"),
+            rows(
+                &connection,
+                "SELECT COUNT(*) FROM remote_catalogue_fts_docsize"
+            ),
             rows(&connection, "SELECT COUNT(*) FROM remote_catalogue"),
             "every stored announcement has to have a document of its own"
         );
@@ -1431,9 +1501,15 @@ mod tests {
         connection
             .execute("DELETE FROM remote_catalogue_fts", [])
             .unwrap();
-        assert_eq!(rows(&connection, "SELECT COUNT(*) FROM remote_catalogue"), 1);
         assert_eq!(
-            rows(&connection, "SELECT COUNT(*) FROM remote_catalogue_fts_docsize"),
+            rows(&connection, "SELECT COUNT(*) FROM remote_catalogue"),
+            1
+        );
+        assert_eq!(
+            rows(
+                &connection,
+                "SELECT COUNT(*) FROM remote_catalogue_fts_docsize"
+            ),
             0
         );
         assert_eq!(

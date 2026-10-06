@@ -541,7 +541,18 @@ pub fn page(
         )
         .optional()
         .map_err(|error| error.to_string())?;
-    let Some((title, display_name, artist, mbid, image, tags, private, published, updated_at, total)) = head
+    let Some((
+        title,
+        display_name,
+        artist,
+        mbid,
+        image,
+        tags,
+        private,
+        published,
+        updated_at,
+        total,
+    )) = head
     else {
         return Ok(None);
     };
@@ -633,7 +644,9 @@ fn sole_author(connection: &Connection, playlist_id: &str) -> Result<String, Str
     match authors.len() {
         0 => Ok(String::new()),
         1 => Ok(authors[0].clone()),
-        _ => Err("Two playlists here share that id, so which author's is meant has to be said".into()),
+        _ => Err(
+            "Two playlists here share that id, so which author's is meant has to be said".into(),
+        ),
     }
 }
 
@@ -847,10 +860,7 @@ pub fn playlist_event_builder(
 }
 
 /// Sign the body that withdraws this author's revision of a playlist.
-pub fn playlist_withdrawal_builder(
-    playlist_id: &str,
-    keys: &Keys,
-) -> Result<Event, String> {
+pub fn playlist_withdrawal_builder(playlist_id: &str, keys: &Keys) -> Result<Event, String> {
     if !is_canonical_uuid(playlist_id) {
         return Err("a playlist id is a canonical lowercase UUID".into());
     }
@@ -957,7 +967,11 @@ fn is_false(value: &bool) -> bool {
 fn playlist_tags(value: &str) -> String {
     let mut seen = HashSet::new();
     let mut words = Vec::new();
-    for word in value.split(',').map(str::trim).filter(|word| !word.is_empty()) {
+    for word in value
+        .split(',')
+        .map(str::trim)
+        .filter(|word| !word.is_empty())
+    {
         let word = crate::audio::sanitise_public_text(word);
         let word = word.trim();
         if word.is_empty() || word.chars().count() > PLAYLIST_TAG_CHARACTER_LIMIT {
@@ -1000,8 +1014,7 @@ mod tests {
     use super::*;
 
     const PLAYLIST_ID: &str = "77abf082-7075-4d36-afe2-e9710ac6b33c";
-    const ENTER_SANDMAN: &str =
-        "48e5979efa6a56dc3cab293b954ae84e36f464b936bd8c534838189abcc93c68";
+    const ENTER_SANDMAN: &str = "48e5979efa6a56dc3cab293b954ae84e36f464b936bd8c534838189abcc93c68";
     const ROOSTER: &str = "cdf1741591bf1e580b1e7a2712ce781ef7ade8b12ebf309731d264498accf5ce";
 
     fn playlist() -> RemotePlaylist {
@@ -1091,12 +1104,14 @@ mod tests {
         assert_eq!(read.title, published.title);
         assert_eq!(read.artist, published.artist);
         assert_eq!(read.mbid, published.mbid);
-        assert_eq!(read.image, published.image, "the picture survives as a file id");
+        assert_eq!(
+            read.image, published.image,
+            "the picture survives as a file id"
+        );
         assert_eq!(read.author, keys.public_key().to_hex());
         assert_eq!(read.updated_at, event.created_at.as_secs() as i64);
         assert_eq!(
-            read.tracks,
-            published.tracks,
+            read.tracks, published.tracks,
             "the members and their order must come back unchanged"
         );
         // The picture is not a member: it gets no `x` tag, so a relay answering
@@ -1159,7 +1174,13 @@ mod tests {
     #[test]
     fn the_authors_own_tags_are_the_search_words() {
         let keys = Keys::generate();
-        let words = |event: &Event| event.tags.hashtags().map(str::to_string).collect::<Vec<_>>();
+        let words = |event: &Event| {
+            event
+                .tags
+                .hashtags()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
 
         // Their words, and nothing of ours on top of them.
         let mut mine = playlist();
@@ -1228,7 +1249,11 @@ mod tests {
         // it can be found, and somebody may be playing it right now.
         assert_eq!(playlist_tags("ok, Ok,   , "), "ok", "blanks and repeats go");
         assert_eq!(playlist_tags(&"x".repeat(40)), "", "an over-long word goes");
-        assert_eq!(playlist_tags("a\u{202e}b"), "a b", "formatting characters go");
+        assert_eq!(
+            playlist_tags("a\u{202e}b"),
+            "a b",
+            "formatting characters go"
+        );
         let many = (1..=13)
             .map(|index| format!("w{index}"))
             .collect::<Vec<_>>()
@@ -1376,7 +1401,10 @@ mod tests {
         assert!(playlist_event(&rebuild(padded, id_tags(PLAYLIST_ID))).is_none());
         // Another protocol's event that happens to use this kind, which is the
         // case the marker exists for.
-        let foreign = rebuild(body(PLAYLIST_ID), vec![Tag::parse(["d", PLAYLIST_ID]).unwrap()]);
+        let foreign = rebuild(
+            body(PLAYLIST_ID),
+            vec![Tag::parse(["d", PLAYLIST_ID]).unwrap()],
+        );
         assert!(playlist_event(&foreign).is_none());
         // And our own body under a kind that is not ours: kind `30423` carries
         // audiobook manifests, which share this envelope's shape.
@@ -1420,7 +1448,10 @@ mod tests {
         let stored_page = page(&connection, &stored.author, PLAYLIST_ID, 0, 10)
             .unwrap()
             .unwrap();
-        assert_eq!(stored_page.total, 1, "a dropped member is gone, not left behind");
+        assert_eq!(
+            stored_page.total, 1,
+            "a dropped member is gone, not left behind"
+        );
         assert_eq!(stored_page.tracks.len(), 1);
         assert_eq!(stored_page.tracks[0].file_id, ENTER_SANDMAN);
         // A caller that names only an id is answered while it is unambiguous.
@@ -1443,7 +1474,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            second.tracks.iter().map(|track| track.position).collect::<Vec<_>>(),
+            second
+                .tracks
+                .iter()
+                .map(|track| track.position)
+                .collect::<Vec<_>>(),
             vec![2, 3]
         );
         assert_eq!(second.total, 5);
@@ -1675,7 +1710,10 @@ mod tests {
         // revision it replaced is gone with it.
         mark_withdrawn(&connection, &theirs(0).author, PLAYLIST_ID, 1_100).unwrap();
         remove(&connection, &theirs(0).author, PLAYLIST_ID).unwrap();
-        assert_eq!(withdrawn_at(&connection, &theirs(0).author, PLAYLIST_ID).unwrap(), Some(1_100));
+        assert_eq!(
+            withdrawn_at(&connection, &theirs(0).author, PLAYLIST_ID).unwrap(),
+            Some(1_100)
+        );
         // A relay that still answers with the older revision cannot put it back.
         assert!(!store_from_relay(&connection, &theirs(1_000)).unwrap());
         assert_eq!(list(&connection, 0, 10).unwrap().1, 0);
@@ -1742,7 +1780,10 @@ mod tests {
         save(&connection, &theirs).unwrap();
 
         let copy = file_revision(&connection, theirs.clone(), &mine, 99).unwrap();
-        assert_ne!(copy.playlist_id, theirs.playlist_id, "a copy needs its own id");
+        assert_ne!(
+            copy.playlist_id, theirs.playlist_id,
+            "a copy needs its own id"
+        );
         assert!(is_canonical_uuid(&copy.playlist_id));
         assert_eq!(copy.author, mine);
         assert_eq!(copy.updated_at, 99);
@@ -1756,9 +1797,11 @@ mod tests {
             .unwrap()
             .is_some());
         // Their own revision is untouched by the copy.
-        assert!(page(&connection, &theirs.author, &theirs.playlist_id, 0, 10)
-            .unwrap()
-            .is_some());
+        assert!(
+            page(&connection, &theirs.author, &theirs.playlist_id, 0, 10)
+                .unwrap()
+                .is_some()
+        );
 
         // A revision of this identity's own playlist keeps its coordinate, or
         // an edit would leave a second row behind under a new id.
@@ -1815,7 +1858,10 @@ mod tests {
         assert_eq!(first.len(), 1);
         assert_eq!(second.len(), 1);
         assert_ne!(first[0].author, second[0].author);
-        assert!(list_owned_by(&connection, Some(&mine), 2, 1).unwrap().0.is_empty());
+        assert!(list_owned_by(&connection, Some(&mine), 2, 1)
+            .unwrap()
+            .0
+            .is_empty());
 
         // Nobody's own list is every playlist, which is what the page asks for.
         assert_eq!(list(&connection, 0, 10).unwrap().1, 3);
@@ -1836,7 +1882,8 @@ mod tests {
 
     /// The id is chosen by the author, so it is not the identity on its own.
     #[test]
-    fn two_authors_may_use_one_playlist_id_without_replacing_each_other() {        let directory =
+    fn two_authors_may_use_one_playlist_id_without_replacing_each_other() {
+        let directory =
             std::env::temp_dir().join(format!("napstr-playlist-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&directory).unwrap();
         let db_path = directory.join("napstr.sqlite3");
@@ -1858,7 +1905,11 @@ mod tests {
         save(&connection, &mine).unwrap();
         save(&connection, &theirs).unwrap();
 
-        assert_eq!(list(&connection, 0, 10).unwrap().1, 2, "one coordinate each");
+        assert_eq!(
+            list(&connection, 0, 10).unwrap().1,
+            2,
+            "one coordinate each"
+        );
         let mine_page = page(&connection, &mine.author, PLAYLIST_ID, 0, 10)
             .unwrap()
             .unwrap();

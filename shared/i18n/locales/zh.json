@@ -678,7 +678,6 @@
   "This is published, so it will be withdrawn from the relays as well.": "此播放列表已发布，因此也会从中继撤回。",
   "This is the list this phone sent. The computer is playing something else now.": "This is the list this phone sent. The computer is playing something else now.",
   "This pairing cannot ask Napstr to download from the network.": "此配对无法让 Napstr 从网络下载。",
-  "This pairing cannot sign or publish anything in your name, so it cannot join a conversation.": "此配对无法以你的名义签名或发布任何内容，因此不能参与讨论。",
   "This pairing is read only, so nothing can be changed on the computer.": "此配对为只读，因此无法更改电脑上的任何内容。",
   "This phone": "This phone",
   "This phone has one home computer that signs and downloads for it; the others are libraries to read and play from. What a code may do is set by the computer that issued it.": "这部手机有一台为它签名和下载的家庭电脑；其他计算机是可读取和播放的音乐库。配对码能做什么由发出配对码的电脑决定。",

@@ -119,16 +119,32 @@ test('Napstrfy posts a comment by asking the computer to sign it', async ({ page
   await expect(page.locator('.discussion-message').last()).toContainText('Where did you find this?');
 });
 
-test('Napstrfy does not offer a lent phone the box it may not use', async ({ page }) => {
+test('Napstrfy posts a comment with its own key when the computer signs nothing', async ({ page }) => {
   await openApp(page, { messages: [themFirst], streamOnly: true });
+  // This phone's own key, which is not the computer's: it is what makes the comment
+  // the phone's to say, and what the assertion below about "mine" turns on.
+  await page.addInitScript(() => {
+    window.nostrIdentity = { pubkey: 'd'.repeat(64), npub: `npub1${'d'.repeat(58)}` };
+  });
   await openDiscussion(page);
 
   // It may read, because the messages are public and the computer fetches them...
   await expect(page.locator('.discussion-message')).toHaveCount(1);
-  // ...and it may not post, so there is no composer and no way to try.
-  await expect(page.locator('.discussion-compose')).toHaveCount(0);
-  await expect(page.locator('.discussion-view .settings-note')).toContainText('cannot sign or publish anything in your name');
+  // ...and it may write, because what it writes is its own. The comment is signed
+  // with the key this phone made and never handed over, and the computer's part is
+  // to put it on the relays.
+  await page.locator('.discussion-compose input').fill('Where did you find this?');
+  await page.locator('.discussion-compose button').click();
+
+  await expect.poll(() => callsTo(page, 'remote_send_device_discussion')).toBe(1);
+  // The path that spends the owner's name is not touched on the way past.
   expect(await callsTo(page, 'remote_send_track_discussion')).toBe(0);
+  // The box empties, the comment is read back rather than assumed, and it is drawn
+  // as this person's own: the phone's key is theirs too.
+  await expect(page.locator('.discussion-compose input')).toHaveValue('');
+  await expect(page.locator('.discussion-message')).toHaveCount(2);
+  await expect(page.locator('.discussion-message').last()).toHaveClass(/mine/);
+  await expect(page.locator('.discussion-message').last()).toContainText('Where did you find this?');
 });
 
 /** Plays the one track and opens the player sheet, which is where the card lives. */

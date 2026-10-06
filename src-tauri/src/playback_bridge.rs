@@ -20,9 +20,7 @@
 
 use crate::player::NativePlayer;
 use chrono::Utc;
-use napstr_remote_protocol::{
-    PlaybackCommand, RemotePlaybackState, RemoteRepeat, MAX_PLAY_QUEUE,
-};
+use napstr_remote_protocol::{PlaybackCommand, RemotePlaybackState, RemoteRepeat, MAX_PLAY_QUEUE};
 use std::{
     path::Path,
     sync::{Arc, Mutex},
@@ -209,7 +207,8 @@ impl PlaybackBridge {
                 self.player.seek(position_ms as f64 / 1000.0)?;
             }
             PlaybackCommand::Volume { percent } => {
-                self.player.set_volume(f32::from(percent.min(100)) / 100.0)?;
+                self.player
+                    .set_volume(f32::from(percent.min(100)) / 100.0)?;
                 // The player has it; the window is told so its own slider follows
                 // rather than showing the volume it had a moment ago.
                 self.notify(&PlaybackCommand::Volume { percent });

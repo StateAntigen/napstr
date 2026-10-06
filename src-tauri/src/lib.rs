@@ -28,8 +28,8 @@ mod diag;
 mod mobile;
 mod network;
 mod playback_bridge;
-mod playlist;
 mod player;
+mod playlist;
 mod protocol;
 mod tor;
 mod transfer;
@@ -1969,7 +1969,11 @@ fn unique_destination(folder: &Path, filename: &str) -> PathBuf {
 #[tauri::command]
 async fn remove_transfer(id: i64, state: State<'_, AppState>) -> Result<(), String> {
     if id < 0 {
-        state.network.transfers().remove_downloads(Some(id.checked_neg().ok_or("Invalid transfer ID")?)).await?;
+        state
+            .network
+            .transfers()
+            .remove_downloads(Some(id.checked_neg().ok_or("Invalid transfer ID")?))
+            .await?;
     } else {
         open_db(&state)?
             .execute("DELETE FROM transfers WHERE id = ?1", [id])
@@ -1981,7 +1985,9 @@ async fn remove_transfer(id: i64, state: State<'_, AppState>) -> Result<(), Stri
 #[tauri::command]
 async fn clear_all_transfers(state: State<'_, AppState>) -> Result<(), String> {
     state.network.transfers().remove_downloads(None).await?;
-    open_db(&state)?.execute("DELETE FROM transfers", []).map_err(|error| error.to_string())?;
+    open_db(&state)?
+        .execute("DELETE FROM transfers", [])
+        .map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -2574,7 +2580,9 @@ async fn close_window(window: tauri::Window, state: State<'_, AppState>) -> Resu
     // be able to stop the exit itself. A database that will not answer is a reason
     // to close anyway, and the window used to stay open in exactly that case.
     if let Err(error) = state.network.preserve_interrupted_downloads() {
-        diag::note(&format!("Could not preserve interrupted downloads: {error}"));
+        diag::note(&format!(
+            "Could not preserve interrupted downloads: {error}"
+        ));
     }
     state.tor.stop().await;
     state.mobile.stop().await;
@@ -2604,7 +2612,10 @@ async fn publish_playlist(
     suggest_tags: bool,
     state: State<'_, AppState>,
 ) -> Result<napstr_remote_protocol::RemotePlaylist, String> {
-    state.network.publish_playlist(&playlist, suggest_tags).await
+    state
+        .network
+        .publish_playlist(&playlist, suggest_tags)
+        .await
 }
 
 /// Withdraw a playlist this computer published, on the relays and here.
@@ -2643,7 +2654,9 @@ fn own_playlist_author() -> Result<String, String> {
 /// list is what makes a row expensive, so browsing never carries the members of
 /// playlists nobody opened.
 #[tauri::command]
-fn playlists(state: State<'_, AppState>) -> Result<Vec<napstr_remote_protocol::RemotePlaylistSummary>, String> {
+fn playlists(
+    state: State<'_, AppState>,
+) -> Result<Vec<napstr_remote_protocol::RemotePlaylistSummary>, String> {
     playlist::list(&open_db(&state)?, 0, playlist::PLAYLIST_LIST_LIMIT)
         .map(|(playlists, _)| playlists)
 }
@@ -2713,9 +2726,7 @@ fn delete_playlist(
 /// its own playlists the relays do or do not have, because that question was
 /// not answered.
 #[tauri::command]
-async fn read_playlists(
-    state: State<'_, AppState>,
-) -> Result<network::PlaylistReadReport, String> {
+async fn read_playlists(state: State<'_, AppState>) -> Result<network::PlaylistReadReport, String> {
     state.network.read_public_playlists().await
 }
 
@@ -2785,10 +2796,12 @@ fn set_cover_preferences(
     publish_claims: bool,
     state: State<'_, AppState>,
 ) -> Result<cover_publish::CoverStatus, String> {
-    state.covers.set_preferences(cover_publish::CoverPreferences {
-        lookup_external,
-        publish_claims,
-    })
+    state
+        .covers
+        .set_preferences(cover_publish::CoverPreferences {
+            lookup_external,
+            publish_claims,
+        })
 }
 
 /// Wake the cover worker. It looks at whatever is new and stops again, so this
@@ -2817,10 +2830,7 @@ fn set_allowed_art_hosts(
 /// Not a stored preference: a pause that outlived its reason would be a cache
 /// that never fills and nothing in the window to say why.
 #[tauri::command]
-fn set_art_fill_paused(
-    paused: bool,
-    state: State<'_, AppState>,
-) -> cover_publish::CoverStatus {
+fn set_art_fill_paused(paused: bool, state: State<'_, AppState>) -> cover_publish::CoverStatus {
     state.covers.set_art_fill_paused(paused)
 }
 
@@ -2829,9 +2839,7 @@ fn set_art_fill_paused(
 /// Only the pictures: what it knows about album art, and the log of how it found
 /// out, are untouched, so the cache refills from claims it already has.
 #[tauri::command]
-fn clear_art_cache(
-    state: State<'_, AppState>,
-) -> Result<cover_publish::CoverStatus, String> {
+fn clear_art_cache(state: State<'_, AppState>) -> Result<cover_publish::CoverStatus, String> {
     state.covers.clear_art_cache()
 }
 
@@ -2946,10 +2954,7 @@ pub fn run() {
             // the log: a desktop that will not start is the one case where the
             // file has to already exist by the time somebody looks for it.
             diag::start(&app_data);
-            diag::note(&format!(
-                "Napstr starting from {}",
-                app_data.display()
-            ));
+            diag::note(&format!("Napstr starting from {}", app_data.display()));
             let resource_dir = app
                 .path()
                 .resource_dir()
@@ -3213,7 +3218,9 @@ pub fn run() {
             // Rotate pending requests before stopping Tor, so old workers cannot
             // turn a normal application exit into a permanent failed download.
             if let Err(error) = services.network.preserve_interrupted_downloads() {
-                diag::note(&format!("Could not preserve interrupted downloads: {error}"));
+                diag::note(&format!(
+                    "Could not preserve interrupted downloads: {error}"
+                ));
             }
             services.tor.stop().await;
             services.mobile.stop().await;
@@ -3286,7 +3293,10 @@ mod tests {
         let db_path = directory.join("napstr.sqlite3");
         initialise_database(&db_path, &directory).unwrap();
         let mut connection = open_connection(&db_path).unwrap();
-        assert_eq!(index_path(&mut connection, &directory).unwrap().file_count, 1);
+        assert_eq!(
+            index_path(&mut connection, &directory).unwrap().file_count,
+            1
+        );
         let indexed = load_files(&connection, None).unwrap();
         assert_eq!(indexed.len(), 1);
         let file = &indexed[0];
@@ -3656,7 +3666,9 @@ mod tests {
         let audio = directory.join("track.wav");
         let mut bytes = b"RIFF".to_vec();
         bytes.extend_from_slice(&40u32.to_le_bytes());
-        bytes.extend_from_slice(b"WAVEfmt \x10\0\0\0\x01\0\x01\0\x44\xac\0\0\x88\x58\x01\0\x02\0\x10\0data\x04\0\0\0");
+        bytes.extend_from_slice(
+            b"WAVEfmt \x10\0\0\0\x01\0\x01\0\x44\xac\0\0\x88\x58\x01\0\x02\0\x10\0data\x04\0\0\0",
+        );
         bytes.extend_from_slice(&7u32.to_le_bytes());
         fs::write(&audio, bytes).unwrap();
         let db_path = directory.join("napstr.sqlite3");
@@ -3679,7 +3691,10 @@ mod tests {
         assert_eq!(report.error_count, 1, "the failure is still reported");
         let after = load_files(&connection, None).unwrap();
         assert_eq!(after.len(), 1, "a file that is still here keeps its row");
-        assert_eq!(after[0].file_id, file_id, "and it is the row it already had");
+        assert_eq!(
+            after[0].file_id, file_id,
+            "and it is the row it already had"
+        );
 
         // Gone is still gone: the sweep has to keep doing its own job.
         fs::remove_file(&audio).unwrap();

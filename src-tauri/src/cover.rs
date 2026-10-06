@@ -120,9 +120,7 @@ pub enum CoverClaim {
 /// halves would not round-trip through a single separator, or when the result
 /// exceeds the NIP's length bound.
 pub fn cover_key(artist: &str, album: &str) -> Option<String> {
-    normalise_cover_key(&format!(
-        "{artist}{COVER_KEY_SEPARATOR}{album}"
-    ))
+    normalise_cover_key(&format!("{artist}{COVER_KEY_SEPARATOR}{album}"))
 }
 
 /// Re-normalize a key that came from a caller or from an event tag.
@@ -313,10 +311,7 @@ fn is_noise_group(value: &str) -> bool {
 }
 
 fn is_bracket_character(character: char) -> bool {
-    matches!(
-        character,
-        '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>'
-    )
+    matches!(character, '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>')
 }
 
 // ---------------------------------------------------------------------------
@@ -521,9 +516,7 @@ fn cover_mime(event: &Event) -> String {
         .map(|value| claim_text(&value))
         .filter(|value| {
             value.chars().count() <= COVER_MIME_CHARACTER_LIMIT
-                && value
-                    .to_ascii_lowercase()
-                    .starts_with("image/")
+                && value.to_ascii_lowercase().starts_with("image/")
         })
         .map(|value| value.to_ascii_lowercase())
         .unwrap_or_default()
@@ -1094,7 +1087,10 @@ pub(crate) fn prune_watch(connection: &Connection) -> Result<usize, String> {
     // boundary error would only leave one entry in the table a moment longer.
     let cutoff = (Utc::now() - chrono::Duration::hours(WATCH_RETENTION_HOURS)).to_rfc3339();
     connection
-        .execute("DELETE FROM cover_watch WHERE noted_at < ?1", params![cutoff])
+        .execute(
+            "DELETE FROM cover_watch WHERE noted_at < ?1",
+            params![cutoff],
+        )
         .map_err(|error| error.to_string())
 }
 
@@ -1845,7 +1841,10 @@ mod tests {
 
         let waiting = albums_without_pictures(&connection, 10).unwrap();
         assert_eq!(
-            waiting.iter().map(|album| album.key.as_str()).collect::<Vec<_>>(),
+            waiting
+                .iter()
+                .map(|album| album.key.as_str())
+                .collect::<Vec<_>>(),
             vec!["c|three", "b|two", "a|one"],
             "the most recently resolved album is the one most likely being looked at"
         );
@@ -1998,7 +1997,10 @@ mod tests {
             cover_key("  Pink Floyd ", "Animals").as_deref(),
             Some("pink floyd|animals")
         );
-        assert_eq!(cover_key("BEYONCÉ", "Lemonade").as_deref(), Some("beyoncé|lemonade"));
+        assert_eq!(
+            cover_key("BEYONCÉ", "Lemonade").as_deref(),
+            Some("beyoncé|lemonade")
+        );
         // Edition markers and whitespace runs are preserved verbatim.
         assert_eq!(
             cover_key("Artist", "Album  (Deluxe Edition)").as_deref(),
@@ -2047,12 +2049,19 @@ mod tests {
         let keys = cover_lookup_keys("artist|album (deluxe edition)");
         assert_eq!(
             keys,
-            vec!["artist|album (deluxe edition)".to_string(), "artist|album".to_string()]
+            vec![
+                "artist|album (deluxe edition)".to_string(),
+                "artist|album".to_string()
+            ]
         );
         assert_eq!(cover_lookup_keys("not-a-key"), Vec::<String>::new());
         assert_eq!(
             normalised_request(
-                &[" Artist | Album ".to_string(), "artist|album".to_string(), "junk".to_string()],
+                &[
+                    " Artist | Album ".to_string(),
+                    "artist|album".to_string(),
+                    "junk".to_string()
+                ],
                 10
             ),
             vec!["artist|album".to_string()]
@@ -2064,10 +2073,7 @@ mod tests {
         let keys = Keys::generate();
         let key = "artist|album";
         let event = signed_event(&keys, key, cover_content());
-        assert!(matches!(
-            cover_claim(&event, key),
-            Some(CoverClaim::Art(_))
-        ));
+        assert!(matches!(cover_claim(&event, key), Some(CoverClaim::Art(_))));
 
         let wrong_kind = EventBuilder::new(Kind::from(30421), "x")
             .tags(vec![Tag::identifier(key), Tag::hashtag(COVER_MARKER)])
@@ -2453,7 +2459,9 @@ mod tests {
         // The same holds for an older withdrawal body.
         store_cover_events(&connection, &[(key.clone(), withdrawal.clone())]).unwrap();
         assert_eq!(
-            load_cover_claims(&connection, &[key.clone()]).unwrap().len(),
+            load_cover_claims(&connection, &[key.clone()])
+                .unwrap()
+                .len(),
             1,
             "an older withdrawal cannot retract a newer claim"
         );
@@ -2695,7 +2703,9 @@ mod tests {
             cached_art(&connection, &empty).unwrap(),
             CachedArt::Unknown
         ));
-        assert!(suppressed_art_keys(&connection, &[empty]).unwrap().is_empty());
+        assert!(suppressed_art_keys(&connection, &[empty])
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

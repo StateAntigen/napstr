@@ -114,8 +114,24 @@ pub fn verify_authentication(
     Ok(event.pubkey.to_hex())
 }
 
+/// The key an event a device signed itself names, once its signature is checked.
+///
+/// The same check `verify_authentication` makes, without the proof around it:
+/// there is no challenge here, because an event a device means to publish is not
+/// an answer to a question. What is left is the part that matters - the id is
+/// recomputed from the six other fields rather than read, and the signature has to
+/// check out against the key the event names - so a computer handing this to the
+/// relays is handing over something that key really signed.
+pub fn verify_signed(signed: &SignedEvent) -> Result<String, String> {
+    let event = to_event(signed)?;
+    event
+        .verify()
+        .map_err(|_| "That event is not signed by the key it names".to_string())?;
+    Ok(event.pubkey.to_hex())
+}
+
 /// The wire event as the event type that knows how to check itself.
-fn to_event(signed: &SignedEvent) -> Result<Event, String> {
+pub(crate) fn to_event(signed: &SignedEvent) -> Result<Event, String> {
     let json = serde_json::to_string(signed).map_err(|error| error.to_string())?;
     Event::from_json(&json).map_err(|error| format!("That is not a signed event: {error}"))
 }

@@ -58,7 +58,13 @@ pub fn write(message: &str) {
         ) {
             // SAFETY: both pointers are valid NUL-terminated C strings for the
             // duration of the call, which is all `__android_log_write` reads.
-            unsafe { __android_log_write(ANDROID_LOG_INFO, tag.as_ptr() as *const u8, text.as_ptr() as *const u8) };
+            unsafe {
+                __android_log_write(
+                    ANDROID_LOG_INFO,
+                    tag.as_ptr() as *const u8,
+                    text.as_ptr() as *const u8,
+                )
+            };
         }
     }
     #[cfg(not(target_os = "android"))]
@@ -80,7 +86,12 @@ pub fn note(message: &str) {
 pub fn request_kind(request: &napstr_remote_protocol::ClientRequest) -> String {
     serde_json::to_value(request)
         .ok()
-        .and_then(|value| value.get("type").and_then(|kind| kind.as_str()).map(str::to_string))
+        .and_then(|value| {
+            value
+                .get("type")
+                .and_then(|kind| kind.as_str())
+                .map(str::to_string)
+        })
         .unwrap_or_else(|| "a request".to_string())
 }
 

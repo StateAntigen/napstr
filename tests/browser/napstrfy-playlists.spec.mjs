@@ -1032,39 +1032,50 @@ test('a browse carries the one seed this launch was given, and a search does not
   expect(found.shuffleSeed).toBeUndefined();
 });
 
-test('a read-only pairing reads a playlist and is offered no way to change it', async ({ page }) => {
+test('a pairing lent the network writes its own playlists', async ({ page }) => {
   await mockNative(page, { platform: 'android' });
-  // The computer lent this phone access: it browses, plays and fetches, and every
-  // write it makes is refused. A phone that offered the editor anyway would take a
-  // draft the host would never accept, and the person would only find out by
-  // watching a Save fail.
+  // The computer lent this phone access: it browses, plays and fetches. It was not
+  // lent the owner's signature - which is not the same as being unable to write
+  // anything: a list of its own is filed under the key that wrote it, so making
+  // one is this phone's own act rather than the owner's.
   await page.addInitScript(() => {
     window.streamOnly = true;
+    window.nostrIdentity = { pubkey: 'd'.repeat(64), npub: `npub1${'d'.repeat(58)}` };
   });
   await page.goto('http://127.0.0.1:15174');
   await seed(page, [
-    row({ title: 'Driving', tracks: [member(1, TRACK, 'Enter Sandman', 'Metallica')] })
+    // This phone's own list, by this phone's own key: the case that is its to edit
+    // whether or not the owner's signature was lent.
+    row({
+      title: 'Driving',
+      author: 'd'.repeat(64),
+      tracks: [member(1, TRACK, 'Enter Sandman', 'Metallica')]
+    })
   ]);
   await page.locator('.bottom-nav button').filter({ hasText: 'Playlists' }).click();
   await expect(page.locator('.playlist-view')).toBeVisible();
 
-  // Reading is what the pairing is for, so the playlist is there...
+  // Reading is still what the pairing is for, so the playlist is there...
   await expect(page.locator('.playlist-row strong')).toHaveText(['Driving']);
-  // ...and the button that would start a new one is not offered.
-  await expect(page.locator('.playlist-new')).toBeDisabled();
+  // ...and the button that starts a new one is offered rather than greyed: there is
+  // no refusal behind it any more.
+  await expect(page.locator('.playlist-new')).toBeEnabled();
 
   await page.locator('.playlist-open').click();
-  // It opens as itself rather than as a draft, so there is no Save anywhere on it.
   await expect(page.locator('.playlist-sheet h1')).toHaveText('Driving');
-  await expect(page.locator('.playlist-sheet .playlist-save')).toHaveCount(0);
-  // And the tools that exist only to change it are all off.
+  // The tools that exist to change it are live, and saving goes to the computer,
+  // which files the list under this phone's own key.
   const tools = page.locator('.playlist-sheet .playlist-tools button');
   await expect(tools).toHaveCount(4);
-  for (const tool of await tools.all()) await expect(tool).toBeDisabled();
+  for (const tool of await tools.all()) await expect(tool).toBeEnabled();
 
-  // Nothing was even asked of the computer: the screen does not offer what the
-  // host would refuse.
-  expect(await calls(page, 'remote_save_playlist')).toHaveLength(0);
+  await tools.filter({ hasText: 'Name & details' }).click();
+  await page.locator('.playlist-actions button.primary').click();
+  await expect.poll(async () => (await calls(page, 'remote_save_playlist')).length).toBe(1);
+
+  // Publishing is the other half of it: that is a signature, and the one this
+  // phone has is its own, so it never goes by the path that spends the owner's.
+  await page.locator('.playlist-actions button').filter({ hasText: 'Publish' }).click();
+  await expect.poll(async () => (await calls(page, 'remote_publish_device_playlist')).length).toBe(1);
   expect(await calls(page, 'remote_publish_playlist')).toHaveLength(0);
-  expect(await calls(page, 'remote_new_playlist_id')).toHaveLength(0);
 });

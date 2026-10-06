@@ -319,6 +319,25 @@ export async function mockNative(page, { app = 'napstrfy', nativeLocale = 'en-GB
             const known = window.discussionActivity ?? {};
             return args.fileIds.map((fileId) => known[fileId]).filter(Boolean);
           }
+          // What a phone lent the network but not the signature says: the same
+          // comment, signed by the phone's own key instead of by this computer's.
+          // The event is the phone's, so it is authored by the phone.
+          case 'remote_send_device_discussion': {
+            const said = window.discussionMessages ?? [];
+            const parent = said.find((message) => message.eventId === args.replyTo);
+            const sent = {
+              eventId: `device-${said.length}`,
+              pubkey: phonePubkey(),
+              npub: 'npub1device',
+              displayName: 'This phone',
+              content: args.content,
+              createdAt: 1_800_000_200,
+              ...(args.replyTo ? { replyTo: args.replyTo } : {}),
+              ...(parent ? { reply: { author: parent.displayName, excerpt: parent.content } } : {})
+            };
+            window.discussionMessages = [...said, sent];
+            return sent.eventId;
+          }
           case 'remote_transfers': return [{ ...transfers[1], fileId: track.fileId }];
           case 'reconcile_audio_cache': return true;
           // The native side draws the track code, so answer the way it does.
@@ -422,6 +441,10 @@ export async function mockNative(page, { app = 'napstrfy', nativeLocale = 'en-GB
             return { likes: moved.length, dislikes: turnedOff.length, playlists: mine.length, skipped: 0, failed: [] };
           }
           case 'remote_publish_playlist':
+            return filePlaylistRevision(args.playlist, { published: true });
+          // Publishing without the owner's signature: the phone signed the event
+          // itself, so what is filed is the list it signed.
+          case 'remote_publish_device_playlist':
             return filePlaylistRevision(args.playlist, { published: true });
           case 'remote_delete_playlist': dropPlaylistRow(args.author, args.playlistId); return null;
           case 'remote_withdraw_playlist': dropPlaylistRow('', args.playlistId); forgetRelayPlaylist(args.playlistId); return null;

@@ -678,7 +678,6 @@
   "This is published, so it will be withdrawn from the relays as well.": "Esta está publicada, así que también se retirará de los relés.",
   "This is the list this phone sent. The computer is playing something else now.": "This is the list this phone sent. The computer is playing something else now.",
   "This pairing cannot ask Napstr to download from the network.": "Esta vinculación no puede pedirle a Napstr que descargue de la red.",
-  "This pairing cannot sign or publish anything in your name, so it cannot join a conversation.": "Esta vinculación no puede firmar ni publicar nada en tu nombre, así que no puede participar en una conversación.",
   "This pairing is read only, so nothing can be changed on the computer.": "Esta vinculación es de sólo lectura, así que no se puede cambiar nada en el ordenador.",
   "This phone": "This phone",
   "This phone has one home computer that signs and downloads for it; the others are libraries to read and play from. What a code may do is set by the computer that issued it.": "Este teléfono tiene un ordenador principal que firma y descarga por él; los demás son bibliotecas para leer y reproducir. Lo que un código permite lo decide el ordenador que lo emitió.",
