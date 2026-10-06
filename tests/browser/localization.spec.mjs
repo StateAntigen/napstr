@@ -550,8 +550,16 @@ test('website language links and sharing metadata work without JavaScript', asyn
   await context.close();
 });
 
+/**
+ * The repository the website's release list reads, which is the one the page's
+ * `github-repository` meta names. It is this fork rather than upstream, so these
+ * assertions follow `website/template.mjs` - if they disagree, the site is
+ * offering somebody else's installers.
+ */
+const RELEASE_REPOSITORY = 'StateAntigen/napstr';
+
 test('website downloads select the right product and display translated release status', async ({ page }) => {
-  await page.route('https://api.github.com/**', (route) => route.fulfill({ contentType: 'application/json', body: JSON.stringify({ tag_name: 'v0.2.2', html_url: 'https://github.com/lnbits/napstr/releases/tag/v0.2.2', assets: ['Napstrfy_0.2.2_x64.exe', 'Napstr_0.2.2_x64.exe', 'Napstrfy_0.2.2_amd64.AppImage', 'Napstr_0.2.2_amd64.AppImage'].map((name) => ({ name, size: 1234567, browser_download_url: `https://github.com/lnbits/napstr/releases/download/v0.2.2/${name}` })) }) }));
+  await page.route('https://api.github.com/**', (route) => route.fulfill({ contentType: 'application/json', body: JSON.stringify({ tag_name: 'v0.2.2', html_url: `https://github.com/${RELEASE_REPOSITORY}/releases/tag/v0.2.2`, assets: ['Napstrfy_0.2.2_x64.exe', 'Napstr_0.2.2_x64.exe', 'Napstrfy_0.2.2_amd64.AppImage', 'Napstr_0.2.2_amd64.AppImage'].map((name) => ({ name, size: 1234567, browser_download_url: `https://github.com/${RELEASE_REPOSITORY}/releases/download/v0.2.2/${name}` })) }) }));
   await page.goto('http://127.0.0.1:15175/es/download.html');
   await expect(page.locator('[data-release-platform="windows"]').first()).toHaveAttribute('href', /Napstr_0.2.2_x64.exe$/);
   await expect(page.locator('#release-status')).toContainText('0.2.2');
@@ -564,9 +572,9 @@ test('Napstrfy downloads follow newly published assets and keep unavailable clie
   let clients = ['android.apk'];
   await page.route('https://api.github.com/**', (route) => route.fulfill({ json: {
     tag_name: `v${version}`,
-    html_url: `https://github.com/lnbits/napstr/releases/tag/v${version}`,
+    html_url: `https://github.com/${RELEASE_REPOSITORY}/releases/tag/v${version}`,
     assets: [...clients.map((client) => `Napstrfy_${version}_${client}`), `Napstr_${version}_x64.exe`].map((name) => ({
-      name, size: 1234567, browser_download_url: `https://github.com/lnbits/napstr/releases/download/v${version}/${name}`
+      name, size: 1234567, browser_download_url: `https://github.com/${RELEASE_REPOSITORY}/releases/download/v${version}/${name}`
     }))
   } }));
   await page.goto('http://127.0.0.1:15175/napstrfy.html');
@@ -580,7 +588,7 @@ test('Napstrfy downloads follow newly published assets and keep unavailable clie
   await page.reload();
   await expect(page.locator('#release-status')).toHaveText('Napstrfy 0.2.2 downloads are ready.');
   for (const [platform, file] of Object.entries({ windows: 'x64.exe', linux: 'amd64.AppImage', 'macos-arm64': 'aarch64.dmg', 'macos-intel': 'x64.dmg', 'napstrfy-android': 'android.apk' })) {
-    await expect(page.locator(`[data-release-platform="${platform}"]`)).toHaveAttribute('href', `https://github.com/lnbits/napstr/releases/download/v0.2.2/Napstrfy_0.2.2_${file}`);
+    await expect(page.locator(`[data-release-platform="${platform}"]`)).toHaveAttribute('href', `https://github.com/${RELEASE_REPOSITORY}/releases/download/v0.2.2/Napstrfy_0.2.2_${file}`);
     await expect(page.locator(`[data-release-version="${platform}"]`)).toHaveText('0.2.2');
   }
   await page.setViewportSize({ width: 390, height: 844 });
@@ -592,7 +600,7 @@ test('Napstrfy downloads retain a release-page fallback when GitHub is unavailab
   await page.route('https://api.github.com/**', (route) => route.fulfill({ status: 403, json: { message: 'API rate limit exceeded' } }));
   await page.goto('http://127.0.0.1:15175/napstrfy.html');
   await expect(page.locator('#release-status')).toHaveText('The automatic download list is temporarily unavailable.');
-  await expect(page.locator('#release-page')).toHaveAttribute('href', 'https://github.com/lnbits/napstr/releases/latest');
+  await expect(page.locator('#release-page')).toHaveAttribute('href', `https://github.com/${RELEASE_REPOSITORY}/releases/latest`);
   await expect(page.locator('[data-release-version="windows"]')).toHaveText('Unavailable');
   await expect(page.locator('[data-release-platform][href]')).toHaveCount(0);
 });
