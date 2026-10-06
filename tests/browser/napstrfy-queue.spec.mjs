@@ -160,14 +160,16 @@ test('a list that names one file twice still opens, as one row', async ({ page }
   const twice = [away, { ...away }, furtherAway];
   await openDiscoverApp(page, twice);
   await page.locator('.bottom-nav button[data-tab="search"]').click();
-  await page.locator('section[aria-label="Discover"] .track-open').first().click();
+  await page.locator('section[aria-label="Network Library"] .track-open').first().click();
 
   await openQueue(page);
   // A file is one thing however many entries name it, so the row is there once -
   // and the count is the count of files rather than of entries.
   await expect(page.locator('.queue-row', { hasText: 'Sharp Dressed Man' })).toHaveCount(1);
   await expect(page.locator('.queue-row', { hasText: 'Legs' })).toHaveCount(1);
-  await expect(page.locator('.queue-view')).toContainText('3 tracks');
+  // Two rows, not three: the list itself is one row per file, so the file the list
+  // named twice is in the queue once rather than once and a ghost.
+  await expect(page.locator('.queue-row')).toHaveCount(2);
 });
 
 async function addFoundTrack(page, result = found) {

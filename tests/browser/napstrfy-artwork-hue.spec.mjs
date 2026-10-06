@@ -147,7 +147,7 @@ test('the drawer takes its colour from the cover, not from the track', async ({ 
   // Red, and specifically not the app's own colour, which is what a cover with no
   // readable pixels leaves behind.
   await expect.poll(() => sheetHue(page)).toBe('5');
-  expect(await drawnFill(page)).toBe(await paintOf(page, 'hsl(5 100% 88%)'));
+  expect(await drawnFill(page)).toBe(await paintOf(page, 'hsl(5 100% 64%)'));
 });
 
 test('a cover with no colour in it leaves the app’s own colour in place', async ({ page }) => {
@@ -157,5 +157,5 @@ test('a cover with no colour in it leaves the app’s own colour in place', asyn
   // A grey sleeve has no colour to name, and the app does not invent one: the
   // fallback is its own, which is the violet it uses for everything else.
   await expect.poll(() => sheetHue(page)).toBe('247');
-  expect(await drawnFill(page)).toBe(await paintOf(page, 'hsl(247 100% 88%)'));
+  expect(await drawnFill(page)).toBe(await paintOf(page, 'hsl(247 100% 64%)'));
 });

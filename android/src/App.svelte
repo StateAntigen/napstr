@@ -2605,25 +2605,36 @@
    * next one is fetched - and the pre-load depth is what starts the asks early
    * enough to use it.
    *
-   * `leadOwned` puts one of those tracks in front as well, because a chip is a
-   * press that expects to make a sound: without it the first thing heard is the
-   * first thing fetched, which is minutes away. Tapping a row does not, because a
-   * tap on a row means that row.
+   * The rows go after whatever is already queued rather than being mixed into it: a
+   * run of the network's music is a run of the network's music, and nobody who asked
+   * for one asked for their own records dealt between it. A hosted file that is not
+   * ready when its turn comes is covered by the runway, which is chosen then, from
+   * what this phone holds - see `pullQueueEntry`.
    */
-  function runDiscover(start: number, leadOwned = false) {
-    const list = discoverRows;
+  function playDiscoverList() {
+    queueDiscover(discoverRows, discoverRows[0]?.fileId ?? '');
+  }
+
+  /**
+   * Put a list from the network behind the queue this phone already has, and start.
+   *
+   * The list keeps its own order, which for a chip is the ranking the computer
+   * answered with and for a shuffle is the shuffle itself. What was already queued
+   * stays in front of it, less any row this list names: the queue is keyed by file,
+   * and a file named twice is a list Svelte refuses to draw at all.
+   */
+  function queueDiscover(list: RemoteTrack[], startFileId: string) {
     if (list.length === 0) return;
-    const first = list[Math.min(Math.max(start, 0), list.length - 1)];
-    const lead = leadOwned ? randomOwnedTrack(list) : null;
-    playerQueue = [...(lead ? [lead] : []), ...withOwnRunway(list, lead ? [lead] : [])];
+    const named = new Set(list.map((track) => track.fileId));
+    playerQueue = [...playerQueue.filter((item) => !named.has(item.fileId)), ...list];
     // The queue is this phone's own list rather than the library, and the flag is
     // what the computer caches the audio by - so it says which of the two this is.
     playerQueueLibraryVisible = true;
-    playerIndex = playerQueue.findIndex((item) => item.fileId === (lead ?? first).fileId);
+    playerIndex = Math.max(0, playerQueue.findIndex((item) => item.fileId === startFileId));
     resetRandomOrder();
     // The queue was built here, so it is kept: a track that has to be fetched must
     // not lose the list it is part of when its bytes land.
-    void activateTrack(playerQueue[Math.max(0, playerIndex)], true);
+    void activateTrack(playerQueue[playerIndex], true);
   }
 
   /**
@@ -2650,11 +2661,14 @@
    * nobody holds, which is where the records worth finding are, and where the
    * waits are. Nothing is promised about it arriving: the runway and the
    * substitution are what keep a slow file from stopping the music.
+   *
+   * It changes the list and stops there. Playing it is the button beside the title,
+   * because a chip is a way of looking at the network rather than a decision to
+   * spend the next hour on it.
    */
   async function startDigging() {
     discoverShuffling = false;
     await ensureDiscover('leastSeeded');
-    runDiscover(0, true);
   }
 
   /**
@@ -2668,12 +2682,11 @@
     discoverShuffling = true;
     discoverShuffleSeed += 1;
     await ensureDiscover('mostSeeded');
-    runDiscover(0, true);
   }
 
   /** A row of the list is somebody choosing where in the list to start listening. */
   function openDiscoverRow(track: RemoteTrack) {
-    runDiscover(discoverRows.findIndex((item) => item.fileId === track.fileId));
+    queueDiscover(discoverRows, track.fileId);
   }
 
   /**
@@ -2690,42 +2703,6 @@
     const spare = tracks.filter((track) => mayBeChosen(track) && !named.has(track.fileId));
     if (spare.length === 0) return null;
     return spare[Math.floor(Math.random() * spare.length)];
-  }
-
-  /**
-   * The list with one owned track after each of its own, so every network file has
-   * something to be fetched behind.
-   *
-   * Each track of ours is used at most once, and never one the run already names.
-   * The queue is keyed by file and Svelte refuses to draw a list that names one
-   * twice - so a run longer than this phone's library, which is the ordinary case,
-   * did not merely run out of fillers: it lost the whole queue, and the drawer
-   * could not be opened at all.
-   *
-   * `exclude` is a track already placed elsewhere - the one a Play all put in front
-   * of the run - so it is not placed twice.
-   *
-   * Nothing is invented when there is nothing to spare: a library with no tracks
-   * left over leaves the rest of the run network-to-network, and the waits are the
-   * waits.
-   */
-  function withOwnRunway(discovery: RemoteTrack[], exclude: RemoteTrack[] = []): RemoteTrack[] {
-    const taken = new Set([...discovery, ...exclude].map((track) => track.fileId));
-    const owned = tracks.filter((track) => mayBeChosen(track) && !taken.has(track.fileId));
-    // Shuffled, so a long run is not filled by the same handful of records - and
-    // properly, rather than by sorting on a coin toss.
-    for (let index = owned.length - 1; index > 0; index -= 1) {
-      const swap = Math.floor(Math.random() * (index + 1));
-      [owned[index], owned[swap]] = [owned[swap], owned[index]];
-    }
-    const mixed: RemoteTrack[] = [];
-    let next = 0;
-    discovery.forEach((track, index) => {
-      mixed.push(track);
-      if (index + 1 < discovery.length && next < owned.length) mixed.push(owned[next]);
-      if (next < owned.length) next += 1;
-    });
-    return mixed;
   }
 
   // Asked when the search tab is opened on nothing, which is where the network's
@@ -4957,6 +4934,18 @@
   let libraryAlbums = $derived(albumsFromTracks(tracks));
   /** Search results grouped the way the results view presents them. */
   let resultArtists = $derived(artistsFromTracks(tracks));
+  /**
+   * The playlists a search answers with, by their names.
+   *
+   * Lists are what people search for as often as records are, and the playlists
+   * this phone knows about are already in hand, so nothing here is fetched: a
+   * search says what it holds rather than what the network might have.
+   */
+  let searchedPlaylists = $derived(
+    query.trim()
+      ? playlists.filter((row) => row.title.toLowerCase().includes(query.trim().toLowerCase()))
+      : []
+  );
   let searching = $derived(Boolean(query.trim()) && !showingLikedMusic);
 
   let lastPlayed = $derived(
@@ -7389,10 +7378,15 @@
               <i class="away" style={`--host-hue:${hostHue(computer.endpointId)}`}></i>
             {/each}
           </span>
-          <span>{$t(statusLabel())}{status.streamOnly ? $t(" · Read only") : ''}</span>
+          <span>{$t(statusLabel())}</span>
         </button>
       {:else}
         <button class="status-chip offline" onclick={showMusic}><i></i><span>{$t("Pair Napstr")}</span></button>
+      {/if}
+      <!-- How much this phone's computers are hosting, in the middle of the bar:
+           the library is not a page, it is what every page here is drawn from. -->
+      {#if status.paired && activeTab === 'music' && !showingLikedMusic}
+        <span class="header-count">{$t(total === 1 ? "{p0} hosted track" : "{p0} hosted tracks", { p0: total })}</span>
       {/if}
       <button class="header-icon" onclick={() => (showSettings = true)} aria-label={$t("Settings")}>
         <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -7429,7 +7423,7 @@
         </section>
         <div class="chips-row"><div class="chips"><button class:active={showingLikedMusic} onclick={showLikedTracks}>{$t("♥ Liked")}</button>{#each musicChips as chip}<button class:active={!showingLikedMusic && query.toLocaleLowerCase() === chip.toLocaleLowerCase()} onclick={() => selectChip(chip)}>{chip}</button>{/each}</div></div>
   
-        {#if searching && (resultArtists.length > 0 || libraryAlbums.length > 0)}
+        {#if searching && (resultArtists.length > 0 || searchedPlaylists.length > 0 || libraryAlbums.length > 0)}
           <section class="album-shelves">
             {#if resultArtists.length > 0}
               <div class="album-shelf-block">
@@ -7448,6 +7442,26 @@
                 </div>
               </div>
             {/if}
+            {#if searchedPlaylists.length > 0}
+              <div class="album-shelf-block">
+                <div class="section-label"><b>{$t("Playlists")}</b><span>{searchedPlaylists.length} {$t("in these results")}</span></div>
+                <div class="album-shelf">
+                  {#each searchedPlaylists as playlist (playlist.author + playlist.playlistId)}
+                    <div class="album-card">
+                      <button class="album-open" onclick={() => void openPlaylistFromHome(playlist)} aria-label={`${$t("Open the playlist")} ${playlist.title}`}>
+                        {#if playlistRowTrack(playlist)}
+                          <TrackArtwork track={playlistRowTrack(playlist) as RemoteTrack} lookup />
+                        {:else}
+                          <span class="card-art-empty" aria-hidden="true">♪</span>
+                        {/if}
+                      </button>
+                      <strong>{playlist.title}</strong>
+                      <small>{playlist.trackCount} {$t("Tracks")}</small>
+                    </div>
+                  {/each}
+                </div>
+              </div>
+            {/if}
             {#if libraryAlbums.length > 0}
               <div class="album-shelf-block">
                 <div class="section-label"><b>{$t("Albums")}</b><span>{libraryAlbums.length} {$t("in these results")}</span></div>
@@ -7456,7 +7470,6 @@
                     <div class="album-card">
                       <button class="album-open" onclick={() => void openAlbum(album)} aria-label={`Open ${album.album} by ${album.artist || 'an unknown artist'}`}>
                         <TrackArtwork track={album.representative} lookup />
-                        <span class="album-play" aria-hidden="true">▶</span>
                       </button>
                       <strong>{album.album}</strong>
                       <small>{album.artist || 'Unknown artist'}</small>
@@ -7472,8 +7485,22 @@
                eyebrow above it and no line under it: what the page holds is the
                network's own list, which is the one thing the chips below start. -->
           <section class="library-heading">
-            <div><h1>{$t("Discover")}</h1></div>
-            <span>{discoverTotal} {$t("live on the network")}</span>
+            <div class="discover-title">
+              <h1>{$t("Network Library")}</h1>
+              <small>{$t("Tracks hosted across the peer-to-peer network")}</small>
+              <small class="discover-note">{$t("Each track buffers before it plays.")}</small>
+            </div>
+            <!-- The one thing here that starts anything: the list above is the
+                 network's, and pressing this puts all of it in the queue. -->
+            <button
+              class="discover-start"
+              onclick={playDiscoverList}
+              disabled={!mayDownload || discoverRows.length === 0}
+              aria-label={$t("Play")}
+              title={$t("Play")}
+            >
+              <span class="icon-play"></span>
+            </button>
           </section>
           {#if discoverTracks.length > 0}
             <!-- What the network has, above the library it is not. The rows are
@@ -7483,7 +7510,7 @@
               <button class="discover-play" class:active={!discoverShuffling && discoverListMode === 'leastSeeded'} onclick={() => void startDigging()} disabled={!mayDownload}>{$t("Crate Digging")}</button>
               <button class="discover-play" class:active={discoverShuffling} onclick={() => void startRandom()} disabled={!mayDownload}>{$t("Random")}</button>
             </div>
-            <section class="track-list" role="list" aria-label={$t("Discover")} aria-busy={discoverLoading}>
+            <section class="track-list" role="list" aria-label={$t("Network Library")} aria-busy={discoverLoading}>
               {#each discoverRows as track (track.fileId)}
                 {@render trackRow(track, openDiscoverRow)}
               {/each}
@@ -7518,8 +7545,6 @@
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6.5 6.5l11 11" /><path d="M17.5 6.5l-11 11" /></svg>
               </button>
             </div>
-          {:else}
-            <span>{total} {total === 1 ? 'track' : 'tracks'}</span>
           {/if}
         </section>
   
@@ -7533,7 +7558,6 @@
                     <div class="album-card">
                       <button class="album-open" onclick={() => void openAlbum(album)} aria-label={`Open ${album.album} by ${album.artist || 'an unknown artist'}`}>
                         <TrackArtwork track={album.representative} lookup />
-                        <span class="album-play" aria-hidden="true">▶</span>
                       </button>
                       <strong>{album.album}</strong>
                       <small>{album.artist || 'Unknown artist'}</small>
@@ -7570,7 +7594,6 @@
                     <div class="album-card">
                       <button class="album-open" onclick={() => void openAlbum(album)} aria-label={`Open ${album.album} by ${album.artist || 'an unknown artist'}`}>
                         <TrackArtwork track={album.representative} lookup />
-                        <span class="album-play" aria-hidden="true">▶</span>
                       </button>
                       <strong>{album.album}</strong>
                       <small>{album.artist || 'Unknown artist'}</small>
@@ -8409,7 +8432,6 @@
       </button>
     </header>
     <div class="settings-scroll">
-      {#if status.streamOnly}<p class="settings-note">{$t("This pairing cannot sign or publish anything in your name.")}</p>{/if}
       {#if status.paired && !status.mayDownload}<p class="settings-note">{$t("This pairing cannot ask Napstr to download from the network.")}</p>{/if}
 
       {#if status.paired}
@@ -8745,7 +8767,6 @@
               <div class="album-card">
                 <button class="album-open" onclick={() => void openAlbum(album)} aria-label={`Open ${album.album}`}>
                   <TrackArtwork track={album.representative} lookup />
-                  <span class="album-play" aria-hidden="true">▶</span>
                 </button>
                 <strong>{album.album}</strong>
                 <small>{album.artist || 'Unknown artist'}</small>

@@ -75,6 +75,11 @@ audio { display: none; }
 .status-chip i { flex: 0 0 auto; width: 7px; height: 7px; border-radius: 50%; background: #38d366; box-shadow: 0 0 6px #38d366; }
 .status-chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .status-chip.offline { color: #d8bd9e; }.status-chip.offline i { background: #ff9b3f; box-shadow: 0 0 6px #ff9b3f; }
+/* How many tracks this phone's computer is hosting, in the middle of the header bar:
+   it is about the library as a whole rather than about the page under it, and the bar
+   is the one place with nothing in it. Centred by position, so the chip and the button
+   either side keep the ends to themselves. */
+.header-count { position: absolute; left: 50%; transform: translateX(-50%); color: #85858d; font-size: 12px; white-space: nowrap; }
 .header-icon { width: 40px; height: 40px; padding: 0; flex: 0 0 auto; display: grid; place-items: center; color: #b9b9c4; background: transparent; border: 0; }
 .header-icon svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
 .nav-icon svg { width: 28px; height: 28px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
@@ -110,6 +115,16 @@ audio { display: none; }
 .track-badge svg { width: 22px; height: 22px; flex: 0 0 auto; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
 .track-badge b { font-size: 11px; font-weight: 700; font-variant-numeric: tabular-nums; }
 .track-badge.phone { color: #85e89b; }.track-badge.computer { color: #8fb7ff; }.track-badge.network { color: #c3beff; }
+/* The seeder count sits inside the seed rather than beside it: the badge is a grain,
+   filled, with the digits knocked out of it. The grain is laid flat so the number has
+   the length of it to sit in, and a row nobody is seeding is an empty outline - "0
+   seeders" is not something a row should say out loud. */
+.track-badge.network { position: relative; gap: 0; }
+.track-badge.network svg { width: 30px; height: 30px; stroke-width: 1.7; }
+.track-badge.network svg .fill { fill: currentColor; stroke: none; }
+.track-badge.network b { position: absolute; inset: 0; display: grid; place-items: center; font-size: 11px; color: #12121a; }
+.track-badge.network.nothing { color: #6a6a80; }
+.track-badge.network.nothing svg .frame { stroke-dasharray: 2.4 2.2; }
 .track-badge.pending { color: #8fb7ff; }
 .track-badge.pending i { width: 17px; height: 17px; border: 2px solid rgba(255,255,255,.2); border-top-color: currentColor; border-radius: 50%; animation: spin .8s linear infinite; }.like-button { width: 38px; height: 38px; padding: 0; flex: 0 0 38px; color: #b3b3bb; background: transparent; border: 0; border-radius: 50%; font-size: 23px; line-height: 1; }.like-button.liked { color: #ff5576; }.like-button:active { background: rgba(255,255,255,.1); transform: scale(.94); }
 /* The same vertical ellipsis the album track list carries, so the row's menu
@@ -386,8 +401,8 @@ audio { display: none; }
    album glow are built from. Only the hue moves - lightness and saturation are fixed -
    so the edge between played and unplayed reads whatever the album's colours are, and
    the fallback is the purple the track-discussion card uses. */
-.now-sheet-wave path { fill: rgba(255,255,255,.2); }
-.now-sheet-wave path.played { fill: hsl(var(--cover-hue, 247) 100% 88%); }
+.now-sheet-wave path { fill: rgba(255,255,255,.14); }
+.now-sheet-wave path.played { fill: hsl(var(--cover-hue, 247) 100% 64%); }
 /* The exact edge, where the played colour meets the rest. */
 .now-sheet-wave .head { stroke: rgba(255,255,255,.9); stroke-width: 2; vector-effect: non-scaling-stroke; }
 .now-sheet-timeline.waves input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; }
@@ -455,6 +470,14 @@ svg .filled { fill: currentColor; stroke: none; }
    answering - what everyone has, or what almost nobody does - is not something a
    person should have to remember from the last press. */
 .discover-chips { padding: 2px 20px 10px; display: flex; gap: 9px; }
+/* The network's own title block: what these tracks are, and the one thing that starts
+   them. None of it is the library, so none of it is in the library's own heading. */
+.discover-title { display: grid; gap: 3px; }
+.discover-title small { color: #8d8d99; font-size: 12px; }
+.discover-title small.discover-note { color: #6f6f7a; font-size: 11px; }
+.discover-start { width: 46px; height: 46px; padding: 0; flex: 0 0 auto; display: grid; place-items: center; color: #0d0d10; background: #c9c2ff; border: 0; border-radius: 50%; font-size: 18px; }
+.discover-start:active { background: #ded9ff; transform: scale(.96); }
+.discover-start:disabled { color: #6a6a75; background: #26262e; }
 .discover-play { padding: 8px 15px; color: #b9b3ff; background: #1e1c33; border: 1px solid #34305a; border-radius: 16px; font-size: 12px; font-weight: 700; letter-spacing: .03em; }
 .discover-play.active { color: #0b0b0f; background: #c9c2ff; border-color: #c9c2ff; }
 .discover-play:disabled { color: #6a6a75; background: #26262e; border-color: #313139; }

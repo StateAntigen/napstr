@@ -9,6 +9,12 @@
   import type { RemoteTrack } from './types';
   import { hostHue } from './hosts';
 
+  /**
+   * A grain of seed: pointed at both ends, no round end anywhere. What a seeder
+   * is, in one shape, and wide enough once laid flat for a count to sit inside it.
+   */
+  const GRAIN = 'M12 2.8Q18.2 7.6 18.2 12.2 18.2 16.8 12 21.2 5.8 16.8 5.8 12.2 5.8 7.6 12 2.8Z';
+
   let { track, cached = false, pending = false, host = '', hostName = '' }: {
     track: RemoteTrack;
     cached?: boolean;
@@ -47,13 +53,18 @@
 {:else}
   <span
     class="track-badge network"
+    class:nothing={track.sources.length === 0}
     role="img"
     aria-label={`${track.sources.length} ${track.sources.length === 1 ? 'seeder' : 'seeders'} on the network`}
   >
+    <!-- The count is inside the grain rather than beside it, and the grain is laid
+         flat so the digits have its length to sit in. -->
     <svg viewBox="0 0 24 24" aria-hidden="true">
-      <circle class="filled" cx="12" cy="12" r="2.3" />
-      <path d="M6.6 17.4a7.6 7.6 0 0 1 0-10.8" /><path d="M17.4 6.6a7.6 7.6 0 0 1 0 10.8" />
+      <g transform="rotate(90 12 12)">
+        <path class="frame" d={GRAIN} />
+        {#if track.sources.length > 0}<path class="fill" d={GRAIN} />{/if}
+      </g>
     </svg>
-    <b>{track.sources.length}</b>
+    {#if track.sources.length > 0}<b>{track.sources.length}</b>{/if}
   </span>
 {/if}
