@@ -4157,14 +4157,63 @@ impl NetworkService {
     ) -> Result<String, String> {
         let event = crate::device_account::to_event(&event)?;
         let event_id = event.id.to_hex();
-        self.client
+        let kind = event.kind;
+        let client = self
+            .client
             .read()
             .await
             .clone()
-            .ok_or("Nostr is not connected")?
+            .ok_or("Nostr is not connected")?;
+        let output = client
             .send_event(&event)
             .await
             .map_err(|error| format!("publication failed: {error}"))?;
+        // The rule every other send here follows: one relay taking it is the event
+        // being on the network, and a relay that was slow or refused is not a
+        // failure. This used to take `send_event`'s own answer for the whole truth,
+        // so a comment five relays had already accepted was reported to the phone as
+        // a failure the moment a sixth did not answer in time.
+        if output.success.is_empty() {
+            return Err(relay_failure(
+                "what this phone signed was refused by every relay",
+                &output.failed,
+            ));
+        }
+        // Kept here as well as sent. The phone's own key signed it, so waiting for a
+        // relay to echo it back before either side admits it exists is waiting for
+        // nothing: the conversation it belongs to is on this computer.
+        let _ = client.database().save_event(&event).await;
+        if kind == Kind::from(TROLLBOX_MESSAGE_KIND) {
+            if let Some(topic) = event
+                .tags
+                .iter()
+                .find(|tag| tag.kind() == TagKind::t())
+                .and_then(|tag| tag.content())
+                .map(str::to_string)
+            {
+                if topic == TROLLBOX_HASHTAG {
+                    let _ = self.cache_trollbox_event(event.clone()).await;
+                }
+                // Whoever has the conversation open hears that something landed.
+                let _ = self.app_handle.emit(PUBLIC_CHAT_EVENT, topic);
+            }
+        }
+        if kind == Kind::from(playlist::PLAYLIST_KIND) {
+            // Read back the way this computer reads any playlist, so what it holds
+            // and what the relays hold cannot be two opinions about one list - and so
+            // a playlist this phone published stops being a draft here. Without this
+            // the phone knew it was published and the computer went on offering to
+            // publish it, which is what the row in the database showed.
+            if let Some(playlist::PlaylistEvent::Playlist(read_back)) =
+                playlist::playlist_event(&event)
+            {
+                let stored = RemotePlaylist {
+                    total: read_back.tracks.len(),
+                    ..*read_back
+                };
+                playlist::save(&super::open_connection(&self.db_path)?, &stored)?;
+            }
+        }
         Ok(event_id)
     }
 
