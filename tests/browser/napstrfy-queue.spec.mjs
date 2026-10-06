@@ -132,6 +132,44 @@ async function openQueue(page) {
 }
 
 /** Add a search result from its own ⋮ menu. */
+/**
+ * The phone, with the network's own list as the only thing worth playing.
+ *
+ * That list is other people's catalogue entries, so one file can be reachable
+ * through two of them.
+ */
+async function openDiscoverApp(page, discovered) {
+  // One track of this phone's own, so the run has a runway to place - and one the
+  // network's list does not name, so it stays that.
+  const library = [first];
+  await mockNative(page, { platform: 'android' });
+  await page.route('**/fixture.wav', serveAudio);
+  await page.addInitScript(({ library, discovered }) => {
+    window.remoteLibrary = library;
+    window.discoverTracks = discovered;
+  }, { library, discovered });
+  await page.goto('http://127.0.0.1:15174');
+}
+
+test('a list that names one file twice still opens, as one row', async ({ page }) => {
+  // The whole list used to refuse to draw for a list like this - the network's
+  // rows, and the playlist built from them - since both are drawn keyed by file
+  // and a keyed list that names one file twice is a list Svelte will not draw at
+  // all. Nothing said so: the section was simply not there, and the playlist was
+  // not there either.
+  const twice = [away, { ...away }, furtherAway];
+  await openDiscoverApp(page, twice);
+  await page.locator('.bottom-nav button[data-tab="search"]').click();
+  await page.locator('section[aria-label="Discover"] .track-open').first().click();
+
+  await openQueue(page);
+  // A file is one thing however many entries name it, so the row is there once -
+  // and the count is the count of files rather than of entries.
+  await expect(page.locator('.queue-row', { hasText: 'Sharp Dressed Man' })).toHaveCount(1);
+  await expect(page.locator('.queue-row', { hasText: 'Legs' })).toHaveCount(1);
+  await expect(page.locator('.queue-view')).toContainText('3 tracks');
+});
+
 async function addFoundTrack(page, result = found) {
   await page.locator('.bottom-nav button[data-tab="search"]').click();
   const input = page.getByRole('textbox', { name: 'Search tracks', exact: true });

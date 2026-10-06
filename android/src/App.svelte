@@ -20,11 +20,12 @@
   import SeekIcon from './lib/SeekIcon.svelte';
   import { rateLimitedTask, safePosition, validDuration } from './lib/playback';
   import { AUDIO_FORMATS, BITRATE_CHOICES, activeProfile, fitsProfile, readQuality, writeQuality, type QualityProfile } from './lib/quality';
-import { playedBars, waveformPeaks } from './lib/waveform';
+  import { playedBars, waveformShape, type WaveBar } from './lib/waveform';
+  import { dedupeByFile } from './lib/tracks';
   import { PRELOAD_DEPTHS, readPreloadDepth, storePreloadDepth } from './lib/preload';
   import { meteredNow, watchNetwork } from './lib/network';
   import appIcon from '../src-tauri/icons/icon.png';
-  import { artworkHue, coverFor, coverKey, invalidateCoverNegatives, loadFullCover, preloadArtwork, type AlbumCover } from './lib/artwork';
+  import { coverFor, coverHueOf, coverHueRevision, coverKey, invalidateCoverNegatives, loadFullCover, placeholderHue, preloadArtwork, rememberCoverHue, type AlbumCover } from './lib/artwork';
   import { reportReasons } from './lib/types';
   import { hostHue } from './lib/hosts';
   import type { AudiobookLibraryPage, CachedAudio, CarryReport, CompanionStatus, CoverReport, LibraryPage, NostrIdentity, PlaybackCommand, PlaylistPage, PodcastDownload, PodcastEpisode, PodcastFeed, ReadOnlyTicketOffer, RemoteAudiobook, RemoteAudiobookSummary, RemoteDiscussionMessage, RemoteHost, RemotePlaybackState, RemotePlaylist, RemotePlaylistCoordinate, RemotePlaylistSummary, RemotePlaylistTrack, RemoteRepeat, RemoteTrack, RemoteTransfer, ReportReason } from './lib/types';
@@ -1043,6 +1044,28 @@ import { playedBars, waveformPeaks } from './lib/waveform';
    */
   let shownTrack = $derived(playbackTarget === 'desktop' ? desktopTrackFromState() : current);
   let shownPlaying = $derived(playbackTarget === 'desktop' ? remoteState?.playing === true : playing);
+  /**
+   * The hue the player drawer is tinted with.
+   *
+   * Read out of this track's cover if that cover has been on screen, and the app's
+   * own colour otherwise - which is also the answer for a sleeve with no colour in
+   * it. Reading the revision is what makes this recompute when a cover is read, so
+   * the tint arrives with the picture rather than after a reload.
+   */
+  let sheetHue = $derived.by(() => {
+    void $coverHueRevision;
+    return coverHueOf(shownTrack?.fileId ?? '') ?? 247;
+  });
+  /** The same question for the album view's glow, which is behind that album's art. */
+  let albumHue = $derived.by(() => {
+    void $coverHueRevision;
+    return coverHueOf(albumView?.tracks[0]?.fileId ?? '') ?? 247;
+  });
+  /** And for the discussion view's glow, which is behind the same track's art. */
+  let discussionHue = $derived.by(() => {
+    void $coverHueRevision;
+    return coverHueOf(discussionTrack?.fileId ?? '') ?? 247;
+  });
   let shownPosition = $derived(playbackTarget === 'desktop' ? remotePositionMs() / 1000 : currentTime);
   let shownDuration = $derived(playbackTarget === 'desktop' ? (remoteState?.durationMs ?? 0) / 1000 : duration);
   /** The length the audio itself reported: what can honestly be sought and published. */
@@ -1068,11 +1091,13 @@ import { playedBars, waveformPeaks } from './lib/waveform';
   /**
    * How many bars the track's shape is drawn in.
    *
-   * Enough to see where the quiet and the loud parts are, few enough that a bar is
-   * a shape rather than a pixel - and few enough that redrawing the played part of
-   * it costs nothing on a phone.
+   * Enough to see where the quiet and the loud parts are, and few enough that
+   * redrawing the played part of it costs nothing on a phone. Dense enough, too,
+   * that the shape reads as one envelope rather than as a comb: six hundred bars
+   * across a phone's width are barely a device pixel each, which is where the bars
+   * stop reading as bars and the track starts reading as a shape.
    */
-  const WAVEFORM_BARS = 140;
+  const WAVEFORM_BARS = 600;
   /**
    * The rate the file is decoded at, which is nothing like the rate it plays at.
    *
@@ -1086,7 +1111,7 @@ import { playedBars, waveformPeaks } from './lib/waveform';
   let mediaSource = $state('');
   /** The bars for the file the drawer is showing, and which file they belong to. */
   let waveformFor = $state('');
-  let waveformBars = $state<number[]>([]);
+  let waveformBars = $state<WaveBar[]>([]);
   /**
    * Shapes already worked out, by file, for as long as the app is running.
    *
@@ -1094,7 +1119,7 @@ import { playedBars, waveformPeaks } from './lib/waveform';
    * to the audio it describes - and a track replayed, scrubbed over, or returned
    * to after the drawer was closed comes back instantly rather than decoded twice.
    */
-  const waveformCache = new Map<string, number[]>();
+  const waveformCache = new Map<string, WaveBar[]>();
   /**
    * Files whose shape has been asked for, whether or not it arrived.
    *
@@ -1110,16 +1135,60 @@ import { playedBars, waveformPeaks } from './lib/waveform';
   );
   /** How many of those bars are behind the play-head. */
   let waveformPlayed = $derived(playedBars(barProgress, WAVEFORM_BARS));
-  /** The playlist the drawer would open: this phone's, or the copy of theirs. */
-  let shownQueue = $derived(playbackTarget === 'desktop' ? remoteQueue : playerQueue);
-  /** The row the playlist marks as playing, or -1 when that cannot be trusted. */
-  let shownQueueIndex = $derived(
-    playbackTarget === 'desktop'
-      ? remoteQueue.length === (remoteState?.queueLen ?? 0)
-        ? remoteState?.queueIndex ?? -1
-        : -1
-      : playerIndex
-  );
+  /**
+   * The whole shape as one closed path: along the loud edge, back along the quiet one.
+   *
+   * Built here rather than in the markup because it is six hundred points either way,
+   * and it only changes when the track does. The played part is the same path drawn
+   * again inside a clip, so the two halves cannot disagree about where the line
+   * between them is.
+   */
+  let waveformPath = $derived.by(() => {
+    if (waveformBars.length === 0) return '';
+    const points: string[] = [];
+    waveformBars.forEach((bar, index) => {
+      points.push(`${index === 0 ? 'M' : 'L'}${index + 0.5} ${((1 - bar.high) / 2).toFixed(4)}`);
+    });
+    for (let index = waveformBars.length - 1; index >= 0; index -= 1) {
+      points.push(`L${index + 0.5} ${((1 - waveformBars[index].low) / 2).toFixed(4)}`);
+    }
+    points.push('Z');
+    return points.join(' ');
+  });
+  /**
+   * The playlist the drawer would open: this phone's, or the copy of theirs.
+   *
+   * One row per file, whatever list it was built from. The rows are drawn keyed by
+   * file id because a row is a file, and a keyed list that names one file twice is
+   * a list Svelte refuses to draw at all - which is not a row out of place, it is
+   * the whole drawer failing to open, silently, on every press.
+   *
+   * A repeat is reachable from several directions - a shuffled library paged while
+   * its files were still arriving, the network's own list naming one file once per
+   * holder, the computer's queue naming one copy per file - so the repeat is
+   * dropped here rather than trusted not to arrive.
+   */
+  let shownQueue = $derived(dedupeByFile(playbackTarget === 'desktop' ? remoteQueue : playerQueue));
+  /**
+   * The row the playlist marks as playing, or -1 when that cannot be trusted.
+   *
+   * Asked of the file rather than of the position, because the list above may have
+   * dropped a repeat before it: a position is the same row only while no row was
+   * dropped, and "the row that is playing" is not a thing to be wrong about.
+   */
+  let shownQueueIndex = $derived.by(() => {
+    if (playbackTarget === 'desktop') {
+      // The computer's position only describes this list while this list is the
+      // length the computer says it is: one that has moved on since is describing
+      // rows this phone does not have, and a wrong row is worse than no row.
+      if (remoteQueue.length !== (remoteState?.queueLen ?? 0)) return -1;
+      const at = remoteState?.queueIndex ?? -1;
+      const playing = at >= 0 ? remoteQueue[at]?.fileId : undefined;
+      return playing ? shownQueue.findIndex((item) => item.fileId === playing) : -1;
+    }
+    const playing = playerQueue[playerIndex]?.fileId;
+    return playing ? shownQueue.findIndex((item) => item.fileId === playing) : -1;
+  });
   let shownShuffle = $derived(playbackTarget === 'desktop' ? remoteState?.shuffle === true : shuffle);
   let shownLoopActive = $derived(
     playbackTarget === 'desktop' ? (remoteState?.repeat ?? 'off') !== 'off' : loopMode !== 'off'
@@ -2458,11 +2527,18 @@ import { playedBars, waveformPeaks } from './lib/waveform';
    * The order is the order the queue will be built in, because these rows are
    * what a press on a chip sends to the player: what a person sees is what they
    * get. Shuffling here rather than only in the queue is the whole difference.
+   *
+   * One row per file, because the rows are drawn keyed by file: a file the list
+   * names twice is the whole list failing to draw, and the network's list names
+   * one file once per catalogue entry, which is what a network does rather than
+   * a mistake in it. The repeat is dropped where the list is chosen.
    */
   let discoverRows = $derived(
-    discoverShuffling
-      ? shuffled(discoverTracks.filter(isDiscoverable), networkDiscoverSeed + discoverShuffleSeed)
-      : discoverTracks.filter(isDiscoverable)
+    dedupeByFile(
+      discoverShuffling
+        ? shuffled(discoverTracks.filter(isDiscoverable), networkDiscoverSeed + discoverShuffleSeed)
+        : discoverTracks.filter(isDiscoverable)
+    )
   );
 
   /**
@@ -2677,7 +2753,12 @@ import { playedBars, waveformPeaks } from './lib/waveform';
         shuffleSeed: libraryShuffleSeed
       });
       if (viewVersion !== musicViewVersion) return;
-      tracks = append ? [...tracks, ...page.tracks] : page.tracks;
+      // One row per file. The pages are not a fixed set: the order is a
+      // permutation of a library that is still arriving, so a page asked for
+      // after a file has landed can name what an earlier page already did. A
+      // repeat here is a duplicate row nobody can tell from two copies of one
+      // song, and a playlist built from it is a list that does not draw at all.
+      tracks = dedupeByFile(append ? [...tracks, ...page.tracks] : page.tracks);
       total = page.total;
       loadedLibraryRevision = status.libraryRevision;
       if (!selected || !tracks.some((track) => track.fileId === selected?.fileId)) selected = tracks[0] ?? null;
@@ -5207,6 +5288,10 @@ import { playedBars, waveformPeaks } from './lib/waveform';
    * decode, a webview that refuses another audio context, and a fetch that never
    * answers all end in the same place - the plain bar the drawer had before there
    * was a waveform - so there is nothing to report when one of them happens.
+   *
+   * The bytes come from this phone's own loopback server, so the one thing that can
+   * stop this before a decode is attempted at all is the window's own policy: its
+   * `connect-src` has to name that address, which is what `tauri.conf.json` does.
    */
   async function loadWaveform(fileId: string, url: string) {
     if (!url || waveformAsked.has(fileId)) return;
@@ -5217,11 +5302,11 @@ import { playedBars, waveformPeaks } from './lib/waveform';
       // One channel at a low rate: the same shape, a fraction of the memory, and
       // all of it thrown away as soon as the bars are counted.
       const decoded = await new OfflineAudioContext(1, 1, WAVEFORM_SAMPLE_RATE).decodeAudioData(bytes);
-      const peaks = waveformPeaks(decoded.getChannelData(0), WAVEFORM_BARS);
-      waveformCache.set(fileId, peaks);
+      const shape = waveformShape(decoded.getChannelData(0), WAVEFORM_BARS);
+      waveformCache.set(fileId, shape);
       if (current?.fileId === fileId) {
         waveformFor = fileId;
-        waveformBars = peaks;
+        waveformBars = shape;
       }
     } catch {
       // The fallback is what was on screen a moment ago, so this is not a failure
@@ -7609,7 +7694,7 @@ import { playedBars, waveformPeaks } from './lib/waveform';
           <div
             class="album-view playlist-sheet"
             class:desktop={desktopShell}
-            style={`--cover-hue:${artworkHue(playlistMembers[0]?.fileId ?? playlistDraft.playlistId)}`}
+            style={`--cover-hue:${coverHueOf(playlistMembers[0]?.fileId ?? '') ?? placeholderHue(playlistMembers[0]?.fileId ?? playlistDraft.playlistId)}`}
             role="dialog"
             aria-modal="true"
             aria-label={playlistDraft.title || $t("Playlist")}
@@ -7626,7 +7711,17 @@ import { playedBars, waveformPeaks } from './lib/waveform';
             <div class="album-scroll playlist-view" onscroll={onPlaylistScroll} bind:this={playlistScroller}>
               <div class="album-art">
                 {#if playlistThumb}
-                  <img class="album-art-backdrop" src={playlistThumb} alt="" aria-hidden="true" />
+                  <!-- The first member's cover, which is where this page's colour
+                       comes from as well as its picture. -->
+                  {@const playlistArtOf = playlistMembers[0]?.fileId ?? ''}
+                  <img
+                    class="album-art-backdrop"
+                    src={playlistThumb}
+                    alt=""
+                    aria-hidden="true"
+                    crossorigin="anonymous"
+                    onload={(event) => rememberCoverHue(playlistArtOf, event.currentTarget as HTMLImageElement)}
+                  />
                 {/if}
                 {#if playlistArt && playlistArt !== playlistThumb}
                   {@const art = playlistArt}
@@ -7636,6 +7731,7 @@ import { playedBars, waveformPeaks } from './lib/waveform';
                     src={art}
                     alt=""
                     decoding="async"
+                    crossorigin="anonymous"
                     onload={() => (playlistArtLoaded = art)}
                   />
                 {:else if !playlistThumb}
@@ -7999,7 +8095,7 @@ import { playedBars, waveformPeaks } from './lib/waveform';
         class:closing={sheetClosing}
         class:dragging={sheetDragging}
         bind:this={sheetElement}
-        style={`--sheet-drag:${sheetDragY}px; --cover-hue:${artworkHue(shownTrack?.fileId ?? '')}`}
+        style={`--sheet-drag:${sheetDragY}px; --cover-hue:${sheetHue}`}
         role={pinned ? 'complementary' : 'dialog'}
         aria-modal={pinned ? undefined : 'true'}
         tabindex="-1"
@@ -8040,20 +8136,34 @@ import { playedBars, waveformPeaks } from './lib/waveform';
           <div class="now-sheet-art">
             {#if sheetThumbUrl()}
               <!-- The tile that was tapped has this one already, so the square is
-                   a cover the moment the drawer opens. -->
-              <img class="now-sheet-art-thumb" src={sheetThumbUrl()} alt="" aria-hidden="true" />
+                   a cover the moment the drawer opens. It is sampled for the colour
+                   of the drawer, so it is asked for in a way that allows that. -->
+              {@const thumbArtOf = shownTrack?.fileId ?? ''}
+              <img
+                class="now-sheet-art-thumb"
+                src={sheetThumbUrl()}
+                alt=""
+                aria-hidden="true"
+                crossorigin="anonymous"
+                onload={(event) => rememberCoverHue(thumbArtOf, event.currentTarget as HTMLImageElement)}
+              />
             {/if}
             <!-- A publisher who gave one rendition gave nothing to fade to, and
                  the thumbnail is that same image, so it is the only layer. -->
             {#if sheetCoverUrl() && sheetCoverUrl() !== sheetThumbUrl()}
               {@const art = sheetCoverUrl()}
+              {@const fullArtOf = shownTrack?.fileId ?? ''}
               <img
                 class="now-sheet-art-full"
                 class:ready={sheetArtLoaded === art}
                 src={art}
                 alt=""
                 decoding="async"
-                onload={() => (sheetArtLoaded = art)}
+                crossorigin="anonymous"
+                onload={(event) => {
+                  sheetArtLoaded = art;
+                  rememberCoverHue(fullArtOf, event.currentTarget as HTMLImageElement);
+                }}
                 onerror={() => (nowArtFailed = true)}
               />
             {:else if !sheetThumbUrl()}
@@ -8074,9 +8184,13 @@ import { playedBars, waveformPeaks } from './lib/waveform';
                    replaced, so a drag, a keyboard and a screen reader keep working
                    exactly as they did when a four-pixel bar was all there was. -->
               <svg class="now-sheet-wave" viewBox={`0 0 ${WAVEFORM_BARS} 1`} preserveAspectRatio="none" aria-hidden="true">
-                {#each waveformBars as peak, index}
-                  <rect x={index + 0.2} y={(1 - peak) / 2} width={0.6} height={peak} class:played={index < waveformPlayed} />
-                {/each}
+                <!-- One filled silhouette rather than a bar per column: the shape is
+                     what is read, and soft edges are what make it a shape. -->
+                <clipPath id="napstr-wave-played"><rect x="0" y="0" width={waveformPlayed} height="1" /></clipPath>
+                <path class="rest" d={waveformPath} />
+                <path class="played" d={waveformPath} clip-path="url(#napstr-wave-played)" />
+                <!-- The play-head as a line of its own: it is not part of the shape. -->
+                <line class="head" x1={waveformPlayed} x2={waveformPlayed} y1="0" y2="1" />
               </svg>
             {/if}
             <input
@@ -8171,16 +8285,16 @@ import { playedBars, waveformPeaks } from './lib/waveform';
                 <path d="M3.5 17.5h3.2l10.1-11h4" /><path d="M18.3 14.7 21 17.5l-2.7 2.8" />
               </svg>
             </button>
-            <button onclick={() => (showQueue = true)} disabled={playbackTarget === 'desktop' && remoteQueue.length === 0} aria-label={$t("Open the playlist")} title={$t("Playlist")}>
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <path d="M4 6.5h16" /><path d="M4 12h16" /><path d="M4 17.5h16" />
-              </svg>
-            </button>
-            <button disabled aria-label={$t("Smart playlists, coming soon")} title={$t("Smart playlists, coming soon")}>
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <path d="M12 12h.01" /><path d="M8.4 8.4a5.1 5.1 0 0 0 0 7.2" /><path d="M15.6 8.4a5.1 5.1 0 0 1 0 7.2" />
-              </svg>
-            </button>
+            <!-- Drawn exactly where the drawer could draw a list, so that no press
+                 is spent on a control that does nothing: a podcast is not a queue,
+                 and the computer's list is not one of this phone's own. -->
+            {#if playbackTarget === 'desktop' || activeMedia === 'music'}
+              <button onclick={() => (showQueue = true)} disabled={playbackTarget === 'desktop' && remoteQueue.length === 0} aria-label={$t("Open the playlist")} title={$t("Playlist")}>
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M4 6.5h16" /><path d="M4 12h16" /><path d="M4 17.5h16" />
+                </svg>
+              </button>
+            {/if}
             <button class="now-mode-like" class:liked={shownLiked} aria-pressed={shownLiked} onclick={toggleShownLike} aria-label={$t("Like this track")} disabled={!shownTrack}>
               <svg viewBox="0 0 24 24" aria-hidden="true">
                 <path d="M12 20.3c-1.4-1-7.2-5.2-7.2-9.4A4.2 4.2 0 0 1 12 8.2a4.2 4.2 0 0 1 7.2 2.7c0 4.2-5.8 8.4-7.2 9.4z" />
@@ -8548,7 +8662,7 @@ import { playedBars, waveformPeaks } from './lib/waveform';
 {/if}
 
 {#if showAlbumView && albumView}
-  <div class="album-view" class:desktop={desktopShell} style={`--cover-hue:${artworkHue(albumView.tracks[0]?.fileId ?? albumView.key)}`} role="dialog" aria-modal="true" aria-label={`${albumView.album} by ${albumView.artist}`}>
+  <div class="album-view" class:desktop={desktopShell} style={`--cover-hue:${albumHue}`} role="dialog" aria-modal="true" aria-label={`${albumView.album} by ${albumView.artist}`}>
     <div class="album-glow" style={albumGlow ? `background-image:url(${albumGlow})` : ''}></div>
     <div class="album-glow-scrim"></div>
     <header class="view-head">
@@ -8566,12 +8680,17 @@ import { playedBars, waveformPeaks } from './lib/waveform';
       <div class="album-art">
         {#if albumView.thumb}
           <!-- The shelf tile has already fetched this one, so the header paints
-               at once and the full cover fades in over it. -->
+               at once and the full cover fades in over it. The album's colour is
+               read off this picture, which is why it is asked for as a CORS
+               request and why it is the one that records it. -->
+          {@const albumArtOf = albumView.tracks[0]?.fileId ?? ''}
           <img
             class="album-art-backdrop"
             src={albumView.thumb}
             alt=""
             aria-hidden="true"
+            crossorigin="anonymous"
+            onload={(event) => rememberCoverHue(albumArtOf, event.currentTarget as HTMLImageElement)}
           />
         {/if}
         {#if albumView.art && albumView.art !== albumView.thumb}
@@ -8582,6 +8701,7 @@ import { playedBars, waveformPeaks } from './lib/waveform';
             src={art}
             alt=""
             decoding="async"
+            crossorigin="anonymous"
             onload={() => (albumArtLoaded = art)}
           />
         {:else if !albumView.thumb}
@@ -8834,7 +8954,7 @@ import { playedBars, waveformPeaks } from './lib/waveform';
   <div
     class="discussion-view"
     class:desktop={desktopShell}
-    style={`--cover-hue:${artworkHue(discussionTrack.fileId)}`}
+    style={`--cover-hue:${discussionHue}`}
     role="dialog"
     aria-modal="true"
     aria-label={$t("Track discussion")}
@@ -8951,7 +9071,7 @@ import { playedBars, waveformPeaks } from './lib/waveform';
               <!-- The mark in the middle is drawn over the code rather than cut
                    out of it: the code is rendered at the highest correction
                    level it can carry, which is what leaves room for this. -->
-              <img class="actions-code-mark" src="/napstr-logo-small.png" alt="" />
+              <img class="actions-code-mark" src="/napstr-logo-mark.png" alt="" />
             </div>
           {:else if trackCodeError}
             <p class="error">{trackCodeError}</p>

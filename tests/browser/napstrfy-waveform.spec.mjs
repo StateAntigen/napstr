@@ -62,15 +62,17 @@ test('the timeline becomes the track’s own shape once the file has been read',
   await openApp(page);
   await playAndOpen(page);
 
-  // The bars are the drawer's own count, so the drawing and the arithmetic behind
-  // the played part of it cannot drift apart.
+  // One silhouette and the played half of it drawn from the same numbers, so the
+  // drawing and the arithmetic behind the play-head cannot drift apart. The
+  // play-head itself is a line of its own rather than part of the shape.
   await expect(page.locator('.now-sheet-timeline.waves')).toBeVisible();
-  await expect(page.locator('.now-sheet-wave rect')).toHaveCount(140);
-  // Back to the beginning: at the start of the track, no bar is behind the
+  await expect(page.locator('.now-sheet-wave path')).toHaveCount(2);
+  await expect(page.locator('.now-sheet-wave .head')).toHaveCount(1);
+  // Back to the beginning: at the start of the track, nothing is behind the
   // play-head. (Not asserted from wherever playback happened to be paused, which is
   // however long the file took to start.)
   await page.getByRole('slider', { name: 'Seek' }).fill('0');
-  await expect(page.locator('.now-sheet-wave rect.played')).toHaveCount(0);
+  await expect(page.locator('.now-sheet-wave clipPath rect')).toHaveAttribute('width', '0');
 });
 
 test('the filled part of the shape is the part behind the play-head', async ({ page }) => {
@@ -78,20 +80,20 @@ test('the filled part of the shape is the part behind the play-head', async ({ p
   await playAndOpen(page);
 
   const timeline = page.getByRole('slider', { name: 'Seek' });
-  const played = page.locator('.now-sheet-wave rect.played');
-  const filled = () => played.count();
+  const head = page.locator('.now-sheet-wave clipPath rect');
+  const filled = async () => Number(await head.getAttribute('width'));
 
-  // A minute of audio: a third of the way in is a third of the bars, give or take
-  // the bar the play-head is standing on.
+  // A sixty-second file: a third of the way in is a third of the bars, give or
+  // take the bar the play-head is standing on.
   await timeline.fill('20');
   await expect.poll(() => audioPosition(page)).toBe(20);
-  await expect.poll(filled).toBeGreaterThan(44);
-  expect(await filled()).toBeLessThan(50);
+  await expect.poll(filled).toBeGreaterThan(194);
+  expect(await filled()).toBeLessThan(207);
 
   await timeline.fill('50');
   await expect.poll(() => audioPosition(page)).toBe(50);
-  await expect.poll(filled).toBeGreaterThan(114);
-  expect(await filled()).toBeLessThan(120);
+  await expect.poll(filled).toBeGreaterThan(494);
+  expect(await filled()).toBeLessThan(507);
 });
 
 test('the shape is drawn over the control rather than instead of it', async ({ page }) => {
@@ -107,5 +109,7 @@ test('the shape is drawn over the control rather than instead of it', async ({ p
 
   await timeline.fill('45');
   await expect.poll(() => audioPosition(page)).toBe(45);
-  await expect.poll(() => page.locator('.now-sheet-wave rect.played').count()).toBeGreaterThan(100);
+  await expect
+    .poll(() => page.locator('.now-sheet-wave clipPath rect').getAttribute('width').then(Number))
+    .toBeGreaterThan(400);
 });

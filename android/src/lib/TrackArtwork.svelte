@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { ARTWORK_RETRY_MS, artworkHue, coverFor, coverRevision, dropCover } from './artwork';
+  import { ARTWORK_RETRY_MS, coverFor, coverRevision, dropCover, placeholderHue, rememberCoverHue } from './artwork';
   import type { RemoteTrack } from './types';
 
   /**
@@ -16,7 +16,7 @@
   let visible = $state(false);
   let retry = $state(0);
   let retryTimer: ReturnType<typeof setTimeout> | undefined;
-  let hue = $derived(artworkHue(track.fileId));
+  let hue = $derived(placeholderHue(track.fileId));
 
   function observe(node: HTMLElement) {
     const observer = new IntersectionObserver((entries) => {
@@ -77,5 +77,9 @@
 </script>
 
 <div use:observe class:large class="artwork" style={`--cover-hue:${hue}`}>
-  {#if image && !failed}<img src={image} alt="" onerror={imageFailed} />{:else}<img class="fallback" src="/napstr-logo-small.png" alt="" />{/if}
+  <!-- `crossorigin` is what makes this picture's pixels readable, and the colour of
+       the cover is read off them: a picture from another origin taints the canvas
+       unless it was fetched as a CORS request. The app serves its own pictures and
+       sends the header that allows one, so this costs a fetch and nothing else. -->
+  {#if image && !failed}<img src={image} alt="" crossorigin="anonymous" onerror={imageFailed} onload={(event) => rememberCoverHue(track.fileId, event.currentTarget as HTMLImageElement)} />{:else}<img class="fallback" src="/napstr-logo-small.png" alt="" />{/if}
 </div>

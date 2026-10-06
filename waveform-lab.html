@@ -1,0 +1,786 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Napstr waveform lab</title>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        padding: 20px 22px 90px;
+        background: #08080a;
+        color: #e9e9ef;
+        font: 13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+        max-width: 800px;
+      }
+      h1 {
+        margin: 0 0 6px;
+        font-size: 19px;
+      }
+      h2 {
+        margin: 26px 0 8px;
+        font-size: 13px;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        color: #9d9da7;
+      }
+      p.lead {
+        margin: 0 0 6px;
+        color: #a9a9b4;
+      }
+      .bar {
+        position: sticky;
+        top: 0;
+        z-index: 2;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        align-items: center;
+        padding: 8px 0;
+        background: #08080a;
+        border-bottom: 1px solid #17171d;
+      }
+      .bar + .bar {
+        border-top: 1px solid #17171d;
+        border-bottom: 0;
+      }
+      button {
+        padding: 6px 12px;
+        color: #d8d8e2;
+        background: #16161b;
+        border: 1px solid #2a2a32;
+        border-radius: 999px;
+        font: inherit;
+        font-size: 12px;
+        cursor: pointer;
+      }
+      button.active {
+        color: #08181a;
+        background: #7adece;
+        border-color: #7adece;
+      }
+      .label {
+        color: #7f7f8a;
+        font-size: 11.5px;
+        padding: 6px 2px;
+      }
+      .filelabel {
+        display: inline-flex;
+        gap: 6px;
+        align-items: center;
+        color: #7f7f8a;
+        font-size: 11.5px;
+      }
+      input[type='file'] {
+        width: 180px;
+        color: #a9a9b4;
+        font: inherit;
+        font-size: 11.5px;
+      }
+      input[type='range'] {
+        width: 130px;
+        accent-color: #cbc4ff;
+      }
+      .pick {
+        padding: 8px 0 2px;
+        border-top: 1px solid #17171d;
+      }
+      .pick b {
+        display: block;
+        color: #f2f2f6;
+        font-size: 12.5px;
+      }
+      .pick canvas {
+        display: block;
+        width: 312px;
+        height: 36px;
+        margin: 4px 0 3px;
+        background: #000;
+      }
+      .pick p {
+        margin: 0;
+        color: #8d8d97;
+        font-size: 11.5px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Napstr waveform lab</h1>
+    <p class="lead">
+      Pick a track, a measure, a style and a contrast. Every canvas is the phone's timeline: 312 × 36
+      CSS px at 2×, played colour over the first 32%, and a play-head line where the colours meet.
+      <b>Contrast</b> is the knob for how far apart the loud and the quiet parts are drawn. The app
+      now draws <b>density</b>, contrast <b>percentile 20–90</b>, style <b>undulating fill</b>, at
+      <b>600</b> bars — which is where this page starts, in the track-discussion purple.
+    </p>
+
+    <div class="bar" id="tracks"></div>
+    <div class="bar" id="styles"></div>
+    <div class="bar" id="contrasts"></div>
+
+    <h2>every measure of <span id="track-name">a brickwalled master</span></h2>
+    <p class="lead" id="status"></p>
+    <div id="picks"></div>
+
+    <h2>contrast ladder: energy (RMS) on <span id="ladder-name">this track</span></h2>
+    <p class="lead">
+      The same samples, the same measure, only the curve from energy to height changed. Nearly all of
+      the difference between a bar that reads and a bar that does not is in this row.
+    </p>
+    <div id="ladder"></div>
+
+    <script>
+      const RATE = 8000; // what the app decodes at
+      let BARS = 600; // what the app draws at
+      const WIDTH = 312 * 2;
+      const HEIGHT = 36 * 2;
+      const PLAYED = 0.32;
+
+      // ---------------------------------------------------------------- samples
+      function noise(seed) {
+        let state = seed >>> 0;
+        return () => {
+          state = (state * 1664525 + 1013904223) >>> 0;
+          return state / 4294967296;
+        };
+      }
+
+      /**
+       * One synthetic track. `character` is what matters: "limited" is a brickwalled
+       * master, where the loudest instant of every bar is the ceiling and only the
+       * density of a section is left to tell the sections apart.
+       */
+      function makeTrack(character, seconds = 95) {
+        const count = RATE * seconds;
+        const samples = new Float32Array(count);
+        const rand = noise(character.length * 7919 + seconds);
+        const sections = [
+          { at: 0.0, gain: 0.22, density: 0.25, tone: 0.06 },
+          { at: 0.08, gain: 0.6, density: 0.45, tone: 0.16 },
+          { at: 0.3, gain: 1.0, density: 0.95, tone: 0.22 },
+          { at: 0.5, gain: 0.5, density: 0.18, tone: 0.1 },
+          { at: 0.6, gain: 1.0, density: 0.9, tone: 0.2 },
+          { at: 0.85, gain: 0.55, density: 0.5, tone: 0.12 }
+        ];
+        for (let index = 0; index < count; index += 1) {
+          const where = index / count;
+          let section = sections[0];
+          for (const candidate of sections) if (where >= candidate.at) section = candidate;
+          const fade = where > 0.94 ? Math.max(0, (1 - where) / 0.06) : 1;
+          const wobble = 0.75 + 0.25 * Math.sin(where * Math.PI * 26 + character.length);
+          const bass = Math.sin((2 * Math.PI * 70 * index) / RATE);
+          const body = Math.sin((2 * Math.PI * 220 * index) / RATE) * 0.5;
+          const hat = rand() * 2 - 1;
+          const raw = (bass + body + hat * 0.35) * section.tone * wobble * fade * 8;
+          let value;
+          if (character === 'limited') {
+            const duty = 0.2 + 0.8 * section.density;
+            const on = Math.sin(index * 0.0009 + section.at * 90) * 0.5 + 0.5 < duty;
+            value = Math.tanh(raw * 3.6) * (on ? 1 : 0.08) * section.gain * 0.98;
+          } else if (character === 'dynamic') {
+            value = Math.tanh(raw * 1.1) * section.gain * 0.95;
+          } else if (character === 'quiet') {
+            value = Math.tanh(raw * 0.35) * section.gain * 0.22;
+          } else {
+            const gate = Math.sin(where * Math.PI * 7) > -0.2 ? 1 : 0.04;
+            value = Math.tanh(raw * 1.6) * section.gain * 0.9 * gate;
+          }
+          samples[index] = value;
+        }
+        return samples;
+      }
+
+      // ------------------------------------------------------- measuring a slice
+      function perBar(samples, bars, measure) {
+        const out = [];
+        const per = Math.max(1, Math.floor(samples.length / bars));
+        for (let bar = 0; bar < bars; bar += 1) {
+          const from = bar * per;
+          out.push(measure(from, Math.min(samples.length, from + per)));
+        }
+        return out;
+      }
+
+      const peakOf = (samples) => (from, to) => {
+        let peak = 0;
+        for (let index = from; index < to; index += 1) {
+          const value = Math.abs(samples[index]);
+          if (value > peak) peak = value;
+        }
+        return peak;
+      };
+
+      const energyOf = (samples) => (from, to) => {
+        let sum = 0;
+        for (let index = from; index < to; index += 1) sum += samples[index] * samples[index];
+        return Math.sqrt(sum / Math.max(1, to - from));
+      };
+
+      const meanAbsoluteOf = (samples) => (from, to) => {
+        let sum = 0;
+        for (let index = from; index < to; index += 1) sum += Math.abs(samples[index]);
+        return sum / Math.max(1, to - from);
+      };
+
+      /**
+       * The samples split into what a one-pole filter calls bass and the rest.
+       *
+       * A measure of the bass alone is worth having because on a brickwalled master
+       * the overall level barely moves: the loudness is pinned, and what still
+       * changes between an intro and a chorus is which band is busy. Cached per
+       * sample array, since every measure of a track is taken over the same one.
+       */
+      const bands = new WeakMap();
+      function bassOf(samples) {
+        if (bands.has(samples)) return bands.get(samples);
+        const low = new Float32Array(samples.length);
+        const high = new Float32Array(samples.length);
+        const coefficient = 1 - Math.exp((-2 * Math.PI * 150) / RATE);
+        let state = 0;
+        for (let index = 0; index < samples.length; index += 1) {
+          state += coefficient * (samples[index] - state);
+          low[index] = state;
+          high[index] = samples[index] - state;
+        }
+        const pair = { low, high };
+        bands.set(samples, pair);
+        return pair;
+      }
+
+      /**
+       * How busy the bar is rather than how loud: the mean of the absolute samples
+       * divided by the loudest one in the same bar.
+       *
+       * A bar that is at the ceiling the whole time scores 1; a bar that is silence
+       * with a few hits in it scores near nothing. On a limited master this is the
+       * contrast that survives the limiting, because the limiting is exactly what
+       * removed the other one.
+       */
+      const densityOf = (samples) => (from, to) => {
+        let sum = 0;
+        let peak = 0;
+        for (let index = from; index < to; index += 1) {
+          const value = Math.abs(samples[index]);
+          sum += value;
+          if (value > peak) peak = value;
+        }
+        const count = Math.max(1, to - from);
+        return peak > 1e-6 ? sum / count / peak : 0;
+      };
+
+      // -------------------------------------------------------- the contrast knob
+      /**
+       * A contrast preset turns a set of measured levels into heights in 0..1.
+       *
+       * `percentile`, when set, maps that pair of percentiles onto 0 and 1 before
+       * anything else, which is the strongest lever of the lot: a single loud moment
+       * no longer decides the scale for the whole track.
+       * `floorDb` says how far below the top still counts; a *smaller* window spreads
+       * the same music over more of the height, so quiet parts get thinner.
+       * `gamma` bends the curve: above 1 it pulls the middle and the quiet down, which
+       * is the "more contrast" half of the same effect, and it works even when the
+       * measure is linear.
+       * `gate` flattens everything below it to nothing, then rescales what is left.
+       */
+      const PRESETS = [
+        ['normal (45 dB)', { floorDb: 45, gamma: 1 }],
+        ['floor 30', { floorDb: 30, gamma: 1 }],
+        ['floor 20', { floorDb: 20, gamma: 1 }],
+        ['floor 12', { floorDb: 12, gamma: 1 }],
+        ['gamma 1.5', { floorDb: 45, gamma: 1.5 }],
+        ['gamma 2.2', { floorDb: 45, gamma: 2.2 }],
+        ['floor 20 + gamma 1.5', { floorDb: 20, gamma: 1.5 }],
+        ['gate 20%', { floorDb: 30, gamma: 1.2, gate: 0.2 }],
+        ['percentile 5–95', { percentile: [5, 95], gamma: 1.2 }],
+        ['percentile 20–90', { percentile: [20, 90], gamma: 1.4 }]
+      ];
+
+      let contrast = PRESETS[0];
+
+      function shapeUnit(unit, options) {
+        const gamma = options.gamma ?? 1;
+        const gate = options.gate ?? 0;
+        return unit.map((value) => {
+          const powered = gamma === 1 ? value : Math.pow(value, gamma);
+          if (!gate) return powered;
+          return Math.max(0, (powered - gate) / (1 - gate));
+        });
+      }
+
+      /** Levels (linear, same units as the samples) to heights in 0..1. */
+      function curve(levels, options = contrast[1], linear = false) {
+        const sorted = [...levels].sort((left, right) => left - right);
+        const at = (percent) =>
+          sorted[Math.min(sorted.length - 1, Math.max(0, Math.round((percent / 100) * (sorted.length - 1))))] || 1e-6;
+        const low = options.percentile ? at(options.percentile[0]) : 0;
+        const high = options.percentile ? at(options.percentile[1]) : Math.max(...levels);
+        const spread = Math.max(1e-6, high - low);
+        const floorDb = linear ? null : options.floorDb ?? 45;
+        const unit = levels.map((level) => {
+          const clamped = Math.min(1, Math.max(0, (level - low) / spread));
+          if (floorDb === null) return clamped;
+          const decibels = 20 * Math.log10(Math.max(1e-6, clamped));
+          return Math.max(0, Math.min(1, (decibels + floorDb) / floorDb));
+        });
+        return shapeUnit(unit, options);
+      }
+
+      // ------------------------------------------------------------- the measures
+      const measures = {
+        rms: (samples, bars) => curve(perBar(samples, bars, energyOf(samples))),
+        rmsLinear: (samples, bars) => curve(perBar(samples, bars, energyOf(samples)), contrast[1], true),
+        meanAbsolute: (samples, bars) => curve(perBar(samples, bars, meanAbsoluteOf(samples))),
+        bass: (samples, bars) => curve(perBar(bassOf(samples).low, bars, energyOf(bassOf(samples).low))),
+        top: (samples, bars) => curve(perBar(bassOf(samples).high, bars, energyOf(bassOf(samples).high))),
+        density: (samples, bars) => curve(perBar(samples, bars, densityOf(samples))),
+        bassPlusDensity: (samples, bars) => {
+          const low = curve(perBar(bassOf(samples).low, bars, energyOf(bassOf(samples).low)));
+          const business = curve(perBar(samples, bars, densityOf(samples)));
+          return low.map((value, index) => Math.min(1, value * 0.6 + business[index] * 0.4));
+        },
+        overlap: (samples, bars) => {
+          const per = Math.max(1, Math.floor(samples.length / bars));
+          const half = Math.max(1, per);
+          const levels = [];
+          for (let bar = 0; bar < bars; bar += 1) {
+            const centre = bar * per + Math.floor(per / 2);
+            const from = Math.max(0, centre - half);
+            const to = Math.min(samples.length, centre + half);
+            let sum = 0;
+            for (let index = from; index < to; index += 1) sum += samples[index] * samples[index];
+            levels.push(Math.sqrt(sum / Math.max(1, to - from)));
+          }
+          return curve(levels);
+        },
+        blend: (samples, bars) => {
+          const body = curve(perBar(samples, bars, energyOf(samples)));
+          const edge = curve(perBar(samples, bars, peakOf(samples)));
+          return body.map((value, index) => Math.min(1, value * 0.65 + edge[index] * 0.35));
+        },
+        stepped: (samples, bars) =>
+          curve(perBar(samples, bars, energyOf(samples))).map((value) => Math.round(value * 7) / 7),
+        peak: (samples, bars) => curve(perBar(samples, bars, peakOf(samples)), contrast[1], true),
+        minMax: (samples, bars) => {
+          const lows = [];
+          const highs = [];
+          perBar(samples, bars, (from, to) => {
+            let low = 0;
+            let high = 0;
+            for (let index = from; index < to; index += 1) {
+              if (samples[index] < low) low = samples[index];
+              if (samples[index] > high) high = samples[index];
+            }
+            lows.push(low);
+            highs.push(high);
+            return 0;
+          });
+          const loudest = Math.max(...highs.map(Math.abs), ...lows.map(Math.abs)) || 1;
+          return { lows: lows.map((value) => value / loudest), highs: highs.map((value) => value / loudest) };
+        },
+        bandEnergy: (samples, bars) => {
+          const band = measures.minMax(samples, bars);
+          const body = measures.rms(samples, bars);
+          return {
+            lows: band.lows.map((value, index) => Math.min(value, -body[index] / 2)),
+            highs: band.highs.map((value, index) => Math.max(value, body[index] / 2))
+          };
+        }
+      };
+
+      const GENERATORS = [
+        ['bass energy', 'energy of everything below about 150 Hz, taken with a one-pole filter. On a master whose level is pinned, this is the band that still moves between an intro and a chorus.', measures.bass],
+        ['top energy', 'everything above that, which is where cymbals and consonants live: often busy where the bass is not.', measures.top],
+        ['density ✦ what the app draws', 'how busy the bar is rather than how loud: the mean of the absolute samples over the loudest one in the same bar. A bar pinned at the ceiling the whole time scores 1; a bar of silence with a few hits in it scores near nothing.', measures.density],
+        ['bass + density', 'the bass band and the density together, which is as much contrast as a brickwalled master has left in it.', measures.bassPlusDensity],
+        ['energy (RMS)', 'the average level of the bar rather than its worst instant. Follows the arrangement instead of the ceiling, which is what made the phone’s old bar useless on a brickwalled master.', measures.rms],
+        ['energy, linear', 'energy with no decibel curve at all: the widest contrast the measure can have, and the quietest parts come close to vanishing.', measures.rmsLinear],
+        ['energy, mean |x|', 'the mean of the absolute samples rather than the root of the mean square: a slightly fuller, gentler body.', measures.meanAbsolute],
+        ['energy, overlapping windows', 'each bar measured over twice its own width, centred on it, so neighbours share half their samples: smooth without lagging.', measures.overlap],
+        ['energy + peak', 'energy for the body of the bar, peak for its edges, so transients show without dragging the body up to them.', measures.blend],
+        ['energy, stepped', 'the curved energy rounded to seven levels: a display rather than a meter.', measures.stepped],
+        ['peak per bar', 'for reference: the worst instant in the bar. On a brickwalled master this is the solid block the phone used to draw.', measures.peak],
+        ['min/max band', 'for reference: the quietest and loudest sample of each bar, drawn as one band. Contrast does not apply.', measures.minMax],
+        ['band + energy', 'what the app draws now: the min/max band widened by the energy, so a quiet-but-present part is not a hairline.', measures.bandEnergy]
+      ];
+
+      const STYLES = [
+        ['solid bars', { kind: 'bars', gap: 0 }],
+        ['thin bars', { kind: 'bars', gap: 0.35 }],
+        ['rounded bars', { kind: 'bars', gap: 0.3, round: true }],
+        ['band, flat', { kind: 'fill', smooth: 0 }],
+        ['undulating line', { kind: 'stroke', smooth: 5 }],
+        ['undulating fill', { kind: 'fill', smooth: 5 }],
+        ['undulating fill, wide', { kind: 'fill', smooth: 11 }],
+        ['fill + glow', { kind: 'fill', smooth: 5, glow: true }],
+        ['area above the line', { kind: 'area', smooth: 5 }]
+      ];
+
+      let PLAYED_FILL = 'hsl(247 100% 88%)'; // the app's fallback hue
+      let hue = 247;
+      const REST_FILL = 'rgba(255,255,255,.2)';
+      const PLAYED_STROKE = '#ded9ff';
+      const REST_STROKE = 'rgba(255,255,255,.35)';
+
+      let style = STYLES[5]; // undulating fill, which is what the app draws
+      let selected = 'limited';
+      let own = null;
+      let ownName = '';
+      contrast = PRESETS[9]; // percentile 20–90, which is what the app draws
+
+      // ------------------------------------------------------------------ drawing
+      function prepare(canvas) {
+        canvas.width = WIDTH;
+        canvas.height = HEIGHT;
+        const ctx = canvas.getContext('2d');
+        ctx.clearRect(0, 0, WIDTH, HEIGHT);
+        ctx.lineJoin = 'round';
+        ctx.lineCap = 'round';
+        return ctx;
+      }
+
+      function envelopeOf(points) {
+        if (points.lows) return { upper: points.highs, lower: points.lows };
+        return { upper: points, lower: points.map((value) => -value) };
+      }
+
+      function smoothed(values, span) {
+        if (!span) return values;
+        return values.map((_value, index) => {
+          let sum = 0;
+          for (let at = index - span; at <= index + span; at += 1) {
+            sum += values[Math.min(values.length - 1, Math.max(0, at))];
+          }
+          return sum / (span * 2 + 1);
+        });
+      }
+
+      function silhouette(upper, lower) {
+        const bars = upper.length;
+        const slot = WIDTH / bars;
+        const path = new Path2D();
+        upper.forEach((value, index) => {
+          const x = index * slot;
+          const y = ((1 - value) * HEIGHT) / 2;
+          if (index === 0) path.moveTo(x, y);
+          else path.lineTo(x, y);
+        });
+        for (let index = bars - 1; index >= 0; index -= 1) {
+          path.lineTo(index * slot, ((1 - lower[index]) * HEIGHT) / 2);
+        }
+        path.closePath();
+        return path;
+      }
+
+      function singleLine(values) {
+        const bars = values.length;
+        const slot = WIDTH / bars;
+        const path = new Path2D();
+        values.forEach((value, index) => {
+          const x = index * slot;
+          const y = ((1 - value) * HEIGHT) / 2;
+          if (index === 0) path.moveTo(x, y);
+          else path.lineTo(x, y);
+        });
+        return path;
+      }
+
+      function drawHead(ctx) {
+        ctx.fillStyle = 'rgba(255,255,255,.9)';
+        ctx.fillRect(Math.round(WIDTH * PLAYED) - 1, 0, 2, HEIGHT);
+      }
+
+      function split(ctx, draw) {
+        const played = WIDTH * PLAYED;
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(0, 0, played, HEIGHT);
+        ctx.clip();
+        draw(PLAYED_FILL, PLAYED_STROKE);
+        ctx.restore();
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(played, 0, WIDTH - played, HEIGHT);
+        ctx.clip();
+        draw(REST_FILL, REST_STROKE);
+        ctx.restore();
+      }
+
+      function render(ctx, points, chosen = style) {
+        const config = chosen[1];
+        const { upper, lower } = envelopeOf(points);
+        const top = smoothed(upper, config.smooth);
+        const bottom = smoothed(lower, config.smooth);
+        if (config.glow) {
+          ctx.shadowColor = 'rgba(122,222,206,.7)';
+          ctx.shadowBlur = 14;
+        }
+        if (config.kind === 'bars') {
+          const bars = top.length;
+          const slot = WIDTH / bars;
+          const width = Math.max(1, slot * (1 - config.gap));
+          for (let index = 0; index < bars; index += 1) {
+            const barHeight = Math.max(1, ((top[index] - bottom[index]) * HEIGHT) / 2);
+            const x = index * slot;
+            const y = ((1 - top[index]) * HEIGHT) / 2;
+            ctx.fillStyle = index < bars * PLAYED ? PLAYED_FILL : REST_FILL;
+            if (config.round) {
+              const radius = Math.min(width / 2, 2);
+              ctx.beginPath();
+              ctx.moveTo(x, y + radius);
+              ctx.arcTo(x, y, x + width, y, radius);
+              ctx.arcTo(x + width, y, x + width, y + barHeight, radius);
+              ctx.arcTo(x + width, y + barHeight, x, y + barHeight, radius);
+              ctx.arcTo(x, y + barHeight, x, y, radius);
+              ctx.fill();
+            } else {
+              ctx.fillRect(x, y, width, barHeight);
+            }
+          }
+        } else if (config.kind === 'fill') {
+          const path = silhouette(top, bottom);
+          split(ctx, (fill) => {
+            ctx.fillStyle = fill;
+            ctx.fill(path);
+          });
+        } else if (config.kind === 'stroke') {
+          const up = singleLine(top);
+          const down = singleLine(bottom);
+          split(ctx, (_fill, stroke) => {
+            ctx.strokeStyle = stroke;
+            ctx.lineWidth = 3;
+            ctx.stroke(up);
+            ctx.stroke(down);
+          });
+        } else if (config.kind === 'area') {
+          const bars = top.length;
+          const slot = WIDTH / bars;
+          const path = new Path2D();
+          path.moveTo(0, HEIGHT / 2);
+          top.forEach((value, index) => path.lineTo(index * slot, ((1 - value) * HEIGHT) / 2));
+          path.lineTo(WIDTH, HEIGHT / 2);
+          path.closePath();
+          split(ctx, (fill) => {
+            ctx.fillStyle = fill;
+            ctx.fill(path);
+          });
+        }
+        ctx.shadowBlur = 0;
+        drawHead(ctx);
+      }
+
+      // -------------------------------------------------------------- the page
+      const synthetic = new Map();
+      function trackFor(character) {
+        if (!synthetic.has(character)) synthetic.set(character, makeTrack(character));
+        return synthetic.get(character);
+      }
+
+      const TRACKS = [
+        ['limited', 'brickwalled'],
+        ['dynamic', 'dynamic'],
+        ['quiet', 'quiet'],
+        ['spoken', 'speech']
+      ];
+
+      const DESCRIPTION = {
+        limited: 'a brickwalled master',
+        dynamic: 'a dynamic master',
+        quiet: 'a quiet master',
+        spoken: 'speech, with long gaps'
+      };
+
+      function samplesFor(key) {
+        if (key === 'yours') return own;
+        return trackFor(key);
+      }
+
+      function pick(title, note, draw) {
+        const box = document.createElement('div');
+        box.className = 'pick';
+        const label = document.createElement('b');
+        label.textContent = title;
+        const canvas = document.createElement('canvas');
+        const caption = document.createElement('p');
+        caption.textContent = note;
+        box.append(label, canvas, caption);
+        draw(prepare(canvas));
+        return box;
+      }
+
+      function buttonRow(host, labelText, entries, isActive, onPick) {
+        host.innerHTML = '';
+        const label = document.createElement('span');
+        label.className = 'label';
+        label.textContent = labelText;
+        host.append(label);
+        for (const entry of entries) {
+          const button = document.createElement('button');
+          button.textContent = entry.text;
+          button.className = isActive(entry) ? 'active' : '';
+          button.addEventListener('click', () => onPick(entry));
+          host.append(button);
+        }
+        return host;
+      }
+
+      function renderTrackButtons() {
+        const host = document.getElementById('tracks');
+        const entries = TRACKS.map(([key, text]) => ({ key, text }));
+        if (own) entries.push({ key: 'yours', text: ownName });
+        buttonRow(
+          host,
+          'track:',
+          entries,
+          (entry) => entry.key === selected,
+          (entry) => {
+            selected = entry.key;
+            renderTrackButtons();
+            renderAll();
+          }
+        );
+        const fileLabel = document.createElement('label');
+        fileLabel.className = 'filelabel';
+        fileLabel.append(document.createTextNode(own ? 'replace:' : 'your own file: '));
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = 'audio/*';
+        input.id = 'file';
+        input.addEventListener('change', (event) => {
+          const file = event.target.files?.[0];
+          if (file) void readOwn(file);
+        });
+        fileLabel.append(input);
+        host.append(fileLabel);
+      }
+
+      function renderStyleButtons() {
+        const entries = STYLES.map((candidate) => ({ candidate, text: candidate[0] }));
+        buttonRow(
+          document.getElementById('styles'),
+          'style:',
+          entries,
+          (entry) => entry.candidate === style,
+          (entry) => {
+            style = entry.candidate;
+            renderStyleButtons();
+            renderAll();
+          }
+        );
+        const host = document.getElementById('styles');
+        const countLabel = document.createElement('span');
+        countLabel.className = 'label';
+        countLabel.textContent = 'bars:';
+        host.append(countLabel);
+        for (const count of [600, 800, 1200]) {
+          const button = document.createElement('button');
+          button.textContent = String(count);
+          button.className = count === BARS ? 'active' : '';
+          button.addEventListener('click', () => {
+            BARS = count;
+            renderStyleButtons();
+            renderAll();
+          });
+          host.append(button);
+        }
+        // The hue the app takes from the track's file id, which is what the played
+        // part is tinted with. Lightness and saturation are fixed there, so every hue
+        // reads against the dim rest of the track; this is the knob for checking that.
+        const hueLabel = document.createElement('span');
+        hueLabel.className = 'label';
+        hueLabel.textContent = 'hue:';
+        const hueInput = document.createElement('input');
+        hueInput.type = 'range';
+        hueInput.min = '0';
+        hueInput.max = '360';
+        hueInput.value = String(hue);
+        hueInput.id = 'hue';
+        const hueValue = document.createElement('span');
+        hueValue.className = 'label';
+        hueValue.textContent = `${hue}°`;
+        hueInput.addEventListener('input', () => {
+          hueValue.textContent = `${hueInput.value}°`;
+        });
+        hueInput.addEventListener('change', () => {
+          hue = Number(hueInput.value);
+          PLAYED_FILL = `hsl(${hue} 100% 88%)`;
+          renderAll();
+        });
+        host.append(hueLabel, hueInput, hueValue);
+      }
+
+      function renderContrastButtons() {
+        const entries = PRESETS.map((candidate) => ({ candidate, text: candidate[0] }));
+        buttonRow(
+          document.getElementById('contrasts'),
+          'contrast:',
+          entries,
+          (entry) => entry.candidate === contrast,
+          (entry) => {
+            contrast = entry.candidate;
+            renderContrastButtons();
+            renderAll();
+          }
+        );
+      }
+
+      function renderAll() {
+        const samples = samplesFor(selected);
+        const name = DESCRIPTION[selected] ?? ownName;
+        document.getElementById('track-name').textContent = name;
+        document.getElementById('ladder-name').textContent = name;
+        const status = document.getElementById('status');
+        const host = document.getElementById('picks');
+        const ladder = document.getElementById('ladder');
+        host.innerHTML = '';
+        ladder.innerHTML = '';
+        if (!samples) {
+          status.textContent = 'Pick a file above to draw your own track in every measure below.';
+          return;
+        }
+        status.textContent =
+          selected === 'yours'
+            ? `${ownName} — ${(samples.length / RATE).toFixed(0)} s decoded at 8 kHz, which is what the app decodes at.`
+            : 'A synthetic master, generated at 8 kHz so every measure below sees the same samples.';
+        for (const [title, note, generate] of GENERATORS) {
+          host.append(pick(title, note, (ctx) => render(ctx, generate(samples, BARS))));
+        }
+        for (const preset of PRESETS) {
+          ladder.append(
+            pick(preset[0], '', (ctx) => {
+              const levels = perBar(samples, BARS, energyOf(samples));
+              render(ctx, curve(levels, preset[1]));
+            })
+          );
+        }
+      }
+
+      async function readOwn(file) {
+        const status = document.getElementById('status');
+        status.textContent = `reading ${file.name}…`;
+        try {
+          const bytes = await file.arrayBuffer();
+          const low = new OfflineAudioContext(1, 1, RATE);
+          const buffer = await low.decodeAudioData(bytes);
+          own = buffer.getChannelData(0);
+          ownName = file.name;
+          selected = 'yours';
+          renderTrackButtons();
+          renderAll();
+        } catch (error) {
+          status.textContent = `could not decode that file: ${error}`;
+        }
+      }
+
+      renderStyleButtons();
+      renderContrastButtons();
+      renderTrackButtons();
+      renderAll();
+    </script>
+  </body>
+</html>

@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { writable } from 'svelte/store';
 import { recordCoverEvent } from './coverDebug';
+import { hueOfImage } from './hue';
 import type { RemoteTrack } from './types';
 
 /**
@@ -453,6 +454,10 @@ function loadRendition(url: string): Promise<string> {
     // the cover is still wanted when it lands is decided by the screen itself.
     const image = new Image();
     image.decoding = 'async';
+    // Asked for the way the screen will ask for it, so the warm-up and the drawing
+    // are one entry in the cache rather than two - and so what lands is a picture
+    // whose pixels can be read.
+    image.crossOrigin = 'anonymous';
     image.onload = () => resolve(url);
     image.onerror = () => resolve('');
     image.src = url;
@@ -674,6 +679,61 @@ export function clearCoverCache() {
   }
 }
 
-export function artworkHue(fileId: string) {
+/**
+ * A colour *for* a track, before any picture has arrived.
+ *
+ * A hash of the file id: stable, varied, and invented. It is what the tiles and the
+ * album glow fall back to while a cover is being fetched, and it is no longer called
+ * the artwork hue, because the colour of an album's artwork is a question about that
+ * artwork - see `coverHueOf` - and this answers a different one.
+ */
+export function placeholderHue(fileId: string) {
   return Number.parseInt(fileId.slice(0, 6) || '5632aa', 16) % 360;
+}
+
+/** Bumped whenever a cover has been read, so anything showing a hue can redraw. */
+export const coverHueRevision = writable(0);
+
+/**
+ * What each cover turned out to be coloured, by the file whose track it is.
+ *
+ * Three states, and the difference between the last two is the point: a number is a
+ * colour that was read out of the picture, `null` is a picture that had no colour to
+ * give - a black-and-white sleeve - and absent means no picture has been read yet.
+ */
+const coverHues = new Map<string, number | null>();
+
+export function coverHueOf(fileId: string): number | null | undefined {
+  return coverHues.get(fileId);
+}
+
+/**
+ * Read the hue out of a picture that has already been decoded.
+ *
+ * Called when a cover's own image element loads, so nothing is fetched twice: the
+ * picture is already in hand and drawing it small is instant.
+ *
+ * Each pixel votes for a hue, weighted by how colourful it is and by how far it is
+ * from black and from white - so a pixel that is nearly grey abstains rather than
+ * voting for a hue it does not have. A monochrome sleeve therefore produces almost
+ * no votes, and few enough votes is `null`: the app's own colour is a better answer
+ * than an invented one.
+ *
+ * The picture has to have been fetched as a CORS request for any of that to be
+ * possible, which is what `crossorigin` on the image elements that call this is for;
+ * on the phone the pictures are served by the app's own server, which is another
+ * origin to the page and does send the header that allows one. What came of the read
+ * is written to the cover log as well as acted on, because the failure here is
+ * silent and total: a picture nobody could read answers "no colour", and every
+ * screen in the app is then tinted the same colour with nothing to say why.
+ */
+export function rememberCoverHue(fileId: string, image: HTMLImageElement) {
+  if (!fileId || coverHues.has(fileId)) return;
+  const read = hueOfImage(image);
+  const name = fileId.slice(0, 8);
+  if (read === undefined) recordCoverEvent('hue', `${name}: picture could not be read`);
+  else if (read === null) recordCoverEvent('hue', `${name}: picture has no colour`);
+  else recordCoverEvent('hue', `${name}: hue ${read}`);
+  coverHues.set(fileId, read ?? null);
+  coverHueRevision.update((value) => value + 1);
 }

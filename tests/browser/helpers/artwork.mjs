@@ -40,9 +40,16 @@ export function artHashes(seed) {
   return { thumb: artHash(seed, 'thumb'), full: artHash(seed, 'full') };
 }
 
-/** A 1x1 PNG, so every artwork in every test is a real image to the browser. */
+/**
+ * A 1x1 PNG, so every artwork in every test is a real image to the browser.
+ *
+ * Opaque red, and a stream a decoder will actually accept: the one this used to
+ * hold failed its zlib checksum, so whether anything was ever drawn from it came
+ * down to how forgiving the decoder felt - which is not a thing for a test that
+ * shows artwork to rest on. Specs that only read the `src` never noticed.
+ */
 export const ART_PNG = Buffer.from(
-  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==',
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC',
   'base64'
 );
 
