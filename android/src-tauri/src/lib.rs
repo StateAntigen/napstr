@@ -4761,7 +4761,7 @@ async fn remote_send_device_discussion(
     {
         Ok(ServerResponse::DeviceEventPublished { event_id }) => Ok(event_id),
         Ok(response) => Err(unexpected_response(&response)),
-        Err(error) => Err(friendly_if_missing(error, DISCUSSION_UNAVAILABLE)),
+        Err(error) => Err(friendly_if_missing(error, DEVICE_COMMENT_UNAVAILABLE)),
     }
 }
 
@@ -4849,7 +4849,7 @@ async fn remote_publish_device_playlist(
             ..playlist
         }),
         Ok(response) => Err(unexpected_response(&response)),
-        Err(error) => Err(friendly_if_missing(error, DISCUSSION_UNAVAILABLE)),
+        Err(error) => Err(friendly_if_missing(error, DEVICE_PLAYLIST_UNAVAILABLE)),
     }
 }
 
@@ -5575,6 +5575,14 @@ const REPORT_UNAVAILABLE: &str =
     "This Napstr cannot publish reports yet. Update Napstr on your computer.";
 const DISCUSSION_UNAVAILABLE: &str =
     "This Napstr cannot show track discussions yet. Update Napstr on your computer.";
+/// The same for the two things a phone says with its own key. They are separate
+/// sentences because the suggestion is the same and the reason is not: a comment
+/// this phone signed is a request an older computer has never heard of, and being
+/// told it cannot "show track discussions" would describe the wrong half of it.
+const DEVICE_COMMENT_UNAVAILABLE: &str =
+    "This Napstr cannot take a comment signed by this phone yet. Update Napstr on your computer.";
+const DEVICE_PLAYLIST_UNAVAILABLE: &str =
+    "This Napstr cannot publish a playlist signed by this phone yet. Update Napstr on your computer.";
 
 /// A host that does not know a request answers with a parse error, which says
 /// nothing useful to the person holding the phone.
